@@ -1,4 +1,4 @@
-# tools: compute_basic_stat, fit_1D_trend
+# tools: compute_basic_stat, fit_1D_trend, transform_unit
 
 import xarray as xr
 import numpy as np
@@ -49,16 +49,15 @@ def compute_basic_stat(data: xr.DataArray, op: str, dim: str | list[str] | None 
     description="Fit a trend line to a 1D xarray.DataArray using common climate trend models.",
     args={
         "data": "xr.DataArray, required. 1D data array (e.g., time series) to fit the trend.",
-        "method": "str, optional. Trend fitting method. Supported values: "
-        "'linear' (y = a*x + b), 'quadratic' (y = a*x^2 + b*x + c), "
-        "'exponential' (y = a*exp(b*x)), 'sinusoidal' (y = a*sin(b*x + c) + d). "
-        "If None, the best method is automatically chosen based on R² score."
+        "method": "str, optional. Trend fitting method. Supported values:"
+            "'linear' (y = a*x + b), 'quadratic' (y = a*x^2 + b*x + c), "
+            "'exponential' (y = a*exp(b*x)), 'sinusoidal' (y = a*sin(b*x + c) + d). "
+            "If None, the best method is automatically chosen based on R² score."
     },
     returns="A dictionary containing: " \
     "'fitted_data' (xr.DataArray): Fitted values aligned with input." \
     "'equation' (str): String representation of the fitted function." \
-    "'metrics' (dict): Difference metrics {rmse, mae, r2}." \
-    "'method' (str): The fitting method used."
+    "'metrics' (dict): Difference metrics {rmse, mae, r2}."
 )
 def fit_1D_trend(data: xr.DataArray, method: str = None) -> Dict[str, Any]:
     if data.ndim != 1:
@@ -77,10 +76,10 @@ def fit_1D_trend(data: xr.DataArray, method: str = None) -> Dict[str, Any]:
         return a * np.sin(b * x + c) + d
     
     models = {
-        "linear": (linear, [0, np.mean(y)]),
-        "quadratic": (quadratic, [0, 0, np.mean(y)]),
-        "exponential": (exponential, [1, 0.01]),
-        "sinusoidal": (sinusoidal, [np.std(y), 2*np.pi/12, 0, np.mean(y)]),
+        "linear, a * x + b": (linear, [0, np.mean(y)]),
+        "quadratic, a * x**2 + b * x + c": (quadratic, [0, 0, np.mean(y)]),
+        "exponential, a * np.exp(b * x)": (exponential, [1, 0.01]),
+        "sinusoidal, a * np.sin(b * x + c) + d": (sinusoidal, [np.std(y), 2*np.pi/12, 0, np.mean(y)]),
     }
 
     results = {}
@@ -112,10 +111,108 @@ def fit_1D_trend(data: xr.DataArray, method: str = None) -> Dict[str, Any]:
     )
 
     param_str = ", ".join([f"{p:.4f}" for p in chosen["params"]])
-    equation = f"{method} fit with params: [{param_str}]"
+    equation = f"{method}, fit with params: [{param_str}]"
 
     return {
         "fitted_data": fitted_data,
         "equation": equation,
         "metrics": chosen["metrics"],
     }
+
+
+@register_tools(
+    name="transform_unit",
+    description="Transform units of oceanographic variables in an xarray.DataArray. "
+                "Supports common conversions for temperature, concentration, salinity, and velocity. "
+                "Uses standard seawater density (ρ = 1025 kg/m³) for mass/volume conversions.",
+    args={
+        "data": "xr.DataArray, required. Input data array to convert.",
+        "from_unit": "str, required. Source unit (case-insensitive). "
+                     "Supported: 'Kelvin', 'Celsius' (temperature); "
+                     "'μmol/kg', 'μmol/L', 'mmol/m3', 'mmol/kg' (concentration); "
+                     "'psu', 'PSU' (salinity); 'm/s', 'mm/s', 'cm/s' (velocity).",
+        "to_unit": "str, required. Target unit (case-insensitive). "
+                   "Must be compatible with from_unit category."
+    },
+    returns="xr.DataArray. Converted data with updated 'units' attribute and added 'original_units' metadata."
+)
+def transform_unit(data: xr.DataArray, from_unit: str, to_unit: str) -> xr.DataArray:
+    from_unit = from_unit.strip().lower()
+    to_unit = to_unit.strip().lower()
+
+    if from_unit == to_unit:
+        result = data.copy()
+        result.attrs['units'] = to_unit
+        return result
+    
+    unit_aliases = {
+        'k': 'kelvin', 'kelvin': 'kelvin',
+        '°c': 'celsius', 'degc': 'celsius', 'celsius': 'celsius', 'c': 'celsius',
+        
+        'μmol/kg': 'umol/kg', 'umol/kg': 'umol/kg', 'micromol/kg': 'umol/kg', 'μmol·kg^-1': 'umol/kg', 'umol·kg^-1': 'umol/kg', 
+        
+        'μmol/l': 'umol/l', 'umol/l': 'umol/l', 'micromol/l': 'umol/l', 'μmol·l^-1': 'umol/l', 'umol·l^-1': 'umol/l',
+        
+        'mmol/m3': 'mmol/m3', 'mmol/m^3': 'mmol/m3',
+        
+        'mmol/kg': 'mmol/kg',
+        
+        'psu': 'psu',
+        
+        'm/s': 'm/s', 'mm/s': 'mm/s', 'cm/s': 'cm/s',
+    }
+
+    std_from = unit_aliases.get(from_unit)
+    std_to = unit_aliases.get(to_unit)
+    
+    if std_from is None:
+        raise ValueError(f"Unsupported from_unit: '{from_unit}'")
+    if std_to is None:
+        raise ValueError(f"Unsupported to_unit: '{to_unit}'")
+
+    conversion_key = (std_from, std_to)
+    conversions = {
+        ('kelvin', 'celsius'): lambda x: x - 273.15,
+        ('celsius', 'kelvin'): lambda x: x + 273.15,
+        
+        # seawater density ρ ≈ 1025 kg/m³ = 1.025 kg/L
+        ('umol/kg', 'umol/l'): lambda x: x * 1.025,
+        ('umol/l', 'umol/kg'): lambda x: x / 1.025,
+        
+        ('umol/kg', 'mmol/m3'): lambda x: x * 1.025,
+        ('mmol/m3', 'umol/kg'): lambda x: x / 1.025,
+        
+        ('umol/l', 'mmol/m3'): lambda x: x,
+        ('mmol/m3', 'umol/l'): lambda x: x,
+        
+        ('umol/kg', 'mmol/kg'): lambda x: x / 1000,
+        ('mmol/kg', 'umol/kg'): lambda x: x * 1000,
+        
+        ('umol/l', 'mmol/kg'): lambda x: x / 1000 / 1.025,
+        ('mmol/kg', 'umol/l'): lambda x: x * 1000 * 1.025,
+        
+        ('mmol/m3', 'mmol/kg'): lambda x: x / 1.025,
+        ('mmol/kg', 'mmol/m3'): lambda x: x * 1.025,
+        
+        ('m/s', 'mm/s'): lambda x: x * 1000,
+        ('mm/s', 'm/s'): lambda x: x / 1000,
+        ('m/s', 'cm/s'): lambda x: x * 100,
+        ('cm/s', 'm/s'): lambda x: x / 100,
+        ('cm/s', 'mm/s'): lambda x: x * 10,
+        ('mm/s', 'cm/s'): lambda x: x / 10,
+        
+        ('psu', 'psu'): lambda x: x,
+    }
+
+    if conversion_key not in conversions:
+        raise ValueError(f"Unsupported conversion from '{from_unit}' to '{to_unit}'.")
+
+    convert_func = conversions[conversion_key]
+    result = data.copy()
+    result.values = convert_func(result.values)
+
+    result.attrs['units'] = to_unit
+    if 'original_units' not in result.attrs:
+        result.attrs['original_units'] = from_unit
+    
+    return result
