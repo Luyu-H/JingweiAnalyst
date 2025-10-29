@@ -3,7 +3,7 @@
 import xarray as xr
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 from scipy.optimize import curve_fit
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
