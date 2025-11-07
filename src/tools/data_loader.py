@@ -14,8 +14,10 @@ from src.utils.geolocator import Geolocator
 
 @register_tools(
     name="load_regular_data",
-    description="Load regional ocean data from a selected zarr file with dimensions (time, depth, lat, lon). " \
-    "The variable name is parsed automatically from the file name. Supports subsetting by 1 – 4 dimensions.",
+    description="Load a regular subset of ocean data from a Zarr dataset with dimensions (time, depth, lat, lon). "
+        "This tool supports only continuous range-based subsetting along 1–4 dimensions, "
+        "rather than irregular or point-based selections. "
+        "The target variable name is automatically inferred from the file name.",
     args={
         "zarr_path": "str, required. Path to the zarr dataset. File name should follow the format 'recon_{var}_sjtu_jingwei_{ver}.zarr'.",
         "time_range": "list[str, str], optional. Time range (start, end) in unified date format (e.g., '2000-01-01').",
@@ -35,8 +37,12 @@ def load_regular_data(zarr_path: str, time_range: list[str, str] = None, depth_r
 
     ds = xr.open_zarr(zarr_path)
     if var_name not in ds:
-        if "n" in ds:
+        if "n" in ds and var_name == "no3":
             var_name = "n"
+        elif "p" in ds and var_name == "po4":
+            var_name = "p"
+        elif "salinity" in ds and var_name == "so":
+            var_name = "salinity"
         else:
             raise KeyError(f"Variable '{var_name}' not found in {fname}. "
                        f"Available: {list(ds.data_vars)}")
