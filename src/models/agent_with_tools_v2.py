@@ -4,7 +4,7 @@ import json
 import traceback
 import base64
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 import matplotlib.pyplot as plt
 
@@ -73,6 +73,7 @@ class AgentWithTools:
         
         self.sessions: Dict[str, ConversationSession] = {}
         self.max_turns_per_session = max_turns_per_session
+        self.max_code_iterations = max_code_iterations
     
     def _build_tool_list(self, tools_meta: Dict[str, Dict]) -> List[Tool]:
         tool_list = []
@@ -86,7 +87,7 @@ class AgentWithTools:
             tool_list.append(tool)
         return tool_list
 
-    def _safe_execute_tool(self, code: str, context: dict = None) -> Dict[str, Any]:
+    def _safe_execute_tool(self, code: str, context: dict = None, code_type: str = "compute") -> Dict[str, Any]:
         """Safely execute generated code in a sandboxed environment with registered tools."""
         sandbox_globals = {"__builtins__": __builtins__}
         
@@ -116,9 +117,19 @@ class AgentWithTools:
             sandbox_globals['plt'] = plt
             sandbox_globals['np'] = np
         except ImportError:
-            print("[Warning] matplotlib or numpy not available for visualization")
+            if code_type == "visualization":
+                return {
+                    "success": False,
+                    "error": "matplotlib or numpy not available",
+                    "error_type": "ImportError"
+                }
         
         print(f"[Info] Successfully registered {registered_count} tools to sandbox")
+
+        if code_type == "compute":
+            print(f"[Info] Executing computation code with {registered_count} registered tools")
+        else:
+            print(f"[Info] Executing visualization code")
 
         if context:
             sandbox_globals.update(context)
@@ -138,13 +149,17 @@ class AgentWithTools:
             }
             
             if isinstance(e, NameError):
-                error_info["hint"] = "Function not found. Check if the function name is correct and registered."
-            if isinstance(e, TypeError) and "'dict' object is not callable" in str(e):
-                error_info["hint"] = "Trying to call a dict as function. Check function registration."
+                error_info["hint"] = "Function or variable not found. Check spelling and availability."
+            elif isinstance(e, TypeError):
+                error_info["hint"] = "Type error. Check function arguments and data types."
+            elif isinstance(e, KeyError):
+                error_info["hint"] = "Key not found in data structure. Check data keys."
+            elif isinstance(e, IndexError):
+                error_info["hint"] = "Index out of range. Check array dimensions."
             
             return error_info
     
-    def _save_visualization(self, locals_dict: Dict[str, Any], turn_id: str) -> Optional[str]:
+    def _save_visualization(self, turn_id: str) -> Optional[str]:
         """Save generated matplotlib visualization if exists."""
         try:
             if plt.get_fignums():
@@ -182,6 +197,90 @@ class AgentWithTools:
         with open(fname, "w", encoding="utf-8") as f:
             json.dump(session_data, f, indent=2, ensure_ascii=False)
         print(f"[System] Session saved to {fname}")
+    
+    def _execute_with_retry(self, initial_code: str, context: dict, code_type: str,
+                           full_specs: Dict[str, Any], user_query: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """
+        Execute code with retries upon failure, regenerating code as needed.
+        
+        Returns:
+            - Dict: Final execution result dict
+            - List: List of all execution attempts with code and results
+        """
+        iteration_history = []
+        current_code = initial_code
+
+        for iteration in range(self.max_code_iterations):
+            print(f"\n--- Iteration {iteration + 1}/{self.max_code_iterations} ({code_type}) ---")
+            
+            exec_result = self._safe_execute_tool(current_code, context, code_type)
+            
+            iteration_record = {
+                "iteration": iteration + 1,
+                "code": current_code,
+                "success": exec_result["success"]
+            }
+            
+            if exec_result["success"]:
+                iteration_record["output"] = {k: str(v)[:] for k, v in exec_result["output"].items()}
+                iteration_history.append(iteration_record)
+                print(f"[Success] {code_type.capitalize()} code executed successfully!")
+                return exec_result, iteration_history
+            
+            # If failed, record error info
+            iteration_record["error"] = exec_result["error"]
+            iteration_record["error_type"] = exec_result["error_type"]
+            iteration_history.append(iteration_record)
+            
+            print(f"[Error] Execution failed: {exec_result['error']}")
+            
+            # Request code fix from LLM
+            if iteration < self.max_code_iterations - 1:
+                print("[System] Requesting code fix from LLM...")
+                
+                fix_prompt = f"""The following {code_type} code failed to execute:
+
+<failed_code>
+{current_code}
+</failed_code>
+
+<error_info>
+Error Type: {exec_result['error_type']}
+Error Message: {exec_result['error']}
+{exec_result.get('hint', '')}
+
+Traceback:
+{exec_result.get('traceback', 'N/A')}
+</error_info>
+
+Original task: {user_query}
+
+Available tools and their specifications:
+{json.dumps(full_specs, indent=2)}
+
+Please fix the code and output the corrected version inside <execute></execute> tags.
+Focus on:
+1. Fixing the specific error mentioned above
+2. Ensuring proper variable names and function calls
+3. Using correct syntax and library functions
+"""
+                
+                fix_response = self.llm.invoke([
+                    SystemMessage(content="You are a code debugging expert."),
+                    HumanMessage(content=fix_prompt)
+                ])
+                
+                code_match = re.search(r"<execute>(.*?)</execute>", fix_response.content, re.S)
+                if code_match:
+                    current_code = code_match.group(1).strip()
+                    print(f"[System] Code fixed, retrying...")
+                else:
+                    print("[Warning] LLM did not return fixed code in proper format")
+                    break
+            else:
+                print(f"[System] Max iterations reached for {code_type}")
+        
+        return exec_result, iteration_history
     
     def create_session(self, session_id: Optional[str] = None) -> str:
         """Create a new conversation session."""
@@ -307,88 +406,176 @@ Analyze the user's question and select appropriate data and tools. Follow this f
 
 {json.dumps(full_specs, indent=2)}
 
-Generate executable Python code between <execute></execute> tags to solve: "{user_query}"
+Generate TWO separate code blocks to solve: "{user_query}"
 
 Requirements:
-1. The dataset path is available as variable `selected_data` = {str(selected_data_path)}"
-2. Call the necessary tools to perform calculations
-3. Store key results in variables (e.g., result, mean_value, etc.)
-4. If the result can be visualized (time series, spatial distribution, histogram, etc.), 
-   generate matplotlib code to create an appropriate visualization
-5. Available libraries: matplotlib.pyplot as plt, numpy as np
-6. Use plt.savefig() is NOT needed - the system will handle saving automatically
-7. Add proper and scientific labels, title, and legend to your plots
+1. The dataset path is available as variable `selected_data` = "{selected_data_path}"
+2. Available libraries: matplotlib.pyplot as plt, numpy as np
 
-Example structure:
-<execute>
-# Step 1: Load and process data
-result = some_tool(selected_data, ...)
+Generate code in this format:
 
-# Step 2: Perform calculations
-mean_value = result.mean()
+<compute>
+# Computation code only
+# Call tools to load and process data
+# Perform calculations and store results in variables
+# Examples: result, mean_value, trend, etc.
+</compute>
 
-# Step 3: Create visualization (if appropriate)
-plt.figure(figsize=(10, 6))
-plt.plot(result)
-plt.xlabel('...')
-plt.ylabel('...')
-plt.title('...')
-plt.grid(True)
-</execute>
+<visualize>
+# Visualization code only (this section is optional)
+# Use results from computation (they will be available as variables)
+# Create matplotlib plots with proper labels and titles
+# Use plt.figure(), plt.plot(), plt.xlabel(), etc.
+# DO NOT use plt.savefig() - handled automatically
+</visualize>
+
+Important:
+- Computation code MUST be complete and standalone
+- Visualization code can reference variables from computation
+- If visualization is not appropriate for this query, leave <visualize> empty or omit it
 """
         
         exec_response = self.llm.invoke([
             SystemMessage(content=system_prompt_2),
-            HumanMessage(content="Generate code now.")
+            HumanMessage(content="Generate the two code blocks now.")
         ])
         print("\n=== Generated Code ===\n", exec_response.content)
         result_record["generated_code"] = exec_response.content
 
-        # Step 3: Extract and execute code
-        code_match = re.search(r"<execute>(.*?)</execute>", exec_response.content, re.S)
-        if not code_match:
-            print("[Error] No <execute> code block found.")
-            result_record["error"] = "No executable code found"
+        # Step 3: Extract and execute the computation code
+        compute_match = re.search(r"<compute>(.*?)</compute>", exec_response.content, re.S)
+        if not compute_match:
+            print("[Error] No <compute> code block found.")
+            result_record["error"] = "No computation code found"
             session.add_turn(result_record)
             return result_record
         
-        code_block = code_match.group(1).strip()
+        compute_code = compute_match.group(1).strip()
         turn_id = f"{session_id}_turn{session.turn_count + 1}"
-        exec_result = self._safe_execute_tool(code_block, context={"selected_data": selected_data_path})
+        
+        compute_result, compute_iterations = self._execute_with_retry(
+            compute_code,
+            context={"selected_data": selected_data_path},
+            code_type="compute",
+            full_specs=full_specs,
+            user_query=user_query
+        )
 
-        if exec_result["success"]:
-            print("\n=== Observation ===")
-            obs = {k: str(v)[:] for k, v in exec_result["output"].items()}
-            print(json.dumps(obs, indent=2))
-            observation_text = json.dumps(obs, indent=2)
-            
-            vis_path = self._save_visualization(exec_result["output"], turn_id)
-            if vis_path:
-                result_record["visualization_path"] = vis_path
-                result_record["visualization_base64"] = self._image_to_base64(vis_path)
+        result_record["compute_iterations"] = compute_iterations
+
+        observation_parts = []
+        
+        if compute_result["success"]:
+            print("\n=== Computation Observation ===")
+            compute_obs = {k: str(v)[:500] for k, v in compute_result["output"].items()}
+            print(json.dumps(compute_obs, indent=2))
+            observation_parts.append({
+                "type": "computation",
+                "status": "success",
+                "results": compute_obs
+            })
+
+            # Step 4: Extract and execute the visualization code (if any)
+            visualize_match = re.search(r"<visualize>(.*?)</visualize>", exec_response.content, re.S)
+            if visualize_match:
+                visualize_code = visualize_match.group(1).strip()
+                
+                if visualize_code:
+                    vis_context = {"selected_data": selected_data_path}
+                    vis_context.update(compute_result["output"])
+                    
+                    vis_result, vis_iterations = self._execute_with_retry(
+                        visualize_code,
+                        context=vis_context,
+                        code_type="visualization",
+                        full_specs=full_specs,
+                        user_query=user_query
+                    )
+                    
+                    result_record["visualization_iterations"] = vis_iterations
+                    
+                    if vis_result["success"]:
+                        print("\n=== Visualization Observation ===")
+                        print("Visualization code executed successfully")
+                        
+                        vis_path = self._save_visualization(turn_id)
+                        if vis_path:
+                            result_record["visualization_path"] = vis_path
+                            result_record["visualization_base64"] = self._image_to_base64(vis_path)
+                            observation_parts.append({
+                                "type": "visualization",
+                                "status": "success",
+                                "path": vis_path
+                            })
+                        else:
+                            observation_parts.append({
+                                "type": "visualization",
+                                "status": "no_figure",
+                                "message": "Code executed but no figure was generated"
+                            })
+                    else:
+                        print("\n=== Visualization Failed ===")
+                        print(f"Error: {vis_result['error']}")
+                        observation_parts.append({
+                            "type": "visualization",
+                            "status": "failed",
+                            "error": vis_result['error'],
+                            "message": "Visualization failed but computation succeeded"
+                        })
+                else:
+                    print("[Info] No visualization code provided")
+                    observation_parts.append({
+                        "type": "visualization",
+                        "status": "not_applicable",
+                        "message": "No visualization was generated for this query"
+                    })
+            else:
+                observation_parts.append({
+                    "type": "visualization",
+                    "status": "not_provided",
+                    "message": "No visualization block found in generated code"
+                })
         else:
-            print("\n=== Execution Error ===")
-            print(exec_result["traceback"])
-            observation_text = f"Execution failed: {exec_result['error']}\n{exec_result.get('hint', '')}"
+            print("\n=== Computation Failed ===")
+            print(compute_result["traceback"])
+            observation_parts.append({
+                "type": "computation",
+                "status": "failed",
+                "error": compute_result['error'],
+                "iterations": len(compute_iterations)
+            })
 
+        observation_text = json.dumps(observation_parts, indent=2, ensure_ascii=False)
         result_record["observation"] = observation_text
 
         # Step 4: Generate final answer
+        has_computation_success = observation_parts[0]["status"] == "success"
+        has_visualization = any(p.get("type") == "visualization" and p.get("status") == "success" 
+                               for p in observation_parts)
+        
         solution_prompt = f"""
-Here is the result of your code execution:
+Here are the results of code execution:
 
 <observation>
 {observation_text}
 </observation>
 
-{"A visualization has been generated and saved." if "visualization_path" in result_record else ""}
+Status Summary:
+- Computation: {'Success' if has_computation_success else 'Failed'}
+- Visualization: {'Generated' if has_visualization else 'Not generated or failed'}
 
 Please provide a clear scientific summary inside <solution></solution> tags.
-Include:
-1. Direct answer to the question
-2. Key numerical results
-3. Description of visualization (if generated)
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows
 4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, tool choice, and visualization attempts
+3. Suggestions for how to reformulate the query
 """
         final_response = self.llm.invoke([
             SystemMessage(content=solution_prompt),
@@ -437,8 +624,9 @@ if __name__ == "__main__":
         }
     ]
 
-    api_key = "sk-edc62146735146e4a9904740057ace47"
-    agent = AgentWithTools(TOOLS, data_list, api_key, max_turns_per_session=10)
+    api_key = ""
+    agent = AgentWithTools(TOOLS, data_list, api_key, 
+                           max_turns_per_session=10, max_code_iterations=3)
     
     session_id = agent.create_session()
     
