@@ -5,8 +5,10 @@ import os
 import yaml
 import numpy as np
 import xarray as xr
+import pandas as pd
 import xesmf as xe
 from pyproj import Geod
+from typing import Optional, Union, List
 
 from src.tools.registry import register_tools
 from src.utils.geolocator import Geolocator
@@ -43,6 +45,8 @@ def load_regular_data(zarr_path: str, time_range: list[str, str] = None, depth_r
             var_name = "p"
         elif "salinity" in ds and var_name == "so":
             var_name = "salinity"
+        elif "temperature" in ds and var_name == "thetao":
+            var_name = "temperature"
         else:
             raise KeyError(f"Variable '{var_name}' not found in {fname}. "
                        f"Available: {list(ds.data_vars)}")
@@ -54,8 +58,25 @@ def load_regular_data(zarr_path: str, time_range: list[str, str] = None, depth_r
         data = data.sel(depth=slice(depth_range[0], depth_range[1]))
     if lat_range is not None:
         data = data.sel(lat=slice(lat_range[0], lat_range[1]))
+
     if lon_range is not None:
-        data = data.sel(lon=slice(lon_range[0], lon_range[1]))
+        lon_min, lon_max = lon_range[0], lon_range[1]
+        data_lon_min = float(data.lon.min())
+        data_lon_max = float(data.lon.max())
+        if lon_min > 180 or lon_max > 180:
+            lon_min_converted = lon_min if lon_min <= 180 else lon_min - 360
+            lon_max_converted = lon_max if lon_max <= 180 else lon_max - 360
+            
+            if lon_min_converted <= lon_max_converted:
+                data = data.sel(lon=slice(lon_min_converted, lon_max_converted))
+            else:
+                part1 = data.sel(lon=slice(lon_min_converted, data_lon_max))
+                part2 = data.sel(lon=slice(data_lon_min, lon_max_converted))
+                
+                data = xr.concat([part1, part2], dim='lon')
+                
+        else:
+            data = data.sel(lon=slice(lon_min, lon_max))
 
     return data
 
@@ -68,12 +89,12 @@ def load_regular_data(zarr_path: str, time_range: list[str, str] = None, depth_r
         "time_range": "tuple[str, str], optional. Time range (start, end) in unified date format (e.g., '2000-01-01').",
         "depth_range": "tuple[float, float], optional. Depth range (min_depth, max_depth) in meters.",
         "geofeature": "str, required. Must be one of 'country', 'state', 'continent', 'water_body'.",
-        "loc_name": "str, required. Name of the geofeature, e.g. 'Arctic Ocean'."
+        "loc_name": "str or list[str], required. Name(s) of the geofeature, e.g. 'Arctic Ocean' or ['North Atlantic Ocean', 'South Atlantic Ocean']."
     },
     returns="xr.DataArray. Regular subset of the requested variable data."
 )
 def load_data_with_geolocator(zarr_path: str, time_range: tuple[str, str] = None, depth_range: tuple[float, float] = None, 
-                                geofeature: str = "water_body", loc_name: str = None) -> xr.DataArray:
+                                geofeature: str = "water_body", loc_name: str | list[str] = None) -> xr.DataArray:
     fname = os.path.basename(zarr_path)
     match = re.match(r"recon_([a-zA-Z0-9]+)_", fname)
     if not match:
@@ -82,7 +103,16 @@ def load_data_with_geolocator(zarr_path: str, time_range: tuple[str, str] = None
 
     ds = xr.open_zarr(zarr_path)
     if var_name not in ds:
-        raise KeyError(f"Variable '{var_name}' not found in {fname}. "
+        if "n" in ds and var_name == "no3":
+            var_name = "n"
+        elif "p" in ds and var_name == "po4":
+            var_name = "p"
+        elif "salinity" in ds and var_name == "so":
+            var_name = "salinity"
+        elif "temperature" in ds and var_name == "thetao":
+            var_name = "temperature"
+        else:
+            raise KeyError(f"Variable '{var_name}' not found in {fname}. "
                        f"Available: {list(ds.data_vars)}")
     data = ds[var_name]
 
@@ -97,9 +127,9 @@ def load_data_with_geolocator(zarr_path: str, time_range: tuple[str, str] = None
     if not cache_dir or not natural_earth_path:
         raise ValueError("Both 'cache_dir' and 'natural_earth_path' must be defined in configs/default_paths.yaml")
 
-    latitudes = np.arange(-89.5, 90.5, 1.0)
-    longitudes = np.arange(-179.5, 180.5, 1.0)
-    geolocator = Geolocator(latitudes, longitudes, cache_dir, natural_earth_path)
+    geolocator_lats = np.arange(-89.5, 90.5, 1.0)
+    geolocator_lons = np.arange(-179.5, 180.5, 1.0)
+    geolocator = Geolocator(geolocator_lats, geolocator_lons, cache_dir, natural_earth_path)
 
     if time_range is not None:
         data = data.sel(time=slice(time_range[0], time_range[1]))
@@ -107,13 +137,25 @@ def load_data_with_geolocator(zarr_path: str, time_range: tuple[str, str] = None
         data = data.sel(depth=slice(depth_range[0], depth_range[1]))
 
     if geofeature is not None and loc_name is not None:
-        try:
-            mask = geolocator.get_mask_by_geofeature(geofeature, loc_name)
-        except Exception as e:
-            raise RuntimeError(f"Failed to get mask for {geofeature}='{loc_name}': {e}")
+        loc_names = [loc_name] if isinstance(loc_name, str) else loc_name
+
+        combined_mask = None
+        for name in loc_names:
+            try:
+                mask = geolocator.get_mask_by_geofeature(geofeature, name)
+            except Exception as e:
+                raise RuntimeError(f"Failed to get mask for {geofeature}='{name}': {e}")
+            
+            if combined_mask is None:
+                combined_mask = mask
+            else:
+                combined_mask = combined_mask | mask
         
-        mask_da = xr.DataArray(mask, coords={"lat": latitudes, "lon": longitudes}, dims=["lat", "lon"])
-        mask_da = mask_da.sel(lat=data.lat, lon=data.lon, method="nearest")
+        combined_mask = combined_mask.T
+        geolocator_lons_converted = np.where(geolocator_lons >= 180, geolocator_lons - 360, geolocator_lons)
+        mask_da = xr.DataArray(combined_mask.astype(float), coords={"lat": geolocator_lats, "lon": geolocator_lons_converted}, dims=["lat", "lon"])
+        mask_da = mask_da.interp(lat=data.lat, lon=data.lon, method="nearest", kwargs={"fill_value": 0})
+        mask_da = mask_da > 0.5
         data = data.where(mask_da)
     
     return data
@@ -250,3 +292,141 @@ def load_depth_levels(depth_range: list[float, float] = None) -> tuple[xr.DataAr
         )
     
     return depth_da, depth_bnds_da
+
+
+# https://www.ncei.noaa.gov/data/oceans/woa/WOA23/DOCUMENTATION/WOA23_Product_Documentation.pdf#page=15&zoom=100,93,86
+BASIN_NAMES = {
+    1: "Atlantic Ocean",
+    2: "Pacific Ocean",
+    3: "Indian Ocean",
+    4: "Mediterranean Sea",
+    5: "Baltic Sea",
+    6: "Black Sea",
+    7: "Red Sea",
+    8: "Persian Gulf",
+    9: "Hudson Bay",
+    10: "Southern Ocean",
+    11: "Arctic Ocean",
+    12: "Sea of Japan",
+    13: "Kara Sea",
+    14: "Sulu Sea",
+    15: "Baffin Bay",
+    16: "East Mediterranean",
+    17: "West Mediterranean",
+    18: "Sea of Okhotsk",
+    19: "Banda Sea",
+    20: "Caribbean Sea",
+    21: "Andaman Basin",
+    22: "North Caribbean",
+    23: "Gulf of Mexico",
+    24: "Beaufort Sea",
+    25: "South China Sea",
+    26: "Barents Sea",
+    27: "Celebes Sea",
+    28: "Aleutian Basin",
+    29: "Fiji Basin",
+    30: "North American Basin",
+    31: "West European Basin",
+    32: "Southeast Indian Basin",
+    33: "Coral Sea",
+    34: "East Indian Basin",
+    35: "Central Indian Basin",
+    36: "Southwest Atlantic Basin",
+    37: "Southeast Atlantic Basin",
+    38: "Southeast Pacific Basin",
+    39: "Guatemala Basin",
+    40: "East Caroline Basin",
+    41: "Marianas Basin",
+    42: "Philippine Sea",
+    43: "Arabian Sea",
+    44: "Chile Basin",
+    45: "Somali Basin",
+    46: "Mascarene Basin",
+    47: "Crozet Basin",
+    48: "Guinea Basin",
+    49: "Brazil Basin",
+    50: "Argentine Basin",
+    51: "Tasman Sea",
+    52: "Atlantic Indian Basin",
+    53: "Caspian Sea",
+    54: "Sulu Sea II",
+    55: "Venezuela Basin",
+    56: "Bay of Bengal",
+    57: "Java Sea",
+    58: "East Indian Atlantic Basin",
+    59: "Chiloe",
+    60: "Bransfield Strait",
+}
+BASIN_CODES = {v: k for k, v in BASIN_NAMES.items()}
+
+
+def load_basin_mask(depth_levels: Optional[Union[str, List[str]]] = None) -> xr.DataArray:
+    filepath = "/data1/lorraine-20419/jingwei_QA/others/basin_01.csv"
+    df = pd.read_csv(filepath, comment='#')
+    
+    lats = df['Latitude'].unique()
+    lons = df['Longitude'].unique()
+    lats = np.sort(lats)
+    lons = np.sort(lons)
+    
+    depth_cols = [col for col in df.columns if col.startswith('Basin_')]
+    depths = []
+    for col in depth_cols:
+        depth_str = col.replace('Basin_', '').replace('m', '')
+        depths.append(int(depth_str))
+    depths = np.array(depths)
+    
+    basin_data = np.full((len(depths), len(lats), len(lons)), np.nan)
+    
+    # Fill data
+    for _, row in df.iterrows():
+        lat_idx = np.searchsorted(lats, row['Latitude'])
+        lon_idx = np.searchsorted(lons, row['Longitude'])
+        
+        for d_idx, col in enumerate(depth_cols):
+            value = row[col]
+            if pd.notna(value) and value != '':
+                try:
+                    basin_data[d_idx, lat_idx, lon_idx] = float(value)
+                except (ValueError, TypeError):
+                    pass
+    
+    # Build full 3D mask first
+    full_mask = xr.DataArray(
+        data=basin_data,
+        dims=['depth', 'lat', 'lon'],
+        coords={
+            'depth': depths,
+            'lat': lats,
+            'lon': lons
+        },
+        name='basin_mask',
+        attrs={
+            'long_name': 'WOA23 Basin Mask',
+            'description': 'Ocean basin identification codes',
+            'basin_names': BASIN_NAMES,
+            'depth_levels': [f"{d}m" for d in depths],
+            'valid_range': [1, 60]
+        }
+    )
+    
+    if depth_levels is not None:
+        if isinstance(depth_levels, str):
+            depth_levels = [depth_levels]
+        
+        selected_depths = []
+        for dl in depth_levels:
+            depth_val = int(dl.replace('m', ''))
+            if depth_val not in depths:
+                available = [f"{d}m" for d in depths]
+                raise ValueError(f"Depth {dl} not found. Available: {available}")
+            selected_depths.append(depth_val)
+        
+        if len(selected_depths) == 1:
+            # Single depth, return 2D
+            return full_mask.sel(depth=selected_depths[0])
+        else:
+            # Multiple depths, return 3D subset
+            return full_mask.sel(depth=selected_depths)
+    
+    return full_mask

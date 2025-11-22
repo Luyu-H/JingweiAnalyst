@@ -102,7 +102,7 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean')
         # QS-DEC starts seasons in Dec-Jan-Feb pattern
         result = data.resample(time='QS-DEC').map(agg_funcs[op])
         
-        season_map = {1: 'DJF', 2: 'MAM', 3: 'JJA', 4: 'SON'}
+        season_map = {12: 'DJF', 3: 'MAM', 6: 'JJA', 9: 'SON'}
         seasons = [season_map[m] for m in result['time'].dt.month.values]
         years = result['time'].dt.year.values
         

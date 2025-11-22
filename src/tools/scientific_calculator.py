@@ -643,23 +643,24 @@ def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", de
     if nino_region not in nino_regions:
         raise ValueError(f"nino_region must be one of {list(nino_regions.keys())}, got '{nino_region}'")
 
-    if 'depth' in data.dims:
-        data_surface = data.sel(depth=slice(0, depth_level))
-        # Average over depth dimension
-        data_surface = data_surface.mean(dim='depth', skipna=True)
-    else:
-        raise ValueError("Input data must have 'depth' dimension")
-
     lat_min, lat_max, lon_min, lon_max = nino_regions[nino_region]
     if lon_max < lon_min:  # Crosses dateline (e.g., Niño 4: 160 to -150)
-        data_region1 = data_surface.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, 180))
-        data_region2 = data_surface.sel(lat=slice(lat_min, lat_max), lon=slice(-180, lon_max))
+        data_region1 = data.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, 180))
+        data_region2 = data.sel(lat=slice(lat_min, lat_max), lon=slice(-180, lon_max))
         data_region = xr.concat([data_region1, data_region2], dim='lon')
     else:
-        data_region = data_surface.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
+        data_region = data.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
     
     anomaly = compute_anomaly(data=data_region, var="thetao", freq=anomaly_freq, method="subtract")
-    nino_index = compute_basic_stat(data=anomaly, op="area_weighted_mean", dim=["lat", "lon"])
+
+    if 'depth' in anomaly.dims:
+        anomaly_surface = anomaly.sel(depth=slice(0, depth_level))
+        # Average over depth dimension
+        anomaly_surface = anomaly_surface.mean(dim='depth', skipna=True)
+    else:
+        anomaly_surface = anomaly
+    
+    nino_index = compute_basic_stat(data=anomaly_surface, op="area_weighted_mean", dim=["lat", "lon"])
 
     nino_index.attrs = {
         'long_name': f'{nino_region.upper()} Index',

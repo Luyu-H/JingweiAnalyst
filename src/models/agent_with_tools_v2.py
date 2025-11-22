@@ -11,7 +11,6 @@ import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import Tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_core.prompts import PromptTemplate
 
 from src.tools.registry import TOOLS, auto_import_tools, export_tools_doc
 
@@ -624,7 +623,7 @@ if __name__ == "__main__":
         }
     ]
 
-    api_key = ""
+    api_key = "sk-edc62146735146e4a9904740057ace47"
     agent = AgentWithTools(TOOLS, data_list, api_key, 
                            max_turns_per_session=10, max_code_iterations=3)
     

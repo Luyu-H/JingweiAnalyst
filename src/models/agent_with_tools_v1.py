@@ -223,7 +223,7 @@ if __name__ == "__main__":
         "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_o2_sjtu_jingwei_v1_1.zarr"
     ]
 
-    api_key = ""
+    api_key = "sk-edc62146735146e4a9904740057ace47"
     agent = AgentWithTools(TOOLS, api_key)
     query = "What is the mean oxygen concentration between 2000 and 2010 at surface level?"
     result = agent.run(query, data_list)
