@@ -9,7 +9,7 @@ import matplotlib.patches as mpatches
 import matplotlib.dates as mdates
 from matplotlib.colors import LinearSegmentedColormap
 
-zarr_path = "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_thetao_sjtu_jingwei_v1_1.zarr"
+zarr_path = "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_temp_sjtu_jingwei_v1_1.zarr"
 time_range = ["1960-01-01", "2020-12-31"]
 temp_data = load_regular_data(
     zarr_path=zarr_path,

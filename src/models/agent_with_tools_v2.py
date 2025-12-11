@@ -66,6 +66,7 @@ class AgentWithTools:
         self.tools_meta = tools
         self.data_list = data_list
         self.llm = ChatOpenAI(model=model_name, temperature=temperature, api_key=api_key, base_url="https://api.deepseek.com")
+        # self.llm = ChatOpenAI(model=model_name, temperature=temperature, api_key=api_key)
         self.tools = self._build_tool_list(tools)
         self.result_dir = Path(result_dir)
         self.result_dir.mkdir(parents=True, exist_ok=True)
@@ -631,13 +632,13 @@ if __name__ == "__main__":
     
     # first question
     result1 = agent.run(
-        "What is the mean oxygen concentration between 2000 and 2010 at surface level?",
+        "In the North Pacific, evaluate the lagged correlation between mixed layer depth (MLD) and surface (10 m) dissolved oxygen anomalies on a seasonal scale for the period 1990–2010 (to identify lead–lag relationships), and construct a multivariate regression model to examine the contributions of MLD, sea-surface temperature (SST), and salinity to surface oxygen. Pay attention to checking the data dimensions. The longitude and latitude, depth, and time resolution of the initial data of all variables are the same.",
         session_id=session_id
     )
-    # second question in the same session
-    result2 = agent.run(
-        "How does this compare to the phosphate levels in the same period?",
-        session_id=session_id
-    )
+    # # second question in the same session
+    # result2 = agent.run(
+    #     "How does this compare to the phosphate levels in the same period?",
+    #     session_id=session_id
+    # )
     
     agent.end_session(session_id)

@@ -1,6 +1,7 @@
 # tools: compute_basic_stat, temporal_aggregate, fit_1D_trend, transform_unit, 
-# fit_multivariate_relation, analyze_correlation
+# fit_multivariate_relation, analyze_correlation, detect_outliers
 
+import re
 import xarray as xr
 import numpy as np
 import pandas as pd
@@ -23,10 +24,11 @@ from src.tools.data_loader import load_areas
     description="Perform a basic statistical operation (count, max, min, mean, area_weighted_mean, median, sum) " \
     "on an xarray.DataArray along specified dimension(s).",
     args={
-        "data": "xr.DataArray, required. Input data array with 4 dimensions (time, depth, lat, lon).",
+        "data": "xr.DataArray, required. Input data array with dimensions.",
         "op": "str, required. The statistical operation to perform. "
             "Supported values: 'count' (number of non-NaN elements), 'max', 'min', 'mean', 'area_weighted_mean', 'median', 'sum'.",
         "dim": "str or list of str, optional. Dimension(s) over which to perform the operation. "
+            "If the input DataArray has three dimensions (time, lat, lon) and the operation is performed over ['lat', 'lon'], the output will contain only the time dimension."
             "If None, operation is applied over all dimensions."
     },
     returns="xr.DataArray. Result of the statistical operation, with reduced dimension(s)."
@@ -68,14 +70,23 @@ def compute_basic_stat(data: xr.DataArray, op: str, dim: str | list[str] | None 
 
 @register_tools(
     name="temporal_aggregate",
-    description="Aggregate ocean data temporally at different resolutions (monthly, seasonal, annual) "
-                "for trend analysis and seasonal cycle studies. Supports multiple aggregation operations.",
+    description="Perform temporal aggregation of an xarray.DataArray along its ‘time' dimension."
+                "Supports common aggregation frequencies used in ocean/climate analysis (annual, seasonal, multi-year climatology) and basic summary operations."
+                "The tool preserves non-time dimensions and most metadata attributes, and is written to be safe for data with missing values (uses skipna behavior).",
     args={
-        "data": "xr.DataArray, required. Input data array with time dimension.",
-        "freq": "str, optional. Temporal frequency: 'season' (DJF/MAM/JJA/SON), 'year' (annual), 'climatology' (multi-year monthly mean). Default: 'year'.",
-        "op": "str, optional. Aggregation operation: 'mean', 'median', 'min', 'max', 'std'. Default: 'mean'."
+        "data": "xr.DataArray, required. Input array that must contain a 'time' coordinate/dimension.",
+        "freq": "str, optional. Aggregation frequency. Accepted values: "
+                "'year' - collapse to annual summaries (one value per calendar year), "
+                "'season' - seasonal summaries using conventional seasons DJF/MAM/JJA/SON, "
+                "'climatology' - multi-year monthly climatology (one value per calendar month aggregated across all years)."
+                " Default: 'year'.",
+        "op": "str, optional. Aggregation operation to apply along time. Supported: 'mean', 'median', 'min', 'max', 'std'. Default: 'mean'."
     },
     returns="xr.DataArray. Temporally aggregated data with updated time coordinate."
+            "Behavior by freq:"
+            "- 'year': result is resampled to calendar years; the time coordinate is replaced/renamed to an integer 'year' coordinate (e.g. 1990, 1991, ...). Useful for interannual trend analysis."
+            "- 'season': result contains one entry per seasonal period (DJF, MAM, JJA, SON). Two new coordinates are attached to the time axis: 'season' (string labels 'DJF'|'MAM'|'JJA'|'SON') and 'year' (integer year, where DJF is labelled by the year containing Jan/Feb). This layout is convenient for seasonal-cycle studies and compositing by season."
+            "- 'climatology': returns the aggregated statistic for each calendar month across all years. The coordinate 'month' (1..12) remains and an additional 'month_name' coordinate (Jan..Dec) is set."
 )
 def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean') -> xr.DataArray:
     if 'time' not in data.dims:
@@ -89,6 +100,9 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean')
         'std': lambda x: x.std(dim='time', skipna=True)
     }
     
+    freq = freq.lower()
+    op = op.lower()
+
     if op not in agg_funcs:
         raise ValueError(f"Operation '{op}' not supported. Choose from: {list(agg_funcs.keys())}")
     
@@ -135,22 +149,28 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean')
 
 @register_tools(
     name="fit_1D_trend",
-    description="Fit a trend line to a 1D xarray.DataArray using common climate trend models.",
+    description="Fit a trend line to a 1D xarray.DataArray using common climate trend models. Several commonly used trend forms are supported, including linear, quadratic, exponential, and sinusoidal models." \
+    "If no method is specified, the model with the highest R² score is automatically selected.",
     args={
-        "data": "xr.DataArray, required. 1D data array (e.g., time series) to fit the trend.",
+        "data": "xr.DataArray, required. Input must be strictly 1-dimensional.",
         "method": "str, optional. Trend fitting method. Supported values:"
             "'linear' (y = a*x + b), 'quadratic' (y = a*x^2 + b*x + c), "
             "'exponential' (y = a*exp(b*x)), 'sinusoidal' (y = a*sin(b*x + c) + d). "
-            "If None, the best method is automatically chosen based on R² score."
+            "If None, the function tests all models and automatically selects the one with the highest R² value.\n"
+            "Notes:"
+            "- Automatic model selection is based solely on R²."
+            "- Sinusoidal fitting assumes an initial seasonal frequency guess (2π/12), which is suitable for monthly or cyclic climate signals."
     },
     returns="A dictionary containing: " \
-    "'fitted_data' (xr.DataArray): Fitted values aligned with input." \
-    "'equation' (str): String representation of the fitted function." \
+    "'fitted_data' (xr.DataArray): Fitted values at the same coordinates and dimension as the input." \
+    "'equation' (str): Human-readable description of the selected model and its fitted parameters." \
     "'metrics' (dict): Difference metrics {rmse, mae, r2}."
 )
 def fit_1D_trend(data: xr.DataArray, method: str = None) -> Dict[str, Any]:
     if data.ndim != 1:
         raise ValueError("Input DataArray must be 1D.")
+
+    method = method.lower() if method is not None else None
 
     x = np.arange(len(data))
     y = data.values.astype(float)
@@ -163,6 +183,10 @@ def fit_1D_trend(data: xr.DataArray, method: str = None) -> Dict[str, Any]:
         return a * np.exp(b * x)
     def sinusoidal(x, a, b, c, d):
         return a * np.sin(b * x + c) + d
+
+    def prepare_exponential_y(y):
+        y_fixed = np.where(y <= 0, 0, y)
+        return y_fixed
     
     models = {
         "linear, a * x + b": (linear, [0, np.mean(y)]),
@@ -175,7 +199,11 @@ def fit_1D_trend(data: xr.DataArray, method: str = None) -> Dict[str, Any]:
 
     for name, (func, p0) in models.items():
         try:
-            params, _ = curve_fit(func, x, y, p0=p0, maxfev=10000)
+            y_input = y.copy()
+            if name.startswith("exponential"):
+                y_input = prepare_exponential_y(y_input)
+
+            params, _ = curve_fit(func, x, y_input, p0=p0, maxfev=10000)
             y_fit = func(x, *params)
             metrics = {
                 "rmse": float(np.sqrt(mean_squared_error(y, y_fit))),
@@ -212,43 +240,63 @@ def fit_1D_trend(data: xr.DataArray, method: str = None) -> Dict[str, Any]:
 @register_tools(
     name="transform_unit",
     description="Transform units of oceanographic variables in an xarray.DataArray. "
-                "Supports common conversions for temperature, concentration, salinity, and velocity. "
-                "Uses standard seawater density (ρ = 1025 kg/m³) for mass/volume conversions.",
+                "Supports common conversions for temperature, concentration, salinity, and velocity with automatic alias normalization. "
+                "Mass–volume concentration conversions rely on the standard seawater density ρ = 1025 kg/m³ (≈ 1.025 kg/L), unless a custom density is provided.",
     args={
         "data": "xr.DataArray, required. Input data array to convert.",
-        "from_unit": "str, required. Source unit (case-insensitive). "
-                     "Supported: 'Kelvin', 'Celsius' (temperature); "
-                     "'μmol/kg', 'μmol/L', 'mmol/m3', 'mmol/kg' (concentration); "
-                     "'psu', 'PSU' (salinity); 'm/s', 'mm/s', 'cm/s' (velocity).",
-        "to_unit": "str, required. Target unit (case-insensitive). "
-                   "Must be compatible with from_unit category."
+        "from_unit": "str, required. The original unit of the data. The input is case-insensitive and can include Unicode variants or symbols. Supported categories include: \n"
+                     "- Temperature: 'Kelvin', 'K', 'Celsius', '°C', 'degC'\n"
+                     "- Concentration: 'μmol/kg', 'µmol/kg', 'umol/kg', 'μmol/L', 'mmol/m3', 'mmol/kg'\n"
+                     "- Salinity: 'psu', 'PSU'\n"
+                     "- Velocity: 'm/s', 'cm/s', 'mm/s'\n"
+            "Aliases and formatting variations (e.g., 'μmol kg^-1', 'µmol·L^-1') are automatically normalized.",
+        "to_unit": "str, required. The target unit to convert the data into. Must belong to the same physical category as `from_unit` (e.g., temperature → temperature, concentration → concentration). "
+            "Case-insensitive and supports the same alias expansion rules as `from_unit`.",
+        "density": "float, optional. Seawater density in kg/L for mass/volume conversions. Default is 1.025 kg/L."
     },
-    returns="xr.DataArray. Converted data with updated 'units' attribute and added 'original_units' metadata."
+    returns="xr.DataArray. A new DataArray with values converted to the target unit, the 'units' attribute updated accordingly, and additional metadata fields 'original_units', 'standardized_from', and 'standardized_to' added to record the unit transformation history."
 )
-def transform_unit(data: xr.DataArray, from_unit: str, to_unit: str) -> xr.DataArray:
-    from_unit = from_unit.strip().lower()
-    to_unit = to_unit.strip().lower()
+def transform_unit(data: xr.DataArray, from_unit: str, to_unit: str, density:float=1.025) -> xr.DataArray:
 
-    if from_unit == to_unit:
-        result = data.copy()
-        result.attrs['units'] = to_unit
-        return result
+    def normalize(u: str) -> str:
+        if u is None:
+            return None
+        u = u.strip().lower()
+
+        # unify unicode micro sign
+        u = u.replace('µ', 'μ')
+
+        # remove invisible chars
+        u = re.sub(r'[\s·]', '', u)
+
+        # convert superscripts/variants
+        u = u.replace('⁻¹', '^-1').replace('–', '-')
+
+        return u
+
+    from_unit_raw = from_unit
+    to_unit_raw = to_unit
+
+    from_unit = normalize(from_unit)
+    to_unit = normalize(to_unit)
     
     unit_aliases = {
         'k': 'kelvin', 'kelvin': 'kelvin',
         '°c': 'celsius', 'degc': 'celsius', 'celsius': 'celsius', 'c': 'celsius',
         
-        'μmol/kg': 'umol/kg', 'umol/kg': 'umol/kg', 'micromol/kg': 'umol/kg', 'μmol·kg^-1': 'umol/kg', 'umol·kg^-1': 'umol/kg', 
+        'μmol/kg': 'umol/kg', 'umol/kg': 'umol/kg', 'micromol/kg': 'umol/kg', 'μmolkg^-1': 'umol/kg', 'umolkg^-1': 'umol/kg', 
         
-        'μmol/l': 'umol/l', 'umol/l': 'umol/l', 'micromol/l': 'umol/l', 'μmol·l^-1': 'umol/l', 'umol·l^-1': 'umol/l',
+        'μmol/l': 'umol/l', 'umol/l': 'umol/l',
+        'μmoll^-1': 'umol/l', 'umoll^-1': 'umol/l',
+        'micromol/l': 'umol/l',
         
-        'mmol/m3': 'mmol/m3', 'mmol/m^3': 'mmol/m3',
+        'mmol/m3': 'mmol/m3', 'mmol/m^3': 'mmol/m3', 'mmolm^-3': 'mmol/m3',
         
         'mmol/kg': 'mmol/kg',
         
         'psu': 'psu',
         
-        'm/s': 'm/s', 'mm/s': 'mm/s', 'cm/s': 'cm/s',
+        'm/s': 'm/s', 'ms^-1': 'm/s', 'cm/s': 'cm/s', 'cms^-1': 'cm/s', 'mm/s': 'mm/s', 'mms^-1': 'mm/s',
     }
 
     std_from = unit_aliases.get(from_unit)
@@ -259,17 +307,21 @@ def transform_unit(data: xr.DataArray, from_unit: str, to_unit: str) -> xr.DataA
     if std_to is None:
         raise ValueError(f"Unsupported to_unit: '{to_unit}'")
 
-    conversion_key = (std_from, std_to)
+    if std_from == std_to:
+        out = data.copy()
+        out.attrs['units'] = std_to
+        return out
+
+    seawater_density = density  # in kg/L
     conversions = {
         ('kelvin', 'celsius'): lambda x: x - 273.15,
         ('celsius', 'kelvin'): lambda x: x + 273.15,
         
-        # seawater density ρ ≈ 1025 kg/m³ = 1.025 kg/L
-        ('umol/kg', 'umol/l'): lambda x: x * 1.025,
-        ('umol/l', 'umol/kg'): lambda x: x / 1.025,
-        
-        ('umol/kg', 'mmol/m3'): lambda x: x * 1.025,
-        ('mmol/m3', 'umol/kg'): lambda x: x / 1.025,
+        ('umol/kg', 'umol/l'): lambda x: x * seawater_density,
+        ('umol/l', 'umol/kg'): lambda x: x / seawater_density,
+
+        ('umol/kg', 'mmol/m3'): lambda x: x * seawater_density,
+        ('mmol/m3', 'umol/kg'): lambda x: x / seawater_density,
         
         ('umol/l', 'mmol/m3'): lambda x: x,
         ('mmol/m3', 'umol/l'): lambda x: x,
@@ -277,11 +329,11 @@ def transform_unit(data: xr.DataArray, from_unit: str, to_unit: str) -> xr.DataA
         ('umol/kg', 'mmol/kg'): lambda x: x / 1000,
         ('mmol/kg', 'umol/kg'): lambda x: x * 1000,
         
-        ('umol/l', 'mmol/kg'): lambda x: x / 1000 / 1.025,
-        ('mmol/kg', 'umol/l'): lambda x: x * 1000 * 1.025,
-        
-        ('mmol/m3', 'mmol/kg'): lambda x: x / 1.025,
-        ('mmol/kg', 'mmol/m3'): lambda x: x * 1.025,
+        ('umol/l', 'mmol/kg'): lambda x: x / (1000 * seawater_density),
+        ('mmol/kg', 'umol/l'): lambda x: x * (1000 * seawater_density),
+
+         ('mmol/m3', 'mmol/kg'): lambda x: x / seawater_density,
+        ('mmol/kg', 'mmol/m3'): lambda x: x * seawater_density,
         
         ('m/s', 'mm/s'): lambda x: x * 1000,
         ('mm/s', 'm/s'): lambda x: x / 1000,
@@ -293,50 +345,61 @@ def transform_unit(data: xr.DataArray, from_unit: str, to_unit: str) -> xr.DataA
         ('psu', 'psu'): lambda x: x,
     }
 
-    if conversion_key not in conversions:
+    key = (std_from, std_to)
+    if key not in conversions:
         raise ValueError(f"Unsupported conversion from '{from_unit}' to '{to_unit}'.")
 
-    convert_func = conversions[conversion_key]
+    convert_func = conversions[key]
     result = data.copy()
     result.values = convert_func(result.values)
 
-    result.attrs['units'] = to_unit
-    if 'original_units' not in result.attrs:
-        result.attrs['original_units'] = from_unit
+    result.attrs['units'] = std_to
+    out.attrs['original_units'] = from_unit_raw
+    out.attrs['standardized_from'] = std_from
+    out.attrs['standardized_to'] = std_to
     
     return result
 
 
 @register_tools(
     name="fit_multivariate_relation",
-    description="Fit multivariate relationships between ocean variables. "
-                "Supports linear, polynomial, and nonlinear models. "
-                "If method is None, automatically selects the best method based on validation R².",
+    description="Fits a multivariate statistical model that predicts one oceanographic variable from multiple predictor variables.The function supports linear, regularized, polynomial, and nonlinear regression methods, and returns both the fitted values and detailed diagnostics for scientific interpretation."
+                "When method=None, the tool automatically evaluates all supported models using a validation split (default 80% train / 20% validation) and selects the method with the highest validation R²." \
+                "All input DataArrays must share compatible coordinates (e.g., same lat–lon–depth–time grid). Missing values are automatically masked before fitting.",
     args={
-        "target": "xr.DataArray, required. One target variable to predict.",
-        "predictors": "list[xr.DataArray], required. List of predictor variables. Must have compatible coordinates with target.",
+        "target": "xr.DataArray, required. The response variable to be modeled. Must have numeric values and coordinates  compatible with all predictors.",
+        "predictors": "list[xr.DataArray], required. List of predictor variables. All predictors must align with the target in spatial and temporal coordinates.",
         "method": "str, optional. Regression method. Options: "
-                  "'linear', 'ridge', 'lasso', 'polynomial', 'random_forest'. "
-                  "If None, automatically selects best method based on test R². Default: None.",
+                  "'linear' - Ordinary least squares, "
+                  "'ridge' - L2-regularized linear regression, "
+                  "'lasso' - L1-regularized linear regression, "
+                  "'polynomial' - Polynomial regression up to poly_degree, "
+                  "'random_forest' - Nonlinear tree-based regression. "
+                  "If None, all methods are tested and the method with the best validation R² is selected automatically.. Default: None.",
         "alpha": "float, optional. Regularization strength for ridge/lasso (default: 1.0).",
         "poly_degree": "int, optional. Polynomial degree for 'polynomial' method (default: 2).",
         "test_size": "float, optional. Fraction of data for validation (default: 0.2).",
         "standardize": "bool, optional. Whether to standardize predictors (default: True for ridge/lasso)."
     },
-    returns="dict with keys: "
-            "'fitted_data' (xr.DataArray): Predicted values with same coords as target. "
-            "'equation' (str): Model equation or description. "
+    returns="A dictionary with the following keys:"
+            "'fitted_data' (xr.DataArray): Predicted values arranged on the same coordinates as the target variable."
+            "'equation' (str): Analytical model equation if available (linear/ridge/lasso/polynomial). For nonlinear models (e.g., random_forest), a descriptive string is returned."
             "'metrics' (dict): {rmse, mae, r2, adj_r2, train_r2, test_r2}. "
-            "'coefficients' (dict): Model parameters (if applicable). "
-            "'feature_importance' (dict): Variable importance (for tree-based models). "
+            "'coefficients' (dict): Model coefficients for linear/ridge/lasso/polynomial models. None for tree-based models."
+            "'feature_importance' (dict): Variable importance scores when applicable (e.g., random_forest). None for linear models."
             "'diagnostics' (dict): Residual statistics and VIF (multicollinearity check)."
-            "'method_used' (str): The method used (useful when method=None for auto-selection). "
-            "'all_methods_scores' (dict): R² scores for all methods (when auto-selecting)."
+            "'method_used' (str): The final model selected (especially useful when method=None). "
+            "'all_methods_scores' (dict): Validation R² for every candidate model when using automatic model selection."
 )
 def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArray], method: str = None,
                               alpha: float = 1.0, poly_degree: int = 2, test_size: float = 0.2, standardize: bool = None) -> Dict[str, Any]:
     if not predictors:
         raise ValueError("At least one predictor variable is required.")
+    
+    for p in predictors:
+        if not p.coords.equals(target.coords):
+            raise ValueError("Predictor coordinates do not match target.")
+
 
     predictor_names = []
     for i, pred in enumerate(predictors):

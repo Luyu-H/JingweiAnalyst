@@ -149,5 +149,5 @@ nc_files = [
     "/data1/wangzhaokun-20382/Foundation_Model_gridded_data/EN4/en4_decade_2010-2019.nc",
     "/data1/wangzhaokun-20382/Foundation_Model_gridded_data/EN4/en4_decade_2020-2024.nc"
 ]
-zarr_path = "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_thetao_sjtu_jingwei_v1_1.zarr"
+zarr_path = "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_temp_sjtu_jingwei_v1_1.zarr"
 merge_nc_files_to_zarr(nc_files, zarr_path)

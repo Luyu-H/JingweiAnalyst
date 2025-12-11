@@ -29,32 +29,32 @@ app.mount("/static", StaticFiles(directory="./results"), name="static")
 # Data configuration
 DATA_LIST = [
     {
-        "name": "nitrate_data_v1.1",
+        "name": "recon_no3_sjtu_jingwei_v1_1",
         "path": "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_no3_sjtu_jingwei_v1_1.zarr",
         "description": "Nitrate concentration data from ocean reconstruction, version 1.1"
     },
     {
-        "name": "oxygen_data_v1.1",
+        "name": "recon_o2_sjtu_jingwei_v1_1",
         "path": "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_o2_sjtu_jingwei_v1_1.zarr",
         "description": "Dissolved oxygen concentration data from ocean reconstruction, version 1.1"
     },
     {
-        "name": "phosphate_data_v1.1", 
+        "name": "recon_po4_sjtu_jingwei_v1_1", 
         "path": "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_po4_sjtu_jingwei_v1_1.zarr",
         "description": "Phosphate concentration data from ocean reconstruction, version 1.1"
     },
     {
-        "name": "silicate_data_v1.1", 
+        "name": "recon_si_sjtu_jingwei_v1_1", 
         "path": "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_si_sjtu_jingwei_v1_1.zarr",
         "description": "Silicate concentration data from ocean reconstruction, version 1.1"
     },
     {
-        "name": "temperature_data_v1.1", 
+        "name": "recon_temp_sjtu_jingwei_v1_1", 
         "path": "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_temp_sjtu_jingwei_v1_1.zarr",
         "description": "Sea temperature data from ocean reconstruction, version 1.1"
     },
     {
-        "name": "salinity_data_v1.1", 
+        "name": "recon_so_sjtu_jingwei_v1_1", 
         "path": "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_so_sjtu_jingwei_v1_1.zarr",
         "description": "Sea salinity data from ocean reconstruction, version 1.1"
     }

@@ -20,7 +20,7 @@ from src.tools.basic_calculator import compute_basic_stat
     description="Compute anomaly of reconstruction data based on WOA23 climatology data.",
     args={
         "data": "xr.DataArray, required. Input reconstruction data.",
-        "var": "str, required. Need to select from 'thetao', 'so', 'si', 'o2', 'no3', 'po4'.",
+        "var": "str, required. Need to select from 'temp', 'so', 'si', 'o2', 'no3', 'po4'.",
         "freq": "str, optional. Frequency of climatology data. Choose from 'month', 'season', 'year'. Default is 'month'.",
         "method": "str, optional. Method to compute anomaly. Choose from 'subtract' (data - climatology) "
                   "or 'ratio' ((data - climatology) / climatology * 100). Default is 'subtract'."
@@ -41,7 +41,7 @@ def compute_anomaly(data: xr.DataArray, var: str, freq: str = "month", method: s
     clim_base_path = cfg.get("climatology_data_path")
     
     var_path_map = {
-        "thetao": os.path.join(clim_base_path, "temperature_1971-2000"),
+        "temp": os.path.join(clim_base_path, "temperature_1971-2000"),
         "so": os.path.join(clim_base_path, "salinity_1971-2000"),
         "si": os.path.join(clim_base_path, "silicate_all_time_periods"),
         "o2": os.path.join(clim_base_path, "oxygen_all_time_periods"),
@@ -651,7 +651,7 @@ def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", de
     else:
         data_region = data.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
     
-    anomaly = compute_anomaly(data=data_region, var="thetao", freq=anomaly_freq, method="subtract")
+    anomaly = compute_anomaly(data=data_region, var="temp", freq=anomaly_freq, method="subtract")
 
     if 'depth' in anomaly.dims:
         anomaly_surface = anomaly.sel(depth=slice(0, depth_level))

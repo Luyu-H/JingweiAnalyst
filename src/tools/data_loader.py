@@ -45,7 +45,7 @@ def load_regular_data(zarr_path: str, time_range: list[str, str] = None, depth_r
             var_name = "p"
         elif "salinity" in ds and var_name == "so":
             var_name = "salinity"
-        elif "temperature" in ds and var_name == "thetao":
+        elif "temperature" in ds and var_name == "temp":
             var_name = "temperature"
         else:
             raise KeyError(f"Variable '{var_name}' not found in {fname}. "
@@ -109,7 +109,7 @@ def load_data_with_geolocator(zarr_path: str, time_range: tuple[str, str] = None
             var_name = "p"
         elif "salinity" in ds and var_name == "so":
             var_name = "salinity"
-        elif "temperature" in ds and var_name == "thetao":
+        elif "temperature" in ds and var_name == "temp":
             var_name = "temperature"
         else:
             raise KeyError(f"Variable '{var_name}' not found in {fname}. "
