@@ -189,10 +189,10 @@ def fit_1D_trend(data: xr.DataArray, method: str = None) -> Dict[str, Any]:
         return y_fixed
     
     models = {
-        "linear, a * x + b": (linear, [0, np.mean(y)]),
-        "quadratic, a * x**2 + b * x + c": (quadratic, [0, 0, np.mean(y)]),
-        "exponential, a * np.exp(b * x)": (exponential, [1, 0.01]),
-        "sinusoidal, a * np.sin(b * x + c) + d": (sinusoidal, [np.std(y), 2*np.pi/12, 0, np.mean(y)]),
+        "linear": (linear, [0, np.mean(y)]),
+        "quadratic": (quadratic, [0, 0, np.mean(y)]),
+        "exponential": (exponential, [1, 0.01]),
+        "sinusoidal": (sinusoidal, [np.std(y), 2*np.pi/12, 0, np.mean(y)]),
     }
 
     results = {}

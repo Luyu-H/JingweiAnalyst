@@ -17,6 +17,7 @@ from langchain_core.tools import Tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from src.tools.registry import TOOLS, auto_import_tools
+from src.models.prompt import PromptTemplates
 
 auto_import_tools()
 
@@ -92,6 +93,17 @@ class AgentWithTools:
             tool_list.append(tool)
         return tool_list
 
+    def _detect_language(self, text: str) -> str:
+        """Detect if the input text is Chinese or English.
+        Returns 'zh' for Chinese, 'en' for English."""
+        chinese_char_count = len(re.findall(r'[\u4e00-\u9fff]', text))
+        english_char_count = len(re.findall(r'[a-zA-Z]', text))
+
+        if chinese_char_count > english_char_count:
+            return 'zh'
+        else:
+            return 'en'
+
     def _safe_execute_tool(self, code: str, context: dict = None, code_type: str = "compute") -> Dict[str, Any]:
         """Safely execute generated code in a sandboxed environment."""
         sandbox_globals = {"__builtins__": __builtins__}
@@ -104,13 +116,21 @@ class AgentWithTools:
             func = meta.get("func")
             if func is None or not callable(func):
                 continue
-            
+            if not callable(func):
+                continue
+
             sandbox_globals[name] = func
             registered_count += 1
         
         try:
+            import matplotlib
+            matplotlib.use('Agg')  # Use non-interactive backend
+            import matplotlib.pyplot as plt
+            import numpy as np
             sandbox_globals['plt'] = plt
             sandbox_globals['np'] = np
+            plt.rcParams['font.sans-serif'] = ['Noto Sans CJK']
+            plt.rcParams['axes.unicode_minus'] = False
         except ImportError:
             if code_type == "visualization":
                 return {
@@ -142,6 +162,8 @@ class AgentWithTools:
                 error_info["hint"] = "Type error. Check function arguments."
             elif isinstance(e, KeyError):
                 error_info["hint"] = "Key not found in data structure."
+            elif isinstance(e, IndexError):
+                error_info["hint"] = "Index out of range. Check array dimensions."
             
             return error_info
     
@@ -166,8 +188,7 @@ class AgentWithTools:
             return None
     
     def _execute_with_retry(self, initial_code: str, context: dict, code_type: str,
-                           full_specs: Dict[str, Any], user_query: str,
-                           status_callback: Optional[Callable] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+                           full_specs: Dict[str, Any], user_query: str, language: str = 'en', status_callback: Optional[Callable] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         """
         Execute code with retry mechanism and status callbacks.
         """
@@ -208,34 +229,13 @@ class AgentWithTools:
                         "error": exec_result["error"]
                     })
                 
-                fix_prompt = f"""The following {code_type} code failed to execute:
-
-<failed_code>
-{current_code}
-</failed_code>
-
-<error_info>
-Error Type: {exec_result['error_type']}
-Error Message: {exec_result['error']}
-{exec_result.get('hint', '')}
-
-Traceback:
-{exec_result.get('traceback', 'N/A')}
-</error_info>
-
-Original task: {user_query}
-
-Available tools and their specifications:
-{json.dumps(full_specs, indent=2)}
-
-Please fix the code and output the corrected version inside <execute></execute> tags.
-Focus on:
-1. Fixing the specific error mentioned above
-2. Ensuring proper variable names and function calls
-3. Using correct syntax and library functions"""
+                fix_prompt = PromptTemplates.get_fix_prompt(
+                    language, current_code, exec_result, user_query, full_specs, code_type
+                )
+                system_content = PromptTemplates.get_fix_system_message(language)
                 
                 fix_response = self.llm.invoke([
-                    SystemMessage(content="You are a code debugging expert."),
+                    SystemMessage(content=system_content),
                     HumanMessage(content=fix_prompt)
                 ])
                 
@@ -270,6 +270,8 @@ Focus on:
             - status_callback: Async function to send status updates to frontend
                            Format: async def callback(data: dict)
         """
+        language = self._detect_language(user_query)
+
         # Create or get session
         if session_id is None:
             session_id = self.create_session()
@@ -285,7 +287,8 @@ Focus on:
         
         result_record = {
             "session_id": session_id,
-            "user_query": user_query
+            "user_query": user_query,
+            "language": language
         }
         
         # Status update helper
@@ -314,26 +317,14 @@ Focus on:
             for data in self.data_list
         }
 
-        system_prompt_1 = f"""You are a scientific data analysis assistant.
-
-{context_summary}
-
-Available tools:
-{json.dumps(tool_overview, indent=2)}
-
-Available datasets:
-{json.dumps(data_overview, indent=2)}
-Note that if the user does not specify which version of the data is needed, select the latest version of relevant variables.
-
-Analyze the user's question and select appropriate data and tools. Follow this format strictly:
-<plan>step-by-step reasoning about which data and tools are needed</plan>
-<selected_data>comma-separated list of dataset names you will use</selected_data>
-<selected_tools>comma-separated list of tool names you will use</selected_tools>
-"""
+        system_prompt_1 = PromptTemplates.get_planning_prompt(
+            language, tool_overview, data_overview, context_summary
+        )
+        planning_input = PromptTemplates.get_planning_input(language, user_query)
 
         planning_response = self.llm.invoke([
             SystemMessage(content=system_prompt_1),
-            HumanMessage(content=f"User question: {user_query}")
+            HumanMessage(content=planning_input)
         ])
         
         result_record["plan"] = planning_response.content
@@ -381,41 +372,14 @@ Analyze the user's question and select appropriate data and tools. Follow this f
             for name in selected_tool_names if name in self.tools_meta
         }
 
-        system_prompt_2 = f"""Here are the full specifications for the tools you have selected:
-{json.dumps(full_specs, indent=2)}
-
-Generate TWO separate code blocks to solve: "{user_query}"
-
-Requirements:
-1. The dataset path is available as variable `selected_data` = "{selected_data_path}"
-2. Available libraries: matplotlib.pyplot as plt, numpy as np
-
-Generate code in this format:
-
-<compute>
-# Computation code only
-# Call tools to load and process data
-# Perform calculations and store results in variables
-# Examples: result, mean_value, trend, etc.
-</compute>
-
-<visualize>
-# Visualization code only (this section is optional)
-# Use results from computation (they will be available as variables)
-# Create matplotlib plots with proper labels and titles
-# Use plt.figure(), plt.plot(), plt.xlabel(), etc.
-# DO NOT use plt.savefig() - handled automatically
-</visualize>
-
-Important:
-- Computation code MUST be complete and standalone
-- Visualization code can reference variables from computation
-- If visualization is not appropriate for this query, leave <visualize> empty or omit it
-"""
+        system_prompt_2 = PromptTemplates.get_code_generation_prompt(
+            language, full_specs, user_query, selected_data_path
+        )
+        exec_input = PromptTemplates.get_code_generation_input(language)
         
         exec_response = self.llm.invoke([
             SystemMessage(content=system_prompt_2),
-            HumanMessage(content="Generate the two code blocks now.")
+            HumanMessage(content=exec_input)
         ])
         
         result_record["generated_code"] = exec_response.content
@@ -449,6 +413,7 @@ Important:
             code_type="compute",
             full_specs=full_specs,
             user_query=user_query,
+            language=language,
             status_callback=sync_status_callback
         )
 
@@ -483,6 +448,7 @@ Important:
                         code_type="visualization",
                         full_specs=full_specs,
                         user_query=user_query,
+                        language=language,
                         status_callback=sync_status_callback
                     )
                     
@@ -534,18 +500,19 @@ Important:
             "stage": "generating_answer",
             "message": "正在生成最终回复..."
         })
-        
-        solution_prompt = f"""Results:
-<observation>
-{observation_text}
-</observation>
 
-Please provide a clear scientific summary inside <solution></solution> tags.
-"""
+        has_computation_success = observation_parts[0]["status"] == "success"
+        has_visualization = any(p.get("type") == "visualization" and p.get("status") == "success" 
+                               for p in observation_parts)
+
+        solution_prompt = PromptTemplates.get_solution_prompt(
+            language, observation_text, has_computation_success, has_visualization
+        )
+        final_input = PromptTemplates.get_solution_input(language)
         
         final_response = self.llm.invoke([
             SystemMessage(content=solution_prompt),
-            HumanMessage(content="Provide final explanation.")
+            HumanMessage(content=final_input)
         ])
         
         result_record["solution"] = final_response.content

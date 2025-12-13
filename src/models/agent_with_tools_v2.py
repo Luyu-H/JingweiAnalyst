@@ -1,5 +1,6 @@
 import random
 import re
+import os
 import json
 import traceback
 import base64
@@ -13,6 +14,7 @@ from langchain_core.tools import Tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from src.tools.registry import TOOLS, auto_import_tools, export_tools_doc
+from src.models.prompt import PromptTemplates
 
 # import all tools and register them to TOOLS
 auto_import_tools()
@@ -61,7 +63,7 @@ class AgentWithTools:
     """An agent that can select and call provided tools to answer scientific questions with multi-turn conversation support."""
     
     def __init__(self, tools: Dict[str, Dict], data_list: List[Dict[str, str]],
-                 api_key: str, model_name: str = "deepseek-chat", temperature: float = 0.0, 
+                 api_key: str, model_name: str = "deepseek-reasoner", temperature: float = 0.0, 
                  result_dir: str = "./results", max_turns_per_session: int = 10, max_code_iterations: int = 3):
         self.tools_meta = tools
         self.data_list = data_list
@@ -86,6 +88,17 @@ class AgentWithTools:
             )
             tool_list.append(tool)
         return tool_list
+
+    def _detect_language(self, text: str) -> str:
+        """Detect if the input text is Chinese or English.
+        Returns 'zh' for Chinese, 'en' for English."""
+        chinese_char_count = len(re.findall(r'[\u4e00-\u9fff]', text))
+        english_char_count = len(re.findall(r'[a-zA-Z]', text))
+
+        if chinese_char_count > english_char_count:
+            return 'zh'
+        else:
+            return 'en'
 
     def _safe_execute_tool(self, code: str, context: dict = None, code_type: str = "compute") -> Dict[str, Any]:
         """Safely execute generated code in a sandboxed environment with registered tools."""
@@ -116,6 +129,9 @@ class AgentWithTools:
             import numpy as np
             sandbox_globals['plt'] = plt
             sandbox_globals['np'] = np
+            plt.rcParams['font.sans-serif'] = ['Noto Sans CJK']
+            plt.rcParams['axes.unicode_minus'] = False
+            
         except ImportError:
             if code_type == "visualization":
                 return {
@@ -199,7 +215,7 @@ class AgentWithTools:
         print(f"[System] Session saved to {fname}")
     
     def _execute_with_retry(self, initial_code: str, context: dict, code_type: str,
-                           full_specs: Dict[str, Any], user_query: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+                           full_specs: Dict[str, Any], user_query: str, language: str = 'en') -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         """
         Execute code with retries upon failure, regenerating code as needed.
         
@@ -238,35 +254,13 @@ class AgentWithTools:
             if iteration < self.max_code_iterations - 1:
                 print("[System] Requesting code fix from LLM...")
                 
-                fix_prompt = f"""The following {code_type} code failed to execute:
-
-<failed_code>
-{current_code}
-</failed_code>
-
-<error_info>
-Error Type: {exec_result['error_type']}
-Error Message: {exec_result['error']}
-{exec_result.get('hint', '')}
-
-Traceback:
-{exec_result.get('traceback', 'N/A')}
-</error_info>
-
-Original task: {user_query}
-
-Available tools and their specifications:
-{json.dumps(full_specs, indent=2)}
-
-Please fix the code and output the corrected version inside <execute></execute> tags.
-Focus on:
-1. Fixing the specific error mentioned above
-2. Ensuring proper variable names and function calls
-3. Using correct syntax and library functions
-"""
+                fix_prompt = PromptTemplates.get_fix_prompt(
+                    language, current_code, exec_result, user_query, full_specs, code_type
+                )
+                system_content = PromptTemplates.get_fix_system_message(language)
                 
                 fix_response = self.llm.invoke([
-                    SystemMessage(content="You are a code debugging expert."),
+                    SystemMessage(content=system_content),
                     HumanMessage(content=fix_prompt)
                 ])
                 
@@ -309,6 +303,9 @@ Focus on:
         Returns:
             Dict, the result record including plan, selected data/tools, generated code, observation, and solution.
         """
+        language = self._detect_language(user_query)
+        print(f"[System] Detected language: {'Chinese' if language == 'zh' else 'English'}")
+
         if session_id is None:
             session_id = self.create_session()
         elif session_id not in self.sessions:
@@ -325,7 +322,8 @@ Focus on:
         
         result_record = {
             "session_id": session_id,
-            "user_query": user_query
+            "user_query": user_query,
+            "language": language
         }
         
         context_summary = session.get_context_summary()
@@ -344,24 +342,11 @@ Focus on:
         }
 
         # Step 1: Planning, including selecting data and tools
-        system_prompt_1 = f"""You are a scientific data analysis assistant with conversation history support.
+        system_prompt_1 = PromptTemplates.get_planning_prompt(
+            language, tool_overview, data_overview, context_summary
+        )
+        planning_input = PromptTemplates.get_planning_input(language, user_query)
 
-{context_summary}
-
-Available tools:
-{json.dumps(tool_overview, indent=2)}
-
-Available datasets:
-{json.dumps(data_overview, indent=2)}
-Note that if the user does not specify which version of the data is needed, select the latest version of relevant variables.
-
-Analyze the user's question and select appropriate data and tools. Follow this format strictly:
-<plan>step-by-step reasoning about which data and tools are needed</plan>
-<selected_data>comma-separated list of dataset names you will use</selected_data>
-<selected_tools>comma-separated list of tool names you will use</selected_tools>
-"""
-
-        planning_input = f"User question: {user_query}\n\nNow output your reasoning and selections."
         planning_response = self.llm.invoke([
             SystemMessage(content=system_prompt_1),
             HumanMessage(content=planning_input)
@@ -402,42 +387,14 @@ Analyze the user's question and select appropriate data and tools. Follow this f
             for name in selected_tool_names if name in self.tools_meta
         }
 
-        system_prompt_2 = f"""Here are the full specifications for the tools you have selected:
-
-{json.dumps(full_specs, indent=2)}
-
-Generate TWO separate code blocks to solve: "{user_query}"
-
-Requirements:
-1. The dataset path is available as variable `selected_data` = "{selected_data_path}"
-2. Available libraries: matplotlib.pyplot as plt, numpy as np
-
-Generate code in this format:
-
-<compute>
-# Computation code only
-# Call tools to load and process data
-# Perform calculations and store results in variables
-# Examples: result, mean_value, trend, etc.
-</compute>
-
-<visualize>
-# Visualization code only (this section is optional)
-# Use results from computation (they will be available as variables)
-# Create matplotlib plots with proper labels and titles
-# Use plt.figure(), plt.plot(), plt.xlabel(), etc.
-# DO NOT use plt.savefig() - handled automatically
-</visualize>
-
-Important:
-- Computation code MUST be complete and standalone
-- Visualization code can reference variables from computation
-- If visualization is not appropriate for this query, leave <visualize> empty or omit it
-"""
+        system_prompt_2 = PromptTemplates.get_code_generation_prompt(
+            language, full_specs, user_query, selected_data_path
+        )
+        exec_input = PromptTemplates.get_code_generation_input(language)
         
         exec_response = self.llm.invoke([
             SystemMessage(content=system_prompt_2),
-            HumanMessage(content="Generate the two code blocks now.")
+            HumanMessage(content=exec_input)
         ])
         print("\n=== Generated Code ===\n", exec_response.content)
         result_record["generated_code"] = exec_response.content
@@ -458,7 +415,8 @@ Important:
             context={"selected_data": selected_data_path},
             code_type="compute",
             full_specs=full_specs,
-            user_query=user_query
+            user_query=user_query,
+            language=language
         )
 
         result_record["compute_iterations"] = compute_iterations
@@ -489,7 +447,8 @@ Important:
                         context=vis_context,
                         code_type="visualization",
                         full_specs=full_specs,
-                        user_query=user_query
+                        user_query=user_query,
+                        language=language
                     )
                     
                     result_record["visualization_iterations"] = vis_iterations
@@ -553,33 +512,14 @@ Important:
         has_visualization = any(p.get("type") == "visualization" and p.get("status") == "success" 
                                for p in observation_parts)
         
-        solution_prompt = f"""
-Here are the results of code execution:
-
-<observation>
-{observation_text}
-</observation>
-
-Status Summary:
-- Computation: {'Success' if has_computation_success else 'Failed'}
-- Visualization: {'Generated' if has_visualization else 'Not generated or failed'}
-
-Please provide a clear scientific summary inside <solution></solution> tags.
-
-If computation succeeded, include:
-1. Direct answer to the user's question
-2. Key numerical results and their interpretation
-3. If visualization was generated, describe what it shows
-4. Any important insights or patterns observed
-
-If computation failed, explain:
-1. What went wrong
-2. Efforts made by the agent to solve the question, including data selection, tool choice, and visualization attempts
-3. Suggestions for how to reformulate the query
-"""
+        solution_prompt = PromptTemplates.get_solution_prompt(
+            language, observation_text, has_computation_success, has_visualization
+        )
+        final_input = PromptTemplates.get_solution_input(language)
+        
         final_response = self.llm.invoke([
             SystemMessage(content=solution_prompt),
-            HumanMessage(content="Provide the final explanation.")
+            HumanMessage(content=final_input)
         ])
         print("\n=== Final Solution ===\n", final_response.content)
         result_record["solution"] = final_response.content
@@ -624,21 +564,87 @@ if __name__ == "__main__":
         }
     ]
 
+    def run_tests_from_folder(folder_path, agent):
+        """
+        Read all JSON files inside folder_path.
+        Each JSON file contains an array of test items.
+        For each item: create a new agent session and run the query.
+        """
+
+        # list all .json files
+        json_files = [
+            os.path.join(folder_path, f)
+            for f in os.listdir(folder_path)
+            if f.endswith(".json")
+        ]
+
+        print(f"Found {len(json_files)} test files.")
+
+        all_results = []   # collect everything
+
+        for json_file in json_files:
+            print(f"\n=== Loading test file: {json_file} ===")
+            with open(json_file, "r") as f:
+                test_items = json.load(f)
+
+            # test_items should be a list
+            if not isinstance(test_items, list):
+                raise ValueError(f"JSON file {json_file} must contain a list/array.")
+
+            for idx, item in enumerate(test_items):
+                query = item.get("query")
+
+                if query is None:
+                    print(f"Skipping item {idx} because no 'query' field.")
+                    continue
+
+                print(f"\n--- Running test case {idx+1}/{len(test_items)} ---")
+                print(f"Query: {query}")
+
+                # Create a new session for EACH query
+                session_id = agent.create_session()
+
+                try:
+                    result = agent.run(query, session_id=session_id)
+                    all_results.append({
+                        "file": json_file,
+                        "index": idx,
+                        "query": query,
+                        "result": result
+                    })
+                except Exception as e:
+                    print(f"Error running test case {idx}: {e}")
+                finally:
+                    agent.end_session(session_id)
+
+        return all_results
+
     api_key = "sk-edc62146735146e4a9904740057ace47"
-    agent = AgentWithTools(TOOLS, data_list, api_key, 
+    agent = AgentWithTools(TOOLS, data_list, api_key, model_name="deepseek-reasoner",
                            max_turns_per_session=10, max_code_iterations=3)
+    
+    # folder = "/home/lorraine/jingwei_QA/data/test_cases"
+    # results = run_tests_from_folder(folder, agent)
+
+    # print("Finished all tests.")
     
     session_id = agent.create_session()
     
-    # first question
-    result1 = agent.run(
-        "In the North Pacific, evaluate the lagged correlation between mixed layer depth (MLD) and surface (10 m) dissolved oxygen anomalies on a seasonal scale for the period 1990–2010 (to identify lead–lag relationships), and construct a multivariate regression model to examine the contributions of MLD, sea-surface temperature (SST), and salinity to surface oxygen. Pay attention to checking the data dimensions. The longitude and latitude, depth, and time resolution of the initial data of all variables are the same.",
-        session_id=session_id
-    )
+    # # first question
+    # result1 = agent.run(
+    #     "In the North Pacific, evaluate the lagged correlation between mixed layer depth (MLD) and surface (10 m) dissolved oxygen anomalies on a seasonal scale for the period 1990–2010 (to identify lead–lag relationships), and construct a multivariate regression model to examine the contributions of MLD, sea-surface temperature (SST), and salinity to surface oxygen. Pay attention to checking the data dimensions. The longitude and latitude, depth, and time resolution of the initial data of all variables are the same.",
+    #     session_id=session_id
+    # )
     # # second question in the same session
     # result2 = agent.run(
     #     "How does this compare to the phosphate levels in the same period?",
     #     session_id=session_id
     # )
+
+    # first question
+    result1 = agent.run(
+        "计算1980年1月至2023年12月的每月Niño 3.4指数，确定El Niño事件（指数> 0.5°C至少连续5个月）。",
+        session_id=session_id
+    )
     
     agent.end_session(session_id)

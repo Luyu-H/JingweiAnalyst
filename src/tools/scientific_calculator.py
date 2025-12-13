@@ -120,6 +120,9 @@ def compute_anomaly(data: xr.DataArray, var: str, freq: str = "month", method: s
         
         clim = climatology_dict[code]
         data_slice = data.isel(time=time_idx)
+
+        if var == "temp":
+            data_slice = data_slice - 273.15
         
         # Calculate anomaly
         if method == "subtract":
