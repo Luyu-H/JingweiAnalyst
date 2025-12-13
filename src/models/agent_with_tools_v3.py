@@ -129,7 +129,7 @@ class AgentWithTools:
             import numpy as np
             sandbox_globals['plt'] = plt
             sandbox_globals['np'] = np
-            plt.rcParams['font.sans-serif'] = ['Noto Sans CJK']
+            plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC']
             plt.rcParams['axes.unicode_minus'] = False
         except ImportError:
             if code_type == "visualization":
