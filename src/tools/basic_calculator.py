@@ -669,20 +669,22 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
 
 @register_tools(
     name="analyze_correlation",
-    description="Calculate correlation coefficients between two ocean variables with flexible dimension handling, lag analysis, and significance testing. ",
+    description="Calculate correlation coefficients between two ocean variables with flexible dimension handling, lag analysis, and significance testing. Note that the variable dimensions need to be aligned. Special attention should be paid to data preprocessed by temporal_aggregate, compute_basic_stat, etc.",
     args={
-        "var1": "xr.DataArray, required. First variable.",
-        "var2": "xr.DataArray, required. Second variable (must be broadcastable with var1).",
-        "dim": "str or list[str], optional. Dimension(s) along which to compute correlation. Default: 'time'.",
+        "var1": "xr.DataArray, required. Primary variable for correlation analysis. Must share compatible dimensions with var2.",
+        "var2": "xr.DataArray, required. Secondary variable for correlation analysis. Dimensions will be aligned with var1 automatically.",
+        "dim": "str or list[str], optional. Dimension(s) over which correlation is computed. Default: 'time'. Examples: 'time' for temporal correlation, ['lat', 'lon'] for spatial correlation.",
         "method": "str, optional. Choose from 'pearson' and 'spearman'. Default: 'pearson'.",
-        "lag": "int, optional. Time lag to apply to var2 (in units of the time dimension index). "
-               "Positive lag means var2 leads var1. Example: lag=3 for 3-month lead. Default: 0.",
+        "lag": "int, optional. Time lag applied to variables for lead-lag analysis. "
+            "Positive values: var2 leads var1 (e.g., lag=3 means var2 precedes var1 by 3 time steps). Negative values: var1 leads var2."
+            "Negative values: var1 leads var2."
+            "Require 'time' dimension in correlation dimensions. Default: 0 (no lag).",
         "min_periods": "int, optional. Minimum number of valid (non-NaN) pairs required to compute correlation. Default: 3."
     },
-    returns="dict with keys: "
-            "'correlation' (xr.DataArray): Correlation coefficients in range [-1, 1]. "
-            "'pvalue' (xr.DataArray): Two-tailed p-values for significance testing. "
-            "'n_samples' (xr.DataArray): Number of valid sample pairs used for each correlation."
+    returns="dict containing three xarray DataArrays:"
+            "'correlation' (xr.DataArray): Correlation coefficients ranging from -1 to 1. Positive values indicate direct relationships, negative values indicate inverse relationships. Shape determined by non-correlation dimensions."
+            "'pvalue' (xr.DataArray): Two-tailed p-values for significance testing. Values < 0.05 typically indicate statistically significant correlations. Same dimensions as 'correlation'."
+            "'n_samples' (xr.DataArray): Count of valid data pairs used for each correlation calculation. Useful for assessing confidence in results. Same dimensions as 'correlation'. Example access: results['correlation'].sel(lat=30, lon=120) returns correlation at specific location."
 )
 def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, List[str]] = "time",
                         method: str = "pearson", lag: int = 0, min_periods: int = 3) -> Dict[str, xr.DataArray]:
@@ -708,14 +710,19 @@ def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, 
     if lag != 0:
         if 'time' not in dims_to_correlate:
             raise ValueError("Lag can only be applied when 'time' is in correlation dimensions")
+
+        time_len = len(var1_aligned['time'])
+        if abs(lag) >= time_len:
+            raise ValueError(f"Lag {lag} exceeds available time dimension length {time_len}")
+
         if lag > 0:
             # var2 leads var1: shift var2 backward (earlier times)
             var2_aligned = var2_aligned.isel(time=slice(None, -lag))
             var1_aligned = var1_aligned.isel(time=slice(lag, None))
         else:
             # var1 leads var2: shift var1 backward
-            var1_aligned = var1_aligned.isel(time=slice(None, lag))
-            var2_aligned = var2_aligned.isel(time=slice(-lag, None))
+            var1_aligned = var1_aligned.isel(time=slice(None, -abs(lag)))
+            var2_aligned = var2_aligned.isel(time=slice(abs(lag), None))
     
     def correlation_func(x, y):
         """Calculate correlation with NaN handling"""
@@ -730,12 +737,20 @@ def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, 
         if n < min_periods:
             return np.nan, np.nan, n
         
-        if method == "pearson":
-            corr, pval = stats.pearsonr(x_valid, y_valid)
-        else:  # spearman
-            corr, pval = stats.spearmanr(x_valid, y_valid)
+        if n < 2:
+            return np.nan, np.nan, n
         
-        return corr, pval, n
+        if np.std(x_valid) == 0 or np.std(y_valid) == 0:
+            return np.nan, np.nan, n
+        
+        try: 
+            if method == "pearson":
+                corr, pval = stats.pearsonr(x_valid, y_valid)
+            else:  # spearman
+                corr, pval = stats.spearmanr(x_valid, y_valid)
+            return float(corr), float(pval), int(n)
+        except Exception:
+            return np.nan, np.nan, n
     
     corr_values, pval_values, n_samples = xr.apply_ufunc(
         correlation_func,
@@ -792,21 +807,33 @@ def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, 
 
 @register_tools(
     name="detect_outliers",
-    description="Detect and flag outliers in ocean data for quality control or extreme event identification. "
-                "Supports multiple statistical methods suitable for oceanographic variables.",
+    description="Identify statistical outliers in oceanographic datasets using robust detection methods. "
+                "Essential for data quality control, extreme event analysis, and preprocessing of spatio-temporal ocean variables before statistical modeling or visualization.",
     args={
         "data": "xr.DataArray, required. Input ocean data array with dimensions (time, depth, lat, lon) or subset.",
-        "method": "str, optional. Detection method: 'zscore' (default), 'iqr', 'mad', 'percentile'. "
-                  "'zscore': standard score method; 'iqr': interquartile range; 'mad': median absolute deviation; "
-                  "'percentile': absolute percentile thresholds.",
-        "threshold": "float, optional. Threshold value. For 'zscore'/'mad': number of std/MAD (default=3.0); "
-                     "For 'iqr': IQR multiplier (default=1.5); For 'percentile': percentile value (default=99.0).",
-        "dim": "str or list[str], optional. Dimension(s) along which to compute statistics. "
-               "Default is 'time' for temporal anomalies. Use ['lat', 'lon'] for spatial, or None for global."
+        "method": "str, optional. Statistical method for outlier detection. "
+                  "- 'zscore': Standard deviation-based (parametric, assumes normal distribution). "
+                  "- 'iqr': Interquartile range-based (non-parametric, robust to moderate outliers). "
+                  "- 'mad': Median Absolute Deviation (highly robust to extreme outliers). "
+                  "- 'percentile': Direct percentile thresholds (simple, distribution-free). "
+                  "Default: 'zscore'.",
+        "threshold": "float, optional. Sensitivity parameter controlling outlier detection strictness. Interpretation varies by method: "
+                    "-  zscore': Number of standard deviations (default=3.0)."
+                    "- 'iqr': Multiplier for interquartile range (default=1.5)."
+                    "- 'mad': Multiplier for scaled MAD (default=3.0)."
+                    "- 'percentile': Symmetric percentile cutoff (e.g., 99.0 detects values outside 0.5th-99.5th percentiles). Default=99.0.",
+        "dim": "str or list[str], or None, optional. Dimension(s) along which to compute statistics. "
+               "None: Compute statistics across all dimensions (global outliers)."
+               "Default: 'time' (detect outliers at each spatial location over time)."
     },
-    returns="xr.DataArray. Boolean array with same shape as input, True indicates outliers."
+    returns="xr.DataArray. Boolean mask with identical dimensions as input data, where True indicates an outlier, False indicates a valid data point."
 )
 def detect_outliers(data: xr.DataArray, method: str = "zscore", threshold: float = None, dim: Union[str, list, None] = "time") -> xr.DataArray:
+    method = method.lower()
+    valid_methods = ['zscore', 'iqr', 'mad', 'percentile']
+    if method not in valid_methods:
+        raise ValueError(f"Method '{method}' not supported. Choose from {valid_methods}")
+
     # Set default thresholds for each method
     if threshold is None:
         default_thresholds = {
@@ -815,49 +842,75 @@ def detect_outliers(data: xr.DataArray, method: str = "zscore", threshold: float
             'mad': 3.0,
             'percentile': 99.0
         }
-        threshold = default_thresholds.get(method, 3.0)
+        threshold = default_thresholds[method]
+    
+    if method == 'percentile' and threshold <= 0 or threshold >= 100:
+        raise ValueError(f"For 'percentile' method, threshold must be 0 < threshold < 100, got {threshold}")
+    elif method != 'percentile' and threshold <= 0:
+        raise ValueError(f"Threshold must be positive, got {threshold}")
+    
+    if dim is None:
+        dims_to_use = list(data.dims)
+    elif isinstance(dim, str):
+        dims_to_use = [dim]
+    else:
+        dims_to_use = list(dim)
+    
+    for d in dims_to_use:
+        if d not in data.dims:
+            raise ValueError(f"Dimension '{d}' not found in data. Available dimensions: {list(data.dims)}")
     
     # Apply detection method
     if method == "zscore":
         # Standard score method: |x - μ| > threshold * σ
-        mean = data.mean(dim=dim, skipna=True)
-        std = data.std(dim=dim, skipna=True)
-        z_scores = xr.ufuncs.fabs((data - mean) / std)
+        mean = data.mean(dim=dims_to_use, skipna=True)
+        std = data.std(dim=dims_to_use, skipna=True)
+        std_safe = std.where(std > 0, np.nan)
+        z_scores = xr.ufuncs.fabs((data - mean) / std_safe)
         outliers = z_scores > threshold
         
     elif method == "iqr":
         # Interquartile range method: x < Q1 - threshold*IQR or x > Q3 + threshold*IQR
-        q1 = data.quantile(0.25, dim=dim, skipna=True)
-        q3 = data.quantile(0.75, dim=dim, skipna=True)
+        q1 = data.quantile(0.25, dim=dims_to_use, skipna=True)
+        q3 = data.quantile(0.75, dim=dims_to_use, skipna=True)
         iqr = q3 - q1
-        lower_bound = q1 - threshold * iqr
-        upper_bound = q3 + threshold * iqr
+        iqr_safe = iqr.where(iqr > 0, np.nan)
+        lower_bound = q1 - threshold * iqr_safe
+        upper_bound = q3 + threshold * iqr_safe
         outliers = (data < lower_bound) | (data > upper_bound)
         
     elif method == "mad":
         # Median Absolute Deviation: more robust to outliers than std
-        median = data.median(dim=dim, skipna=True)
-        mad = xr.ufuncs.fabs(data - median).median(dim=dim, skipna=True)
+        median = data.median(dim=dims_to_use, skipna=True)
+        mad = xr.ufuncs.fabs(data - median).median(dim=dims_to_use, skipna=True)
         # MAD to std conversion factor for normal distribution
-        mad_scores = xr.ufuncs.fabs((data - median) / (mad * 1.4826))
+        normalization_factor = 1.4826
+        mad_safe = mad.where(mad > 0, np.nan)
+        mad_scores = xr.ufuncs.fabs((data - median) / (mad_safe * normalization_factor))
         outliers = mad_scores > threshold
         
     elif method == "percentile":
-        # Values above the threshold percentile are marked as outliers
-        upper_threshold = data.quantile(threshold / 100.0, dim=dim, skipna=True)
-        lower_threshold = data.quantile((100 - threshold) / 100.0, dim=dim, skipna=True)
+        lower_percentile = (100.0 - threshold) / 2.0
+        upper_percentile = 100.0 - lower_percentile
+        lower_threshold = data.quantile(lower_percentile / 100.0, dim=dims_to_use, skipna=True)
+        upper_threshold = data.quantile(upper_percentile / 100.0, dim=dims_to_use, skipna=True)
         outliers = (data > upper_threshold) | (data < lower_threshold)
     
     else:
         raise ValueError(f"Unknown method: {method}. Choose from 'zscore', 'iqr', 'mad', 'percentile'.")
     
     # Ensure output is boolean type
-    outliers = outliers.astype(bool)
-    
-    outliers.attrs['detection_method'] = method
-    outliers.attrs['threshold'] = threshold
-    outliers.attrs['detection_dim'] = str(dim)
-    outliers.attrs['description'] = f'Outlier mask: True indicates outlier detected by {method} method'
+    outliers = outliers.astype(bool).fillna(False)
+
+    outliers.name = f"outlier_mask_{method}"
+    outliers.attrs.update({
+        'detection_method': method,
+        'threshold': float(threshold),
+        'detection_dimensions': str(dims_to_use),
+        'description': f'Outlier mask: True indicates outlier detected by {method} method',
+        'input_data_name': data.name if data.name else 'unnamed',
+        'input_data_dims': str(list(data.dims))
+    })
     
     return outliers
 

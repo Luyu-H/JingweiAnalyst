@@ -3,7 +3,7 @@ from typing import Dict, Any
 
 
 class PromptTemplates:
-    """Collection of all prompt templates for the agent."""
+    """Collection of all prompt templates for the agent."""     
     
     @staticmethod
     def get_planning_prompt(language: str, tool_overview: Dict, data_overview: Dict, context_summary: str) -> str:
