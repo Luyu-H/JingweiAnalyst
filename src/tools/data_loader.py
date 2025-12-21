@@ -18,7 +18,8 @@ from src.utils.geolocator import Geolocator
     name="load_regular_data",
     description="Load a regular subset of ocean data from a Zarr dataset with dimensions (time, depth, lat, lon). "
         "This tool supports only continuous range-based subsetting along 1–4 dimensions, rather than irregular or point-based selections. "
-        "The target variable name is automatically inferred from the file name.",
+        "The target variable name is automatically inferred from the file name." \
+        "If the user's question requires loading data for computational analysis, at least one of load_regular_data or load_data_with_geolocator must be used.",
     args={
         "zarr_path": "str, required. Path to the zarr dataset. File name should follow the format 'recon_{var}_sjtu_jingwei_{ver}.zarr'.",
         "time_range": "list[str, str], optional. Continuous time window for subsetting. Format: ['start_date', 'end_date'] using ISO 8601 format (YYYY-MM-DD). Example: ['2000-01-01', '2010-12-31'] selects data from Jan 2000 to Dec 2010. If None, returns all available time steps.",
@@ -91,7 +92,7 @@ SUPPORTED_WATER_BODIES = ['Arctic Ocean', 'SOUTHERN OCEAN', 'North Atlantic Ocea
 
 @register_tools(
     name="load_data_with_geolocator",
-    description="Load oceanographic data for specific geographic regions using a pre-defined geolocator system. This tool provides intelligent geographic subsetting based on known ocean basins and water bodies, ensuring accurate spatial selection without requiring manual coordinate specification. When requested regions are not in the supported list, please use load_regular_data(zarr_path: str, time_range: list[str, str] = None, depth_range: list[float, float] = None, lat_range: list[float, float] = None, lon_range: list[float, float] = None) to load data by specifying latitude and longitude ranges directly.",
+    description="Load oceanographic data for specific geographic regions using a pre-defined geolocator system. This tool provides intelligent geographic subsetting based on known ocean basins and water bodies, ensuring accurate spatial selection without requiring manual coordinate specification. When requested regions are not in the supported list, please use load_regular_data(zarr_path: str, time_range: list[str, str] = None, depth_range: list[float, float] = None, lat_range: list[float, float] = None, lon_range: list[float, float] = None) to load data by specifying latitude and longitude ranges directly. If the user's question requires loading data for computational analysis, at least one of load_regular_data or load_data_with_geolocator must be used.",
     args={
         "zarr_path": "str, required. Path to the zarr dataset. File name should follow the format 'recon_{var}_sjtu_jingwei_{ver}.zarr'.",
         "time_range": "tuple[str, str], optional. Time range (start, end) in ISO 8601 format (YYYY-MM-DD) (e.g., '2000-01-01'). If None, returns all available time steps.",

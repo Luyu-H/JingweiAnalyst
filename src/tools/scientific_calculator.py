@@ -17,15 +17,15 @@ from src.tools.basic_calculator import compute_basic_stat
 
 @register_tools(
     name="compute_anomaly",
-    description="Compute anomaly of reconstruction data based on WOA23 climatology data.",
+    description="Compute anomaly of gridded reconstruction data based on WOA23 climatology data. The anomaly is computed independently for each time step by matching its calendar month/season/year to the corresponding climatology.\n" \
+    "To ensure spatial alignment with WOA23 climatology, the input data must retain the original WOA-compatible depth, latitude, and longitude coordinates: spatial subsetting is allowed, but spatial aggregation or resampling (e.g., interpolation, regridding, averaging) is not permitted.",
     args={
-        "data": "xr.DataArray, required. Input reconstruction data.",
-        "var": "str, required. Need to select from 'temp', 'so', 'si', 'o2', 'no3', 'po4'.",
-        "freq": "str, optional. Frequency of climatology data. Choose from 'month', 'season', 'year'. Default is 'month'.",
-        "method": "str, optional. Method to compute anomaly. Choose from 'subtract' (data - climatology) "
-                  "or 'ratio' ((data - climatology) / climatology * 100). Default is 'subtract'."
+        "data": "xr.DataArray, required. Input reconstruction data. Must contain a 'time' coordinate with valid month information, and spatial dimensions compatible with WOA23 climatology.",
+        "var": "str, required. Target variable name used to select the corresponding WOA23 climatology. Need to select from 'temp' (temperature), 'so' (salinity), 'si' (silicate), 'o2' (dissolved oxygen), 'no3' (nitrate), 'po4' (phosphate).",
+        "freq": "str, optional. Temporal resolution of the climatology used for anomaly computation. Choose from 'month', 'season', 'year'. Default is 'month'.",
+        "method": "str, optional. Method to compute anomaly. Choose from 'subtract' (data - climatology) or 'ratio' ((data - climatology) / climatology * 100). Default is 'subtract'."
     },
-    returns="xr.DataArray. Anomaly data with same dimensions as input."
+    returns="xr.DataArray. Anomaly data with the same dimensions and coordinates as the input data."
 )
 def compute_anomaly(data: xr.DataArray, var: str, freq: str = "month", method: str = "subtract") -> xr.DataArray:
     if freq not in ["month", "season", "year"]:
@@ -152,12 +152,14 @@ def compute_anomaly(data: xr.DataArray, var: str, freq: str = "month", method: s
 
 @register_tools(
     name="convert_concentration_to_content",
-    description="Convert concentration data (μmol/kg) to content data (mol) by multiplying with grid cell volume. ",
+    description="Convert concentration data (μmol/kg) to content data (mol) by integrating over grid-cell volume. The conversion assumes concentration is given in μmol/kg and uses a constant seawater density. \n" \
+    "To ensure physically meaningful results, the input data must be defined on a standard WOA-compatible grid with explicit depth, latitude, and longitude coordinates. Spatial subsetting is allowed, but spatial aggregation, regridding, or resampling must not be applied prior to conversion, as grid-cell area and thickness are inferred from the original coordinate values. \n"
+    "The computation of grid-cell volumes is integrated within this tool, so users do not need to load depth/area/volume data separately.",
     args={
-        "concentration": "xr.DataArray, required. Concentration data with dimensions (time, depth, lat, lon) in μmol/kg.",
+        "concentration": "xr.DataArray, required. Concentration data with dimensions, including 'depth', 'lat', and 'lon' (time dimension is optional), in μmol/kg.",
         "density": "float, optional. Seawater density in kg/m³. Default is 1025 kg/m³."
     },
-    returns="xr.DataArray. Content data in moles (mol) with same dimensions as input."
+    returns="xr.DataArray. Content data in moles (mol) with same dimensions and coordinates as input."
 )
 def convert_concentration_to_content(concentration: xr.DataArray, density: float = 1025.0) -> xr.DataArray:
     lat_values = concentration.lat.values
@@ -199,12 +201,12 @@ def convert_concentration_to_content(concentration: xr.DataArray, density: float
 
 @register_tools(
     name="compute_vertical_gradient",
-    description="Compute vertical gradient of a variable in an xarray.DataArray along the depth dimension. "
-                "Gradient is computed as Δvar / Δz, consistent with interface method.",
+    description="Compute vertical gradient of a gridded oceanographic variable in an xarray.DataArray along the depth dimension using an interface-based finite-difference method. \n"
+    "To ensure a physically meaningful gradient, the input data must retain the original depth coordinate values (or a direct subset thereof).",
     args={
-        "data": "xr.DataArray, required. Input data with 'depth' dimension. Should have dimensions like (time, depth, lat, lon) or subset thereof."
+        "data": "xr.DataArray, required. Input data with 'depth' dimension, optionally accompanied by other dimensions. Depth coordinate values must be monotonic, represent layer centers, and be compatible with standard ocean depth definitions. "
     },
-    returns="xr.DataArray. Vertical gradient (dVar/dDepth) with same dimensions as input. Units are [original_units]/meters."
+    returns="xr.DataArray. Vertical gradient (dVar/dDepth) defined at the original depth levels, with same dimensions and coordinates as the input data. Units are [original_units]/meters."
 )
 def compute_vertical_gradient(data: xr.DataArray) -> xr.DataArray:
     """
@@ -280,12 +282,12 @@ def compute_vertical_gradient(data: xr.DataArray) -> xr.DataArray:
 
 @register_tools(
     name="compute_ratio",
-    description="Compute ratio between two DataArrays: (data1 / data2). ",
+    description="Compute ratio between two DataArrays: (data1 / data2). The two inputs must be defined on compatible grids with matching dimensions and coordinates (or be broadcastable under xarray rules).",
     args={
-        "data1": "xr.DataArray, required. Numerator DataArray.",
+        "data1": "xr.DataArray, required. Numerator DataArray. Must share compatible dimensions and coordinates with data2, or be broadcastable according to xarray alignment rules.",
         "data2": "xr.DataArray, required. Denominator DataArray."
     },
-    returns="xr.DataArray. Ratio DataArray with same dimensions as input."
+    returns="xr.DataArray. Element-wise ratio field with dimensions and coordinates inherited from xarray alignment of the two inputs."
 )
 def compute_ratio(data1: xr.DataArray, data2: xr.DataArray) -> xr.DataArray:
     """
@@ -306,14 +308,15 @@ def compute_ratio(data1: xr.DataArray, data2: xr.DataArray) -> xr.DataArray:
 
 @register_tools(
     name="identify_oxygen_minimum_zone",
-    description="Identify Oxygen Minimum Zones (OMZ) with dissolved oxygen concentration data and calculate their thickness. "
-                "An OMZ is defined as areas where oxygen concentration is below the threshold.",
+    description="Identify Oxygen Minimum Zones (OMZ) with dissolved oxygen concentration data and compute their total vertical thickness. OMZs are defined as areas where oxygen concentration is below the threshold." \
+    "To ensure physically meaningful OMZ thickness estimates, the input data must retain the original depth coordinate values (or a direct subset thereof)." \
+    "The computation of vertical thickness is integrated within this tool, so users do not need to load depth data separately.",
     args={
-        "data": "xr.DataArray, required. Oxygen concentration data.",
+        "data": "xr.DataArray, required. Oxygen concentration data with dimensions including 'depth' and optionally 'time', 'lat', and 'lon'.",
         "threshold": "float, optional. Oxygen concentration threshold for OMZ identification in μmol/kg. Default is 20.0 μmol/kg.",
     },
     returns="tuple[xr.DataArray, xr.DataArray]. Returns (omz_thickness, omz_mask) where:\n"
-            "  - omz_thickness: Thickness of OMZ in meters with dimensions (time, lat, lon) or subset\n"
+            "  - omz_thickness: Total vertical thickness of OMZ layers at each time and horizontal grid point in meters, obtained by summing the thicknesses of all depth layers satisfying the OMZ criterion\n"
             "  - omz_mask: Boolean array indicating OMZ locations with same dimensions as input data"
 )
 def identify_oxygen_minimum_zone(o2_data: xr.DataArray, threshold: float = 20.0) -> tuple[xr.DataArray, xr.DataArray]:
@@ -352,14 +355,14 @@ def identify_oxygen_minimum_zone(o2_data: xr.DataArray, threshold: float = 20.0)
 
 @register_tools(
     name="compute_potential_density_anomaly",
-    description="Compute potential density anomaly from in-situ temperature and practical salinity. "
-                "Uses TEOS-10 standard via GSW library. Potential density is referenced to surface pressure (0 dbar).",
+    description="Compute potential density anomaly from in-situ temperature and practical salinity using the TEOS-10 standard (GSW library). Potential density is referenced to surface pressure (0 dbar). \n " \
+    "To ensure physically meaningful results, temperature and salinity inputs must share identical dimensions and coordinates, include a valid 'depth' coordinate representing positive-downward depth in meters, and be defined on the same spatial and temporal grid. Spatial or vertical regridding, aggregation, or mismatched coordinate definitions must not be applied prior to calling this function.",
     args={
-        "temp_data": "xr.DataArray, required. In-situ temperature in degrees Celsius.",
-        "sal_data": "xr.DataArray, required. Practical salinity (PSS-78).",
+        "temp_data": "xr.DataArray, required. In-situ temperature in degrees Celsius. Must include a 'depth' coordinate and share identical dimensions and coordinates with the salinity input.",
+        "sal_data": "xr.DataArray, required. Practical salinity (PSS-78). Must include a 'depth' coordinate and share identical dimensions and coordinates with the temperature input.",
         "ref_pressure": "float, optional. Reference pressure in dbar for potential density calculation. Default is 0 dbar (sigma0)."
     },
-    returns="xr.DataArray. Potential density anomaly (σ_θ = ρ - 1000) in kg/m³, with same dimensions as input."
+    returns="xr.DataArray. Potential density anomaly (σ_θ = ρ - 1000) in kg/m³, with same dimensions and coordinates as the input fields."
 )
 def compute_potential_density_anomaly(temp_data: xr.DataArray, sal_data: xr.DataArray, ref_pressure: float = 0.0) -> xr.DataArray:
     if temp_data.dims != sal_data.dims:
@@ -469,18 +472,18 @@ def _find_threshold_depth(data: xr.DataArray, depth: np.ndarray, threshold: floa
 
 @register_tools(
     name="compute_mixed_layer_depth",
-    description="Calculate mixed layer depth (MLD) using density threshold criterion. "
-                "MLD is defined as the depth where potential density exceeds the near-surface "
-                "reference density by a specified threshold (default: 0.03 kg/m³).",
+    description="Compute ocean mixed layer depth (MLD) based on vertical threshold criteria applied to potential density and/or temperature profiles. The MLD is defined as the shallowest depth (from discrete depth levels) at which the potential density anomaly or temperature difference relative to a near-surface reference depth first exceeds a specified threshold. \n "
+    "temp_data and sal_data must be xr.DataArray objects with identical dimensions and coordinates. A 1D 'depth' coordinate (in meters, positive downward) is required and must represent discrete vertical levels. The computation of potential density anomaly is integrated in this function, so users do not need to call the function compute_potential_density_anomaly separately. \n" \
+    "If the threshold is never exceeded below the reference depth, MLD is returned as NaN.",
     args={
-        "temp_data": "xr.DataArray, required. In-situ temperature in degrees Celsius.",
+        "temp_data": "xr.DataArray, required. In-situ temperature in degrees Celsius. Must include a 'depth' coordinate and share identical dimensions with sal_data.",
         "sal_data": "xr.DataArray, required. Practical salinity (PSS-78, unitless) with same dimensions as temp_data.",
-        "ref_depth": "float, optional. Reference depth for surface density in meters. Default is 10 m.",
+        "ref_depth": "float, optional. Reference depth in meters used to define near-surface properties. Default is 10.0 m.",
         "method": "str, optional. Method for MLD calculation: 'density' (default), 'temperature', or 'both'.",
         "density_threshold": "float, optional. Density difference threshold in kg/m³, used for method 'density'. Default is 0.03 kg/m³.",
         "temp_threshold": "float, optional. Temperature difference threshold in °C, used for method 'temperature'. Default is 0.2 °C."
     },
-    returns="xr.DataArray. Mixed layer depth in meters with dimensions excluding depth."
+    returns="xr.DataArray. Mixed layer depth in meters, defined on all non-depth dimensions of the input. Values correspond to discrete depth levels."
 )
 def compute_mixed_layer_depth(temp_data: xr.DataArray, sal_data: xr.DataArray, 
                               ref_depth: float = 10.0, method: str = 'density', density_threshold: float = 0.03, temp_threshold: float = 0.2) -> xr.DataArray:
@@ -561,15 +564,15 @@ def compute_mixed_layer_depth(temp_data: xr.DataArray, sal_data: xr.DataArray,
 
 @register_tools(
     name="compute_nutricline_depth",
-    description="Compute nutricline depth as the depth where vertical gradient (dN/dz) is maximum. ",
+    description="Compute nutricline depth as the depth of the maximum positive vertical gradient of nutrient concentration. If the maximum gradient is non-positive or cannot be determined, the nutricline depth is returned as NaN. \n"
+    "Input must be an xr.DataArray with a 'depth' dimension representing vertical levels in meters. The computation of vertical gradients is integrated in this function, so users do not need to call the function compute_vertical_gradient separately. ",
     args={
-        "data": "xr.DataArray, required. Input nutrient concentration data with 'depth' dimension. "
-                "Should have dimensions like (time, depth, lat, lon) or subset thereof.",
-        "min_depth": "float, optional. Minimum depth (m) to search for nutricline. Default is 0.",
-        "max_depth": "float, optional. Maximum depth (m) to search for nutricline. Default is None (search all depths)."
+        "data": "xr.DataArray, required. Input nutrient concentration data with 'depth' dimension. May include additional dimensions such as time, lat, and lon. ",
+        "min_depth": "float, optional. Minimum depth (m) for nutricline detection. Default is 0.",
+        "max_depth": "float, optional. Maximum depth (m) for nutricline detection. Default is None (search all depths)."
     },
     returns="xr.DataArray. Nutricline depth with same dimensions as input except 'depth' is removed. "
-            "Units are meters. NaN where gradient is not positive or nutricline cannot be determined."
+            "Values correspond to discrete depth levels. Units are meters. NaN where gradient is not positive or nutricline cannot be determined."
 )
 def compute_nutricline_depth(data: xr.DataArray, min_depth: float = 0.0, max_depth: float = None) -> xr.DataArray:
     if 'depth' not in data.dims:
@@ -621,15 +624,16 @@ def compute_nutricline_depth(data: xr.DataArray, min_depth: float = 0.0, max_dep
 
 @register_tools(
     name="compute_enso_nino_index",
-    description="Compute ENSO Niño index for a specified region from monthly temperature data. "
-                "Calculates area-weighted mean temperature anomaly for the selected Niño region.",
+    description=" Compute ENSO Niño index as an area-weighted mean temperature anomaly over a specified Niño region. \n"
+    "To implement this function, first load monthly temperature data with load_regular_data. The computation of temperature anomalies is integrated in this function, so users do not need to call the function compute_anomaly separately. To ensure spatial alignment with WOA23 climatology, the input data must retain the original WOA-compatible depth, latitude, and longitude coordinates: spatial subsetting is allowed, but spatial aggregation or resampling (e.g., interpolation, regridding, averaging) is not permitted. \n"
+    "If a 'depth' dimension exists, anomalies are averaged over depths shallower than depth_level. If no depth dimension exists, data are treated as surface values. ",
     args={
-        "data": "xr.DataArray, required. Input temperature data with dimensions (time, depth, lat, lon).",
-        "nino_region": "str, optional. Niño region to compute. Choose from 'nino1+2', 'nino3', 'nino3.4', 'nino4'. Default is 'nino3.4'.",
-        "depth_level": "float, optional. Average across depth levels (in meters) that are shallower than depth_level in the data. Default is 10 (surface). ",
-        "anomaly_freq": "str, optional. Frequency for climatology when computing anomaly. Choose from 'month', 'season', 'year'. Default is 'month'."
+        "data": "xr.DataArray, required. Temperature data with dimensions including 'time', 'lat', and 'lon'. May optionally include a 'depth' dimension. Units should be degrees Celsius.",
+        "nino_region": "str, optional. Niño region to compute the index for. Choose from 'nino1+2', 'nino3', 'nino3.4', 'nino4'. Default is 'nino3.4'.",
+        "depth_level": "float, optional. Upper-ocean depth (m) over which temperature anomalies are vertically averaged when a depth dimension is present. Default is 10 (surface). ",
+        "anomaly_freq": "str, optional. Temporal frequency used to compute the climatology for anomaly calculation. Choose from 'month', 'season', 'year'. Default is 'month'."
     },
-    returns="xr.DataArray. Time series of Niño index (temperature anomaly in °C) for the specified region."
+    returns="xr.DataArray. Time series of Niño index (temperature anomaly in °C) with a 'time' dimension for the specified region."
 )
 def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", depth_level: float = 10.0, anomaly_freq: str = "month") -> xr.DataArray:
     # (lat_min, lat_max, lon_min, lon_max)
@@ -680,19 +684,17 @@ def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", de
 
 @register_tools(
     name="compute_pdo_index",
-    description="Compute Pacific Decadal Oscillation (PDO) index from sea surface temperature data. "
-                "PDO is defined as the leading principal component of North Pacific SST anomalies (poleward of 20°N). "
-                "The SST anomalies are computed by removing the global mean SST to isolate regional patterns and temperal trends.",
+    description="Compute Pacific Decadal Oscillation (PDO) index from sea surface temperature data using Empirical Orthogonal Function (EOF) analysis. \n"
+    "PDO is defined as the leading principal component of North Pacific SST anomalies (poleward of 20°N). The SST anomalies are computed by removing the global mean SST to isolate regional patterns and temperal trends. \n"
+    "To implement this function, first load monthly temperature data with load_regular_data. The computation of temperature anomalies is integrated in this function, so users do not need to call the function compute_anomaly separately. To ensure spatial alignment with WOA23 climatology, the input data must retain the original WOA-compatible depth, latitude, and longitude coordinates: spatial subsetting is allowed, but spatial aggregation or resampling (e.g., interpolation, regridding, averaging) is not permitted. \n",
     args={
-        "data": "xr.DataArray, required. Temperature data with dimensions (time, lat, lon, depth). "
+        "data": "xr.DataArray, required. Temperature data with dimensions including 'time', 'lat', and 'lon'. May optionally include a 'depth' dimension. Units should be degrees Celsius. "
                     "Must cover at least the North Pacific region (20°N-70°N, 110°E-100°W). ",
         "depth_level": "float, optional. Average across depth levels (in meters) that are shallower than depth_level in the data. Default is 10 (surface). ",
-        "standardize": "bool, optional. Whether to standardize the PDO index to zero mean and unit variance. "
-                       "Default is True."
+        "standardize": "bool, optional. Whether to standardize the PDO index to zero mean and unit variance. Default is True."
     },
     returns="tuple[xr.DataArray, xr.DataArray, float]. Returns (pdo_index, eof_pattern, explained_variance) where: "
-            "pdo_index is 1D time series of PDO values, eof_pattern is 2D spatial pattern (lat, lon) of the first EOF, "
-            "explained_variance is the percentage of variance explained by the first EOF."
+            "pdo_index is 1D time series of PDO values, eof_pattern is 2D spatial pattern (lat, lon) of the first EOF, and explained_variance is the percentage of variance explained by the first EOF."
 )
 def compute_pdo_index(data: xr.DataArray, depth_level: float = 10.0, standardize: bool = True) -> tuple[xr.DataArray, xr.DataArray, float]:
     # Extract surface temperature

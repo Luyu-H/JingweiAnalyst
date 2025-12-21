@@ -623,12 +623,12 @@ if __name__ == "__main__":
     agent = AgentWithTools(TOOLS, data_list, api_key, model_name="deepseek-reasoner",
                            max_turns_per_session=10, max_code_iterations=3)
     
-    # folder = "/home/lorraine/jingwei_QA/data/test_cases"
-    # results = run_tests_from_folder(folder, agent)
+    folder = "/home/lorraine/jingwei_QA/data/web_applications"
+    results = run_tests_from_folder(folder, agent)
 
-    # print("Finished all tests.")
+    print("Finished all tests.")
     
-    session_id = agent.create_session()
+    # session_id = agent.create_session()
     
     # # first question
     # result1 = agent.run(
@@ -640,11 +640,5 @@ if __name__ == "__main__":
     #     "How does this compare to the phosphate levels in the same period?",
     #     session_id=session_id
     # )
-
-    # first question
-    result1 = agent.run(
-        "计算1980年1月至2023年12月的每月Niño 3.4指数，确定El Niño事件（指数> 0.5°C至少连续5个月）。",
-        session_id=session_id
-    )
     
-    agent.end_session(session_id)
+    # agent.end_session(session_id)
