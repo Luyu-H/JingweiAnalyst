@@ -9,7 +9,7 @@ class PromptTemplates:
     def get_planning_prompt(language: str, tool_overview: Dict, data_overview: Dict, context_summary: str) -> str:
 
         if language == 'zh':
-            return f"""你是一个科学数据分析助手，支持对话历史功能。
+            return f"""你是一个海洋科学数据分析助手，支持对话历史功能。
 
 {context_summary}
 
@@ -24,10 +24,12 @@ class PromptTemplates:
 <plan>关于需要哪些数据和工具的逐步推理</plan>
 <selected_data>您将使用的数据集名称，用逗号分隔</selected_data>
 <selected_tools>您将使用的工具名称，用逗号分隔</selected_tools>
+
+尤其需要注意，回复中必须包含所需的所有XML标签，并且标签必须正确闭合。
 """
         
         else:  # English
-            return f"""You are a scientific data analysis assistant with conversation history support.
+            return f"""You are an oceanographic data analysis assistant with conversation history support.
 
 {context_summary}
 
@@ -42,6 +44,8 @@ Analyze the user's question and select appropriate data and tools. Follow this f
 <plan>step-by-step reasoning about which data and tools are needed</plan>
 <selected_data>comma-separated list of dataset names you will use</selected_data>
 <selected_tools>comma-separated list of tool names you will use</selected_tools>
+
+IMPORTANT: Your response MUST contain all required XML tags, and tags must be properly closed.
 """
     
     @staticmethod
@@ -61,7 +65,7 @@ Analyze the user's question and select appropriate data and tools. Follow this f
 
 生成两个独立的代码块来解决："{user_query}"
 
-要求：
+环境变量：
 1. 数据集路径可通过变量 `selected_data` = "{selected_data_path}" 获取
 2. 可用库：matplotlib.pyplot as plt, numpy as np
 
@@ -69,9 +73,8 @@ Analyze the user's question and select appropriate data and tools. Follow this f
 
 <compute>
 # 仅计算代码
-# 调用工具加载和处理数据
-# 执行计算并将结果存储在变量中
-# 示例：result, mean_value, trend 等
+# 调用工具首先加载数据，之后根据用户问题处理数据
+# 执行计算并将结果存储在变量中，比如 result, mean_value, trend 等
 </compute>
 
 <visualize>
@@ -79,7 +82,7 @@ Analyze the user's question and select appropriate data and tools. Follow this f
 # 使用计算结果（它们将作为变量可用）
 # 创建带有适当标签和标题的matplotlib图表
 # 使用 plt.figure(), plt.plot(), plt.xlabel() 等
-# 不要使用 plt.savefig() - 会自动处理
+# 不要使用 plt.savefig()
 </visualize>
 
 重要提示：
@@ -95,7 +98,7 @@ Analyze the user's question and select appropriate data and tools. Follow this f
 
 Generate TWO separate code blocks to solve: "{user_query}"
 
-Requirements:
+Context variables:
 1. The dataset path is available as variable `selected_data` = "{selected_data_path}"
 2. Available libraries: matplotlib.pyplot as plt, numpy as np
 
@@ -103,9 +106,8 @@ Generate code in this format:
 
 <compute>
 # Computation code only
-# Call tools to load and process data
-# Perform calculations and store results in variables
-# Examples: result, mean_value, trend, etc.
+# Call tools to load data first and process data based on the user's question
+# Perform calculations and store results in variables (e.g. result, mean_value, trend, etc.)
 </compute>
 
 <visualize>
@@ -113,7 +115,7 @@ Generate code in this format:
 # Use results from computation (they will be available as variables)
 # Create matplotlib plots with proper labels and titles
 # Use plt.figure(), plt.plot(), plt.xlabel(), etc.
-# DO NOT use plt.savefig() - handled automatically
+# DO NOT use plt.savefig()
 </visualize>
 
 Important:
@@ -203,25 +205,25 @@ Focus on:
             return f"""
 以下是代码执行的结果：
 
-<observation>
-{observation_text}
-</observation>
-
 状态摘要：
 - 计算：{'成功' if has_computation_success else '失败'}
 - 可视化：{'已生成' if has_visualization else '未生成或失败'}
+
+<observation>
+{observation_text}
+</observation>
 
 请在 <solution></solution> 标签内提供清晰的科学总结。
 
 如果计算成功，请包括：
 1. 对用户问题的直接回答
 2. 关键数值结果及其解释
-3. 如果生成了可视化，描述它显示的内容
+3. 如果生成了可视化，描述它显示的内容。注意描述可视化逻辑和方法，而不是解释具体的视觉结果。
 4. 观察到的任何重要见解或模式
 
 如果计算失败，请解释：
 1. 出了什么问题
-2. Agent为解决问题所做的努力，包括数据选择、工具选择和可视化尝试
+2. Agent为解决问题所做的努力，包括数据选择、工具选择以及计算与可视化尝试
 3. 如何重新表述查询的建议
 """
         
@@ -229,25 +231,25 @@ Focus on:
             return f"""
 Here are the results of code execution:
 
-<observation>
-{observation_text}
-</observation>
-
 Status Summary:
 - Computation: {'Success' if has_computation_success else 'Failed'}
 - Visualization: {'Generated' if has_visualization else 'Not generated or failed'}
+
+<observation>
+{observation_text}
+</observation>
 
 Please provide a clear scientific summary inside <solution></solution> tags.
 
 If computation succeeded, include:
 1. Direct answer to the user's question
 2. Key numerical results and their interpretation
-3. If visualization was generated, describe what it shows
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
 4. Any important insights or patterns observed
 
 If computation failed, explain:
 1. What went wrong
-2. Efforts made by the agent to solve the question, including data selection, tool choice, and visualization attempts
+2. Efforts made by the agent to solve the question, including data selection, tool choice, computation and visualization attempts
 3. Suggestions for how to reformulate the query
 """
     
