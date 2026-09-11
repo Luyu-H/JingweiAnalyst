@@ -619,7 +619,7 @@ if __name__ == "__main__":
 
         return all_results
 
-    api_key = "sk-edc62146735146e4a9904740057ace47"
+    api_key = "xxxxx"
     agent = AgentWithTools(TOOLS, data_list, api_key, model_name="deepseek-reasoner",
                            max_turns_per_session=10, max_code_iterations=3)
     

@@ -61,7 +61,7 @@ DATA_LIST = [
 ]
 
 # Initialize agent (singleton)
-API_KEY = "sk-edc62146735146e4a9904740057ace47"
+API_KEY = "xxxxx"
 agent = AgentWithTools(
     TOOLS, 
     DATA_LIST, 
