@@ -130,9 +130,6 @@ def merge_nc_files_to_zarr(nc_files, zarr_path, has_year_month=True):
     ds_result.close()
 
 
-# nc_path = "/data1/wangzhaokun-20382/Foundation_Model_results/1.1/Si_1960-2024.nc"
-# zarr_path = "/data1/lorraine-20419/jingwei_QA/reconstruction/recon_si_sjtu_jingwei_v1_1.zarr"
-# convert_nc_to_zarr(nc_path, zarr_path)
 
 nc_files = [
     "/data1/wangzhaokun-20382/Foundation_Model_gridded_data/EN4/en4_decade_1900-1909.nc",

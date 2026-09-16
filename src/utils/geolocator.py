@@ -227,7 +227,6 @@ class Geolocator:
         if geofeature not in {'country', 'continent', 'water_body'}:
             raise ValueError("Invalid geofeature. Supported geofeatures are 'country', 'continent', and 'water_body'.")
 
-        # Handle continent -> countries
         if geofeature == 'continent':
             continent_name_col = get_name_col('continent')
             if name not in self.continent_df[continent_name_col].unique():
@@ -236,7 +235,6 @@ class Geolocator:
             country_name_col = get_name_col('country')
             return list(sub_df[country_name_col].dropna())
 
-        # Handle country -> states
         elif geofeature == 'country':
             country_name_col = get_name_col('country')
             if name not in self.country_df[country_name_col].unique():
@@ -248,7 +246,6 @@ class Geolocator:
             state_name_col = get_name_col('state')
             return [f'{state}, {name}' for state in list(sub_df[state_name_col].dropna())]
 
-        # Handle water_body -> marine areas
         elif geofeature == 'water_body':
             valid_water_bodies = {
                 'ocean', 'sea', 'reef', 'bay', 'gulf', 'strait', 'channel',
@@ -262,7 +259,6 @@ class Geolocator:
             water_body_name_col = get_name_col('water_body')
             return list(filtered_df[water_body_name_col].dropna())
 
-        # Default case
         return []
 
     def get_geodistance_for_points(self, point1, point2):

@@ -1,255 +1,555 @@
-# tools: compute_anomaly, convert_concentration_to_content, compute_vertical_gradient, 
+# tools: compute_anomaly_vs_woa23, compute_anomaly_vs_own_climatology,
+# convert_concentration_to_content, compute_vertical_gradient,
 # compute_ratio, identify_oxygen_minimum_zone, compute_potential_density_anomaly, compute_mixed_layer_depth,
 # compute_nutricline_depth, compute_enso_nino_index
 
-import os
-import yaml
-from pathlib import Path
 import xarray as xr
 import numpy as np
 import gsw
 from sklearn.decomposition import PCA
 
 from src.tools.registry import register_tools
-from src.tools.data_loader import load_areas, load_depth_levels
+from src.tools.data_openers import (SEASON_ORDER, carry_provenance, molar_basis,
+                                    normalize_units, open_woa23)
+from src.tools.data_loader import (areas_like, layer_bounds_like, layer_thickness_like,
+                                   volumes_like)
 from src.tools.basic_calculator import compute_basic_stat
 
 
+def _broadcastable(coord: xr.DataArray, data: xr.DataArray) -> np.ndarray:
+    """
+    Reshape a coordinate so it broadcasts against `data`'s array.
+
+    gsw works on plain arrays, so depth, latitude and longitude have to be laid
+    out on the axes they belong to before they are handed over. Passing the
+    bare 1-D coordinates instead only works when the field is a single profile:
+    on a (depth, lat, lon) field, depth of length 102 and latitude of length 180
+    cannot broadcast against each other at all.
+    """
+    shape = [1] * data.ndim
+    for dim in coord.dims:
+        shape[data.dims.index(dim)] = coord.sizes[dim]
+    return np.asarray(coord.values, dtype="float64").reshape(shape)
+
+
+def temperature_kind(temp_data: xr.DataArray, declared: str = "auto") -> tuple:
+    """
+    Whether a temperature field is in-situ or potential temperature, and why.
+
+    TEOS-10 needs to know: in-situ temperature is converted to Conservative
+    Temperature with CT_from_t, potential temperature with CT_from_pt, and using
+    the wrong one biases density. CMIP6's 'thetao' is potential temperature by
+    definition, while WOA23 and GLODAP report in-situ temperature, so mixing
+    them up is easy and the error grows with depth: about 0.01 kg/m3 in sigma0
+    at 2000 m and 0.026 kg/m3 at 4000 m, the latter comparable to the 0.03
+    kg/m3 threshold used to define a mixed layer.
+    """
+    if declared in ("in_situ", "potential"):
+        return declared, "specified by the caller"
+    if declared != "auto":
+        raise ValueError(
+            f"temperature_type must be 'auto', 'in_situ' or 'potential', got '{declared}'"
+        )
+    standard_name = str(temp_data.attrs.get("standard_name", "")).lower()
+    if "potential_temperature" in standard_name:
+        return "potential", f"standard_name '{standard_name}'"
+    if str(temp_data.name).lower() in ("thetao", "theta", "pt", "potential_temperature"):
+        return "potential", f"variable name '{temp_data.name}'"
+    if "sea_water_temperature" in standard_name:
+        return "in_situ", f"standard_name '{standard_name}'"
+    return "in_situ", "assumed: nothing in the metadata identifies it as potential temperature"
+
+
+def depth_average(data: xr.DataArray, max_depth: float) -> xr.DataArray:
+    """
+    Average the layers above `max_depth`, weighted by layer thickness.
+
+    Layers are not equally thick anywhere in this archive, so a plain mean over
+    depth weights a 5 m layer the same as a 100 m one. Where the thicknesses
+    cannot be established — after an anomaly has intersected two products'
+    vertical grids, for instance — the average falls back to unweighted and says
+    so in the attributes rather than failing.
+    """
+    upper = data.sel(depth=slice(0, max_depth))
+    if upper.sizes.get("depth", 0) == 0:
+        raise ValueError(
+            f"No levels at or above {max_depth} m; this field spans "
+            f"{float(data.depth.min()):g} to {float(data.depth.max()):g} m."
+        )
+    if upper.sizes["depth"] == 1:
+        result = upper.isel(depth=0, drop=True)
+        result.attrs = dict(data.attrs)
+        result.attrs["depth_averaging"] = f"single level at {float(upper.depth[0]):g} m"
+        return result
+
+    try:
+        thickness = layer_thickness_like(upper)
+        weights = thickness.where(upper.notnull())
+        result = (upper * weights).sum("depth", skipna=True) / weights.sum("depth")
+        note = "thickness-weighted"
+    except Exception as exc:
+        result = upper.mean("depth", skipna=True)
+        note = f"unweighted (layer thicknesses unavailable: {exc.__class__.__name__})"
+
+    result.attrs = dict(data.attrs)
+    result.attrs["depth_averaging"] = f"{note} over 0-{max_depth} m"
+    return result
+
+
 @register_tools(
-    name="compute_anomaly",
-    description="Compute anomaly of gridded reconstruction data based on WOA23 climatology data. The anomaly is computed independently for each time step by matching its calendar month/season/year to the corresponding climatology.\n" \
-    "To ensure spatial alignment with WOA23 climatology, the input data must retain the original WOA-compatible depth, latitude, and longitude coordinates: spatial subsetting is allowed, but spatial aggregation or resampling (e.g., interpolation, regridding, averaging) is not permitted.",
+    name="compute_anomaly_vs_woa23",
+    description="Compute the anomaly of a gridded time series against the WOA23 observed climatology.\n"
+        "Each time step is matched to the climatology of its own calendar month, season or to the annual "
+        "mean, so the seasonal cycle is removed along with the mean state. Because the reference is "
+        "observed, the result carries the field's bias against observations inside it: this is the tool "
+        "for 'how far is this field from the observed ocean'.\n"
+        "Its sibling compute_anomaly_vs_own_climatology removes the field's OWN climatology instead, "
+        "leaving variability with the bias taken out — that is the one for an index, a trend or a "
+        "comparison between two products, and the only one that works off this climatology's grid or on a "
+        "chosen baseline period.\n"
+        "The input must sit on the climatology's grid and share its units; a spatial subset is fine, but "
+        "aggregation, interpolation or regridding beforehand is not.",
     args={
-        "data": "xr.DataArray, required. Input reconstruction data. Must contain a 'time' coordinate with valid month information, and spatial dimensions compatible with WOA23 climatology.",
-        "var": "str, required. Target variable name used to select the corresponding WOA23 climatology. Need to select from 'temp' (temperature), 'so' (salinity), 'si' (silicate), 'o2' (dissolved oxygen), 'no3' (nitrate), 'po4' (phosphate).",
-        "freq": "str, optional. Temporal resolution of the climatology used for anomaly computation. Choose from 'month', 'season', 'year'. Default is 'month'.",
-        "method": "str, optional. Method to compute anomaly. Choose from 'subtract' (data - climatology) or 'ratio' ((data - climatology) / climatology * 100). Default is 'subtract'."
+        "data": "xr.DataArray, required. A field on the climatology's grid, with a 'time' coordinate.",
+        "var": "str, required. Which climatology to use: 'temp', 'so', 'si', 'o2', 'no3' or 'po4'. Full "
+            "names such as 'temperature' or 'nitrate' are also accepted.",
+        "freq": "str, optional, default 'month'. Which climatology each step is matched against: 'month' "
+            "(12 fields), 'season' (4 fields) or 'year' (one annual field). The seasons here are the "
+            "calendar quarters the seasonal files are built on, NOT the meteorological DJF/MAM/JJA/SON; "
+            "the two are offset by a month.",
+        "method": "str, optional, default 'subtract'. 'subtract' gives data minus climatology in the "
+            "data's units; 'ratio' gives the difference as a percentage of the climatology, which is only "
+            "accepted for concentrations, since a percentage of temperature, salinity or pH has no "
+            "physical meaning.",
+        "period": "str, optional. Which climate normal to use where the variable offers more than one. If "
+            "None, a default period is chosen so that anomalies computed with different freq values share "
+            "a baseline."
     },
-    returns="xr.DataArray. Anomaly data with the same dimensions and coordinates as the input data."
+    returns="xr.DataArray of anomalies, in the input's units for 'subtract' and in percent for 'ratio'. "
+        "The monthly and seasonal climatologies are shallower than the annual one, so the result is "
+        "trimmed to the depth levels the two share. attrs record which climatology period was used, which "
+        "generally differs from the input's own period."
 )
-def compute_anomaly(data: xr.DataArray, var: str, freq: str = "month", method: str = "subtract") -> xr.DataArray:
+def compute_anomaly_vs_woa23(data: xr.DataArray, var: str, freq: str = "month",
+                             method: str = "subtract", period: str = None) -> xr.DataArray:
     if freq not in ["month", "season", "year"]:
         raise ValueError(f"freq must be 'month', 'season', or 'year', got '{freq}'")
     if method not in ["subtract", "ratio"]:
         raise ValueError(f"method must be 'subtract' or 'ratio', got '{method}'")
-    
-    config_path = "/home/lorraine/jingwei_QA/configs/default_paths.yaml"
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
-    clim_base_path = cfg.get("climatology_data_path")
-    
-    var_path_map = {
-        "temp": os.path.join(clim_base_path, "temperature_1971-2000"),
-        "so": os.path.join(clim_base_path, "salinity_1971-2000"),
-        "si": os.path.join(clim_base_path, "silicate_all_time_periods"),
-        "o2": os.path.join(clim_base_path, "oxygen_all_time_periods"),
-        "no3": os.path.join(clim_base_path, "nitrate_all_time_periods"),
-        "po4": os.path.join(clim_base_path, "phosphate_all_time_periods")
-    }
-    if var not in var_path_map:
-        raise ValueError(f"Variable '{var}' not supported. Available: {list(var_path_map.keys())}")
-    
-    # Map frequency to file suffix codes
-    freq_to_codes = {
-        "year": ["00"], # annual
-        "month": [f"{i:02d}" for i in range(1, 13)], # 01-12
-        "season": ["13", "14", "15", "16"] # winter, spring, summer, autumn
-    }
-    
-    clim_dir = var_path_map[var]
-    clim_files = list(Path(clim_dir).glob("*.nc"))
-    if not clim_files:
-        raise FileNotFoundError(f"No climatology files found in {clim_dir}")
-    
-    sample_file = clim_files[0].stem # woa23_all_o00_01
-    # Pattern: woa23_*_01.nc -> extract prefix before last underscore and number
-    parts = sample_file.rsplit('_', 2) # ['woa23_all', 'o00', '01']
+    if data.attrs.get("grid_type") == "curvilinear":
+        raise ValueError(
+            f"{data.attrs.get('model', 'This dataset')} is on a curvilinear grid, whose index dimensions do "
+            f"not align with the WOA23 1-degree grid. Put it on the WOA23 grid first with "
+            f"regrid_horizontal, use GFDL-ESM4 or an observational product, or remove the field's own "
+            f"climatology with compute_anomaly_vs_own_climatology."
+        )
+    if "time" not in data.coords:
+        raise ValueError("data must have a 'time' coordinate to be matched against the climatology.")
 
-    if len(parts) >= 3:
-        base_name = '_'.join(parts[:-2]) # 'woa23_all'
-        var_code = parts[-2] # 'o00'
-        clim_pattern = f"{base_name}_{var_code[:-2]}" # 'woa23_all_o'
-    else:
-        # Fallback: try to find pattern
-        clim_pattern = sample_file.rsplit('_', 1)[0] + '_'
-    
-    # Load climatology data
-    climatology_dict = {}
-    for code in freq_to_codes[freq]:
-        clim_file = os.path.join(clim_dir, f"{clim_pattern}{code}_01.nc")
-        if os.path.exists(clim_file):
-            ds = xr.open_dataset(clim_file, decode_times=False)
-            # Find the main variable (usually ends with _an for analyzed mean)
-            var_name = [var for var in ds.data_vars if var.endswith("_an")]
-            if var_name:
-                climatology_dict[code] = ds[var_name[0]]
-            ds.close()
-    
-    if not climatology_dict:
-        raise FileNotFoundError(f"No valid climatology files found for freq='{freq}'")
-    
-    # Create time-based mapping for anomaly calculation
-    def get_time_code(time_val):
-        """Map datetime to climatology code based on frequency"""
-        if freq == "year":
-            return "00"
-        elif freq == "month":
-            return f"{time_val.month:02d}"
-        elif freq == "season":
-            month = time_val.month
-            if month in [12, 1, 2]:
-                return "13" # winter
-            elif month in [3, 4, 5]:
-                return "14" # spring
-            elif month in [6, 7, 8]:
-                return "15" # summer
-            else:
-                return "16" # autumn
-    
-    anomaly_list = []
-    
-    for time_idx in range(len(data.time)):
-        time_val = data.time.values[time_idx]
-        time_dt = xr.DataArray(time_val).dt
-        code = get_time_code(time_dt)
-        
-        if code not in climatology_dict:
-            raise ValueError(f"Climatology for code '{code}' not found")
-        
-        clim = climatology_dict[code]
-        data_slice = data.isel(time=time_idx)
-        
-        # Calculate anomaly
-        if method == "subtract":
-            anom = data_slice - clim
-        elif method == "ratio":
-            anom = xr.where(
-                clim != 0,
-                (data_slice - clim) / clim * 100,
-                np.nan
+    slice_for_freq = {"year": "annual", "month": "monthly", "season": "seasonal"}
+    climatology = open_woa23(var, time_slice=slice_for_freq[freq], period=period)
+
+    data_units = data.attrs.get("units")
+    clim_units = climatology.attrs.get("units")
+    if normalize_units(data_units) != normalize_units(clim_units):
+        raise ValueError(
+            f"Unit mismatch: the data is in '{data_units}' but the WOA23 climatology is in '{clim_units}'. "
+            f"CMIP6 reports concentrations per unit volume (mol m-3) while WOA23 reports them per unit mass "
+            f"(micromoles per kilogram); convert with in-situ density before differencing them "
+            f"(mol m-3 = micromol kg-1 * rho / 1000)."
+        )
+
+    # A single level selected with isel leaves depth behind as a scalar
+    # coordinate, which cannot be aligned against the climatology's depth axis.
+    # Take the matching climatology level instead and drop the coordinate.
+    if "depth" in data.coords and data["depth"].ndim == 0:
+        if "depth" in climatology.dims:
+            climatology = climatology.sel(depth=data["depth"], method="nearest")
+        data = data.drop_vars("depth")
+        climatology = climatology.drop_vars("depth", errors="ignore")
+
+    # A surface field (CMIP6 'tos', ERSSTv5 'sst') has no depth dimension at all.
+    # Left alone, it would broadcast against the climatology's 57 levels and the
+    # "anomaly" would be the surface value minus the temperature at every depth —
+    # a plausible-looking array that is not an anomaly. A surface field is
+    # comparable to the shallowest climatology level, so take that one.
+    surface_note = None
+    if "depth" not in data.dims and "depth" in climatology.dims:
+        surface_level = float(climatology["depth"].min())
+        climatology = climatology.sel(depth=surface_level).drop_vars("depth", errors="ignore")
+        surface_note = (f"input has no depth dimension, so it was compared against the shallowest "
+                        f"WOA23 level ({surface_level:g} m)")
+
+    # A dateline-crossing subset arrives on a continuous axis running past 180
+    # (the loaders shift the western piece by +360 to keep the window contiguous
+    # and the axis monotonic). Those labels are absent from WOA23's -180~180
+    # grid, so match on the wrapped values and put the array's own labels back on
+    # the result. The cells are the same cells either way.
+    original_lon = None
+    if "lon" in data.coords and float(np.max(np.atleast_1d(data["lon"].values))) > 180.0:
+        original_lon = data["lon"]
+        data = data.assign_coords(
+            lon=((np.asarray(original_lon.values, dtype=float) + 180.0) % 360.0) - 180.0
+        )
+
+    # The climatology is on WOA23's 1-degree grid. A field on any other regular
+    # grid — ERSSTv5's 2 degrees, or anything interpolated or regridded — shares
+    # no cell centres with it, and the inner join below would then return an
+    # empty array rather than raising.
+    for axis in ("lat", "lon"):
+        if axis not in data.coords or axis not in climatology.coords:
+            continue
+        data_labels = np.round(np.atleast_1d(data[axis].values).astype(float), 4)
+        clim_labels = np.round(np.asarray(climatology[axis].values, dtype=float), 4)
+        missing = data_labels[~np.isin(data_labels, clim_labels)]
+        if missing.size:
+            raise ValueError(
+                f"{missing.size} of this array's {len(data_labels)} '{axis}' values have no cell on the "
+                f"WOA23 1-degree grid (first few: {missing[:5].tolist()}). This tool matches the data "
+                f"cell by cell against WOA23, so the field must be on that grid: ERSSTv5 is on a 2-degree "
+                f"grid, and interpolating or regridding takes a field off it too. A spatial subset of the "
+                f"WOA23 grid is fine. Either put the field on the WOA23 grid with regrid_horizontal, or "
+                f"remove its own climatology with compute_anomaly_vs_own_climatology, which works on any "
+                f"grid."
             )
-        
-        anomaly_list.append(anom)
-    
-    # Concatenate along time dimension
-    anomaly_data = xr.concat(anomaly_list, dim=data.time)
-    
-    anomaly_data.attrs = data.attrs.copy()
-    anomaly_data.attrs['anomaly_method'] = method
-    anomaly_data.attrs['anomaly_freq'] = freq
-    anomaly_data.attrs['climatology_reference'] = clim_dir
-    
-    if method == "subtract":
-        anomaly_data.attrs['long_name'] = f"{data.attrs.get('long_name', var)} anomaly"
+
+    # Trim both to the levels and cells they share before any arithmetic. The
+    # monthly and seasonal climatologies are shallower than the annual one, and
+    # groupby arithmetic reuses the data's chunking for the climatology, which
+    # fails outright if the two disagree on a dimension's length.
+    data, climatology = xr.align(data, climatology, join="inner", exclude=("time", "month", "season"))
+    if data.sizes.get("depth", 1) == 0:
+        raise ValueError(
+            f"The data and the WOA23 '{slice_for_freq[freq]}' climatology share no depth levels. "
+            f"The monthly and seasonal climatologies only reach 800 m (nutrients) or 1500 m "
+            f"(temperature/salinity/oxygen), and levels must match exactly."
+        )
+
+    if method == "ratio":
+        # A percentage anomaly only means something on a ratio scale, i.e. one
+        # with a true zero. Degrees Celsius is an interval scale: a percentage
+        # of it diverges as the climatology approaches 0 C and changes sign
+        # below it, so "10 percent warmer" is arithmetic without physical
+        # content. Concentrations are fine.
+        if molar_basis(clim_units) is None:
+            raise ValueError(
+                f"method='ratio' gives a percentage anomaly, which requires a quantity with a true zero. "
+                f"'{var}' is in '{clim_units}', an interval scale (degrees Celsius, practical salinity, pH), "
+                f"where a percentage of the climatology diverges near zero and flips sign below it. Use "
+                f"method='subtract' for this variable; 'ratio' is meant for concentrations."
+            )
+        # Zero climatology values would blow up the ratio; NaN propagates instead.
+        climatology = climatology.where(climatology != 0)
+
+    if freq == "year":
+        difference = data - climatology
+        anomaly = difference if method == "subtract" else difference / climatology * 100
     else:
-        anomaly_data.attrs['long_name'] = f"{data.attrs.get('long_name', var)} percentage anomaly"
-        anomaly_data.attrs['units'] = 'percent'
-    
-    return anomaly_data
+        if freq == "month":
+            group_coord = "month"
+            labels = data["time"].dt.month
+        else:
+            # WOA23 seasons are Jan-Mar, Apr-Jun, Jul-Sep, Oct-Dec, so the season
+            # index is simply the quarter of the year, not the usual DJF grouping.
+            group_coord = "season"
+            labels = xr.DataArray(
+                np.asarray(SEASON_ORDER)[(data["time"].dt.month.values - 1) // 3],
+                dims="time", coords={"time": data["time"]},
+            )
+        data = data.assign_coords({group_coord: labels})
+        difference = data.groupby(group_coord) - climatology
+        if method == "subtract":
+            anomaly = difference
+        else:
+            anomaly = difference.groupby(group_coord) / climatology * 100
+        anomaly = anomaly.drop_vars(group_coord)
+
+    anomaly.attrs = data.attrs.copy()
+    anomaly.attrs["anomaly_method"] = method
+    anomaly.attrs["anomaly_freq"] = freq
+    if freq == "season":
+        # WOA23's seasonal files are calendar quarters, so this tool is bound to
+        # that convention. temporal_aggregate defaults to DJF/MAM/JJA/SON, which
+        # is a different three months; pass season_convention='woa' there to
+        # match this, and never composite one against the other.
+        anomaly.attrs["season_convention"] = (
+            "woa (JFM/AMJ/JAS/OND calendar quarters, as WOA23 defines them) - NOT the meteorological "
+            "DJF/MAM/JJA/SON; use temporal_aggregate(season_convention='woa') to stay consistent"
+        )
+    anomaly.attrs["climatology_reference"] = (
+        f"WOA23 {climatology.attrs.get('woa_period', '')} {climatology.attrs.get('woa_time_slice', '')}".strip()
+    )
+    if original_lon is not None:
+        # Back to the caller's longitude convention, in the caller's order: the
+        # inner join above may have reordered the axis while intersecting it.
+        wrapped = ((np.asarray(original_lon.values, dtype=float) + 180.0) % 360.0) - 180.0
+        anomaly = anomaly.sel(lon=wrapped).assign_coords(lon=original_lon)
+
+    anomaly.attrs["climatology_period"] = climatology.attrs.get("climatology_period", "")
+    if surface_note:
+        anomaly.attrs["climatology_depth"] = surface_note
+
+    long_name = data.attrs.get("long_name", var)
+    if method == "subtract":
+        anomaly.attrs["long_name"] = f"{long_name} anomaly"
+    else:
+        anomaly.attrs["long_name"] = f"{long_name} percentage anomaly"
+        anomaly.attrs["units"] = "percent"
+
+    return anomaly
+
+
+@register_tools(
+    name="compute_anomaly_vs_own_climatology",
+    description="Remove a field's own climatology, leaving its variability about its own mean state.\n"
+        "Each time step is matched to the mean of its own calendar month, season or of the whole record, "
+        "computed from the same field over a baseline period you choose. Whatever bias the field carries "
+        "cancels, which is what an index, a trend, a composite or a comparison between two products "
+        "needs. Its sibling compute_anomaly_vs_woa23 measures the departure from observations instead, "
+        "keeping the bias in.\n"
+        "It works on any grid and any product, including a series that is already an area average with no "
+        "spatial dimensions left.\n"
+        "THE BASELINE IS PART OF THE ANSWER: an anomaly is only defined relative to the period its "
+        "climatology came from, and two series built on different baselines differ by a constant offset "
+        "even when their variability is identical. Match the baseline of any published series being "
+        "compared against.",
+    args={
+        "data": "xr.DataArray, required. A field or series with a 'time' dimension.",
+        "freq": "str, optional, default 'month'. What each step is matched against: 'month' (the "
+            "climatology of its own calendar month, removing the seasonal cycle), 'season' (the "
+            "meteorological DJF/MAM/JJA/SON), or 'year' (a single long-term mean, leaving the seasonal "
+            "cycle in place).",
+        "base_period": "list[str, str], optional. The baseline window as ['start', 'end']. The climatology "
+            "is computed over this window only and subtracted from every step of the series, including "
+            "those outside it. Default None: the whole record is the baseline.",
+        "method": "str, optional, default 'subtract'. 'subtract' gives the anomaly in the data's units; "
+            "'ratio' gives it as a percentage of the climatology, which is refused for quantities without "
+            "a true zero."
+    },
+    returns="xr.DataArray of anomalies on the input's own grid and time axis. attrs record the exact "
+        "baseline window and how many years stand behind each climatological value; state the baseline "
+        "whenever the series is compared with a published index."
+)
+def compute_anomaly_vs_own_climatology(data: xr.DataArray, freq: str = "month",
+                                       base_period: list = None,
+                                       method: str = "subtract") -> xr.DataArray:
+    if freq not in ("month", "season", "year"):
+        raise ValueError(f"freq must be 'month', 'season' or 'year', got '{freq}'")
+    if method not in ("subtract", "ratio"):
+        raise ValueError(f"method must be 'subtract' or 'ratio', got '{method}'")
+    if "time" not in data.dims:
+        raise ValueError(
+            f"An anomaly against a climatology needs a time axis to build the climatology from; this field "
+            f"has dimensions {list(data.dims)}. A climatology product (WOA23, GLODAP) is already a "
+            f"long-term mean and has no anomaly of its own."
+        )
+
+    baseline = data
+    if base_period is not None:
+        if len(base_period) != 2:
+            raise ValueError(f"base_period must be ['start', 'end'], got {base_period}")
+        start, end = str(base_period[0]), str(base_period[1])
+        baseline = data.sel(time=slice(start, end))
+        if baseline.sizes["time"] == 0:
+            stamps = data["time"].values
+            raise ValueError(
+                f"The baseline window {start} to {end} contains none of this series, which runs "
+                f"{str(stamps.min())[:7]} to {str(stamps.max())[:7]}. Load a period that covers the "
+                f"baseline, or leave base_period out to use the record itself."
+            )
+
+    stamps = baseline["time"].values
+    span = f"{str(stamps.min())[:7]} to {str(stamps.max())[:7]}"
+
+    if freq == "year":
+        climatology = baseline.mean("time", skipna=True)
+        coverage = f"{baseline.sizes['time']} time steps"
+    else:
+        group = "time.month" if freq == "month" else "time.season"
+        grouped = baseline.groupby(group)
+        climatology = grouped.mean("time", skipna=True)
+        sizes = {str(key): len(index) for key, index in grouped.groups.items()}
+        expected = 12 if freq == "month" else 4
+        if len(sizes) < expected:
+            missing = expected - len(sizes)
+            raise ValueError(
+                f"The baseline {span} covers only {len(sizes)} of the {expected} {freq}s, so {missing} of "
+                f"them would have no climatology and their anomalies would be NaN. Widen base_period to at "
+                f"least one full year."
+            )
+        coverage = f"{min(sizes.values())} to {max(sizes.values())} samples per {freq}"
+
+    if method == "ratio":
+        # A percentage anomaly needs a ratio scale: degrees Celsius is not one,
+        # and a percentage of a climatology near 0 C diverges and changes sign.
+        units = data.attrs.get("units")
+        if molar_basis(normalize_units(units)) is None and molar_basis(units) is None:
+            raise ValueError(
+                f"method='ratio' gives a percentage anomaly, which needs a quantity with a true zero. This "
+                f"field is in '{units}', an interval scale (degrees Celsius, practical salinity, pH), where "
+                f"a percentage of the climatology diverges near zero and flips sign below it. Use "
+                f"method='subtract'."
+            )
+        climatology = climatology.where(climatology != 0)
+
+    if freq == "year":
+        difference = data - climatology
+        anomaly = difference if method == "subtract" else difference / climatology * 100
+    else:
+        group = "time.month" if freq == "month" else "time.season"
+        difference = data.groupby(group) - climatology
+        if method == "subtract":
+            anomaly = difference
+        else:
+            anomaly = difference.groupby(group) / climatology * 100
+        anomaly = anomaly.drop_vars(group.split(".")[1], errors="ignore")
+
+    # groupby arithmetic drops attrs, and the grid identity recorded there is
+    # what lets a later area-weighted mean find the right cell areas.
+    anomaly.attrs = dict(data.attrs)
+    anomaly.attrs["anomaly_method"] = method
+    anomaly.attrs["anomaly_freq"] = freq
+    anomaly.attrs["climatology_reference"] = f"the field's own {freq} climatology over {span}"
+    anomaly.attrs["climatology_baseline"] = span
+    anomaly.attrs["baseline_coverage"] = coverage
+    if freq == "season":
+        anomaly.attrs["season_convention"] = (
+            "meteorological (DJF/MAM/JJA/SON) - NOT the WOA23 calendar quarters used by "
+            "compute_anomaly_vs_woa23"
+        )
+    long_name = data.attrs.get("long_name", data.name or "field")
+    if method == "subtract":
+        anomaly.attrs["long_name"] = f"{long_name} anomaly"
+    else:
+        anomaly.attrs["long_name"] = f"{long_name} percentage anomaly"
+        anomaly.attrs["units"] = "percent"
+    anomaly.name = f"{data.name}_anomaly" if data.name else "anomaly"
+    return anomaly
 
 
 @register_tools(
     name="convert_concentration_to_content",
-    description="Convert concentration data (μmol/kg) to content data (mol) by integrating over grid-cell volume. The conversion assumes concentration is given in μmol/kg and uses a constant seawater density. \n" \
-    "To ensure physically meaningful results, the input data must be defined on a standard WOA-compatible grid with explicit depth, latitude, and longitude coordinates. Spatial subsetting is allowed, but spatial aggregation, regridding, or resampling must not be applied prior to conversion, as grid-cell area and thickness are inferred from the original coordinate values. \n"
-    "The computation of grid-cell volumes is integrated within this tool, so users do not need to load depth/area/volume data separately.",
+    description="Integrate a concentration over grid-cell volume to get content in moles, for inventories "
+        "such as the total oxygen or nitrate held in a region.\n"
+        "Cell volumes come from the grid the data came from, preferring a model's own published cell "
+        "volumes where they exist, since those alone account for partial cells at the sea floor.\n"
+        "Both molar bases are handled: a mass-basis concentration needs a density to reach a volume, a "
+        "volume-basis one needs none, and the units attribute decides which path is taken.\n"
+        "The field must still be on its original grid and levels: subsetting is fine, interpolation, "
+        "regridding or averaging over depth is not.",
     args={
-        "concentration": "xr.DataArray, required. Concentration data with dimensions, including 'depth', 'lat', and 'lon' (time dimension is optional), in μmol/kg.",
-        "density": "float, optional. Seawater density in kg/m³. Default is 1025 kg/m³."
+        "concentration": "xr.DataArray, required. A concentration with 'depth' and horizontal dimensions, "
+            "optionally 'time', in either molar basis.",
+        "density": "float, optional, default 1025. Seawater density in kg/m3, used only for a mass-basis "
+            "input. It is ignored for a volume-basis field, which is already per unit volume."
     },
-    returns="xr.DataArray. Content data in moles (mol) with same dimensions and coordinates as input."
+    returns="xr.DataArray of content in moles on the input's coordinates. Sum it over depth and the "
+        "horizontal to get a region's inventory. attrs record where the volumes came from and, for a "
+        "mass-basis input, the density assumed."
 )
 def convert_concentration_to_content(concentration: xr.DataArray, density: float = 1025.0) -> xr.DataArray:
-    lat_values = concentration.lat.values
-    lat_range = [float(lat_values.min()), float(lat_values.max())]
-    lon_values = concentration.lon.values
-    lon_range = [float(lon_values.min()), float(lon_values.max())]
-    depth_values = concentration.depth.values
-    depth_range = [float(depth_values.min()), float(depth_values.max())]
+    units = concentration.attrs.get("units")
+    basis = molar_basis(units)
+    if basis is None:
+        raise ValueError(
+            f"Cannot integrate a field whose units are '{units}': a content in moles needs a concentration "
+            f"in umol kg-1 (WOA23, GLODAP) or mol m-3 (CMIP6). If the array lost its units attribute, set it "
+            f"back before integrating."
+        )
 
-    areas = load_areas(lat_range=lat_range, lon_range=lon_range)
-    depth, depth_bnds = load_depth_levels(depth_range=depth_range)
-    thickness = depth_bnds[:, 1] - depth_bnds[:, 0]
-    thickness_da = xr.DataArray(
-        thickness.values,
-        coords={'depth': depth.values},
-        dims=['depth']
-    )
+    volume = volumes_like(concentration)
 
-    # in case data dimensions are not aligned, though it should not happen
-    thickness_aligned = thickness_da.reindex(depth=concentration.depth, method='nearest', tolerance=0.1)
-    areas_aligned = areas.reindex(lat=concentration.lat, lon=concentration.lon, method='nearest', tolerance=0.01)
-    volume = thickness_aligned * areas_aligned
+    canonical = normalize_units(units)
+    if basis == "mass":
+        # umol kg-1 -> mol m-3 needs a density; mmol kg-1 is a thousand times that.
+        per_volume = concentration * density * (1e-6 if canonical == "umol kg-1" else 1e-3)
+        density_note = f"constant seawater density {density} kg/m3 (in-situ density not used)"
+    else:
+        # mol m-3 is already per unit volume; mmol m-3 is a thousandth of it.
+        per_volume = concentration * (1.0 if canonical == "mol m-3" else 1e-3)
+        density_note = "not needed: the input is already per unit volume"
 
-    # concentration (μmol/kg), density (kg/m³), volumn (m³), content (mol)
-    content = concentration * density * volume * 1e-6
+    content = per_volume * volume
+    content.attrs = dict(concentration.attrs)
     content.attrs.update({
-        'units': 'mol',
-        'description': 'Content calculated from concentration * density * volume',
-        'original_units_of_concentration': 'μmol/kg',
-        'density_used': f'{density} kg/m³',
-        'conversion_factor': '1e-6 (μmol to mol)'
+        "units": "mol",
+        "long_name": f"{concentration.attrs.get('long_name', concentration.name or 'tracer')} content",
+        "description": "Concentration integrated over grid-cell volume",
+        "original_units": units,
+        "molar_basis_of_input": basis,
+        "density_assumption": density_note,
+        "volume_source": volume.attrs.get(
+            "volume_source", volume.attrs.get("area_source", "cell area x layer thickness")
+        ),
     })
-
-    if hasattr(concentration, 'name') and concentration.name:
-        content.name = f'{concentration.name}_content'
-    
+    if concentration.name:
+        content.name = f"{concentration.name}_content"
     return content
 
 
 @register_tools(
     name="compute_vertical_gradient",
-    description="Compute vertical gradient of a gridded oceanographic variable in an xarray.DataArray along the depth dimension using an interface-based finite-difference method. \n"
-    "To ensure a physically meaningful gradient, the input data must retain the original depth coordinate values (or a direct subset thereof).",
+    description="Compute the vertical gradient of a field with respect to depth, layer by layer.\n"
+        "The value is interpolated onto each layer's interfaces and differenced across them, so an uneven "
+        "vertical grid is handled correctly: differencing neighbouring levels directly would attribute a "
+        "near-surface difference and a deep-ocean one to the same nominal spacing. The topmost and "
+        "bottommost gradients are one-sided.\n"
+        "Layer boundaries come from the grid the data came from, so the field must keep its original "
+        "levels.",
     args={
-        "data": "xr.DataArray, required. Input data with 'depth' dimension, optionally accompanied by other dimensions. Depth coordinate values must be monotonic, represent layer centers, and be compatible with standard ocean depth definitions. "
+        "data": "xr.DataArray, required. A field with a 'depth' dimension, plus any other dimensions."
     },
-    returns="xr.DataArray. Vertical gradient (dVar/dDepth) defined at the original depth levels, with same dimensions and coordinates as the input data. Units are [original_units]/meters."
+    returns="xr.DataArray of d(value)/d(depth) at the same levels and dimensions as the input, in the "
+        "field's units per metre. Depth is positive downward, so a positive gradient means the quantity "
+        "increases with depth."
 )
 def compute_vertical_gradient(data: xr.DataArray) -> xr.DataArray:
     """
-    Compute vertical gradient using centered finite differences.
-    - Interior points: gradient[i] = (data[i+1] - data[i-1]) / (depth[i+1] - depth[i-1])
-    - Top boundary: gradient[0] = (data[1] - data[0]) / (depth[1] - depth[0])
-    - Bottom boundary: gradient[-1] = (data[-1] - data[-2]) / (depth[-1] - depth[-2])
+    Compute the vertical gradient layer by layer, across each layer's own bounds.
+
+    The value is linearly interpolated from the two neighbouring level centres
+    onto each interface, and the gradient of a layer is the difference across
+    its two interfaces divided by its thickness. This respects an uneven
+    vertical grid, which every one of these products has: differencing
+    neighbouring levels directly would attribute a 5 m difference near the
+    surface and a 500 m one in the deep ocean to the same nominal spacing.
+    The topmost and bottommost interfaces take the adjacent level's value, so
+    the gradient there is one-sided.
     """
     if 'depth' not in data.dims:
         raise ValueError("Input DataArray must have a 'depth' dimension.")
 
-    # Load corresponding depth levels and boundaries
+    # The layer boundaries come from the vertical grid the data itself came from.
+    # They are not shared between products: GLODAP's levels are far thicker than
+    # WOA23's at the same depths, and each CMIP6 model has its own, so taking a
+    # default set would rescale every gradient.
     depth_vals = data['depth'].values
-    depth_range = [float(depth_vals.min()), float(depth_vals.max())]
-    depth_da, depth_bnds_da = load_depth_levels(depth_range=depth_range)
+    depth_bnds = layer_bounds_like(data).values
 
-    depth_levels = depth_da.values
-    depth_bnds = depth_bnds_da.values
-
-    if not np.allclose(depth_levels, depth_vals, atol=1e-4):
-        lower_interp = np.interp(depth_vals, depth_levels, depth_bnds[:, 0])
-        upper_interp = np.interp(depth_vals, depth_levels, depth_bnds[:, 1])
-        depth_bnds = np.stack([lower_interp, upper_interp], axis=-1)
-
-    # Compute interface values
-    interfaces = np.empty(len(depth_bnds) + 1, dtype=np.float32)
+    interfaces = np.empty(len(depth_bnds) + 1, dtype=np.float64)
     interfaces[0] = depth_bnds[0, 0]
     for i in range(len(depth_bnds)):
         interfaces[i + 1] = depth_bnds[i, 1]
 
-    dz = depth_bnds[:, 1] - depth_bnds[:, 0]
-    dz_safe = np.where(dz == 0, np.nan, dz)
+    # The span each difference is taken over. For an interior layer that is the
+    # layer thickness, but the top and bottom differences run only from the
+    # outermost level CENTRE to the first interior interface, which is part of a
+    # layer. Dividing those by the full thickness understates the gradient at
+    # both ends: on a perfectly linear profile the deepest layer comes out six
+    # times too small.
+    span = (depth_bnds[:, 1] - depth_bnds[:, 0]).astype("float64")
+    if len(span) > 1:
+        span[0] = interfaces[1] - depth_vals[0]
+        span[-1] = depth_vals[-1] - interfaces[-2]
+    dz_safe = np.where(span <= 0, np.nan, span)
 
     transposed = data.transpose(..., 'depth')
-    v_np = transposed.values  # shape: (..., depth)
+    v_np = transposed.values.astype("float64")  # shape: (..., depth)
     n_depth = v_np.shape[-1]
 
-    # Compute interface values for variable using linear interpolation between centers
-    v_int = np.empty(v_np.shape[:-1] + (n_depth + 1,), dtype=np.float32)
-    # Top/bottom extrapolation
+    v_int = np.empty(v_np.shape[:-1] + (n_depth + 1,), dtype=np.float64)
     v_int[..., 0] = v_np[..., 0]
     v_int[..., -1] = v_np[..., -1]
-    # Internal interfaces interpolation
     for k in range(1, n_depth):
         z_if = interfaces[k]
         z_up, z_dn = depth_vals[k - 1], depth_vals[k]
@@ -261,14 +561,14 @@ def compute_vertical_gradient(data: xr.DataArray) -> xr.DataArray:
             w_dn = (z_if - z_up) / denom
             v_int[..., k] = w_up * v_np[..., k - 1] + w_dn * v_np[..., k]
 
-    # Compute vertical gradients for each layer
     dv = v_int[..., 1:] - v_int[..., :-1]  # (..., depth)
     dvdz = dv / dz_safe.reshape((1,) * (v_np.ndim - 1) + (-1,))
 
     grad = xr.DataArray(
         dvdz,
         dims=transposed.dims,
-        coords={dim: transposed.coords[dim] for dim in transposed.dims},
+        coords={name: coord for name, coord in transposed.coords.items()
+                if set(coord.dims).issubset(transposed.dims)},
         attrs={
             "long_name": f"Vertical gradient of {data.name or 'variable'}",
             "units": f"{data.attrs.get('units', '')} / m",
@@ -277,94 +577,151 @@ def compute_vertical_gradient(data: xr.DataArray) -> xr.DataArray:
         }
     ).transpose(*data.dims)
 
-    return grad
+    return carry_provenance(grad, data)
 
 
 @register_tools(
     name="compute_ratio",
-    description="Compute ratio between two DataArrays: (data1 / data2). The two inputs must be defined on compatible grids with matching dimensions and coordinates (or be broadcastable under xarray rules).",
+    description="Compute the element-wise ratio of two fields, for stoichiometric quantities such as N:P.\n"
+        "Two concentrations on different molar bases are refused rather than divided, because their ratio "
+        "would not be a molar ratio; convert one of them first. Two concentrations on the same basis but "
+        "with different prefixes are rescaled so the ratio is dimensionless.",
     args={
-        "data1": "xr.DataArray, required. Numerator DataArray. Must share compatible dimensions and coordinates with data2, or be broadcastable according to xarray alignment rules.",
-        "data2": "xr.DataArray, required. Denominator DataArray."
+        "data1": "xr.DataArray, required. The numerator.",
+        "data2": "xr.DataArray, required. The denominator. Cells where it is zero come back missing rather "
+            "than infinite."
     },
-    returns="xr.DataArray. Element-wise ratio field with dimensions and coordinates inherited from xarray alignment of the two inputs."
+    returns="xr.DataArray of the ratio at every cell. Note that averaging this field is not the same as "
+        "dividing two averages: the mean of a ratio weights every cell's composition equally, while the "
+        "ratio of means weights each cell by its content and is pulled towards the richest water. Both are "
+        "defensible, so state which was computed; this tool gives the first, and the second is a weighted "
+        "mean of each field before the ratio. attrs record the units of both inputs and whether the result "
+        "is a true molar ratio."
 )
 def compute_ratio(data1: xr.DataArray, data2: xr.DataArray) -> xr.DataArray:
-    """
-    Compute ratio between two DataArrays: (data1 / data2)
-    Handles division by zero by assigning NaN where data2 is zero.
-    """
-    ratio = xr.where(
-        data2 != 0,
-        (data1 / data2),
-        np.nan
-    )
+    units1, units2 = data1.attrs.get("units"), data2.attrs.get("units")
+    basis1, basis2 = molar_basis(units1), molar_basis(units2)
+    canonical1, canonical2 = normalize_units(units1), normalize_units(units2)
+
+    scale = 1.0
+    if basis1 and basis2:
+        if basis1 != basis2:
+            raise ValueError(
+                f"'{units1}' is a per-{basis1} concentration and '{units2}' is a per-{basis2} one, so their "
+                f"ratio is not a molar ratio: WOA23 and GLODAP report per unit mass (umol kg-1) while CMIP6 "
+                f"reports per unit volume (mol m-3). Convert one of them with transform_unit first — left as "
+                f"they are, a Redfield N:P of about 16 comes out near 0.008."
+            )
+        # Same basis, possibly different prefixes (umol kg-1 against mmol kg-1,
+        # or mol m-3 against mmol m-3); rescale so the ratio is dimensionless.
+        prefix = {"umol kg-1": 1.0, "mmol kg-1": 1000.0, "mmol m-3": 1.0, "mol m-3": 1000.0}
+        scale = prefix.get(canonical1, 1.0) / prefix.get(canonical2, 1.0)
+        ratio_units, ratio_basis = "1", f"both per unit {basis1}"
+    elif canonical1 is not None and canonical1 == canonical2:
+        ratio_units, ratio_basis = "1", f"both in {units1}"
+    else:
+        ratio_units = f"({units1 or '?'})/({units2 or '?'})"
+        ratio_basis = "not a molar ratio; the two fields carry different kinds of unit"
+
+    ratio = xr.where(data2 != 0, (data1 * scale) / data2, np.nan)
     ratio.attrs.update({
         'long_name': f'Ratio of {data1.name} to {data2.name}',
-        'description': 'Computed as (data1 / data2)'
+        'description': 'Computed as (data1 / data2)',
+        'units': ratio_units,
+        'ratio_basis': ratio_basis,
+        'numerator_units': units1,
+        'denominator_units': units2,
     })
-    return ratio
+    ratio.name = f"{data1.name}_to_{data2.name}_ratio" if data1.name and data2.name else "ratio"
+    return carry_provenance(ratio, data1)
 
 
 @register_tools(
     name="identify_oxygen_minimum_zone",
-    description="Identify Oxygen Minimum Zones (OMZ) with dissolved oxygen concentration data and compute their total vertical thickness. OMZs are defined as areas where oxygen concentration is below the threshold." \
-    "To ensure physically meaningful OMZ thickness estimates, the input data must retain the original depth coordinate values (or a direct subset thereof)." \
-    "The computation of vertical thickness is integrated within this tool, so users do not need to load depth data separately.",
+    description="Identify oxygen minimum zones from a dissolved oxygen field and measure their total "
+        "vertical thickness.\n"
+        "Every layer below the threshold counts, and the thickness is the summed thickness of those "
+        "layers, giving a map of how much of the water column is oxygen-depleted. Layer thicknesses come "
+        "from the grid the data came from, so the field must keep its original levels.\n"
+        "The threshold must be in the same units as the field. A mass-basis threshold applied to a "
+        "volume-basis field marks the entire ocean as depleted; convert one of them first.",
     args={
-        "data": "xr.DataArray, required. Oxygen concentration data with dimensions including 'depth' and optionally 'time', 'lat', and 'lon'.",
-        "threshold": "float, optional. Oxygen concentration threshold for OMZ identification in μmol/kg. Default is 20.0 μmol/kg.",
+        "o2_data": "xr.DataArray, required. Dissolved oxygen with a 'depth' dimension, optionally with "
+            "time and horizontal dimensions.",
+        "threshold": "float, optional, default 20.0. The concentration below which a layer counts, in the "
+            "data's own units. Common alternatives are 60 for hypoxia and 5 for suboxia in umol kg-1."
     },
-    returns="tuple[xr.DataArray, xr.DataArray]. Returns (omz_thickness, omz_mask) where:\n"
-            "  - omz_thickness: Total vertical thickness of OMZ layers at each time and horizontal grid point in meters, obtained by summing the thicknesses of all depth layers satisfying the OMZ criterion\n"
-            "  - omz_mask: Boolean array indicating OMZ locations with same dimensions as input data"
+    returns="tuple (omz_thickness, omz_mask):\n"
+        "- omz_thickness: total thickness in metres of the layers meeting the criterion at each horizontal "
+        "point, missing where there is no ocean.\n"
+        "- omz_mask: boolean array with the input's dimensions, True inside the zone.\n"
+        "For the volume rather than the thickness, use compute_exceedance_fraction with volume weighting, "
+        "which returns the cubic metres directly. attrs record the threshold and where the layer "
+        "thicknesses came from."
 )
 def identify_oxygen_minimum_zone(o2_data: xr.DataArray, threshold: float = 20.0) -> tuple[xr.DataArray, xr.DataArray]:
-    depth_values = o2_data['depth'].values
-    depth_range = [float(depth_values.min()), float(depth_values.max())]
-    depth_da, depth_bnds_da = load_depth_levels(depth_range=depth_range)
-    
-    omz_mask = xr.where(o2_data.notnull(), o2_data < threshold, np.nan)
+    units = o2_data.attrs.get("units")
+    if molar_basis(units) == "volume":
+        raise ValueError(
+            f"This oxygen field is in '{units}', a per-volume unit, but the threshold {threshold} is read in "
+            f"the data's own units and the conventional OMZ thresholds (20, 60, 5) are per mass (umol kg-1). "
+            f"Convert the field with transform_unit(data, '{units}', 'umol/kg') first, or pass a threshold "
+            f"already in {units} ({threshold} umol kg-1 is about {threshold * 1.025e-3:.4g} mol m-3). "
+            f"Left as it is, every ocean cell would be counted as an oxygen minimum zone."
+        )
 
-    layer_thickness = depth_bnds_da.values[:, 1] - depth_bnds_da.values[:, 0]
-    thickness_da = xr.DataArray(
-        layer_thickness,
-        coords={'depth': depth_da},
-        dims=['depth']
-    )
-    
-    omz_thickness = (thickness_da * omz_mask).sum(dim='depth', skipna=True)
-    omz_thickness = omz_thickness.where(o2_data.isel(depth=0).notnull())
+    thickness = layer_thickness_like(o2_data)
+    omz_mask = o2_data < threshold
+
+    omz_thickness = (thickness * omz_mask).sum(dim="depth", skipna=True)
+    # Cells with no ocean at all must stay NaN rather than reading as a zero-metre
+    # OMZ, so the result is masked wherever the column holds no data.
+    omz_thickness = omz_thickness.where(o2_data.notnull().any(dim="depth"))
+
     omz_thickness.attrs = {
-        'long_name': 'Oxygen minimum zone thickness',
-        'units': 'meters',
-        'description': f'Total vertical thickness of layers where oxygen < {threshold} μmol/kg',
-        'threshold': threshold,
-        'threshold_units': 'μmol/kg'
+        "long_name": "Oxygen minimum zone thickness",
+        "units": "m",
+        "description": f"Total thickness of the layers where oxygen < {threshold} {units}",
+        "threshold": threshold,
+        "threshold_units": units,
+        "thickness_source": thickness.attrs.get("bounds_source", ""),
     }
-    
     omz_mask.attrs = {
-        'long_name': 'Oxygen minimum zone mask',
-        'description': f'Boolean mask indicating where oxygen < {threshold} μmol/kg',
-        'threshold': threshold,
-        'threshold_units': 'μmol/kg'
+        "long_name": "Oxygen minimum zone mask",
+        "description": f"True where oxygen < {threshold} {units}",
+        "threshold": threshold,
+        "threshold_units": units,
     }
-    
-    return omz_thickness, omz_mask
+    return carry_provenance(omz_thickness, o2_data), carry_provenance(omz_mask, o2_data)
 
 
 @register_tools(
     name="compute_potential_density_anomaly",
-    description="Compute potential density anomaly from in-situ temperature and practical salinity using the TEOS-10 standard (GSW library). Potential density is referenced to surface pressure (0 dbar). \n " \
-    "To ensure physically meaningful results, temperature and salinity inputs must share identical dimensions and coordinates, include a valid 'depth' coordinate representing positive-downward depth in meters, and be defined on the same spatial and temporal grid. Spatial or vertical regridding, aggregation, or mismatched coordinate definitions must not be applied prior to calling this function.",
+    description="Compute density anomaly (sigma) from temperature and practical salinity using TEOS-10.\n"
+        "Sigma referenced to a fixed pressure is what labels a water mass, because it removes the "
+        "compression that makes any water denser with depth. Referenced to each cell's own pressure it is "
+        "the in-situ density, which is what mass-per-volume arithmetic needs — converting a concentration "
+        "between molar bases, or a volume into a mass.\n"
+        "The two temperature conventions take different routes to Conservative Temperature, and using the "
+        "wrong one biases density increasingly with depth, so the kind of temperature supplied is read "
+        "from its metadata and recorded in the result.",
     args={
-        "temp_data": "xr.DataArray, required. In-situ temperature in degrees Celsius. Must include a 'depth' coordinate and share identical dimensions and coordinates with the salinity input.",
-        "sal_data": "xr.DataArray, required. Practical salinity (PSS-78). Must include a 'depth' coordinate and share identical dimensions and coordinates with the temperature input.",
-        "ref_pressure": "float, optional. Reference pressure in dbar for potential density calculation. Default is 0 dbar (sigma0)."
+        "temp_data": "xr.DataArray, required. Temperature in degrees Celsius, in-situ or potential, with a "
+            "'depth' coordinate in metres.",
+        "sal_data": "xr.DataArray, required. Practical salinity (PSS-78), on the same dimensions as "
+            "temp_data.",
+        "ref_pressure": "float or None, optional, default 0. Reference pressure in dbar: 0 gives sigma0, "
+            "the usual water-mass label at the surface, and 2000 or 4000 are used for the deep ocean. Pass "
+            "None for the in-situ density anomaly, evaluated at each cell's own pressure — use that for "
+            "unit conversion, and a fixed reference whenever water masses are compared.",
+        "temperature_type": "str, optional, default 'auto'. Whether temp_data is 'in_situ' or 'potential' "
+            "temperature; 'auto' reads it from the metadata."
     },
-    returns="xr.DataArray. Potential density anomaly (σ_θ = ρ - 1000) in kg/m³, with same dimensions and coordinates as the input fields."
+    returns="xr.DataArray of sigma in kg/m3, i.e. density minus 1000, on the input's coordinates. attrs "
+        "record the reference pressure and which temperature convention was detected."
 )
-def compute_potential_density_anomaly(temp_data: xr.DataArray, sal_data: xr.DataArray, ref_pressure: float = 0.0) -> xr.DataArray:
+def compute_potential_density_anomaly(temp_data: xr.DataArray, sal_data: xr.DataArray, ref_pressure=0.0,
+                                      temperature_type: str = "auto") -> xr.DataArray:
     if temp_data.dims != sal_data.dims:
         raise ValueError(f"Temperature and salinity must have same dimensions. "
                         f"Got temp: {temp_data.dims}, sal: {sal_data.dims}")
@@ -372,121 +729,162 @@ def compute_potential_density_anomaly(temp_data: xr.DataArray, sal_data: xr.Data
     if 'depth' not in temp_data.coords:
         raise ValueError("Temperature and salinity data must have 'depth' coordinate")
 
-    depth = temp_data['depth'].values
-    if 'lat' in temp_data.coords:
-        lat = temp_data['lat'].values
-        if lat.ndim == 0:  # scalar
-            lat = float(lat)
+    # Depth, latitude and longitude are laid out on their own axes first, so
+    # that a full (depth, lat, lon) field broadcasts. The 2-D lat/lon of the
+    # curvilinear models are handled by the same reshape.
+    depth_arr = _broadcastable(temp_data["depth"], temp_data)
+    lat_coord = temp_data.attrs.get("lat_coord", "lat")
+    lon_coord = temp_data.attrs.get("lon_coord", "lon")
+    lat_arr = _broadcastable(temp_data[lat_coord], temp_data) if lat_coord in temp_data.coords else 0.0
+    lon_arr = _broadcastable(temp_data[lon_coord], temp_data) if lon_coord in temp_data.coords else 0.0
+
+    salinity_units = normalize_units(sal_data.attrs.get("units"))
+    if salinity_units not in (None, "1"):
+        raise ValueError(
+            f"Salinity must be practical salinity (PSS-78, dimensionless), but sal_data is in "
+            f"'{sal_data.attrs.get('units')}'. WOA23 reports it as '1', CMIP6 as '0.001'; both are PSS-78."
+        )
+    temperature_units = normalize_units(temp_data.attrs.get("units"))
+    if temperature_units not in (None, "degC"):
+        raise ValueError(
+            f"Temperature must be in degrees Celsius, but temp_data is in "
+            f"'{temp_data.attrs.get('units')}'. Convert it with transform_unit first."
+        )
+
+    kind, kind_reason = temperature_kind(temp_data, temperature_type)
+
+    pressure = gsw.p_from_z(-depth_arr, lat_arr)
+    absolute_salinity = gsw.SA_from_SP(sal_data.values, pressure, lon_arr, lat_arr)
+    # CMIP6's thetao is potential temperature and WOA23's is in-situ; TEOS-10
+    # takes a different route from each to Conservative Temperature, and using
+    # the wrong one biases density increasingly with depth.
+    if kind == "potential":
+        conservative_temperature = gsw.CT_from_pt(absolute_salinity, temp_data.values)
     else:
-        lat = 0.0  # default latitude
-        
-    if 'lon' in temp_data.coords:
-        lon = temp_data['lon'].values
-        if lon.ndim == 0:  # scalar
-            lon = float(lon)
-    else:
-        lon = 0.0
-    
-    pressure = gsw.p_from_z(-depth, lat)
-    if 'depth' in temp_data.dims:
-        depth_axis = temp_data.dims.index('depth')
-        # Create shape for broadcasting
-        shape = [1] * temp_data.ndim
-        shape[depth_axis] = len(depth)
-        pressure = pressure.reshape(shape)
-    
-    absolute_salinity = gsw.SA_from_SP(sal_data.values, pressure, lon, lat)
-    conservative_temperature = gsw.CT_from_t(absolute_salinity, temp_data.values, pressure)
-    sigma_theta = gsw.sigma0(absolute_salinity, conservative_temperature) if ref_pressure == 0.0 else gsw.pot_rho_t_exact(absolute_salinity, temp_data.values, pressure, ref_pressure) - 1000.0
+        conservative_temperature = gsw.CT_from_t(absolute_salinity, temp_data.values, pressure)
+
+    # rho(SA, CT, p_ref) - 1000 is the potential density anomaly referenced to
+    # p_ref, and reduces to sigma0 at p_ref = 0. Evaluated at each cell's own
+    # pressure instead, it is the in-situ density anomaly: not a water-mass
+    # label, but the density the water actually has, which is what converts
+    # between a concentration per unit volume and one per unit mass.
+    evaluation_pressure = pressure if ref_pressure is None else ref_pressure
+    sigma_theta = gsw.rho(absolute_salinity, conservative_temperature, evaluation_pressure) - 1000.0
 
     rho_data = xr.DataArray(
         sigma_theta,
         coords=temp_data.coords,
         dims=temp_data.dims,
         attrs={
-            'long_name': f'Potential density anomaly (sigma_{int(ref_pressure)})',
+            'long_name': ('In-situ density anomaly' if ref_pressure is None
+                          else f'Potential density anomaly (sigma_{int(ref_pressure)})'),
             'units': 'kg/m³',
-            'reference_pressure': f'{ref_pressure} dbar',
-            'description': f'Potential density anomaly (rho - 1000 kg/m³) referenced to {ref_pressure} dbar',
+            'reference_pressure': ("each cell's own in-situ pressure" if ref_pressure is None
+                                   else f'{ref_pressure} dbar'),
+            'description': (
+                'In-situ density anomaly (rho - 1000 kg/m³), evaluated at each cell\'s own pressure'
+                if ref_pressure is None else
+                f'Potential density anomaly (rho - 1000 kg/m³) referenced to {ref_pressure} dbar'),
             'method': 'TEOS-10 (GSW library)',
-            'source_temperature': 'in-situ temperature',
+            'source_temperature': f'{"potential" if kind == "potential" else "in-situ"} temperature '
+                                  f'({kind_reason})',
             'source_salinity': 'practical salinity (PSS-78)'
         }
     )
-    
-    return rho_data
+
+    return carry_provenance(rho_data, temp_data)
 
 
-def _find_threshold_depth(data: xr.DataArray, depth: np.ndarray, threshold: float, ref_depth: float) -> xr.DataArray:
+def _first_crossing_depth(data: xr.DataArray, depth: np.ndarray, threshold: float,
+                          ref_depth: float) -> xr.DataArray:
     """
-    Helper function to find depth where data exceeds threshold.
+    Depth at which `data` first reaches `threshold`, interpolated between levels.
 
-    Args:
-        - data (xr.DataArray): Data array with depth dimension (e.g., density difference)
-        - depth (np.ndarray): Depth values, m
-        - threshold (float): Threshold value
-        - ref_depth (float): Reference depth, m
+    Returning the discrete level instead quantises the answer onto the vertical
+    grid, and these grids are coarse where mixed layers actually sit: WOA23
+    jumps 25 m at a time below 100 m, so a deep winter mixed layer could only
+    ever come back as one of a handful of values. Linear interpolation between
+    the bracketing levels is what the community definition asks for
+    (de Boyer Montegut et al. 2004).
 
-    Returns:
-        - xr.DataArray: Depth (m, from existing discrete depth levels) where threshold is first exceeded
+    Vectorised over every other dimension: the profile-by-profile Python loop
+    this replaces took one pass per horizontal cell, which is millions of passes
+    on a global monthly field.
     """
-    exceeds_threshold = data >= threshold
+    transposed = data.transpose(..., "depth")
+    values = transposed.values
+    z = np.asarray(depth, dtype="float64")
 
-    depth_dim = data.dims.index('depth')
+    # Only levels at or below the reference depth can define the crossing.
+    eligible = z >= ref_depth
+    exceeds = (values >= threshold) & eligible
+    found = exceeds.any(axis=-1)
 
-    # xarray -> numpy
-    data_values = data.values
-    threshold_mask = exceeds_threshold.values
+    first = np.argmax(exceeds, axis=-1)
+    # Interpolate between the level that crosses and the one above it.
+    upper_index = np.clip(first - 1, 0, len(z) - 1)
+    value_at = np.take_along_axis(values, first[..., None], axis=-1)[..., 0]
+    value_above = np.take_along_axis(values, upper_index[..., None], axis=-1)[..., 0]
+    z_at, z_above = z[first], z[upper_index]
 
-    output_shape = list(data_values.shape)
-    output_shape.pop(depth_dim)
-    mld_values = np.full(output_shape, np.nan)
+    span = value_at - value_above
+    with np.errstate(invalid="ignore", divide="ignore"):
+        fraction = np.where(np.abs(span) > 0, (threshold - value_above) / span, 0.0)
+    fraction = np.clip(np.nan_to_num(fraction, nan=0.0), 0.0, 1.0)
+    crossing = z_above + fraction * (z_at - z_above)
 
-    # Get indices for iteration (all dimensions except depth)
-    other_dims = list(range(data_values.ndim))
-    other_dims.pop(depth_dim)
-    for idx in np.ndindex(*[data_values.shape[i] for i in other_dims]):
-        full_idx = list(idx)
-        full_idx.insert(depth_dim, slice(None))
-        full_idx = tuple(full_idx)
+    # The very first eligible level already exceeding the threshold leaves
+    # nothing to interpolate from, and a mixed layer cannot be shallower than
+    # the reference depth it is measured against.
+    crossing = np.where(first == 0, z_at, crossing)
+    crossing = np.maximum(crossing, ref_depth)
+    crossing = np.where(found, crossing, np.nan)
 
-        mask_profile = threshold_mask[full_idx]
-
-        exceeded_indices = np.where(mask_profile)[0]
-        if len(exceeded_indices) > 0:
-            first_idx = exceeded_indices[0]
-            d_mld = depth[first_idx]
-
-            if d_mld >= ref_depth:
-                output_idx = list(idx)
-                output_idx = tuple(output_idx)
-                mld_values[output_idx] = d_mld
-
-    mld_array = xr.DataArray(
-        mld_values,
-        coords={k: v for k, v in data.coords.items() if k != 'depth'},
-        dims=[d for d in data.dims if d != 'depth']
+    remaining = [d for d in transposed.dims if d != "depth"]
+    return xr.DataArray(
+        crossing,
+        coords={k: v for k, v in data.coords.items() if k != "depth" and set(v.dims) <= set(remaining)},
+        dims=remaining,
     )
 
-    return mld_array
 
 @register_tools(
     name="compute_mixed_layer_depth",
-    description="Compute ocean mixed layer depth (MLD) based on vertical threshold criteria applied to potential density and/or temperature profiles. The MLD is defined as the shallowest depth (from discrete depth levels) at which the potential density anomaly or temperature difference relative to a near-surface reference depth first exceeds a specified threshold. \n "
-    "temp_data and sal_data must be xr.DataArray objects with identical dimensions and coordinates. A 1D 'depth' coordinate (in meters, positive downward) is required and must represent discrete vertical levels. The computation of potential density anomaly is integrated in this function, so users do not need to call the function compute_potential_density_anomaly separately. \n" \
-    "If the threshold is never exceeded below the reference depth, MLD is returned as NaN.",
+    description="Compute mixed layer depth from a density or temperature threshold.\n"
+        "The MLD is the depth at which potential density, or temperature, first departs from its value at "
+        "a near-surface reference depth by more than the threshold. The defaults are the de Boyer "
+        "Montegut criterion, which is what observational MLD climatologies use, so the two are directly "
+        "comparable. The crossing depth is interpolated between the bracketing levels rather than snapped "
+        "to one, because these vertical grids are coarse where mixed layers sit.\n"
+        "COMPARING WITH A MODEL'S OWN MLD OUTPUT: those are usually defined against the SURFACE rather "
+        "than a 10 m reference, so pass ref_depth equal to the model's shallowest level to compute the "
+        "same quantity; left at the default the difference is the definition's, not the model's.\n"
+        "ORDER OF OPERATIONS: the MLD of an averaged profile is not the average of the MLDs and is "
+        "systematically shallower, because averaging smooths the pycnocline away. Compute it step by step "
+        "and average the result; never average temperature and salinity first.",
     args={
-        "temp_data": "xr.DataArray, required. In-situ temperature in degrees Celsius. Must include a 'depth' coordinate and share identical dimensions with sal_data.",
-        "sal_data": "xr.DataArray, required. Practical salinity (PSS-78, unitless) with same dimensions as temp_data.",
-        "ref_depth": "float, optional. Reference depth in meters used to define near-surface properties. Default is 10.0 m.",
-        "method": "str, optional. Method for MLD calculation: 'density' (default), 'temperature', or 'both'.",
-        "density_threshold": "float, optional. Density difference threshold in kg/m³, used for method 'density'. Default is 0.03 kg/m³.",
-        "temp_threshold": "float, optional. Temperature difference threshold in °C, used for method 'temperature'. Default is 0.2 °C."
+        "temp_data": "xr.DataArray, required. Temperature in degrees Celsius with a 'depth' coordinate in "
+            "metres.",
+        "sal_data": "xr.DataArray, required. Practical salinity (PSS-78) on identical dimensions.",
+        "ref_depth": "float, optional, default 10.0. The near-surface reference depth in metres. Use the "
+            "field's shallowest level when matching a model's own surface-referenced output.",
+        "method": "str, optional, default 'density'. 'density' uses the density threshold, 'temperature' "
+            "the temperature threshold, 'both' takes whichever is shallower.",
+        "density_threshold": "float, optional, default 0.03. Density difference in kg/m3 defining the base "
+            "of the mixed layer.",
+        "temp_threshold": "float, optional, default 0.2. Temperature difference in degrees Celsius, for "
+            "the temperature criterion.",
+        "temperature_type": "str, optional, default 'auto'. Whether temp_data is in-situ or potential "
+            "temperature; 'auto' reads it from the metadata."
     },
-    returns="xr.DataArray. Mixed layer depth in meters, defined on all non-depth dimensions of the input. Values correspond to discrete depth levels."
+    returns="xr.DataArray of mixed layer depth in metres on all non-depth dimensions of the input, "
+        "interpolated between levels. Missing where the threshold is never reached — a column mixed all "
+        "the way down, or one with no data."
 )
-def compute_mixed_layer_depth(temp_data: xr.DataArray, sal_data: xr.DataArray, 
-                              ref_depth: float = 10.0, method: str = 'density', density_threshold: float = 0.03, temp_threshold: float = 0.2) -> xr.DataArray:
+def compute_mixed_layer_depth(temp_data: xr.DataArray, sal_data: xr.DataArray,
+                              ref_depth: float = 10.0, method: str = 'density',
+                              density_threshold: float = 0.03, temp_threshold: float = 0.2,
+                              temperature_type: str = "auto") -> xr.DataArray:
     if temp_data.dims != sal_data.dims:
         raise ValueError(f"Temperature and salinity must have same dimensions. "
                         f"Got temp: {temp_data.dims}, sal: {sal_data.dims}")
@@ -496,13 +894,24 @@ def compute_mixed_layer_depth(temp_data: xr.DataArray, sal_data: xr.DataArray,
     
     if method not in ['density', 'temperature', 'both']:
         raise ValueError(f"Method must be 'density', 'temperature', or 'both', got '{method}'")
-    
+    # The third positional parameter is ref_depth, not method, so a call written
+    # as compute_mixed_layer_depth(t, s, 'density') lands the method name here
+    # and would otherwise fail deep inside numpy with an unreadable dtype error.
+    if not isinstance(ref_depth, (int, float)) or isinstance(ref_depth, bool):
+        raise TypeError(
+            f"ref_depth must be a depth in metres, got {ref_depth!r}. Note the parameter order: "
+            f"compute_mixed_layer_depth(temp_data, sal_data, ref_depth, method, ...) — pass the criterion "
+            f"by keyword, as method='{ref_depth}', if that is what you meant."
+        )
+
     depth = temp_data['depth'].values
     if ref_depth < depth.min() or ref_depth > depth.max():
         raise ValueError(f"Reference depth {ref_depth}m is outside data depth range "
                         f"[{depth.min()}, {depth.max()}]m")
     
-    sigma_theta = compute_potential_density_anomaly(temp_data, sal_data, ref_pressure=0.0)
+    sigma_theta = compute_potential_density_anomaly(
+        temp_data, sal_data, ref_pressure=0.0, temperature_type=temperature_type
+    )
 
     ref_idx = np.argmin(np.abs(depth - ref_depth))
     actual_ref_depth = depth[ref_idx]
@@ -512,19 +921,13 @@ def compute_mixed_layer_depth(temp_data: xr.DataArray, sal_data: xr.DataArray,
 
     if method in ['density', 'both']:
         delta_sigma = sigma_theta - sigma_ref
-        mld_density = _find_threshold_depth(
-            delta_sigma, 
-            depth, 
-            threshold=density_threshold,
-            ref_depth=actual_ref_depth
+        mld_density = _first_crossing_depth(
+            delta_sigma, depth, threshold=density_threshold, ref_depth=actual_ref_depth
         )
     if method in ['temperature', 'both']:
         delta_temp = np.abs(temp_data - temp_ref)
-        mld_temperature = _find_threshold_depth(
-            delta_temp,
-            depth,
-            threshold=temp_threshold,
-            ref_depth=actual_ref_depth
+        mld_temperature = _first_crossing_depth(
+            delta_temp, depth, threshold=temp_threshold, ref_depth=actual_ref_depth
         )
     
     if method == 'density':
@@ -534,7 +937,6 @@ def compute_mixed_layer_depth(temp_data: xr.DataArray, sal_data: xr.DataArray,
         mld = mld_temperature
         method_description = f'Temperature threshold: ΔT = {temp_threshold} °C'
     else:  # both
-        # Take minimum (shallowest) MLD from both criteria
         mld = xr.where(
             np.isnan(mld_density), 
             mld_temperature,
@@ -558,21 +960,29 @@ def compute_mixed_layer_depth(temp_data: xr.DataArray, sal_data: xr.DataArray,
             'method': method_description
         }
     )
-    
-    return mld_data
+
+    return carry_provenance(mld_data, temp_data)
 
 
 @register_tools(
     name="compute_nutricline_depth",
-    description="Compute nutricline depth as the depth of the maximum positive vertical gradient of nutrient concentration. If the maximum gradient is non-positive or cannot be determined, the nutricline depth is returned as NaN. \n"
-    "Input must be an xr.DataArray with a 'depth' dimension representing vertical levels in meters. The computation of vertical gradients is integrated in this function, so users do not need to call the function compute_vertical_gradient separately. ",
+    description="Find the nutricline: the depth at which nutrient concentration increases most steeply "
+        "with depth.\n"
+        "It is the depth of the maximum vertical gradient, computed across each layer's own bounds so an "
+        "uneven vertical grid is handled correctly. Where the profile is smooth — in the subtropical gyres "
+        "especially — the position of the maximum can jump between levels, so read a nutricline map "
+        "together with the gradient itself rather than alone.\n"
+        "Restrict the search with min_depth and max_depth when only a particular part of the water column "
+        "is of interest.",
     args={
-        "data": "xr.DataArray, required. Input nutrient concentration data with 'depth' dimension. May include additional dimensions such as time, lat, and lon. ",
-        "min_depth": "float, optional. Minimum depth (m) for nutricline detection. Default is 0.",
-        "max_depth": "float, optional. Maximum depth (m) for nutricline detection. Default is None (search all depths)."
+        "data": "xr.DataArray, required. Nutrient concentration with a 'depth' dimension, plus any other "
+            "dimensions.",
+        "min_depth": "float, optional, default 0. Ignore levels shallower than this when looking for the "
+            "maximum gradient.",
+        "max_depth": "float, optional, default None (every level). Ignore levels deeper than this."
     },
-    returns="xr.DataArray. Nutricline depth with same dimensions as input except 'depth' is removed. "
-            "Values correspond to discrete depth levels. Units are meters. NaN where gradient is not positive or nutricline cannot be determined."
+    returns="xr.DataArray of nutricline depth in metres on the input's dimensions with 'depth' removed. "
+        "Missing where the gradient is never positive or the column has no data."
 )
 def compute_nutricline_depth(data: xr.DataArray, min_depth: float = 0.0, max_depth: float = None) -> xr.DataArray:
     if 'depth' not in data.dims:
@@ -589,7 +999,6 @@ def compute_nutricline_depth(data: xr.DataArray, min_depth: float = 0.0, max_dep
 
     gradient_masked = gradient.copy()
     if not depth_mask.all():
-        # Create indexing for all dimensions
         mask_full = xr.DataArray(
             depth_mask,
             coords={'depth': gradient['depth']},
@@ -597,12 +1006,14 @@ def compute_nutricline_depth(data: xr.DataArray, min_depth: float = 0.0, max_dep
         )
         gradient_masked = gradient_masked.where(mask_full, np.nan)
 
-    max_idx = gradient_masked.argmax(dim='depth', skipna=True)
-    nutricline_depth = gradient['depth'].isel(depth=max_idx)
-    
-    # Set NaN where gradient is not positive or all NaN
-    max_gradient = gradient_masked.max(dim='depth', skipna=True)
+    # argmax raises on an all-NaN profile, and over any ocean field most columns
+    # are land, so the land columns are filled before the search and masked out
+    # again afterwards.
     all_nan = gradient_masked.isnull().all(dim='depth')
+    max_idx = gradient_masked.fillna(-np.inf).argmax(dim='depth')
+    nutricline_depth = gradient['depth'].isel(depth=max_idx)
+
+    max_gradient = gradient_masked.max(dim='depth', skipna=True)
     nutricline_depth = nutricline_depth.where(
         (max_gradient > 0) & (~all_nan),
         np.nan
@@ -610,169 +1021,328 @@ def compute_nutricline_depth(data: xr.DataArray, min_depth: float = 0.0, max_dep
     
     nutricline_depth.attrs = {
         'long_name': f'Nutricline depth ({data.name or "nutrient"})',
-        'standard_name': 'nutricline_depth',
-        'units': 'meters',
+        # No CF standard name exists for the nutricline, so none is claimed;
+        # 'ocean_mixed_layer_thickness' on the MLD below is a real one.
+        'units': 'm',
         'description': 'Depth of maximum vertical gradient in nutrient concentration',
         'method': 'maximum_gradient',
         'positive': 'down',
         'source_variable': data.name or 'unknown'
     }
     nutricline_depth.name = f'{data.name}_nutricline_depth' if data.name else 'nutricline_depth'
-    
-    return nutricline_depth
+
+    # Selecting from the depth coordinate builds the answer out of that
+    # coordinate, so it arrives carrying 'depth' (now meaningless: the values ARE
+    # the depths) and without the horizontal coordinates it was indexed by. The
+    # 2-D lat/lon of a curvilinear model are lost that way, and with them any
+    # chance of regridding or plotting the result.
+    nutricline_depth = nutricline_depth.drop_vars('depth', errors='ignore')
+    nutricline_depth = nutricline_depth.assign_coords({
+        name: coord for name, coord in data.coords.items()
+        if name != 'depth' and set(coord.dims).issubset(set(nutricline_depth.dims))
+    })
+
+    return carry_provenance(nutricline_depth, data)
+
+
+def _on_woa_grid(data: xr.DataArray) -> bool:
+    """Whether a field sits on the WOA23 1-degree cell centres (x.5 spacing)."""
+    if data.attrs.get("grid_type") == "curvilinear":
+        return False
+    if "lat" not in data.coords or "lon" not in data.coords:
+        return False
+    lat, lon = np.atleast_1d(data["lat"].values), np.atleast_1d(data["lon"].values)
+    return bool(
+        np.allclose(np.abs(lat % 1), 0.5, atol=1e-3) and np.allclose(np.abs(lon % 1), 0.5, atol=1e-3)
+    )
+
+
+def _select_region(data: xr.DataArray, lat_min, lat_max, lon_min, lon_max) -> xr.DataArray:
+    """
+    Cut a lat/lon box out of a field, including one that crosses the dateline.
+
+    Masking and dropping the empty rows, rather than slicing and concatenating,
+    keeps the longitude axis in the -180~180 convention and strictly ascending.
+    A concatenated Nino4 box would otherwise run 160..180, -180..-150, which is
+    non-monotonic, so nothing could be selected from it afterwards and the cell
+    areas could not be matched to it.
+
+    The curvilinear models are handled by the same mask. Their lat/lon are 2-D
+    fields over index dimensions, so the box picks out a ragged set of cells
+    rather than a rectangle; dropping the index rows and columns it never
+    touches trims the array to the box's bounding block and leaves the cells
+    outside the box as NaN, which is what an area-weighted mean over it needs —
+    the weights are masked by the field itself. This keeps a regional index on
+    the model's OWN grid and its own areacello, with no interpolation in the way.
+    """
+    curvilinear = data.attrs.get("grid_type") == "curvilinear"
+    lat_name = data.attrs.get("lat_coord", "lat") if curvilinear else "lat"
+    lon_name = data.attrs.get("lon_coord", "lon") if curvilinear else "lon"
+    for name in (lat_name, lon_name):
+        if name not in data.coords:
+            raise ValueError(
+                f"This field has no '{name}' coordinate, so a latitude/longitude box cannot be cut out of "
+                f"it. Load it with load_regular_data, load_climatology_data or open_cmip6."
+            )
+
+    in_lat = (data[lat_name] >= lat_min) & (data[lat_name] <= lat_max)
+    if lon_max < lon_min:                      # crosses the dateline, e.g. Nino4
+        in_lon = (data[lon_name] >= lon_min) | (data[lon_name] <= lon_max)
+    else:
+        in_lon = (data[lon_name] >= lon_min) & (data[lon_name] <= lon_max)
+    # The models' 2-D lat/lon arrive chunked, and xarray cannot drop rows with a
+    # lazy boolean mask because the resulting shape is not known until it is
+    # computed. The mask is one horizontal slice, so computing it here is cheap.
+    mask = in_lat & in_lon
+    if hasattr(mask.data, "compute"):
+        mask = mask.compute()
+    region = data.where(mask, drop=True)
+
+    if curvilinear:
+        y_dim, x_dim = data.attrs.get("y_dim"), data.attrs.get("x_dim")
+        if region.sizes.get(y_dim, 0) == 0 or region.sizes.get(x_dim, 0) == 0:
+            raise ValueError(
+                f"The box lat [{lat_min}, {lat_max}], lon [{lon_min}, {lon_max}] selects no cells from "
+                f"{data.attrs.get('model', 'this model')}'s grid."
+            )
+        return region
+
+    if region.sizes.get("lat", 0) == 0 or region.sizes.get("lon", 0) == 0:
+        raise ValueError(
+            f"The box lat [{lat_min}, {lat_max}], lon [{lon_min}, {lon_max}] selects no cells from this "
+            f"field, which covers lat [{float(data.lat.min())}, {float(data.lat.max())}] and lon "
+            f"[{float(data.lon.min())}, {float(data.lon.max())}]."
+        )
+    return region
 
 
 @register_tools(
     name="compute_enso_nino_index",
-    description=" Compute ENSO Niño index as an area-weighted mean temperature anomaly over a specified Niño region. \n"
-    "To implement this function, first load monthly temperature data with load_regular_data. The computation of temperature anomalies is integrated in this function, so users do not need to call the function compute_anomaly separately. To ensure spatial alignment with WOA23 climatology, the input data must retain the original WOA-compatible depth, latitude, and longitude coordinates: spatial subsetting is allowed, but spatial aggregation or resampling (e.g., interpolation, regridding, averaging) is not permitted. \n"
-    "If a 'depth' dimension exists, anomalies are averaged over depths shallower than depth_level. If no depth dimension exists, data are treated as surface values. ",
+    description="Compute an ENSO Nino index: the area-weighted sea surface temperature anomaly over one of "
+        "the Nino regions, as a monthly series.\n"
+        "Use it to derive the index from a gridded field, which is what a model needs, or to reproduce the "
+        "calculation from an observational product. Where an official observed index is already available "
+        "as a series, there is nothing to compute.\n"
+        "Any grid is accepted, curvilinear included: the region is cut out with a mask and averaged with "
+        "the field's own cell areas, so do not regrid first.\n"
+        "The baseline matters. An index built on one baseline period differs from one built on another by "
+        "a constant offset, even when the variability matches month for month; set base_period to the "
+        "baseline of whatever series it will be compared against.",
     args={
-        "data": "xr.DataArray, required. Temperature data with dimensions including 'time', 'lat', and 'lon'. May optionally include a 'depth' dimension. Units should be degrees Celsius.",
-        "nino_region": "str, optional. Niño region to compute the index for. Choose from 'nino1+2', 'nino3', 'nino3.4', 'nino4'. Default is 'nino3.4'.",
-        "depth_level": "float, optional. Upper-ocean depth (m) over which temperature anomalies are vertically averaged when a depth dimension is present. Default is 10 (surface). ",
-        "anomaly_freq": "str, optional. Temporal frequency used to compute the climatology for anomaly calculation. Choose from 'month', 'season', 'year'. Default is 'month'."
+        "data": "xr.DataArray, required. Temperature with 'time' and horizontal dimensions, optionally "
+            "'depth', in degrees Celsius, on its original grid. Pass the global field, or one already "
+            "subset to a box containing the region.",
+        "nino_region": "str, optional, default 'nino3.4'. 'nino1+2', 'nino3', 'nino3.4' or 'nino4'. "
+            "Nino3.4 is the standard choice for ENSO monitoring.",
+        "depth_level": "float, optional, default 10. When the field has a depth dimension, anomalies are "
+            "averaged over levels shallower than this.",
+        "anomaly_freq": "str, optional, default 'month'. Which climatology each step is matched against: "
+            "'month' (the usual choice, removing the seasonal cycle), 'season' or 'year'.",
+        "climatology": "str, optional, default 'auto'. 'auto' uses the observed climatology where the "
+            "field is on its grid and the field's own elsewhere; 'woa23' forces the observed one and fails "
+            "if the grid does not match; 'self' always removes the field's own.",
+        "base_period": "list[str, str], optional. The baseline window for the field's own climatology, as "
+            "['start', 'end']. Passing it forces the self-climatology, since observed climate normals are "
+            "fixed periods. Default None: the whole record loaded is the baseline."
     },
-    returns="xr.DataArray. Time series of Niño index (temperature anomaly in °C) with a 'time' dimension for the specified region."
+    returns="xr.DataArray, a monthly series of the index in degrees Celsius with a single 'time' "
+        "dimension. attrs record the region box, the climatology used and its baseline, which must be "
+        "stated when the values are compared with a published series."
 )
-def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", depth_level: float = 10.0, anomaly_freq: str = "month") -> xr.DataArray:
-    # (lat_min, lat_max, lon_min, lon_max)
+def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", depth_level: float = 10.0,
+                            anomaly_freq: str = "month", climatology: str = "auto",
+                            base_period: list = None) -> xr.DataArray:
+    # (lat_min, lat_max, lon_min, lon_max), matching the boxes in configs/datasets.yaml
     nino_regions = {
         "nino1+2": (-10, 0, -90, -80),
         "nino3": (-5, 5, -150, -90),
         "nino3.4": (-5, 5, -170, -120),
-        "nino4": (-5, 5, 160, -150)  # crosses dateline
+        "nino4": (-5, 5, 160, -150),   # crosses the dateline
     }
-
     if nino_region not in nino_regions:
         raise ValueError(f"nino_region must be one of {list(nino_regions.keys())}, got '{nino_region}'")
+    if climatology not in ("auto", "woa23", "self"):
+        raise ValueError(f"climatology must be 'auto', 'woa23' or 'self', got '{climatology}'")
+    if "time" not in data.dims:
+        raise ValueError("An ENSO index needs a time series; this field has no 'time' dimension.")
+
+    if base_period is not None and climatology == "woa23":
+        raise ValueError(
+            "base_period sets the window for the field's OWN climatology; WOA23's climate normals are "
+            "fixed periods chosen with the 'period' of the WOA23 tools. Use climatology='self' (or leave "
+            "it at 'auto') to build the index on your own baseline."
+        )
 
     lat_min, lat_max, lon_min, lon_max = nino_regions[nino_region]
-    if lon_max < lon_min:  # Crosses dateline (e.g., Niño 4: 160 to -150)
-        data_region1 = data.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, 180))
-        data_region2 = data.sel(lat=slice(lat_min, lat_max), lon=slice(-180, lon_max))
-        data_region = xr.concat([data_region1, data_region2], dim='lon')
-    else:
-        data_region = data.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
-    
-    anomaly = compute_anomaly(data=data_region, var="temp", freq=anomaly_freq, method="subtract")
+    data_region = _select_region(data, lat_min, lat_max, lon_min, lon_max)
 
-    if 'depth' in anomaly.dims:
-        anomaly_surface = anomaly.sel(depth=slice(0, depth_level))
-        # Average over depth dimension
-        anomaly_surface = anomaly_surface.mean(dim='depth', skipna=True)
+    use_woa = (climatology == "woa23") or (
+        climatology == "auto" and base_period is None and _on_woa_grid(data)
+    )
+    if use_woa:
+        anomaly = compute_anomaly_vs_woa23(data=data_region, var="temp", freq=anomaly_freq,
+                                          method="subtract")
+        baseline = anomaly.attrs.get("climatology_reference", "WOA23")
     else:
-        anomaly_surface = anomaly
-    
-    nino_index = compute_basic_stat(data=anomaly_surface, op="area_weighted_mean", dim=["lat", "lon"])
+        if climatology == "woa23":
+            raise ValueError(
+                "climatology='woa23' needs the field to be on the WOA23 1-degree grid, and this one is not "
+                "(ERSSTv5 is 2-degree). Use climatology='self' to remove the field's own climatology."
+            )
+        anomaly = compute_anomaly_vs_own_climatology(
+            data_region, freq=anomaly_freq, base_period=base_period, method="subtract"
+        )
+        baseline = anomaly.attrs.get("climatology_reference", "the field's own climatology")
+
+    if "depth" in anomaly.dims:
+        # Weighted by layer thickness: WOA23's top levels are 2.5 and 5 m thick,
+        # so averaging them with equal weight tilts the index towards the surface.
+        anomaly = depth_average(anomaly, depth_level)
+
+    nino_index = compute_basic_stat(data=anomaly, op="area_weighted_mean", dim=["lat", "lon"])
 
     nino_index.attrs = {
-        'long_name': f'{nino_region.upper()} Index',
-        'units': '°C',
-        'description': f'Area-weighted sea surface temperature anomaly for {nino_region.upper()} region',
-        'region_bounds': f'lat: [{lat_min}, {lat_max}], lon: [{lon_min}, {lon_max}]',
-        'depth_range': f'0-{depth_level}m averaged',
-        'anomaly_frequency': anomaly_freq,
-        'anomaly_method': 'subtract',
-        'weighting': 'area weighting',
-        'reference': 'WOA23 climatology'
+        "long_name": f"{nino_region.upper()} Index",
+        "units": "degC",
+        "description": f"Area-weighted SST anomaly over the {nino_region.upper()} region",
+        "region_bounds": f"lat: [{lat_min}, {lat_max}], lon: [{lon_min}, {lon_max}]",
+        "depth_range": f"0-{depth_level} m averaged" if "depth" in data.dims else "surface",
+        "anomaly_frequency": anomaly_freq,
+        "anomaly_method": "subtract",
+        "weighting": "area weighted on the dataset's own grid",
+        "climatology_baseline": baseline,
     }
     nino_index.name = f"{nino_region}_index"
-    
     return nino_index
 
 
 @register_tools(
     name="compute_pdo_index",
-    description="Compute Pacific Decadal Oscillation (PDO) index from sea surface temperature data using Empirical Orthogonal Function (EOF) analysis. \n"
-    "PDO is defined as the leading principal component of North Pacific SST anomalies (poleward of 20°N). The SST anomalies are computed by removing the global mean SST to isolate regional patterns and temperal trends. \n"
-    "To implement this function, first load monthly temperature data with load_regular_data. The computation of temperature anomalies is integrated in this function, so users do not need to call the function compute_anomaly separately. To ensure spatial alignment with WOA23 climatology, the input data must retain the original WOA-compatible depth, latitude, and longitude coordinates: spatial subsetting is allowed, but spatial aggregation or resampling (e.g., interpolation, regridding, averaging) is not permitted. \n",
+    description="Compute the Pacific Decadal Oscillation index: the leading EOF of North Pacific sea "
+        "surface temperature anomalies.\n"
+        "The global mean anomaly is removed first, so the index measures the North Pacific pattern rather "
+        "than global warming, and cells are weighted by the square root of their area so the EOF is taken "
+        "on a field whose variance is area-proportional.\n"
+        "The sign of an EOF is arbitrary, so it is fixed by the convention that the positive phase is cool "
+        "in the central and western North Pacific. Both the pattern and the index follow it, which makes a "
+        "negative correlation between two patterns a real disagreement rather than an arbitrary flip.\n"
+        "The EOF is taken over a rectangular latitude-longitude block, so a field on a curvilinear grid "
+        "must be regridded first.",
     args={
-        "data": "xr.DataArray, required. Temperature data with dimensions including 'time', 'lat', and 'lon'. May optionally include a 'depth' dimension. Units should be degrees Celsius. "
-                    "Must cover at least the North Pacific region (20°N-70°N, 110°E-100°W). ",
-        "depth_level": "float, optional. Average across depth levels (in meters) that are shallower than depth_level in the data. Default is 10 (surface). ",
-        "standardize": "bool, optional. Whether to standardize the PDO index to zero mean and unit variance. Default is True."
+        "data": "xr.DataArray, required. Temperature with 'time' and regular 'lat'/'lon' dimensions, "
+            "optionally 'depth', in degrees Celsius.",
+        "depth_level": "float, optional, default 10. When the field has a depth dimension, levels "
+            "shallower than this are averaged first.",
+        "standardize": "bool, optional, default True. Scale the index to zero mean and unit variance, "
+            "which is how it is normally published."
     },
-    returns="tuple[xr.DataArray, xr.DataArray, float]. Returns (pdo_index, eof_pattern, explained_variance) where: "
-            "pdo_index is 1D time series of PDO values, eof_pattern is 2D spatial pattern (lat, lon) of the first EOF, and explained_variance is the percentage of variance explained by the first EOF."
+    returns="tuple (pdo_index, eof_pattern, explained_variance):\n"
+        "- pdo_index: the leading principal component as a monthly series.\n"
+        "- eof_pattern: its spatial pattern, carrying the grid it was computed on, so two patterns can be "
+        "compared with an area-weighted correlation — worth doing, since the domain reaches high latitudes "
+        "where cells are much smaller.\n"
+        "- explained_variance: the percentage of variance the mode accounts for."
 )
 def compute_pdo_index(data: xr.DataArray, depth_level: float = 10.0, standardize: bool = True) -> tuple[xr.DataArray, xr.DataArray, float]:
-    # Extract surface temperature
+    if "time" not in data.dims:
+        raise ValueError("A PDO index needs a time series; this field has no 'time' dimension.")
+    # The EOF is taken on a rectangular lat/lon block and the pattern comes back
+    # as a map on those axes, neither of which a curvilinear model's index
+    # dimensions provide. An area-weighted regional mean tolerates a ragged set
+    # of cells; an EOF does not.
+    if data.attrs.get("grid_type") == "curvilinear":
+        raise ValueError(
+            f"{data.attrs.get('model', 'This model')} is on a curvilinear grid, and the PDO is defined as "
+            f"an EOF over a North Pacific lat/lon block, which its index dimensions cannot describe. Put "
+            f"the field on a regular grid first with regrid_horizontal, then compute the index."
+        )
+
+    # A surface field (ERSSTv5 'sst', CMIP6 'tos') has no depth dimension at all,
+    # so it is used as it stands rather than being averaged over one.
     if 'depth' in data.dims:
-        sst_data = data.sel(depth=slice(0, depth_level))
-        sst_data = sst_data.mean(dim='depth', skipna=True)
-    
-    # Subset to North Pacific region (20°N-70°N, 110°E-100°W)
-    pacific_east = sst_data.sel(lat=slice(20, 70), lon=slice(110, 180))
-    pacific_west = sst_data.sel(lat=slice(20, 70), lon=slice(-180, -100))
-    north_pacific = xr.concat([pacific_east, pacific_west], dim='lon')
-    
-    if len(north_pacific.time) == 0 or len(north_pacific.lat) == 0 or len(north_pacific.lon) == 0:
-        raise ValueError("No data in North Pacific region (20°N-70°N, 110°E-260°E)")
-    
-    # Remove global mean SST
-    global_mean = compute_basic_stat(sst_data, op='area_weighted_mean', dim=['lat', 'lon'])
+        sst_data = depth_average(data, depth_level)
+    else:
+        sst_data = data
+
+    # The PDO is defined on monthly ANOMALIES. Removing only the time mean, as an
+    # EOF of raw SST, leaves the seasonal cycle as by far the largest mode: it
+    # then comes out as the leading EOF with over 90 percent of the variance and
+    # the result is a seasonal cycle, not the PDO.
+    sst_anomaly = compute_anomaly_vs_own_climatology(sst_data, freq="month", method="subtract")
+
+    # North Pacific, 20N-70N, 110E-100W: a box that crosses the dateline.
+    north_pacific = _select_region(sst_anomaly, 20, 70, 110, -100)
+
+    # The PDO is defined on SST anomalies with the global mean removed, so that
+    # it measures the North Pacific pattern rather than the global warming signal.
+    global_mean = compute_basic_stat(sst_anomaly, op='area_weighted_mean', dim=['lat', 'lon'])
     north_pacific = north_pacific - global_mean
-    
-    # Get grid cell areas for North Pacific region
-    lat_range = [float(north_pacific.lat.min()), float(north_pacific.lat.max())]
-    lon_range = [float(north_pacific.lon.min()), float(north_pacific.lon.max())]
-    areas = load_areas(lat_range, lon_range)
-    areas = areas.sel(lat=north_pacific.lat, lon=north_pacific.lon, method="nearest")
-    
-    # Apply area weighting (square root for proper EOF analysis)
-    weights = np.sqrt(areas.values)
-    weighted_data = north_pacific * weights
-    
-    # Remove time mean to get anomalies
-    weighted_anomalies = weighted_data - weighted_data.mean(dim='time')
-    
-    # Reshape data to (time, space) for EOF analysis
-    n_times = len(weighted_anomalies.time)
-    n_lat = len(weighted_anomalies.lat)
-    n_lon = len(weighted_anomalies.lon)
-    data_matrix = weighted_anomalies.values.reshape(n_times, n_lat * n_lon)
-    
-    # Remove any spatial points that are all NaN
-    valid_points = ~np.isnan(data_matrix).all(axis=0)
-    data_matrix_clean = data_matrix[:, valid_points]
-    
-    # Fill any remaining NaNs with 0 for PCA
-    data_matrix_clean = np.nan_to_num(data_matrix_clean, nan=0.0)
-    
-    # Perform EOF analysis using PCA
+    north_pacific.attrs = dict(sst_anomaly.attrs)
+
+    # Cells shrink towards the pole, and this box reaches 70N, so each cell is
+    # weighted by the square root of its area: the EOF is then computed on a
+    # field whose variance is area-proportional.
+    areas = areas_like(north_pacific)
+    weights = np.sqrt(areas)
+    weighted_anomalies = north_pacific * weights
+    weighted_anomalies = weighted_anomalies - weighted_anomalies.mean(dim='time')
+
+    n_times = weighted_anomalies.sizes['time']
+    n_lat = weighted_anomalies.sizes['lat']
+    n_lon = weighted_anomalies.sizes['lon']
+    data_matrix = weighted_anomalies.transpose('time', 'lat', 'lon').values.reshape(n_times, n_lat * n_lon)
+
+    # Land columns are dropped rather than zero-filled, so they cannot dilute the
+    # leading mode; any remaining gap in an ocean column is filled with zero,
+    # which is the mean of an anomaly field.
+    valid_points = ~np.isnan(data_matrix).any(axis=0)
+    if valid_points.sum() < 2:
+        raise ValueError(
+            "Fewer than two North Pacific cells have a complete time series, so no EOF can be computed. "
+            "Check that the field covers 20N-70N, 110E-100W over the whole period."
+        )
+    data_matrix_clean = np.nan_to_num(data_matrix[:, valid_points], nan=0.0)
+
     pca = PCA(n_components=1)
     pdo_index_values = pca.fit_transform(data_matrix_clean).flatten()
-    
-    # Get EOF pattern
+
     eof_pattern_1d = np.full(n_lat * n_lon, np.nan)
     eof_pattern_1d[valid_points] = pca.components_[0, :]
     eof_pattern_2d = eof_pattern_1d.reshape(n_lat, n_lon)
-    
-    # Unweight the EOF pattern for interpretation
-    valid_mask = ~np.isnan(weights.values)
-    eof_pattern_2d[valid_mask] = eof_pattern_2d[valid_mask] / weights.values[valid_mask]
-    
-    # Explained variance
+
+    # Undo the area weighting so the pattern is in the units of the field itself.
+    weight_values = weights.transpose('lat', 'lon').values
+    with np.errstate(invalid='ignore', divide='ignore'):
+        eof_pattern_2d = eof_pattern_2d / weight_values
+
     explained_var = float(pca.explained_variance_ratio_[0] * 100)
-    
+
+    # The sign of an EOF is arbitrary, so it is fixed by the convention that the
+    # PDO's positive phase is cool in the central/western North Pacific: the
+    # pattern is flipped if the region west of the dateline is not negative.
+    western = eof_pattern_2d[:, (north_pacific.lon.values >= 150) | (north_pacific.lon.values <= -170)]
+    if np.nanmean(western) > 0:
+        eof_pattern_2d = -eof_pattern_2d
+        pdo_index_values = -pdo_index_values
+
     if standardize:
         pdo_index_values = (pdo_index_values - np.nanmean(pdo_index_values)) / np.nanstd(pdo_index_values)
-    
+
     pdo_index = xr.DataArray(
         pdo_index_values,
         coords={'time': north_pacific.time},
         dims=['time'],
         attrs={
             'long_name': 'Pacific Decadal Oscillation Index',
-            'description': 'Leading principal component of North Pacific SST anomalies (20°N-70°N)',
+            'description': 'Leading principal component of North Pacific SST anomalies (20N-70N)',
             'units': 'standardized' if standardize else 'dimensionless',
-            'method': 'EOF analysis of area-weighted SST anomalies',
-            'region': 'North Pacific (20°N-70°N, 110°E-100°W)',
-            'standardized': standardize
+            'method': 'EOF of area-weighted monthly SST anomalies with the global mean anomaly removed',
+            'region': 'North Pacific (20N-70N, 110E-100W)',
+            'standardized': standardize,
+            'sign_convention': 'positive phase is cool in the central and western North Pacific',
         }
     )
-    
+
     eof_pattern = xr.DataArray(
         eof_pattern_2d,
         coords={'lat': north_pacific.lat, 'lon': north_pacific.lon},
@@ -781,8 +1351,15 @@ def compute_pdo_index(data: xr.DataArray, depth_level: float = 10.0, standardize
             'long_name': 'First EOF pattern of North Pacific SST',
             'description': 'Spatial pattern of the leading mode of SST variability',
             'units': 'dimensionless',
-            'explained_variance_percent': explained_var
+            'explained_variance_percent': explained_var,
+            'sign_convention': 'positive phase is cool in the central and western North Pacific',
         }
     )
-    
+
+    # The pattern is a map on the grid the SST came from, so it keeps that grid's
+    # identity: without it the cell areas cannot be found, and comparing two
+    # models' patterns is exactly what needs an AREA-WEIGHTED correlation — the
+    # domain reaches 70N, where a cell covers a third of a tropical one.
+    eof_pattern = carry_provenance(eof_pattern, north_pacific)
+
     return pdo_index, eof_pattern, explained_var

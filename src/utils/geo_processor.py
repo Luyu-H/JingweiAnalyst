@@ -80,7 +80,6 @@ def fix_longitudes_and_split(gdf):
         if geometry.is_empty:
             return geometry
         
-        # Handle different geometry types
         if isinstance(geometry, (MultiPolygon, MultiLineString, MultiPoint)):
             list_of_parts = []
             for part in geometry.geoms:
@@ -123,7 +122,6 @@ def fix_longitudes_and_split(gdf):
         else:
             raise ValueError(f"Unsupported geometry type: {type(geometry)}")
     
-    # Apply conversion to all geometries
     result_gdf['geometry'] = result_gdf['geometry'].apply(split_geometry)
     return result_gdf
 
@@ -152,7 +150,6 @@ def build_grid_polygons(latitudes, longitudes):
     num_long = len(longitudes)
     for j in range(num_long-1):
         for i in range(0, num_lat-1):
-            # Create a polygon for each cell
             polygon = Polygon([(longitudes[j], latitudes[i]), 
                                (longitudes[j], latitudes[i + 1]), 
                                (longitudes[j+1], latitudes[i + 1]), 
@@ -190,15 +187,12 @@ def get_intersection_areas(gdf: gpd.GeoDataFrame, grid_polygons: List[shapely.Po
                     
         obj_polygon = obj['geometry'].buffer(0)
 
-        # Initialize list to store areas of intersection with grid cells for this state
         areas = []
         for idx, cell_polygon in enumerate(grid_polygons):
             intersection = obj_polygon.intersection(cell_polygon)
-            # Append the area if there's an intersection
             areas.append(intersection.area * grid_areas[idx] if not intersection.is_empty else 0)
         
         areas = np.array(areas)
-        # Store in dictionary with state name as key
         intersection_areas[obj_name] = areas.reshape(num_lons, num_lats)
     return intersection_areas
 
@@ -214,13 +208,11 @@ def calculate_grid_area(lat_min, lat_max, lon_min, lon_max, radius=1):
     Returns:
         - Area in square kilometers
     """
-    # Convert degrees to radians
     lat_min = math.radians(lat_min)
     lat_max = math.radians(lat_max)
     lon_min = math.radians(lon_min)
     lon_max = math.radians(lon_max)
     
-    # Calculate area using formula
     area = radius**2 * abs(math.sin(lat_max) - math.sin(lat_min)) * abs(lon_max - lon_min)
     
     return area
@@ -265,7 +257,6 @@ def load_and_preprocess_ne_df(natural_earth_path: str,
     elif geofeature == 'state':
         gdf = gpd.read_file(os.path.join(natural_earth_path, '10m_cultural', 'ne_10m_admin_1_states_provinces.shp'))
         remove_list = EXCLUDE_STATES
-        # map state names to country names
         gdf['admin'] = gdf['admin'].replace(DIFF_STATE_ADMIN_TO_COUNTRY_ADMIN)
     elif geofeature == 'continent':
         gdf = gpd.read_file(os.path.join(natural_earth_path, '10m_cultural', 'ne_10m_admin_0_countries.shp'))
@@ -297,7 +288,6 @@ def build_caches(latitudes: np.ndarray, longitudes: np.ndarray, save_dir: str, n
     grid_polygons, grid_areas = build_grid_polygons(latitudes=latitudes,
                                                 longitudes=longitudes)
     
-    # Build caches for the various geospatial datasets
     for geofeature in ['country', 'state', 'continent', 'water_body']:
         area_cache_path = os.path.join(save_dir, f"area_cache_{geofeature}_{resolution}.npz")
         if os.path.exists(area_cache_path):
@@ -305,14 +295,10 @@ def build_caches(latitudes: np.ndarray, longitudes: np.ndarray, save_dir: str, n
                 f"Using existing cache for {geofeature} in {save_dir}")
             continue
         
-        # build the cache
 
-        # Load shapefile containing boundaries
         gdf = load_and_preprocess_ne_df(natural_earth_path, geofeature)
-        # Get name column
         name_col = get_name_col(geofeature)
         
-        # Adjust longitudes in geometries
         gdf = fix_longitudes_and_split(gdf)
 
         include_admin = (geofeature == 'state')
@@ -325,7 +311,6 @@ def build_caches(latitudes: np.ndarray, longitudes: np.ndarray, save_dir: str, n
                                                     num_lats=num_lats,
                                                     num_lons=num_lons, 
                                                     include_admin=include_admin)
-        # Save cache
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         np.savez(os.path.join(save_dir, f"area_cache_{geofeature}_{resolution}.npz"), **intersection_areas)

@@ -160,7 +160,6 @@ recon_data = {
     "geospatial_vertical_units": "meters"
 }
 
-# cursor.execute(sql_insert_observation_metadata, obs_data)
 cursor.execute(sql_insert_reconstruction_metadata, recon_data)
 conn.commit()
 

@@ -139,8 +139,5 @@ CREATE TABLE IF NOT EXISTS recon_o2_sjtu_jingwei_v1_2 (
 if __name__ == "__main__":
     conn = create_connection()
     if conn:
-        # execute_sql(conn, sql_create_observation_metadata)
-        # execute_sql(conn, sql_create_observation)
-        # execute_sql(conn, sql_create_reconstruction_metadata)
         execute_sql(conn, sql_create_reconstruction)
         conn.close()
