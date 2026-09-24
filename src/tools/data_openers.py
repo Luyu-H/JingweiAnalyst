@@ -1,4 +1,9 @@
-# tools: open_cmip6, open_woa23, open_glodap, open_seanoe_mld, open_ersst, open_cpc_index
+# Internal readers: open_cmip6, open_woa23, open_glodap, open_seanoe_mld, open_ersst,
+# open_cpc_index. None of them is registered in src/tools/registry, so none is in the
+# agent's namespace: every one is reachable through a load_* tool in data_loader.py, which
+# is the only entry point the agent has. Registering them too would offer the planning step
+# a second, shorter-looking route that skips the subsetting and the dataset-kind checks the
+# loaders do.
 #
 # One opener per data source, each doing a single job: read the raw files
 # correctly and normalise them.
@@ -25,7 +30,6 @@ import pandas as pd
 import xarray as xr
 import yaml
 
-from src.tools.registry import register_tools
 
 
 CONFIG_PATH = os.path.normpath(
@@ -148,7 +152,8 @@ def list_datasets() -> list:
             span = cfg.get("time", {}).get("range")
             if span:
                 parts.append(f"Monthly, {span[0]} to {span[1]}.")
-            parts.append("Variables differ by model; open_cmip6 lists what is present.")
+            parts.append("Variables differ by model; a variable a model does not publish "
+                         "is reported as missing when it is loaded.")
         elif "variables" in cfg:
             parts.append(f"Variables: {', '.join(sorted(available_variables(cfg)))}.")
         elif "products" in cfg:
@@ -322,9 +327,21 @@ def fix_unit_attribute(obj):
 PROVENANCE_ATTRS = (
     "source_dataset", "model", "experiment", "variant_label", "grid_type",
     "y_dim", "x_dim", "lat_coord", "lon_coord",
+    "cmip6_variable", "grid_point", "vector_component",
     "woa_variable", "woa_time_slice", "woa_period",
     "region", "region_geofeature",
 )
+
+# The horizontal vector components the CMIP6 archive holds, and which grid axis
+# each runs along. Their CMOR standard names are sea_water_x/y_velocity and
+# ocean_mass_x/y_transport: x-ward and y-ward along the model's own grid lines,
+# which on the displaced-pole (CESM2) and bipolar (MPI-ESM1-2-LR) grids are not
+# east and north. They also sit on the velocity points of a staggered grid, not
+# on the tracer points areacello and the tracer masks describe; checked on the
+# local files, CESM2's u/v points are offset by a median 0.22 deg in latitude and
+# 0.56 deg in longitude, and MPI's C-grid puts uo/umo on x-faces and vo/vmo on
+# y-faces. wo and wmo, the vertical components, sit on the tracer points.
+HORIZONTAL_VECTOR_COMPONENTS = {"uo": "x", "umo": "x", "vo": "y", "vmo": "y"}
 
 
 def carry_provenance(result, source):
@@ -421,30 +438,32 @@ def woa23_files(variable: str, time_slice: str = "annual", period: str = None) -
             "period_cfg": period_cfg, "prefix": prefix, "ds_cfg": ds_cfg}
 
 
-@register_tools(
-    name="open_woa23",
-    description="Open a World Ocean Atlas objectively analysed climatology field.\n"
-        "A low-level reader returning the whole global field; use load_climatology_data to read a subset, "
-        "which is the normal entry point.",
-    args={
-        "variable": "str, required. One of the physical or chemical variables the product publishes; "
-            "common aliases are accepted.",
-        "time_slice": "str, optional, default 'annual'. 'annual' for a single all-year field reaching the "
-            "deepest levels, 'monthly' for twelve fields with a 'month' dimension, 'seasonal' for four "
-            "with a 'season' dimension. The monthly and seasonal fields stop well short of the annual "
-            "one's deepest level.",
-        "period": "str, optional. Which climate normal to read, where the variable offers more than one; "
-            "otherwise a single all-years field is returned.",
-        "field": "str, optional, default 'an'. Which statistical field: 'an' the objectively analysed "
-            "value, 'mn' the raw mean of observations, 'sd' their standard deviation, 'dd' the number of "
-            "observations, and others the product defines."
-    },
-    returns="xr.DataArray with dims (depth, lat, lon), plus 'month' or 'season' for those slices, on a "
-        "1-degree grid with longitude in the -180 to 180 convention and depth in metres positive down. "
-        "attrs carry the units, the climatology period and the provenance the weighting tools need."
-)
 def open_woa23(variable: str, time_slice: str = "annual", period: str = None,
                field: str = "an") -> xr.DataArray:
+    """Open a World Ocean Atlas objectively analysed climatology field.
+
+    A low-level reader returning the whole global field; use load_climatology_data to read a
+    subset, which is the normal entry point.
+
+    Args:
+        variable: str, required. One of the physical or chemical variables the product
+            publishes; common aliases are accepted.
+        time_slice: str, optional, default 'annual'. 'annual' for a single all-year field
+            reaching the deepest levels, 'monthly' for twelve fields with a 'month' dimension,
+            'seasonal' for four with a 'season' dimension. The monthly and seasonal fields stop well
+            short of the annual one's deepest level.
+        period: str, optional. Which climate normal to read, where the variable offers more than
+            one; otherwise a single all-years field is returned.
+        field: str, optional, default 'an'. Which statistical field: 'an' the objectively
+            analysed value, 'mn' the raw mean of observations, 'sd' their standard deviation, 'dd'
+            the number of observations, and others the product defines.
+
+    Returns:
+        xr.DataArray with dims (depth, lat, lon), plus 'month' or 'season' for those slices, on
+        a 1-degree grid with longitude in the -180 to 180 convention and depth in metres
+        positive down. attrs carry the units, the climatology period and the provenance the
+        weighting tools need.
+    """
     resolved = woa23_files(variable, time_slice, period)
     ds_cfg, variable = resolved["ds_cfg"], resolved["variable"]
     period, period_cfg, prefix = resolved["period"], resolved["period_cfg"], resolved["prefix"]
@@ -496,21 +515,24 @@ def open_woa23(variable: str, time_slice: str = "annual", period: str = None,
 # 2. GLODAPv2.2016b
 # ---------------------------------------------------------------------------
 
-@register_tools(
-    name="open_glodap",
-    description="Open a GLODAP mapped climatology field of ocean carbon chemistry and hydrography.\n"
-        "A low-level reader returning the whole global field; use load_climatology_data to read a subset.",
-    args={
-        "variable": "str, required. One of the physical, nutrient or carbon variables the product "
-            "publishes, including dissolved inorganic carbon, alkalinity, pH and the saturation states.",
-        "field": "str, optional, default 'main'. Which field to read: the mapped value, or one of the "
-            "accompanying error and input-count fields."
-    },
-    returns="xr.DataArray with dims (depth, lat, lon) and no time dimension, on a 1-degree grid with "
-        "longitude rolled to the -180 to 180 convention. Concentrations are on a mass basis, so they must "
-        "be converted before being compared with a volume-basis product."
-)
 def open_glodap(variable: str, field: str = "main") -> xr.DataArray:
+    """Open a GLODAP mapped climatology field of ocean carbon chemistry and hydrography.
+
+    A low-level reader returning the whole global field; use load_climatology_data to read a
+    subset.
+
+    Args:
+        variable: str, required. One of the physical, nutrient or carbon variables the product
+            publishes, including dissolved inorganic carbon, alkalinity, pH and the saturation
+            states.
+        field: str, optional, default 'main'. Which field to read: the mapped value, or one of
+            the accompanying error and input-count fields.
+
+    Returns:
+        xr.DataArray with dims (depth, lat, lon) and no time dimension, on a 1-degree grid with
+        longitude rolled to the -180 to 180 convention. Concentrations are on a mass basis, so
+        they must be converted before being compared with a volume-basis product.
+    """
     ds_cfg = get_dataset_cfg("glodap")
     variable = resolve_variable(ds_cfg, variable)
     var_cfg = ds_cfg["variables"][variable]
@@ -553,22 +575,23 @@ def open_glodap(variable: str, field: str = "main") -> xr.DataArray:
 # 3. SEANOE mixed layer depth
 # ---------------------------------------------------------------------------
 
-@register_tools(
-    name="open_seanoe_mld",
-    description="Open a global monthly climatology of ocean mixed layer depth.\n"
-        "A low-level reader returning the whole global field; use load_climatology_data to read a subset. "
-        "This is the observed MLD, built profile by profile, and is the reference to compare a computed "
-        "MLD against.",
-    args={
-        "version": "str, optional. Which version to read; versions differ in the reference depth their "
-            "criterion uses.",
-        "variable": "str, optional, default the density-threshold MLD. Which field to read: the mixed "
-            "layer depth itself, or the accompanying mask."
-    },
-    returns="xr.DataArray with dims (month, lat, lon), month running 1-12, on a 1-degree grid with depth "
-        "in metres. attrs record the criterion the product used."
-)
 def open_seanoe_mld(version: str = None, variable: str = "mld_dr003") -> xr.DataArray:
+    """Open a global monthly climatology of ocean mixed layer depth.
+
+    A low-level reader returning the whole global field; use load_climatology_data to read a
+    subset. This is the observed MLD, built profile by profile, and is the reference to compare
+    a computed MLD against.
+
+    Args:
+        version: str, optional. Which version to read; versions differ in the reference depth
+            their criterion uses.
+        variable: str, optional, default the density-threshold MLD. Which field to read: the
+            mixed layer depth itself, or the accompanying mask.
+
+    Returns:
+        xr.DataArray with dims (month, lat, lon), month running 1-12, on a 1-degree grid with
+        depth in metres. attrs record the criterion the product used.
+    """
     ds_cfg = get_dataset_cfg("seanoe_mld")
     version = version or ds_cfg["default_version"]
     if version not in ds_cfg["versions"]:
@@ -607,20 +630,22 @@ def open_seanoe_mld(version: str = None, variable: str = "mld_dr003") -> xr.Data
 # 4. ERSSTv5
 # ---------------------------------------------------------------------------
 
-@register_tools(
-    name="open_ersst",
-    description="Open the extended reconstructed monthly sea surface temperature record.\n"
-        "A low-level reader returning the whole global field; use load_regular_data to read a subset. This "
-        "is the long observed SST record, and the usual observational reference for SST variability and "
-        "for climate indices.",
-    args={
-        "variable": "str, optional, default 'sst'. The dataset provides only sea surface temperature."
-    },
-    returns="xr.DataArray with dims (time, lat, lon) in degrees Celsius, monthly, stamped on the first of "
-        "each month. It is on a coarser grid than the 1-degree climatologies, so it must be regridded "
-        "before any cell-by-cell comparison with them."
-)
 def open_ersst(variable: str = "sst") -> xr.DataArray:
+    """Open the extended reconstructed monthly sea surface temperature record.
+
+    A low-level reader returning the whole global field; use load_regular_data to read a subset.
+    This is the long observed SST record, and the usual observational reference for SST
+    variability and for climate indices.
+
+    Args:
+        variable: str, optional, default 'sst'. The dataset provides only sea surface
+            temperature.
+
+    Returns:
+        xr.DataArray with dims (time, lat, lon) in degrees Celsius, monthly, stamped on the
+        first of each month. It is on a coarser grid than the 1-degree climatologies, so it must
+        be regridded before any cell-by-cell comparison with them.
+    """
     ds_cfg = get_dataset_cfg("ersst")
     path = os.path.join(ds_cfg["root"], ds_cfg["file"])
     if not os.path.exists(path):
@@ -646,6 +671,21 @@ def open_ersst(variable: str = "sst") -> xr.DataArray:
 def _read_cpc_table(path: str, layout: str) -> pd.DataFrame:
     """Parse one whitespace-delimited CPC table, giving the four repeated ANOM
     columns names that say which Nino region they belong to."""
+    if layout == "year_rows":
+        # One row per year and one column per month, behind a title line. The
+        # PDO index comes this way; 99.99 is its missing value, and the trailing
+        # months of the current year carry it.
+        table = pd.read_csv(path, sep=r"\s+", skiprows=1)
+        months = {name: number for number, name in enumerate(
+            ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
+        long = table.melt(id_vars="Year", value_vars=list(months),
+                          var_name="MONTH_NAME", value_name="VALUE")
+        long["MON"] = long["MONTH_NAME"].map(months)
+        long = long.rename(columns={"Year": "YR"})
+        long = long[long["VALUE"] < 99.0]        # drop the 99.99 sentinels
+        return long.sort_values(["YR", "MON"]).reset_index(drop=True)
+
     df = pd.read_csv(path, sep=r"\s+")
     if layout == "seasonal":
         return df
@@ -660,28 +700,31 @@ def _read_cpc_table(path: str, layout: str) -> pd.DataFrame:
     return df.rename(columns=renamed)
 
 
-@register_tools(
-    name="open_cpc_index",
-    description="Open an official ENSO monitoring index as a monthly series.\n"
-        "These are published area-averaged SST values and anomalies over the Nino regions, with no spatial "
-        "dimensions: use them as the observed reference signal to correlate a field or a reconstruction "
-        "against. Products differ in baseline period and are NOT interchangeable, and an index built on "
-        "another baseline is offset from them by a constant.",
-    args={
-        "product": "str, optional. Which published series to read; they differ in the baseline period "
-            "their anomalies are taken against, and one of them is a running-mean index rather than a "
-            "monthly one. Default is the current operational series.",
-        "region": "str, optional, default 'NINO3.4'. Which Nino region: 'NINO1+2', 'NINO3', 'NINO3.4' or "
-            "'NINO4'. Ignored for products defined on Nino3.4 alone.",
-        "field": "str, optional, default 'anomaly'. 'anomaly' for the departure from the baseline "
-            "climatology, or 'total' for the absolute area-averaged temperature."
-    },
-    returns="xr.DataArray with a single 'time' dimension, monthly and stamped on the first of each month, "
-        "in degrees Celsius. A running-mean product has its overlapping seasons placed at their centre "
-        "month so it aligns with the monthly series. attrs record the baseline period and the region's "
-        "box."
-)
-def open_cpc_index(product: str = None, region: str = "NINO3.4", field: str = "anomaly") -> xr.DataArray:
+def open_cpc_index(product: str = None, region: str = None, field: str = "anomaly") -> xr.DataArray:
+    """Open an official ENSO monitoring index as a monthly series.
+
+    These are published area-averaged SST values and anomalies over the Nino regions, with no
+    spatial dimensions: use them as the observed reference signal to correlate a field or a
+    reconstruction against. Products differ in baseline period and are NOT interchangeable, and
+    an index built on another baseline is offset from them by a constant.
+
+    Args:
+        product: str, optional. Which published series to read; they differ in the baseline
+            period their anomalies are taken against, and one of them is a running-mean index rather
+            than a monthly one. Default is the current operational series.
+        region: str, optional. Which Nino region: 'NINO1+2', 'NINO3', 'NINO3.4' or 'NINO4';
+            default 'NINO3.4' for the products that publish all four. Leave it unset for a
+            product defined on a single region or on its own basin-wide domain, which reject
+            a region they cannot provide rather than quietly returning another one.
+        field: str, optional, default 'anomaly'. 'anomaly' for the departure from the baseline
+            climatology, or 'total' for the absolute area-averaged temperature.
+
+    Returns:
+        xr.DataArray with a single 'time' dimension, monthly and stamped on the first of each
+        month, in degrees Celsius. A running-mean product has its overlapping seasons placed at
+        their centre month so it aligns with the monthly series. attrs record the baseline
+        period and the region's box.
+    """
     ds_cfg = get_dataset_cfg("cpc_indices")
     product = product or ds_cfg["default_product"]
     if product not in ds_cfg["products"]:
@@ -696,14 +739,34 @@ def open_cpc_index(product: str = None, region: str = "NINO3.4", field: str = "a
 
     df = _read_cpc_table(path, product_cfg["layout"])
 
-    if product_cfg["layout"] == "seasonal":
+    if product_cfg["layout"] == "year_rows":
+        # A basin-wide EOF index, not a regional box average: there is no
+        # absolute value to report and no region to choose.
+        if field == "total":
+            raise ValueError(
+                f"product='{product}' publishes an index, not an area-averaged temperature, so it "
+                f"has no 'total' field. Use field='anomaly'."
+            )
+        if region is not None:
+            raise ValueError(
+                f"product='{product}' is a basin-wide pattern index defined over its own domain, "
+                f"so it cannot provide the '{region}' box. Drop the region argument, or use one of "
+                f"the Nino products for a regional index."
+            )
+        time = pd.to_datetime(
+            [f"{y:04d}-{m:02d}-01" for y, m in zip(df["YR"].astype(int), df["MON"].astype(int))]
+        )
+        values = df["VALUE"]
+        region_used = product_cfg.get("domain", product)
+
+    elif product_cfg["layout"] == "seasonal":
         months = df["SEAS"].map(ONI_SEASON_TO_CENTER_MONTH)
         if months.isna().any():
             raise ValueError(f"Unrecognised season labels in {path}: {sorted(set(df['SEAS'][months.isna()]))}")
         time = pd.to_datetime(
             [f"{y:04d}-{m:02d}-01" for y, m in zip(df["YR"].astype(int), months.astype(int))]
         )
-        if region != "NINO3.4":
+        if region not in (None, "NINO3.4"):
             raise ValueError(
                 f"product='{product}' is the ONI, which is defined on Nino3.4 alone; it cannot provide "
                 f"'{region}'. Use one of the monthly products "
@@ -712,6 +775,7 @@ def open_cpc_index(product: str = None, region: str = "NINO3.4", field: str = "a
         values = df["ANOM"] if field == "anomaly" else df["TOTAL"]
         region_used = "NINO3.4"
     else:
+        region = region or "NINO3.4"
         time = pd.to_datetime(
             [f"{y:04d}-{m:02d}-01" for y, m in zip(df["YR"].astype(int), df["MON"].astype(int))]
         )
@@ -726,7 +790,10 @@ def open_cpc_index(product: str = None, region: str = "NINO3.4", field: str = "a
         coords={"time": ("time", time, {"stamp_convention": "month_start"})},
         dims=["time"],
         name=f"{region_used}_{'anomaly' if field == 'anomaly' else 'sst'}",
-        attrs={"units": "degC", "long_name": f"{region_used} {field} from CPC {product}"},
+        # The Nino products are temperatures; the PDO is a dimensionless pattern
+        # index, so the unit comes from the product entry where it states one.
+        attrs={"units": product_cfg.get("units", "degC"),
+               "long_name": f"{region_used} {field} from {product_cfg.get('source', 'CPC')} {product}"},
     )
     return tag_provenance(
         da, "cpc_indices", ds_cfg,
@@ -900,33 +967,34 @@ def cmip6_experiments() -> list:
     ]
 
 
-@register_tools(
-    name="open_cmip6",
-    description="Open a CMIP6 ocean variable from the model archive as a monthly time series.\n"
-        "A low-level reader returning the whole global field; use load_regular_data or "
-        "load_data_with_geolocator to read a subset, which is the normal entry point and is the only way "
-        "to subset a curvilinear model grid by latitude and longitude.\n"
-        "Multi-file variables are concatenated along time, the models' different calendars are unified, "
-        "and depth is normalised to metres. Variable coverage differs by model and experiment; the error "
-        "message lists what is actually present.",
-    args={
-        "experiment": "str, required. Which experiment to read.",
-        "model": "str, required. Which model to read.",
-        "variable": "str, required. The CMIP6 short name — a 3-D tracer, a 2-D surface or "
-            "depth-integrated field, or one of the fixed grid fields (cell area, cell volume, sea floor "
-            "depth, sea area fraction).",
-        "chunk_time": "int, optional, default 12. Chunk size along time. The array stays lazy, so opening "
-            "even a very large variable is cheap; computation happens when it is reduced."
-    },
-    returns="xr.DataArray, monthly and stamped on the first of each month, with depth in metres positive "
-        "down and longitude in the -180 to 180 convention. On a regular model grid the dimensions are "
-        "(time, depth, lat, lon); on a curvilinear one they are the model's index dimensions with 2-D "
-        "latitude and longitude coordinates, and those index dimensions are NOT geographic and must not be "
-        "sliced by value. Concentrations are on a volume basis, so they must be converted before being "
-        "compared with a mass-basis product. attrs carry the grid identity that lets the weighting tools "
-        "work without any manual use of cell areas."
-)
 def open_cmip6(experiment: str, model: str, variable: str, chunk_time: int = 12) -> xr.DataArray:
+    """Open a CMIP6 ocean variable from the model archive as a monthly time series.
+
+    A low-level reader returning the whole global field; use load_regular_data or
+    load_data_with_geolocator to read a subset, which is the normal entry point and is the only
+    way to subset a curvilinear model grid by latitude and longitude.
+    Multi-file variables are concatenated along time, the models' different calendars are
+    unified, and depth is normalised to metres. Variable coverage differs by model and
+    experiment; the error message lists what is actually present.
+
+    Args:
+        experiment: str, required. Which experiment to read.
+        model: str, required. Which model to read.
+        variable: str, required. The CMIP6 short name — a 3-D tracer, a 2-D surface or
+            depth-integrated field, or one of the fixed grid fields (cell area, cell volume, sea
+            floor depth, sea area fraction).
+        chunk_time: int, optional, default 12. Chunk size along time. The array stays lazy, so
+            opening even a very large variable is cheap; computation happens when it is reduced.
+
+    Returns:
+        xr.DataArray, monthly and stamped on the first of each month, with depth in metres
+        positive down and longitude in the -180 to 180 convention. On a regular model grid the
+        dimensions are (time, depth, lat, lon); on a curvilinear one they are the model's index
+        dimensions with 2-D latitude and longitude coordinates, and those index dimensions are
+        NOT geographic and must not be sliced by value. Concentrations are on a volume basis, so
+        they must be converted before being compared with a mass-basis product. attrs carry the
+        grid identity that lets the weighting tools work without any manual use of cell areas.
+    """
     dataset = f"cmip6_{experiment}"
     ds_cfg = get_dataset_cfg(dataset)
     if model not in ds_cfg["models"]:
@@ -1020,4 +1088,10 @@ def open_cmip6(experiment: str, model: str, variable: str, chunk_time: int = 12)
         borrowed_from=used_experiment if used_experiment != experiment else None,
         original_units=da.attrs.get("units"),
         ocean_masked_with=mask_source,
+        # Which file describes this field's points, carried onto everything
+        # derived from it: a velocity-point field regridded against the tracer
+        # corner mesh lands half a cell out of place.
+        cmip6_variable=variable,
+        grid_point="velocity" if variable in HORIZONTAL_VECTOR_COMPONENTS else "tracer",
+        vector_component=HORIZONTAL_VECTOR_COMPONENTS.get(variable),
     )

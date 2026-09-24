@@ -11,8 +11,8 @@ from sklearn.decomposition import PCA
 from src.tools.registry import register_tools
 from src.tools.data_openers import (SEASON_ORDER, carry_provenance, molar_basis,
                                     normalize_units, open_woa23)
-from src.tools.data_loader import (areas_like, layer_bounds_like, layer_thickness_like,
-                                   volumes_like)
+from src.tools.data_loader import (areas_like, cell_thickness_like, layer_bounds_like,
+                                   layer_thickness_like, volumes_like)
 from src.tools.basic_calculator import compute_basic_stat
 
 
@@ -60,15 +60,39 @@ def temperature_kind(temp_data: xr.DataArray, declared: str = "auto") -> tuple:
     return "in_situ", "assumed: nothing in the metadata identifies it as potential temperature"
 
 
+def surface_layer(data: xr.DataArray, depth_level=None) -> xr.DataArray:
+    """
+    The sea-surface value of a field that has a depth dimension.
+
+    By default the shallowest level alone, because that is how CMIP6 defines
+    its surface fields: tos is "the prognostic temperature in the upper-most
+    ocean grid cell" (Griffies et al. 2016, H13), and sos likewise. The top cell
+    is 0-10 m in CESM2, 0-2 m natively in GFDL-ESM4 (2.5 m level as archived)
+    and 0-12 m in MPI-ESM1-2-LR. A number instead averages every level
+    shallower than it, thickness-weighted - which is a different quantity, and
+    covers two levels in GFDL-ESM4 but one in the other models at 10 m.
+    """
+    if depth_level is None:
+        ordered = data.sortby("depth")
+        top = float(ordered["depth"].values[0])
+        result = ordered.isel(depth=0, drop=True)
+        result.attrs = dict(data.attrs)
+        result.attrs["depth_averaging"] = f"shallowest level only ({top:g} m), the top cell as tos is defined"
+        return result
+    return depth_average(data, depth_level)
+
+
 def depth_average(data: xr.DataArray, max_depth: float) -> xr.DataArray:
     """
     Average the layers above `max_depth`, weighted by layer thickness.
 
     Layers are not equally thick anywhere in this archive, so a plain mean over
-    depth weights a 5 m layer the same as a 100 m one. Where the thicknesses
-    cannot be established — after an anomaly has intersected two products'
-    vertical grids, for instance — the average falls back to unweighted and says
-    so in the attributes rather than failing.
+    depth weights a 5 m layer the same as a 100 m one. A CMIP6 field is weighted
+    by the water each cell actually holds (volcello / areacello), so a partial
+    cell at the sea floor counts for what it contains rather than a full layer.
+    Where the thicknesses cannot be established — after an anomaly has
+    intersected two products' vertical grids, for instance — the average falls
+    back to unweighted and says so in the attributes rather than failing.
     """
     upper = data.sel(depth=slice(0, max_depth))
     if upper.sizes.get("depth", 0) == 0:
@@ -83,10 +107,10 @@ def depth_average(data: xr.DataArray, max_depth: float) -> xr.DataArray:
         return result
 
     try:
-        thickness = layer_thickness_like(upper)
+        thickness = cell_thickness_like(upper)
         weights = thickness.where(upper.notnull())
         result = (upper * weights).sum("depth", skipna=True) / weights.sum("depth")
-        note = "thickness-weighted"
+        note = f"thickness-weighted ({thickness.attrs.get('bounds_source', 'layer thickness')})"
     except Exception as exc:
         result = upper.mean("depth", skipna=True)
         note = f"unweighted (layer thicknesses unavailable: {exc.__class__.__name__})"
@@ -435,6 +459,10 @@ def compute_anomaly_vs_own_climatology(data: xr.DataArray, freq: str = "month",
         "volumes where they exist, since those alone account for partial cells at the sea floor.\n"
         "Both molar bases are handled: a mass-basis concentration needs a density to reach a volume, a "
         "volume-basis one needs none, and the units attribute decides which path is taken.\n"
+        "Prefer the volume basis. A model's native mol m-3 field integrates exactly, with no density in "
+        "the arithmetic at all. Handing over a umol/kg field without an explicit density applies this "
+        "function's CONSTANT default instead, which silently undoes any in-situ density field used to "
+        "make that field and biases the inventory by about one per cent.\n"
         "The field must still be on its original grid and levels: subsetting is fine, interpolation, "
         "regridding or averaging over depth is not.",
     args={
@@ -641,8 +669,11 @@ def compute_ratio(data1: xr.DataArray, data2: xr.DataArray) -> xr.DataArray:
     description="Identify oxygen minimum zones from a dissolved oxygen field and measure their total "
         "vertical thickness.\n"
         "Every layer below the threshold counts, and the thickness is the summed thickness of those "
-        "layers, giving a map of how much of the water column is oxygen-depleted. Layer thicknesses come "
-        "from the grid the data came from, so the field must keep its original levels.\n"
+        "layers, giving a map of how much of the water column is oxygen-depleted. Thicknesses come from "
+        "the grid the data came from, so the field must keep its original levels. For a CMIP6 model each "
+        "cell counts the water it actually holds (volcello / areacello), so a partial cell at the sea "
+        "floor is not counted as a full layer; this matters most for GFDL-ESM4, whose archived levels "
+        "carry values in bottom cells that are only partly water.\n"
         "The threshold must be in the same units as the field. A mass-basis threshold applied to a "
         "volume-basis field marks the entire ocean as depleted; convert one of them first.",
     args={
@@ -670,7 +701,7 @@ def identify_oxygen_minimum_zone(o2_data: xr.DataArray, threshold: float = 20.0)
             f"Left as it is, every ocean cell would be counted as an oxygen minimum zone."
         )
 
-    thickness = layer_thickness_like(o2_data)
+    thickness = cell_thickness_like(o2_data)
     omz_mask = o2_data < threshold
 
     omz_thickness = (thickness * omz_mask).sum(dim="depth", skipna=True)
@@ -702,6 +733,9 @@ def identify_oxygen_minimum_zone(o2_data: xr.DataArray, threshold: float = 20.0)
         "compression that makes any water denser with depth. Referenced to each cell's own pressure it is "
         "the in-situ density, which is what mass-per-volume arithmetic needs — converting a concentration "
         "between molar bases, or a volume into a mass.\n"
+        "The result is an ANOMALY (roughly 25-35 kg/m3) and carries the metadata that every tool taking a "
+        "density argument reads. Hand it over unchanged: those tools add the 1000 themselves when they need "
+        "an absolute density, so adding it here makes them do it twice.\n"
         "The two temperature conventions take different routes to Conservative Temperature, and using the "
         "wrong one biases density increasingly with depth, so the kind of temperature supplied is read "
         "from its metadata and recorded in the result.",
@@ -856,9 +890,21 @@ def _first_crossing_depth(data: xr.DataArray, depth: np.ndarray, threshold: floa
         "Montegut criterion, which is what observational MLD climatologies use, so the two are directly "
         "comparable. The crossing depth is interpolated between the bracketing levels rather than snapped "
         "to one, because these vertical grids are coarse where mixed layers sit.\n"
-        "COMPARING WITH A MODEL'S OWN MLD OUTPUT: those are usually defined against the SURFACE rather "
-        "than a 10 m reference, so pass ref_depth equal to the model's shallowest level to compute the "
-        "same quantity; left at the default the difference is the definition's, not the model's.\n"
+        "COMPARING WITH A MODEL'S OWN mlotst: pass ref_depth equal to the model's shallowest level, since "
+        "CMIP6 mlotst is referenced to the ocean surface, not to 10 m. That removes the largest definitional "
+        "difference but NOT all of it, so the result is close to mlotst, never identical, and the residual "
+        "must not be read as model error. The CMIP6 protocol (Griffies et al. 2016, H24) computes mlotst "
+        "ONLINE at every model time step, as a buoyancy difference between a surface parcel moved down to "
+        "each level's own pressure and the local water (0.0003 m s-2, about 0.03 kg/m3), and archives the "
+        "monthly MEAN of those instantaneous depths. This tool applies a sigma0 difference to whatever "
+        "profile it is given, and a monthly field is itself a time-averaged profile, so the operator is "
+        "biased shallow against mlotst for the same reason given below. GFDL-ESM4 also computes mlotst on "
+        "its native 75 hybrid layers, while its archived temperature and salinity were remapped to 35 z "
+        "levels, which adds a resolution difference only that model has.\n"
+        "COLUMNS THAT NEVER REACH THE THRESHOLD come back missing. The models' own mlotst does not agree "
+        "on these: GFDL-ESM4 and MPI-ESM1-2-LR report roughly the full column depth there, CESM2 reports 0 "
+        "(checked on March 1990). Exclude them from any comparison with mlotst and report how much area "
+        "was excluded.\n"
         "ORDER OF OPERATIONS: the MLD of an averaged profile is not the average of the MLDs and is "
         "systematically shallower, because averaging smooths the pycnocline away. Compute it step by step "
         "and average the result; never average temperature and salinity first.",
@@ -1082,7 +1128,7 @@ def _select_region(data: xr.DataArray, lat_min, lat_max, lon_min, lon_max) -> xr
         if name not in data.coords:
             raise ValueError(
                 f"This field has no '{name}' coordinate, so a latitude/longitude box cannot be cut out of "
-                f"it. Load it with load_regular_data, load_climatology_data or open_cmip6."
+                f"it. Load it with load_regular_data or load_climatology_data."
             )
 
     in_lat = (data[lat_name] >= lat_min) & (data[lat_name] <= lat_max)
@@ -1134,13 +1180,19 @@ def _select_region(data: xr.DataArray, lat_min, lat_max, lon_min, lon_max) -> xr
             "subset to a box containing the region.",
         "nino_region": "str, optional, default 'nino3.4'. 'nino1+2', 'nino3', 'nino3.4' or 'nino4'. "
             "Nino3.4 is the standard choice for ENSO monitoring.",
-        "depth_level": "float, optional, default 10. When the field has a depth dimension, anomalies are "
-            "averaged over levels shallower than this.",
+        "depth_level": "float or None, optional, default None. Only used when the field has a depth "
+            "dimension. None takes the shallowest level, which is how CMIP6 defines SST (tos is the "
+            "top-cell temperature) and so is the like-for-like substitute where tos is missing. A number "
+            "averages every level shallower than it instead, thickness-weighted; at 10 m that is two "
+            "levels in GFDL-ESM4 but one in CESM2 and MPI-ESM1-2-LR, so it is not the same quantity "
+            "across models.",
         "anomaly_freq": "str, optional, default 'month'. Which climatology each step is matched against: "
             "'month' (the usual choice, removing the seasonal cycle), 'season' or 'year'.",
-        "climatology": "str, optional, default 'auto'. 'auto' uses the observed climatology where the "
-            "field is on its grid and the field's own elsewhere; 'woa23' forces the observed one and fails "
-            "if the grid does not match; 'self' always removes the field's own.",
+        "climatology": "str, optional, default 'auto'. 'auto' removes the field's own climatology for "
+            "CMIP6 model output, always, and uses the observed WOA23 one only for an observational field "
+            "on its grid; 'woa23' forces the observed one and fails if the grid does not match; 'self' "
+            "always removes the field's own. Forcing 'woa23' on a model puts the model's mean-state bias "
+            "into the index, which is then not an ENSO index.",
         "base_period": "list[str, str], optional. The baseline window for the field's own climatology, as "
             "['start', 'end']. Passing it forces the self-climatology, since observed climate normals are "
             "fixed periods. Default None: the whole record loaded is the baseline."
@@ -1149,7 +1201,7 @@ def _select_region(data: xr.DataArray, lat_min, lat_max, lon_min, lon_max) -> xr
         "dimension. attrs record the region box, the climatology used and its baseline, which must be "
         "stated when the values are compared with a published series."
 )
-def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", depth_level: float = 10.0,
+def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", depth_level: float = None,
                             anomaly_freq: str = "month", climatology: str = "auto",
                             base_period: list = None) -> xr.DataArray:
     # (lat_min, lat_max, lon_min, lon_max), matching the boxes in configs/datasets.yaml
@@ -1176,8 +1228,13 @@ def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", de
     lat_min, lat_max, lon_min, lon_max = nino_regions[nino_region]
     data_region = _select_region(data, lat_min, lat_max, lon_min, lon_max)
 
+    # A model's index is its anomaly from its OWN climatology. GFDL-ESM4 happens
+    # to sit on the WOA23 1-degree grid, and subtracting the observed climatology
+    # from it would put the model's monthly mean-state bias into every value of
+    # the index (and drop its 2.5 m level, which WOA23 does not have).
+    is_model = str(data.attrs.get("source_dataset", "")).startswith("cmip6_")
     use_woa = (climatology == "woa23") or (
-        climatology == "auto" and base_period is None and _on_woa_grid(data)
+        climatology == "auto" and base_period is None and not is_model and _on_woa_grid(data)
     )
     if use_woa:
         anomaly = compute_anomaly_vs_woa23(data=data_region, var="temp", freq=anomaly_freq,
@@ -1194,10 +1251,12 @@ def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", de
         )
         baseline = anomaly.attrs.get("climatology_reference", "the field's own climatology")
 
+    surface_note = "surface"
     if "depth" in anomaly.dims:
-        # Weighted by layer thickness: WOA23's top levels are 2.5 and 5 m thick,
-        # so averaging them with equal weight tilts the index towards the surface.
-        anomaly = depth_average(anomaly, depth_level)
+        # The top level by default, matching CMIP6's tos; a depth_level averages
+        # the levels above it, weighted by the water each cell holds.
+        anomaly = surface_layer(anomaly, depth_level)
+        surface_note = anomaly.attrs.get("depth_averaging", surface_note)
 
     nino_index = compute_basic_stat(data=anomaly, op="area_weighted_mean", dim=["lat", "lon"])
 
@@ -1206,7 +1265,7 @@ def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", de
         "units": "degC",
         "description": f"Area-weighted SST anomaly over the {nino_region.upper()} region",
         "region_bounds": f"lat: [{lat_min}, {lat_max}], lon: [{lon_min}, {lon_max}]",
-        "depth_range": f"0-{depth_level} m averaged" if "depth" in data.dims else "surface",
+        "depth_range": surface_note,
         "anomaly_frequency": anomaly_freq,
         "anomaly_method": "subtract",
         "weighting": "area weighted on the dataset's own grid",
@@ -1231,19 +1290,29 @@ def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", de
     args={
         "data": "xr.DataArray, required. Temperature with 'time' and regular 'lat'/'lon' dimensions, "
             "optionally 'depth', in degrees Celsius.",
-        "depth_level": "float, optional, default 10. When the field has a depth dimension, levels "
-            "shallower than this are averaged first.",
+        "depth_level": "float or None, optional, default None. Only used when the field has a depth "
+            "dimension. None takes the shallowest level, matching CMIP6's tos; a number averages every "
+            "level shallower than it, thickness-weighted, which is a different quantity.",
         "standardize": "bool, optional, default True. Scale the index to zero mean and unit variance, "
             "which is how it is normally published."
     },
-    returns="tuple (pdo_index, eof_pattern, explained_variance):\n"
+    returns="tuple (pdo_index, eof_pattern, explained_variance, regression_pattern):\n"
         "- pdo_index: the leading principal component as a monthly series.\n"
-        "- eof_pattern: its spatial pattern, carrying the grid it was computed on, so two patterns can be "
-        "compared with an area-weighted correlation — worth doing, since the domain reaches high latitudes "
-        "where cells are much smaller.\n"
-        "- explained_variance: the percentage of variance the mode accounts for."
+        "- eof_pattern: the unit-norm eigenvector. It says WHERE the mode acts, but it is "
+        "dimensionless and its magnitude means nothing on its own; do not read an amplitude off it.\n"
+        "- explained_variance: the percentage of variance the mode accounts for. It depends on the "
+        "grid and on the length of the record, so compare it only between fields on the same grid "
+        "over the same period.\n"
+        "- regression_pattern: the anomaly field regressed on the STANDARDISED index, in the field's "
+        "own units per standard deviation. This is the map with a physical amplitude, and the form a "
+        "PDO pattern is normally drawn in; its area-weighted RMS is the mode's strength in degrees.\n"
+        "Both patterns carry the grid they were computed on, so two of them can be compared with an "
+        "area-weighted correlation — worth doing, since the domain reaches high latitudes where cells "
+        "are much smaller. Two patterns on DIFFERENT grids cannot be correlated at all; put every "
+        "field on one grid before comparing."
 )
-def compute_pdo_index(data: xr.DataArray, depth_level: float = 10.0, standardize: bool = True) -> tuple[xr.DataArray, xr.DataArray, float]:
+def compute_pdo_index(data: xr.DataArray, depth_level: float = None,
+                      standardize: bool = True) -> tuple[xr.DataArray, xr.DataArray, float, xr.DataArray]:
     if "time" not in data.dims:
         raise ValueError("A PDO index needs a time series; this field has no 'time' dimension.")
     # The EOF is taken on a rectangular lat/lon block and the pattern comes back
@@ -1260,7 +1329,7 @@ def compute_pdo_index(data: xr.DataArray, depth_level: float = 10.0, standardize
     # A surface field (ERSSTv5 'sst', CMIP6 'tos') has no depth dimension at all,
     # so it is used as it stands rather than being averaged over one.
     if 'depth' in data.dims:
-        sst_data = depth_average(data, depth_level)
+        sst_data = surface_layer(data, depth_level)
     else:
         sst_data = data
 
@@ -1328,6 +1397,20 @@ def compute_pdo_index(data: xr.DataArray, depth_level: float = 10.0, standardize
     if standardize:
         pdo_index_values = (pdo_index_values - np.nanmean(pdo_index_values)) / np.nanstd(pdo_index_values)
 
+    # The EOF vector above has unit norm, so it says where the mode acts but not
+    # how strongly in degrees. Regressing the unweighted anomaly field on the
+    # STANDARDISED index gives the amplitude the mode actually has, in the
+    # field's own units per standard deviation of the index, which is how a PDO
+    # pattern is normally drawn and the only form with a physical magnitude.
+    standardised_index = (pdo_index_values - np.nanmean(pdo_index_values)) / np.nanstd(pdo_index_values)
+    unweighted = north_pacific.transpose('time', 'lat', 'lon').values.reshape(
+        n_times, n_lat * n_lon)
+    centred = unweighted - np.nanmean(unweighted, axis=0, keepdims=True)
+    with np.errstate(invalid='ignore'):
+        regression_1d = np.nansum(centred * standardised_index[:, None], axis=0) / n_times
+    regression_1d[~valid_points] = np.nan
+    regression_2d = regression_1d.reshape(n_lat, n_lon)
+
     pdo_index = xr.DataArray(
         pdo_index_values,
         coords={'time': north_pacific.time},
@@ -1356,10 +1439,26 @@ def compute_pdo_index(data: xr.DataArray, depth_level: float = 10.0, standardize
         }
     )
 
-    # The pattern is a map on the grid the SST came from, so it keeps that grid's
-    # identity: without it the cell areas cannot be found, and comparing two
-    # models' patterns is exactly what needs an AREA-WEIGHTED correlation — the
-    # domain reaches 70N, where a cell covers a third of a tropical one.
-    eof_pattern = carry_provenance(eof_pattern, north_pacific)
+    regression_pattern = xr.DataArray(
+        regression_2d,
+        coords={'lat': north_pacific.lat, 'lon': north_pacific.lon},
+        dims=['lat', 'lon'],
+        attrs={
+            'long_name': 'SST anomaly regressed on the standardized PDO index',
+            'description': 'Amplitude of the leading mode, in the field units per standard '
+                           'deviation of the index. This is the map with a physical magnitude; '
+                           'eof_pattern is the unit-norm eigenvector and carries none.',
+            'units': sst_data.attrs.get('units', 'degC'),
+            'explained_variance_percent': explained_var,
+            'sign_convention': 'positive phase is cool in the central and western North Pacific',
+        }
+    )
 
-    return pdo_index, eof_pattern, explained_var
+    # The patterns are maps on the grid the SST came from, so they keep that
+    # grid's identity: without it the cell areas cannot be found, and comparing
+    # two models' patterns is exactly what needs an AREA-WEIGHTED correlation —
+    # the domain reaches 70N, where a cell covers a third of a tropical one.
+    eof_pattern = carry_provenance(eof_pattern, north_pacific)
+    regression_pattern = carry_provenance(regression_pattern, north_pacific)
+
+    return pdo_index, eof_pattern, explained_var, regression_pattern

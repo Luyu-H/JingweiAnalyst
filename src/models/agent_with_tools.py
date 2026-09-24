@@ -1,5 +1,6 @@
 import re
 import os
+import ast
 import sys
 import json
 import types
@@ -12,6 +13,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
+import yaml
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -19,12 +21,12 @@ import matplotlib
 matplotlib.use("Agg")  # headless: figures are saved, never shown
 import matplotlib.pyplot as plt
 
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.tools.data_openers import dataset_notes, list_datasets
 from src.tools.registry import TOOLS, auto_import_tools
 from src.models.prompt import PromptTemplates
+from src.models.llm_providers import LLM_KEYS, build_llm
 
 auto_import_tools()
 
@@ -42,6 +44,39 @@ ALWAYS_AVAILABLE_TOOLS = (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Every setting a run depends on - the model and its endpoint, the loop limits,
+# where results land - lives in this file, so a run is changed by editing YAML
+# rather than the source.
+CONFIG_PATH = REPO_ROOT / "configs" / "agent_with_tools.yaml"
+
+
+def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read the runtime configuration, configs/agent_with_tools.yaml by default."""
+    path = Path(path) if path is not None else CONFIG_PATH
+    if not path.exists():
+        raise FileNotFoundError(f"Agent configuration not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def resolve_path(value: str) -> Path:
+    """A configured path is absolute, or relative to the repo root - never to the cwd."""
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def slugify(text: str) -> str:
+    """
+    A model id as a directory name.
+
+    Vendors write model ids with characters a path cannot take: an
+    openai_compatible endpoint may serve "Qwen/Qwen3-235B", and a version may
+    carry a colon. Everything outside letters, digits, dot, dash and underscore
+    becomes a single dash.
+    """
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-") or "model"
+
 
 # Harness written into every bundle so the recorded code can be re-executed
 # without the agent. It rebuilds the namespace the agent executes code in: every
@@ -92,7 +127,7 @@ with xr.set_options(keep_attrs=True):
 out = BUNDLE / "figures" / "rerun"
 out.mkdir(parents=True, exist_ok=True)
 for index, number in enumerate(plt.get_fignums(), 1):
-    plt.figure(number).savefig(out / ("figure_%d.png" % index), dpi=150, bbox_inches="tight")
+    plt.figure(number).savefig(out / ("figure_%d.png" % index), dpi=__DPI__, bbox_inches="tight")
 print("re-ran %s; %d figure(s) written to %s" % (BUNDLE.name, len(plt.get_fignums()), out))
 '''
 
@@ -149,20 +184,22 @@ class RunBundle:
                 f"{result.get('hint', '')}\n\n{result.get('traceback', '')}\n"
             )
 
-    def write_rerun_harness(self, datasets: List[str]) -> None:
+    def write_rerun_harness(self, datasets: List[str], figure_dpi: int = 150) -> None:
         alias = f"namespace[\"selected_data\"] = {datasets[0]!r}" if len(datasets) == 1 else ""
         script = (RERUN_HARNESS
                   .replace("__REPO__", str(REPO_ROOT))
                   .replace("__DATASETS__", repr(datasets))
-                  .replace("__ALIAS__", alias))
+                  .replace("__ALIAS__", alias)
+                  .replace("__DPI__", str(figure_dpi)))
         self.write("code/run.py", script)
 
 
 class ConversationSession:
     """Manage a multi-turn conversation session."""
-    def __init__(self, session_id: str, max_turns: int = 10):
+    def __init__(self, session_id: str, max_turns: int = 10, context_turns: int = 3):
         self.session_id = session_id
         self.max_turns = max_turns
+        self.context_turns = context_turns
         self.turn_count = 0
         self.history = []  # Record of all turns
         
@@ -182,7 +219,7 @@ class ConversationSession:
             return ""
         
         summary = f"Previous conversation (Turn {self.turn_count}):\n"
-        for i, turn in enumerate(self.history[-3:], 1):  # only summarize last 3 turns
+        for i, turn in enumerate(self.history[-self.context_turns:], 1):  # only the most recent turns
             summary += f"Q{i}: {turn['user_query']}\n"
             if 'solution' in turn:
                 solution_match = re.search(r"<solution>(.*?)</solution>", turn['solution'], re.S)
@@ -195,23 +232,72 @@ class AgentWithTools:
     """An agent that can select and call provided tools to answer scientific questions with multi-turn conversation support."""
     
     def __init__(self, tools: Dict[str, Dict], data_list: List[Dict[str, str]],
-                 api_key: str, model_name: str = "deepseek-reasoner", temperature: float = 0.0, 
-                 result_dir: str = "./results", max_turns_per_session: int = 10, max_code_iterations: int = 3):
+                 api_key: Optional[str] = None, config: Optional[Dict[str, Any]] = None,
+                 config_path: Optional[Path] = None, **overrides):
+        """
+        Args:
+            - tools, data_list: the registry and dataset catalogue the agent works with
+            - api_key: the provider key; read from the environment variable named in
+              the configuration when left out
+            - config / config_path: an already-loaded configuration, or another YAML
+              file to read instead of configs/agent_with_tools.yaml
+            - overrides: single settings from the 'agent' or 'llm' section, by their
+              configured name, for a caller that needs to deviate for one run
+        """
+        self.config = config if config is not None else load_config(config_path)
+        self.config_path = Path(config_path) if config_path is not None else CONFIG_PATH
+        self.config_from_caller = config is not None
+        self.config_overrides = dict(overrides)
+        llm_cfg = dict(self.config.get("llm") or {})
+        agent_cfg = dict(self.config.get("agent") or {})
+        observation_cfg = dict(agent_cfg.pop("observation", None) or {})
+        for key, value in overrides.items():
+            if key in LLM_KEYS:
+                llm_cfg[key] = value
+            elif key in observation_cfg or key in ("max_array_elements", "max_value_chars"):
+                observation_cfg[key] = value
+            else:
+                agent_cfg[key] = value
+
         self.tools_meta = tools
         self.data_list = data_list
         self.data_index = {data["name"]: data for data in data_list}
         self.dataset_notes = dataset_notes()
-        self.model_name = model_name
-        self.temperature = temperature
-        self.base_url = "https://api.deepseek.com"
-        self.llm = ChatOpenAI(model=model_name, temperature=temperature, api_key=api_key, base_url=self.base_url)
-        self.result_dir = Path(result_dir)
+
+        # Which vendor, which endpoint and which environment variable holds the key
+        # is decided in src/models/llm_providers.py from the 'llm' section; the agent
+        # itself only ever sees a chat model it can invoke.
+        self.llm, self.llm_settings = build_llm(llm_cfg, api_key, hint=str(CONFIG_PATH))
+        self.provider = self.llm_settings["provider"]
+        self.model_name = self.llm_settings["model"]
+        self.temperature = self.llm_settings["temperature"]
+        self.base_url = self.llm_settings["base_url"]
+
+        self.result_dir = resolve_path(agent_cfg.get("result_dir", "./results"))
         self.result_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.sessions: Dict[str, ConversationSession] = {}
-        self.max_turns_per_session = max_turns_per_session
-        self.max_code_iterations = max_code_iterations
-    
+        self.max_turns_per_session = agent_cfg.get("max_turns_per_session", 10)
+        self.max_code_iterations = agent_cfg.get("max_code_iterations", 3)
+        self.language = agent_cfg.get("language", "auto")
+        self.context_history_turns = agent_cfg.get("context_history_turns", 3)
+        self.figure_dpi = agent_cfg.get("figure_dpi", 150)
+        self.max_array_elements = observation_cfg.get("max_array_elements", 50)
+        self.max_value_chars = observation_cfg.get("max_value_chars", 800)
+
+        # The settings as they ended up, overrides included. Written to each
+        # turn's bundle so a reader never has to reconstruct them from the YAML.
+        self.agent_settings = {
+            "result_dir": str(self.result_dir),
+            "max_turns_per_session": self.max_turns_per_session,
+            "max_code_iterations": self.max_code_iterations,
+            "language": self.language,
+            "context_history_turns": self.context_history_turns,
+            "figure_dpi": self.figure_dpi,
+            "observation": {"max_array_elements": self.max_array_elements,
+                            "max_value_chars": self.max_value_chars},
+        }
+
     def _environment_snapshot(self) -> Dict[str, Any]:
         """
         What a later reader needs to tell whether a rerun stands on the same ground:
@@ -229,14 +315,16 @@ class AgentWithTools:
 
         versions = {}
         for package in ("xarray", "numpy", "pandas", "dask", "scipy", "gsw", "netCDF4",
-                        "scikit-learn", "matplotlib", "pyproj", "langchain-openai", "openai"):
+                        "scikit-learn", "matplotlib", "pyproj", "langchain-core",
+                        "langchain-openai", "openai", "langchain-anthropic", "anthropic",
+                        "langchain-google-genai"):
             try:
                 versions[package] = importlib.metadata.version(package)
             except Exception:
                 continue
 
         config_digests = {}
-        for name in ("datasets.yaml", "default_paths.yaml"):
+        for name in ("datasets.yaml", "default_paths.yaml", "agent_with_tools.yaml"):
             path = REPO_ROOT / "configs" / name
             if path.exists():
                 config_digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -250,8 +338,41 @@ class AgentWithTools:
             "git_describe": git("describe", "--always", "--dirty"),
             "git_uncommitted_changes": bool(git("status", "--porcelain")),
             "config_sha256": config_digests,
-            "llm": {"model": self.model_name, "temperature": self.temperature,
-                    "base_url": self.base_url},
+            # Everything that reached the client, so a later reader knows which
+            # vendor, endpoint and sampling settings produced these numbers.
+            "llm": {key: value for key, value in self.llm_settings.items() if key != "kind"},
+        }
+
+    def _configuration_snapshot(self) -> Dict[str, Any]:
+        """
+        Everything the agent was configured with, as a record of its own.
+
+        The manifest says what the turn did; this says under which settings. It is
+        kept in a separate file because it is the same for every turn of a session
+        and because it is what a reader copies to repeat the run: the resolved
+        model settings, every agent-side limit, the overrides a caller passed, and
+        the configuration file itself - content as well as digest, so the record
+        can still be read on a machine that does not have that file.
+        """
+        config_file: Dict[str, Any] = {"path": str(self.config_path)}
+        if self.config_path.exists():
+            config_file["sha256"] = hashlib.sha256(self.config_path.read_bytes()).hexdigest()
+        if self.config_from_caller:
+            config_file["note"] = ("the configuration was supplied by the caller; the file above is "
+                                   "only where it would have been read from")
+        config_file["content"] = self.config
+
+        return {
+            "recorded_at": datetime.now().isoformat(),
+            # What actually reached the client, after the provider's defaults and
+            # any override were applied - not what the file says.
+            "llm": self.llm_settings,
+            "agent": self.agent_settings,
+            "overrides_from_caller": self.config_overrides,
+            "config_file": config_file,
+            "always_available_tools": list(ALWAYS_AVAILABLE_TOOLS),
+            "registered_tools": sorted(self.tools_meta),
+            "registered_datasets": sorted(self.data_index),
         }
 
     def _ask(self, bundle: Optional["RunBundle"], name: str, system: str, human: str):
@@ -326,6 +447,12 @@ class AgentWithTools:
         plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC']
         plt.rcParams['axes.unicode_minus'] = False
         
+        # Every attempt starts from a clean canvas. A failed attempt can leave a
+        # half-drawn figure open, and _save_visualizations walks whatever is open
+        # when it runs, so without this the discarded attempt's figure would be
+        # saved beside the good one and reported as a result.
+        plt.close("all")
+
         print(f"[Info] Successfully registered {registered_count} tools to sandbox")
 
         if code_type == "compute":
@@ -397,7 +524,7 @@ class AgentWithTools:
                                    if np.issubdtype(array.dtype, np.floating) else array.tolist())
         return described
 
-    def _summarize_value(self, value: Any, max_chars: int = 800) -> Any:
+    def _summarize_value(self, value: Any, max_chars: Optional[int] = None) -> Any:
         """
         Render one result variable for the solution step.
 
@@ -406,6 +533,9 @@ class AgentWithTools:
         with no numbers in it. Arrays are therefore materialised and reduced to a
         compact numeric summary, with small ones listed in full.
         """
+        if max_chars is None:
+            max_chars = self.max_value_chars
+
         if isinstance(value, (xr.DataArray, xr.Dataset)):
             try:
                 value = value.compute()
@@ -424,11 +554,12 @@ class AgentWithTools:
                 "source_dataset": value.attrs.get("source_dataset"),
             }
             summary = {k: v for k, v in summary.items() if v is not None}
-            summary.update(self._describe_array(value.values))
+            summary.update(self._describe_array(value.values, self.max_array_elements))
             return summary
 
         if isinstance(value, np.ndarray):
-            return {"type": "ndarray", "shape": list(value.shape), **self._describe_array(value)}
+            return {"type": "ndarray", "shape": list(value.shape),
+                    **self._describe_array(value, self.max_array_elements)}
         if isinstance(value, np.generic):
             return value.item()
         if isinstance(value, (pd.DataFrame, pd.Series)):
@@ -444,12 +575,115 @@ class AgentWithTools:
                     "head": [self._summarize_value(v, max_chars) for v in value[:5]]}
         return str(value)[:max_chars]
 
-    def _summarize_outputs(self, output: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _loop_local_names(code: str) -> set:
+        """
+        Names that only a loop assigned, which therefore hold its last iteration.
+
+        `for m in models: dm = compute_difference_metrics(...)` leaves `dm` bound to
+        the last model alone. Reported as an ordinary result it reads as a property
+        of the analysis, and the final answer then states one model's number as if
+        it held for all of them. A name the code also assigns outside the loop is a
+        different matter - `metrics = {}` filled in the loop keeps every model - so
+        those are kept.
+        """
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return set()
+
+        loop_names, outer_names = set(), set()
+
+        def collect(node, inside_loop: bool) -> None:
+            for child in ast.iter_child_nodes(node):
+                target = loop_names if inside_loop else outer_names
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                    target.add(child.id)
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    # A function's own locals never reach the module namespace, so
+                    # only the name it binds matters.
+                    target.add(child.name)
+                elif isinstance(child, (ast.Lambda, ast.ListComp, ast.SetComp,
+                                        ast.DictComp, ast.GeneratorExp)):
+                    # A lambda's arguments and a comprehension's loop variable have
+                    # their own scope and never bind in the namespace the code runs
+                    # in, so they must not count as an assignment outside a loop.
+                    continue
+                else:
+                    collect(child, inside_loop or isinstance(child, (ast.For, ast.AsyncFor, ast.While)))
+
+        collect(tree, False)
+        return loop_names - outer_names
+
+    # Names a generated script uses when it parks a caught exception instead of
+    # raising it. Only string-like values are inspected, so a numeric 'error'
+    # (a standard error, a fit residual) is never mistaken for a failure.
+    _ERROR_KEYS = ("error", "errors", "exception", "exceptions", "err",
+                   "traceback", "failure", "failures", "failed")
+    _ERROR_TEXT = re.compile(
+        r"Traceback \(most recent call last\)"
+        r"|^\s*[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning)\s*\("
+        r"|^\s*[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)\s*:\s*\S"
+    )
+
+    @classmethod
+    def _looks_like_error_text(cls, value: Any) -> bool:
+        return isinstance(value, str) and bool(cls._ERROR_TEXT.search(value))
+
+    @classmethod
+    def _detect_swallowed_errors(cls, output: Dict[str, Any], max_depth: int = 4,
+                                 limit: int = 12) -> List[str]:
+        """
+        Find failures the generated code caught and stored instead of raising.
+
+        A `try/except` that records the exception and carries on leaves the
+        interpreter exit status clean, so the run reads as a success and the
+        repair budget is never spent - while part of the answer is quietly
+        missing. This walks the result namespace for the two shapes that
+        actually occur: an exception object kept in a variable, and an error
+        string parked under a key such as 'error'.
+        """
+        found: List[str] = []
+
+        def walk(node: Any, path: str, depth: int) -> None:
+            if len(found) >= limit or depth > max_depth:
+                return
+            if isinstance(node, BaseException):
+                found.append(f"{path} holds {type(node).__name__}: {node}")
+                return
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if len(found) >= limit:
+                        return
+                    where = f"{path}[{key!r}]"
+                    if (isinstance(key, str) and key.strip().lower() in cls._ERROR_KEYS
+                            and cls._looks_like_error_text(value)):
+                        found.append(f"{where} = {value.strip().splitlines()[-1][:200]}")
+                    else:
+                        walk(value, where, depth + 1)
+                return
+            if isinstance(node, (list, tuple, set)):
+                for i, value in enumerate(list(node)[:50]):
+                    walk(value, f"{path}[{i}]", depth + 1)
+                return
+
+        for name, value in output.items():
+            if name.startswith("_") or callable(value) or isinstance(value, types.ModuleType):
+                continue
+            if cls._looks_like_error_text(value) and name.strip().lower() in cls._ERROR_KEYS:
+                found.append(f"{name} = {value.strip().splitlines()[-1][:200]}")
+            else:
+                walk(value, name, 1)
+        return found[:limit]
+
+    def _summarize_outputs(self, output: Dict[str, Any], code: str = "") -> Dict[str, Any]:
         """Summarize every result variable the executed code left behind."""
+        loop_locals = self._loop_local_names(code) if code else set()
         return {
             name: self._summarize_value(value)
             for name, value in output.items()
             if not name.startswith("_")
+            and name not in loop_locals
             and not callable(value)
             and not isinstance(value, types.ModuleType)
         }
@@ -497,6 +731,7 @@ class AgentWithTools:
                 "observation": "observation.json",
                 "answer": "solution.md",
                 "figures": "figures/",
+                "agent_configuration": "agent_config.json",
             },
             "environment": self._environment_snapshot(),
         }
@@ -516,7 +751,7 @@ class AgentWithTools:
             for i, num in enumerate(fignums, 1):
                 suffix = "" if len(fignums) == 1 else f"_{i}"
                 vis_path = destination / f"visualization_{turn_id}{suffix}.png"
-                plt.figure(num).savefig(vis_path, dpi=150, bbox_inches='tight')
+                plt.figure(num).savefig(vis_path, dpi=self.figure_dpi, bbox_inches='tight')
                 paths.append(str(vis_path))
                 print(f"[System] Visualization saved to {vis_path}")
         except Exception as e:
@@ -526,9 +761,15 @@ class AgentWithTools:
         return paths
     
     def _save_session(self, session: ConversationSession):
-        """Save session history to a JSON file."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = self.result_dir / f"session_{session.session_id}_{timestamp}.json"
+        """
+        Save session history beside the turns it summarises.
+
+        The session id already carries the case, the model and the time, so the
+        history goes inside that session's own directory rather than back at the
+        top of result_dir under a second timestamp.
+        """
+        fname = self.result_dir / session.session_id / "session_history.json"
+        fname.parent.mkdir(parents=True, exist_ok=True)
         
         session_data = {
             "session_id": session.session_id,
@@ -543,21 +784,67 @@ class AgentWithTools:
     
     def _execute_with_retry(self, initial_code: str, context: dict, code_type: str,
                            full_specs: Dict[str, Any], user_query: str, language: str = 'en',
-                           bundle: Optional["RunBundle"] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+                           bundle: Optional["RunBundle"] = None, upstream_code: str = "",
+                           available_variables: Optional[Dict[str, Any]] = None
+                           ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         """
         Execute code with retries upon failure, regenerating code as needed.
-        
+
+        Args:
+            - upstream_code: code that already ran and whose variables this block
+              builds on; shown to the repair step so a broken visualization is not
+              repaired by recomputing the answer a second time
+            - available_variables: what those variables actually hold, as the same
+              summary the final answer is written from
+
         Returns:
             - Dict: Final execution result dict
             - List: List of all execution attempts with code and results
         """
         iteration_history = []
         current_code = initial_code
+        # A run that only swallowed errors is still worth more than nothing. It is
+        # kept here so that if every later repair raises outright, the partial
+        # answer is returned rather than lost to the retry it triggered.
+        best_partial: Optional[Dict[str, Any]] = None
 
         for iteration in range(self.max_code_iterations):
             print(f"\n--- Iteration {iteration + 1}/{self.max_code_iterations} ({code_type}) ---")
             
             exec_result = self._safe_execute_tool(current_code, context, code_type)
+
+            # A caught-and-stored exception leaves the exit status clean, so without
+            # this the run counts as a success and the repair budget goes unspent
+            # while part of the answer is missing. Detected before the attempt is
+            # recorded, so the audit bundle does not file it as a clean success.
+            swallowed = (self._detect_swallowed_errors(exec_result["output"])
+                         if exec_result["success"] else [])
+            retries_left = iteration < self.max_code_iterations - 1
+            if swallowed:
+                print(f"[Warning] {len(swallowed)} failure(s) were caught and stored by the "
+                      f"generated code rather than raised:")
+                for item in swallowed:
+                    print(f"          - {item}")
+
+            if exec_result["success"] and swallowed and retries_left:
+                # Rewritten as a failure so the existing repair path handles it.
+                exec_result["swallowed_errors"] = swallowed
+                exec_result["summary"] = self._summarize_outputs(exec_result["output"],
+                                                                 current_code)
+                best_partial = exec_result
+                detail = "\n".join(f"- {item}" for item in swallowed)
+                exec_result = {
+                    "success": False,
+                    "error": ("The code caught these failures and stored them instead of "
+                              "letting them raise, so part of the analysis is missing:\n"
+                              + detail),
+                    "error_type": "SwallowedError",
+                    "traceback": detail,
+                    "hint": ("Remove the try/except around the failing work, or fix the cause, "
+                             "so every requested item is actually computed. Do not record an "
+                             "error string and continue."),
+                    "registered_tools": list(self.tools_meta.keys()),
+                }
             if bundle is not None:
                 bundle.record_attempt(code_type, iteration + 1, current_code, exec_result)
 
@@ -566,12 +853,28 @@ class AgentWithTools:
                 "code": current_code,
                 "success": exec_result["success"]
             }
-            
+            if swallowed:
+                iteration_record["swallowed_errors"] = swallowed
+
             if exec_result["success"]:
+                if swallowed:
+                    # Last iteration: keep the partial result rather than discarding
+                    # it, but carry the failures into the observation so neither the
+                    # answer nor a reader can miss them.
+                    exec_result["swallowed_errors"] = swallowed
                 # Summarised once here and reused by the caller, so lazy arrays are
                 # materialised a single time rather than on every read.
-                exec_result["summary"] = self._summarize_outputs(exec_result["output"])
+                exec_result["summary"] = self._summarize_outputs(exec_result["output"], current_code)
                 iteration_record["output"] = exec_result["summary"]
+                omitted = sorted(self._loop_local_names(current_code)
+                                 & set(exec_result["output"]))
+                if omitted:
+                    # Recorded, not hidden: an auditor can see which names were held
+                    # back and why, without the model reading one model's number as
+                    # if it were everyone's.
+                    iteration_record["omitted_loop_variables"] = omitted
+                    print(f"[Info] Held back {len(omitted)} loop-local variable(s) from the "
+                          f"observation: {', '.join(omitted)}")
                 iteration_history.append(iteration_record)
                 print(f"[Success] {code_type.capitalize()} code executed successfully!")
                 return exec_result, iteration_history
@@ -594,7 +897,8 @@ class AgentWithTools:
                 specs_for_fix.update(self._specs_used_by(current_code))
 
                 fix_prompt = PromptTemplates.get_fix_prompt(
-                    language, current_code, exec_result, user_query, specs_for_fix, code_type
+                    language, current_code, exec_result, user_query, specs_for_fix, code_type,
+                    upstream_code=upstream_code, available_variables=available_variables
                 )
                 system_content = PromptTemplates.get_fix_system_message(language)
                 
@@ -611,15 +915,35 @@ class AgentWithTools:
                     break
             else:
                 print(f"[System] Max iterations reached for {code_type}")
-        
+
+        if not exec_result.get("success") and best_partial is not None:
+            print("[System] Every repair failed outright; returning the earlier partial "
+                  "result, whose caught failures are carried into the observation.")
+            return best_partial, iteration_history
+
         return exec_result, iteration_history
     
-    def create_session(self, session_id: Optional[str] = None) -> str:
-        """Create a new conversation session."""
+    def create_session(self, session_id: Optional[str] = None,
+                       label: Optional[str] = None) -> str:
+        """
+        Create a new conversation session.
+
+        The session id is the directory every turn of the session is written to, so
+        it carries the model that produced those turns: a run of the same case under
+        two models is then two directories side by side, distinguishable without
+        opening either. Pass `label` for what the session is (a case id, say) and
+        the id becomes "<label>_<model>_<timestamp>"; pass `session_id` to name the
+        directory yourself.
+        """
         if session_id is None:
-            session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            session_id = "_".join([
+                slugify(label) if label else "session",
+                slugify(self.model_name),
+                datetime.now().strftime("%Y%m%d_%H%M%S"),
+            ])
         
-        self.sessions[session_id] = ConversationSession(session_id, self.max_turns_per_session)
+        self.sessions[session_id] = ConversationSession(session_id, self.max_turns_per_session,
+                                                       self.context_history_turns)
         print(f"[System] Created new session: {session_id}")
         return session_id
     
@@ -641,8 +965,10 @@ class AgentWithTools:
         Returns:
             Dict, the result record including plan, selected data/tools, generated code, observation, and solution.
         """
-        language = self._detect_language(user_query)
-        print(f"[System] Detected language: {'Chinese' if language == 'zh' else 'English'}")
+        # The configuration can pin the answer's language; 'auto' reads it off the question.
+        language = self.language if self.language in ("zh", "en") else self._detect_language(user_query)
+        print(f"[System] Language: {'Chinese' if language == 'zh' else 'English'}"
+              f"{' (detected)' if self.language not in ('zh', 'en') else ' (from configuration)'}")
 
         if session_id is None:
             session_id = self.create_session()
@@ -673,6 +999,7 @@ class AgentWithTools:
             "bundle_path": str(bundle.root)
         }
         bundle.write("query.txt", user_query + "\n")
+        bundle.write_json("agent_config.json", self._configuration_snapshot())
 
         context_summary = session.get_context_summary()
         
@@ -779,7 +1106,7 @@ class AgentWithTools:
         if len(selected_datasets) == 1:
             code_context["selected_data"] = selected_datasets[0]
 
-        bundle.write_rerun_harness(selected_datasets)
+        bundle.write_rerun_harness(selected_datasets, self.figure_dpi)
 
         compute_result, compute_iterations = self._execute_with_retry(
             compute_code,
@@ -788,7 +1115,11 @@ class AgentWithTools:
             full_specs=full_specs,
             user_query=user_query,
             language=language,
-            bundle=bundle
+            bundle=bundle,
+            # Nothing ran before this block; the repair step is told only what the
+            # sandbox pre-binds, so it does not invent a dataset id of its own.
+            available_variables={name: self._summarize_value(value)
+                                 for name, value in code_context.items()}
         )
         # The code that actually ran, not the first draft: this is what a reader
         # must audit and what code/run.py re-executes.
@@ -803,11 +1134,24 @@ class AgentWithTools:
             print("\n=== Computation Observation ===")
             compute_obs = compute_result.get("summary", {})
             print(json.dumps(compute_obs, indent=2))
-            observation_parts.append({
+            computation_part = {
                 "type": "computation",
                 "status": "success",
                 "results": compute_obs
-            })
+            }
+            # Reported, never dropped: the code ran to completion but caught these
+            # on the way, so some requested quantity is missing. The answer step is
+            # told, and told to say so.
+            if compute_result.get("swallowed_errors"):
+                computation_part["status"] = "success_with_caught_failures"
+                computation_part["caught_failures"] = compute_result["swallowed_errors"]
+                computation_part["message"] = (
+                    "The code caught and stored these failures instead of raising them, so "
+                    "the corresponding results are MISSING. Say so explicitly in the answer, "
+                    "name what could not be computed, and do not present the remaining items "
+                    "as if the whole question had been answered."
+                )
+            observation_parts.append(computation_part)
 
             # Step 4: Extract and execute the visualization code (if any)
             visualize_match = re.search(r"<visualize>(.*?)</visualize>", exec_response.content, re.S)
@@ -818,6 +1162,13 @@ class AgentWithTools:
                     vis_context = dict(code_context)
                     vis_context.update(compute_result["output"])
                     
+                    # A visualization failure is nearly always a name or a shape:
+                    # the block is handed variables it did not create. So the repair
+                    # step gets the code that created them and a summary of each.
+                    vis_variables = {name: self._summarize_value(value)
+                                     for name, value in code_context.items()}
+                    vis_variables.update(compute_result.get("summary", {}))
+
                     vis_result, vis_iterations = self._execute_with_retry(
                         visualize_code,
                         context=vis_context,
@@ -825,7 +1176,9 @@ class AgentWithTools:
                         full_specs=full_specs,
                         user_query=user_query,
                         language=language,
-                        bundle=bundle
+                        bundle=bundle,
+                        upstream_code=final_compute,
+                        available_variables=vis_variables
                     )
 
                     result_record["visualization_iterations"] = vis_iterations
@@ -886,10 +1239,13 @@ class AgentWithTools:
         result_record["observation"] = observation_text
         bundle.write_json("observation.json", observation_parts)
 
-        # Step 4: Generate final answer. The question, the plan and the code that
+        # Step 5: Generate final answer. The question, the plan and the code that
         # actually ran all go in, so that the methodology is reported from the code
         # rather than guessed from the names of the result variables.
-        has_computation_success = observation_parts[0]["status"] == "success"
+        # A run that caught failures still produced numbers, so the answer is written
+        # from them - the observation carries the instruction to declare what is missing.
+        has_computation_success = observation_parts[0]["status"] in (
+            "success", "success_with_caught_failures")
         has_visualization = any(p.get("type") == "visualization" and p.get("status") == "success" 
                                for p in observation_parts)
 
@@ -963,7 +1319,10 @@ if __name__ == "__main__":
                 print(f"\n--- Running test case {idx+1}/{len(test_items)} ---")
                 print(f"Query: {query}")
 
-                session_id = agent.create_session()
+                # The case's own id when it has one, so the directory says which
+                # case, which model and when - T1_deepseek-reasoner_20260922_193101.
+                label = item.get("case_id") or Path(json_file).stem
+                session_id = agent.create_session(label=label)
 
                 try:
                     result = agent.run(query, session_id=session_id)
@@ -980,18 +1339,20 @@ if __name__ == "__main__":
 
         return all_results
 
-    # Read from the environment rather than living in the source, so the key is
-    # never committed: export DEEPSEEK_API_KEY before running.
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    if not api_key:
-        raise SystemExit("DEEPSEEK_API_KEY is not set in the environment.")
+    # Model, limits, output directory and the batch below all come from
+    # configs/agent_with_tools.yaml; the API key comes from the environment
+    # variable that file names, so no key is ever committed.
+    config = load_config()
+    agent = AgentWithTools(TOOLS, data_list, config=config)
 
-    agent = AgentWithTools(TOOLS, data_list, api_key, model_name="deepseek-reasoner",
-                           max_turns_per_session=10, max_code_iterations=3)
-    
-    folder = os.path.join(os.path.dirname(__file__), "..", "..", "data", "web_applications")
-    for _ in range(10):
-        results = run_tests_from_folder(folder, agent)
+    batch = config.get("batch_run") or {}
+    folder = resolve_path(batch.get("test_folder", "cases"))
+    repeats = int(batch.get("repeats", 1))
+    print(f"[System] Running {folder} x{repeats} with {agent.model_name} "
+          f"({agent.provider}; results -> {agent.result_dir})")
+
+    for _ in range(repeats):
+        results = run_tests_from_folder(str(folder), agent)
 
     print("Finished all tests.")
     

@@ -7,10 +7,11 @@
 # file's.
 #
 # Two entry points, by the kind of data:
-#   load_regular_data         data with a real time axis (CMIP6 historical and
-#                             ssp245, ERSSTv5)
+#   load_regular_data         anything with a real time axis: the gridded records
+#                             (CMIP6 historical and ssp245, ERSSTv5) and the
+#                             ungridded published index series (CPC/NCEI)
 #   load_climatology_data     climatologies (WOA23, GLODAP, SEANOE MLD)
-#   load_data_with_geolocator either kind, selected by named region
+#   load_data_with_geolocator either gridded kind, selected by named region
 #
 # Two paths through the grids:
 #   regular grids (WOA23, GLODAP, SEANOE, ERSST, GFDL-ESM4) are sliced by
@@ -44,6 +45,7 @@ from src.tools.data_openers import (
     load_dataset_config,
     open_cmip6,
     open_cmip6_grid_file,
+    open_cpc_index,
     open_ersst,
     open_glodap,
     open_seanoe_mld,
@@ -71,6 +73,13 @@ GEOLOCATOR_LONS = np.arange(0.5, 360.5, 1.0)
 # ---------------------------------------------------------------------------
 # Subsetting primitives, called only by the loaders below
 # ---------------------------------------------------------------------------
+
+# How closely a stored depth coordinate must match the dataset's own level
+# definitions to count as the same level. It absorbs float32 storage and the
+# centimetre-to-metre scaling CESM2 needs, and is far below any real level
+# spacing, so it can never match the wrong level.
+DEPTH_MATCH_TOL = 1e-4
+
 
 def normalize_lon_range(lon_range):
     """
@@ -250,7 +259,7 @@ def resolve_dataset(dataset: str) -> str:
 
 def open_dataset_array(dataset: str, variable: str, model: str = None, time_slice: str = "annual",
                        period: str = None, field: str = None, version: str = None,
-                       chunk_time: int = 12) -> xr.DataArray:
+                       product: str = None, chunk_time: int = 12) -> xr.DataArray:
     """Route to the opener that owns this dataset."""
     dataset = resolve_dataset(dataset)
 
@@ -268,15 +277,22 @@ def open_dataset_array(dataset: str, variable: str, model: str = None, time_slic
         return open_glodap(variable, field=field or "main")
     if dataset == "seanoe_mld":
         return open_seanoe_mld(version=version, variable=variable or "mld_dr003")
+    if dataset == "cpc_indices":
+        # `variable` names the region the series is published for. It stays None when
+        # unstated: the products defined on a single region or on a whole basin reject
+        # a region outright, and cannot tell a default apart from a real request.
+        return open_cpc_index(product=product, region=variable, field=field or "anomaly")
     raise KeyError(f"No opener registered for dataset '{dataset}'")
 
 
-def require_kind(dataset: str, expected: str, tool: str, alternative: str):
+def require_kind(dataset: str, expected, tool: str, alternative: str):
     dataset = resolve_dataset(dataset)
     kind = get_dataset_cfg(dataset)["kind"]
-    if kind != expected:
+    accepted = (expected,) if isinstance(expected, str) else tuple(expected)
+    if kind not in accepted:
         raise ValueError(
-            f"'{dataset}' is a '{kind}' dataset; {tool} handles '{expected}' datasets. Use {alternative}."
+            f"'{dataset}' is a '{kind}' dataset; {tool} handles "
+            f"{' or '.join(repr(k) for k in accepted)} datasets. Use {alternative}."
         )
     return dataset
 
@@ -289,15 +305,24 @@ def require_kind(dataset: str, expected: str, tool: str, alternative: str):
     name="load_regular_data",
     description="Load a rectangular subset of a time series dataset.\n"
         "This is the entry point for any question about change over time — trends, variability, scenario "
-        "projections. Give the window you need: reading a global field and slicing it afterwards is slower "
+        "projections — and for the published index series (cpc_indices), which have a time axis but no "
+        "grid. Give the window you need: reading a global field and slicing it afterwards is slower "
         "and, on a curvilinear model grid, wrong, because index dimensions cannot be sliced by latitude "
         "and longitude. A window crossing the dateline is handled, and comes back on a continuous "
         "longitude axis.\n"
         "The result stays lazy, so a large request is cheap until it is reduced.",
     args={
         "dataset": "str, required. The dataset id, from the registry of available datasets.",
-        "variable": "str, required. The variable's short name in that dataset.",
+        "variable": "str, required. The variable's short name in that dataset. For an index dataset it "
+            "names the region the series is published for, e.g. 'NINO3.4'; leave it out for an index "
+            "that is defined on its own domain rather than on a region box.",
         "model": "str, required for multi-model datasets. Which model to read.",
+        "product": "str, required for a dataset that publishes several series of the same quantity. "
+            "Which one to read; they differ in baseline period and are not interchangeable. Default is "
+            "the dataset's operational series.",
+        "field": "str, optional, default 'anomaly' where it applies. Which published field to read: "
+            "'anomaly' for the departure from the baseline climatology, or 'total' for the absolute "
+            "value.",
         "time_range": "list[str, str], optional. Continuous window as ['start', 'end'] in ISO 8601, e.g. "
             "['1990-01', '2014-12']. Default is the whole record.",
         "depth_range": "list[float, float], optional. [min, max] in metres, positive downward. Levels are "
@@ -311,13 +336,27 @@ def require_kind(dataset: str, expected: str, tool: str, alternative: str):
         "weighting and derived-quantity tools find the right cell areas, volumes and layer thicknesses. On "
         "a regular grid the dimensions are (time, depth, lat, lon); on a curvilinear model grid they are "
         "the model's index dimensions with 2-D latitude and longitude coordinates, trimmed to the "
-        "requested box."
+        "requested box. An index dataset comes back with 'time' alone and no spatial dimensions."
 )
-def load_regular_data(dataset: str, variable: str, model: str = None, time_range: list = None,
+def load_regular_data(dataset: str, variable: str = None, model: str = None, time_range: list = None,
                       depth_range: list = None, lat_range: list = None, lon_range: list = None,
-                      chunk_time: int = 12) -> xr.DataArray:
-    dataset = require_kind(dataset, "timeseries", "load_regular_data", "load_climatology_data")
-    da = open_dataset_array(dataset, variable, model=model, chunk_time=chunk_time)
+                      product: str = None, field: str = None, chunk_time: int = 12) -> xr.DataArray:
+    dataset = require_kind(dataset, ("timeseries", "index"), "load_regular_data",
+                           "load_climatology_data")
+    if get_dataset_cfg(dataset)["kind"] == "index":
+        # A published index is one number per month, already area-averaged over a
+        # fixed box. Silently ignoring a spatial window would hand back the whole
+        # series as though it had been cut down to the region asked for.
+        given = [name for name, value in (("depth_range", depth_range), ("lat_range", lat_range),
+                                          ("lon_range", lon_range)) if value is not None]
+        if given:
+            raise ValueError(
+                f"'{dataset}' is an ungridded index series with no spatial dimensions, so "
+                f"{', '.join(given)} cannot be applied. Select the region with 'variable' "
+                f"(e.g. variable='NINO3.4'), or read a gridded dataset to cut out a box."
+            )
+    da = open_dataset_array(dataset, variable, model=model, field=field, product=product,
+                            chunk_time=chunk_time)
 
     if time_range is not None:
         if "time" not in da.coords:
@@ -482,7 +521,10 @@ def load_data_with_geolocator(dataset: str, variable: str = None, model: str = N
     dataset = resolve_dataset(dataset)
     kind = get_dataset_cfg(dataset)["kind"]
     if kind not in ("timeseries", "climatology"):
-        raise ValueError(f"'{dataset}' is a '{kind}' dataset and has no grid to mask.")
+        raise ValueError(
+            f"'{dataset}' is a '{kind}' dataset and has no grid to mask. Read it with "
+            f"load_regular_data, which takes its region as an argument."
+        )
 
     da = open_dataset_array(
         dataset, variable, model=model, time_slice=time_slice, period=period,
@@ -1162,7 +1204,16 @@ def areas_like(da: xr.DataArray) -> xr.DataArray:
     than the 1-degree default.
     """
     dataset, model = dataset_of(da)
-    return _align_horizontal(load_areas(dataset=dataset, model=model), da)
+    areas = _align_horizontal(load_areas(dataset=dataset, model=model), da)
+    if da.attrs.get("grid_point") == "velocity":
+        # areacello describes tracer cells. The velocity points of the same
+        # (j, i) sit half a cell away, so the areas are close enough to weight
+        # an average with, but they are not the face widths a transport needs.
+        areas.attrs["area_source"] = (
+            f"{areas.attrs.get('area_source', 'cell areas')}, tracer-cell areas applied to the "
+            f"velocity points of the same index (offset by half a cell)"
+        )
+    return areas
 
 
 def volumes_like(da: xr.DataArray) -> xr.DataArray:
@@ -1268,8 +1319,16 @@ def layer_bounds_like(da: xr.DataArray) -> xr.DataArray:
     dataset, model = dataset_of(da)
     depths = np.atleast_1d(da["depth"].values).astype("float64")
 
+    # The stored depth coordinate can be float32 while the level table is
+    # float64: CESM2's lev is in centimetres and scaling it to metres leaves the
+    # two differing in the last few bits (984.705859 against 984.7059375). An
+    # exact range filter then drops the deepest level of any subset and the
+    # check below reports a grid mismatch that is not one. Widen the request by
+    # the same tolerance that check uses; level spacings are metres, so 0.1 mm
+    # cannot reach a neighbouring level.
+    pad = DEPTH_MATCH_TOL
     kwargs = {"dataset": dataset, "model": model,
-              "depth_range": [float(depths.min()), float(depths.max())]}
+              "depth_range": [float(depths.min()) - pad, float(depths.max()) + pad]}
     if dataset == "woa23":
         # The monthly and seasonal axes are not truncations of the annual one:
         # their deepest layer is closed at the level itself, so the time slice
@@ -1285,7 +1344,7 @@ def layer_bounds_like(da: xr.DataArray) -> xr.DataArray:
         if variable is None or time_slice is None:
             raise ValueError(
                 f"Cannot tell which WOA23 vertical axis this array belongs to: it is missing the "
-                f"'woa_variable' and/or 'woa_time_slice' attributes that open_woa23 records. The axes of "
+                f"'woa_variable' and/or 'woa_time_slice' attributes the loader records. The axes of "
                 f"different variables and time slices share their level centres and differ only in how the "
                 f"deepest layer closes, so none can stand in for another and guessing would quietly "
                 f"misweight the bottom layer. Reload the field with load_climatology_data and keep its "
@@ -1296,7 +1355,7 @@ def layer_bounds_like(da: xr.DataArray) -> xr.DataArray:
         kwargs["period"] = da.attrs.get("woa_period")
     levels, bounds = load_depth_levels(**kwargs)
 
-    if levels.size != depths.size or not np.allclose(levels.values, depths, atol=1e-4):
+    if levels.size != depths.size or not np.allclose(levels.values, depths, atol=DEPTH_MATCH_TOL):
         raise ValueError(
             f"The depth levels of this array do not match the '{dataset}' vertical grid it claims to come "
             f"from ({depths.size} levels against {levels.size}). Layer boundaries can only be taken from the "
@@ -1314,6 +1373,41 @@ def layer_thickness_like(da: xr.DataArray) -> xr.DataArray:
     thickness.attrs = {
         "units": "m", "long_name": "layer thickness",
         "bounds_source": bounds.attrs.get("bounds_source", ""),
+    }
+    return thickness
+
+
+def cell_thickness_like(da: xr.DataArray) -> xr.DataArray:
+    """
+    The thickness of water in each of `da`'s cells, in metres.
+
+    For a CMIP6 model this is volcello / areacello, which is what the protocol
+    recommends where cells are not full (Griffies et al. 2016, Appendix B1.1):
+    the layer bounds give the thickness of a FULL cell, and the cells at the sea
+    floor are not full. The difference is large for GFDL-ESM4, whose fields were
+    remapped from hybrid layers onto z levels and carry values in bottom cells
+    that are only partly water: over the whole ocean, area x layer-bound
+    thickness comes to 1.53e18 m3 against 1.33e18 m3 from its own volcello, and
+    14 per cent of its cells differ by more than one per cent. MPI-ESM1-2-LR's
+    partial bottom steps differ by up to half a layer in 3 per cent of cells;
+    CESM2's two agree.
+
+    Observational products have no partial cells, so their layer bounds are
+    used. The result is aligned to `da` and may carry horizontal dimensions (and
+    time, for GFDL-ESM4, whose volcello is monthly) as well as depth.
+    """
+    dataset, _ = dataset_of(da)
+    if not dataset.startswith("cmip6_"):
+        return layer_thickness_like(da)
+
+    volumes = volumes_like(da)
+    areas = areas_like(da)
+    thickness = (volumes / areas.where(areas > 0)).astype("float64")
+    thickness.name = "cell_thickness"
+    thickness.attrs = {
+        "units": "m", "long_name": "cell thickness (volume per unit area)",
+        "bounds_source": f"volcello / areacello ({volumes.attrs.get('volume_source', 'cell volumes')}), "
+                         f"which accounts for partial cells at the sea floor",
     }
     return thickness
 

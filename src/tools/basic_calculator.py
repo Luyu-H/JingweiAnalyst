@@ -83,7 +83,10 @@ def _resolve_weighted_dims(data, dim, required, op):
 
 @register_tools(
     name="compute_basic_stat",
-    description="Reduce a field along chosen dimensions with one basic statistic.\n"
+    description="Reduce a field along chosen dimensions with one basic statistic, weighted in space but "
+        "never in time.\n"
+        "It weights in SPACE, never in time: a mean taken over a time axis here gives a 28-day February the "
+        "same weight as a 31-day January, so reduce time with temporal_aggregate first.\n"
         "Use a WEIGHTED mean for any physical average. A plain mean is only right when every element "
         "represents the same amount of ocean, which is rarely true: cells shrink towards the poles, and "
         "layer thicknesses vary by more than an order of magnitude with depth. The weights are taken from "
@@ -209,8 +212,13 @@ SEASON_CONVENTIONS = {
 
 @register_tools(
     name="temporal_aggregate",
-    description="Aggregate a time series to annual, seasonal or climatological-monthly values, or smooth "
-        "it with a running window.\n"
+    description="Aggregate a time series in time: a DAY-WEIGHTED long-term mean, or annual, seasonal or "
+        "climatological-monthly values, or a running window.\n"
+        "This is the only tool that weights by month length, and the only correct way to reduce monthly data "
+        "along time; compute_basic_stat does not weight in time.\n"
+        "Do not hand-roll the weighting as (data * weights).sum('time') / weights.sum(): xarray's sum skips "
+        "missing values, so an all-land column returns 0.0 rather than NaN, the land mask is lost, and that "
+        "zero then spreads into neighbouring ocean cells the moment the field is regridded.\n"
         "Means are weighted by the number of days in each month, using the dataset's own calendar: "
         "calendar months are 28 to 31 days long, so averaging them with equal weight is not a time "
         "average. Weighting applies to op='mean' only; a median, minimum, maximum or standard deviation of "
@@ -219,6 +227,10 @@ SEASON_CONVENTIONS = {
     args={
         "data": "xr.DataArray, required. A field with a 'time' dimension.",
         "freq": "str, optional, default 'year'. What to aggregate to:\n"
+            "- 'mean': ONE field for the whole window, the time dimension removed. This is the "
+            "climatology of a period — the 1971-2000 mean state of a model, the field a bias or an "
+            "RMSE is measured on. Use it rather than compute_basic_stat(op='mean', dim='time'), "
+            "which gives every month the same weight and so is not a time average.\n"
             "- 'year': one value per calendar year.\n"
             "- 'season': one value per seasonal period (see season_convention).\n"
             "- 'climatology': one value per calendar month, across all years.\n"
@@ -238,6 +250,10 @@ SEASON_CONVENTIONS = {
             "feature later by half a window."
     },
     returns="xr.DataArray, aggregated in time.\n"
+        "- 'mean': the 'time' dimension is gone and a single field is left, carrying the window it "
+        "covers in attrs['time_mean_period'] and the number of steps it averaged. attrs "
+        "['incomplete_periods'] lists any year the window does not cover in full, which tilts a "
+        "long-term mean towards the seasons those years contribute.\n"
         "- 'year': the time axis becomes an integer 'year' coordinate. attrs['incomplete_periods'] lists "
         "any year not covered by a full 12 months, which biases a trend if left in.\n"
         "- 'season': one entry per seasonal period, with 'season' and 'year' coordinates attached; a "
@@ -310,6 +326,30 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean',
         result.attrs['time_weighting'] = 'unweighted (a running window is a filter over a fixed number of steps)'
         return result
 
+    if freq == 'mean':
+        # One field for the whole window. aggregate() already weights each month
+        # by its length in the dataset's own calendar, so this is a true time
+        # mean and not the arithmetic mean of 12-per-year unequal months.
+        result = aggregate(data)
+        months_per_year = data['time'].dt.year.to_series().value_counts()
+        incomplete = sorted(int(y) for y, n in months_per_year.items() if n != 12)
+        result.attrs = data.attrs.copy()
+        result.attrs['temporal_aggregation'] = f'time_mean_{op}'
+        result.attrs['aggregation_operation'] = op
+        result.attrs['time_weighting'] = (
+            'weighted by days in month' if op == 'mean' else f'unweighted ({op} has no weighted form)'
+        )
+        first, last = data['time'].values[0], data['time'].values[-1]
+        result.attrs['time_mean_period'] = (
+            f"{str(first)[:7]} to {str(last)[:7]}, {data.sizes['time']} time steps"
+        )
+        if incomplete:
+            result.attrs['incomplete_periods'] = (
+                f"years not covered by a full 12 months: {incomplete}; a long-term mean over them leans "
+                f"towards the seasons those years do cover"
+            )
+        return result
+
     if freq == 'year':
         result = data.resample(time='1YE').map(aggregate)
         months_per_year = data['time'].dt.year.to_series().value_counts()
@@ -339,7 +379,8 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean',
 
     else:
         raise ValueError(
-            f"Frequency '{freq}' not supported. Choose from: 'year', 'season', 'climatology', 'rolling'"
+            f"Frequency '{freq}' not supported. Choose from: 'mean', 'year', 'season', "
+            f"'climatology', 'rolling'"
         )
 
     result.attrs = data.attrs.copy()
@@ -707,7 +748,11 @@ def _density_in_kg_per_litre(density):
         "That conversion needs seawater density. The default is a constant, which is the mean surface "
         "value and errs by about a percent in the deep ocean and in fresh polar water — enough to rival "
         "the differences such a comparison sets out to measure. Pass a density field for anything below "
-        "the surface; compute_potential_density_anomaly with ref_pressure=None produces one.",
+        "the surface; compute_potential_density_anomaly with ref_pressure=None produces one.\n"
+        "Pass that field EXACTLY as returned. Do not add 1000 to make it absolute first: whether the array "
+        "is an anomaly or an absolute density is read from its own long_name BEFORE its magnitude, so a "
+        "pre-converted field still labelled 'anomaly' has 1000 added a second time and every converted "
+        "value comes out about half its true size.",
     args={
         "data": "xr.DataArray, required. The field to convert.",
         "from_unit": "str, required, case-insensitive. The unit the data is in; passing the array's own "

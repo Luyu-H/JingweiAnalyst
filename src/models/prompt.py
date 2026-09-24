@@ -27,8 +27,8 @@ class PromptTemplates:
    问 ENSO 监测指数本身 -> 选 cpc_indices。
 3. 模式与观测对比、多变量联合分析时，可以同时选多个数据集，用逗号分隔。
 4. 工具选择：凡是需要读数据，必须包含 load_regular_data / load_climatology_data /
-   load_data_with_geolocator 三者之一（命名海域用 load_data_with_geolocator）。open_* 系列是
-   底层读取器，只在没有对应 load_* 入口时才直接用（例如 cpc_indices 只能用 open_cpc_index）。
+   load_data_with_geolocator 三者之一（命名海域用 load_data_with_geolocator），没有别的读取入口。
+   cpc_indices 这类已发布的指数序列也走 load_regular_data，用 product 选序列、variable 选区域。
 5. 区域平均、全球平均不要自己手算权重，选 compute_basic_stat 并使用其加权算子。
 
 分析用户的问题并选择合适的数据和工具。严格按照以下格式输出：
@@ -61,9 +61,9 @@ Data selection rules:
 3. Select several datasets, comma-separated, when the question compares a model against observations
    or needs variables that live in different products.
 4. Tool selection: any question that needs data must include one of load_regular_data,
-   load_climatology_data or load_data_with_geolocator (the last one for named ocean regions). The
-   open_* tools are the low-level readers; use one directly only when no load_* entry point covers
-   the dataset (cpc_indices is reachable only through open_cpc_index).
+   load_climatology_data or load_data_with_geolocator (the last one for named ocean regions); there
+   is no other way in. A published index series such as cpc_indices also goes through
+   load_regular_data, with 'product' choosing the series and 'variable' the region.
 5. Do not plan to compute area or volume weights by hand: select compute_basic_stat and use its
    weighted operators.
 
@@ -140,6 +140,10 @@ IMPORTANT: Your response MUST contain all required XML tags, and tags must be pr
 
 重要提示：
 - 计算代码必须完整且独立
+- 让错误抛出来。不要用 try/except 把某一步的异常记下来然后继续：那样进程会以「成功」结束，而答案里
+  静静地缺了一块，修复环节也永远看不到这个问题。某个模式或某个变量按你写的方式处理不了时，正确做法
+  是改调用，而不是捕获异常。只有当题目本身要求容忍缺失输入时才捕获，并且仍要把失败留在一个变量里，
+  让最终答案能如实报告。
 - 加载工具返回的是惰性 (dask) 的 xr.DataArray。最终要汇报的结论量必须显式 .compute()（或 float()）
   求值后存进单独的小变量，否则下游只能看到 dask 占位符而读不到数值。中间大数组不必 compute。
 - 区域/全球平均用 compute_basic_stat 的加权算子（area_weighted_mean / volume_weighted_mean），
@@ -155,6 +159,19 @@ IMPORTANT: Your response MUST contain all required XML tags, and tags must be pr
   执行环境已开启 keep_attrs，普通 xarray 运算不会丢掉这些属性；但若某步运算改变了物理量纲
   （如求比值、做差分），请自行用 .assign_attrs(units=...) 更新 units，否则单位标注会失真。
 - 可视化代码可以引用计算中的变量
+- 多子图共用色标时，色标上下限取汇总数据的稳健分位数，例如
+  `vmax = float(np.nanpercentile(np.abs(np.concatenate([...])), 98))`，绝不要取绝对值最大值。
+  近岸或边缘海常有比信号大一个量级的单点，`vmax = nanmax(abs(...))` 会把整个色标让给那一个格点，
+  于是每个子图都渲染成一片空白。差值/距平用以零为中心的发散色图，量值用顺序色图；若做了截断，
+  在色标标签里说明。
+- 给多个子图共用的 colorbar (`fig.colorbar(..., ax=axes)`) 之后，不要再调用 tight_layout()：
+  它不知道这个 colorbar 的存在，会把子图铺到 colorbar 上。要么用
+  `plt.subplots(..., constrained_layout=True)` 且完全不调 tight_layout，要么在添加 colorbar 之前调。
+- 标注不要压住数据：图例用 `loc="best"` 或放到坐标区外。把图例钉在曲线峰值所在的角落，
+  正好遮住这个子图要展示的特征。
+- 曲线网格上的场，其二维坐标并不叫 lat/lon。请用 `da.attrs.get("lat_coord", "lat")` /
+  `da.attrs.get("lon_coord", "lon")` 读出坐标名，不要直接索引 `da.coords["lat"]`——
+  在 CESM2 和 MPI-ESM1-2-LR 上会抛 KeyError。
 - 只要结果还有可展示的维度就必须给出 <visualize>：时间序列、季节循环、垂向廓线、空间分布图、
   多组对比，都属于此列，即使用户没有明说要图也要画。只有当答案就是一个标量或一张几行的表格、
   确实无图可画时，才把 <visualize> 留空。
@@ -207,6 +224,12 @@ Generate code in this format:
 
 Important:
 - Computation code MUST be complete and standalone
+- Let failures raise. Do NOT wrap a step in try/except to record the error and carry on: the run
+  then exits cleanly with part of the answer silently missing, and the repair pass never sees the
+  problem. If one model or one variable cannot be processed the way you wrote it, the right
+  response is to fix the call, not to catch the exception. Only catch one when the question itself
+  asks you to tolerate a missing input, and then still leave the failure in a variable the answer
+  can report.
 - The loaders return LAZY (dask-backed) xr.DataArray objects. Every quantity you want reported must
   be materialised explicitly with .compute() (or float()) into its own small variable, otherwise the
   downstream step sees a dask placeholder and no numbers at all. Large intermediates can stay lazy.
@@ -229,6 +252,22 @@ Important:
   step changes the physical quantity (a ratio, a difference of unlike things), set the new units
   yourself with .assign_attrs(units=...), or the reported units will be wrong.
 - Visualization code can reference variables from computation
+- Colour limits on a shared scale: take them from a robust percentile of the pooled data, e.g.
+  `vmax = float(np.nanpercentile(np.abs(np.concatenate([...])), 98))`, and never from the maximum
+  absolute value. A single coastal or marginal-sea cell is routinely an order of magnitude larger
+  than the signal, and `vmax = nanmax(abs(...))` then hands the whole scale to that one cell so
+  every panel renders as uniform white. Use a diverging map centred on zero for a difference or
+  anomaly and a sequential map for a magnitude, and say in the colourbar label when values are
+  clipped.
+- Do NOT call tight_layout() after attaching a colorbar to several axes (`fig.colorbar(..., ax=axes)`)
+  — it does not know about that colorbar and will lay the panels over it. Either build the figure
+  with `plt.subplots(..., constrained_layout=True)` and add no tight_layout at all, or call
+  tight_layout BEFORE adding the colorbar.
+- Keep annotation off the data: `loc="best"` for a legend, or place it outside the axes. A legend
+  pinned to a corner where a curve peaks hides the very feature the panel is there to show.
+- A field on a curvilinear grid has 2-D coordinates that are NOT called lat/lon. Read the names off
+  the array with `da.attrs.get("lat_coord", "lat")` / `da.attrs.get("lon_coord", "lon")` rather than
+  indexing `da.coords["lat"]`, which raises KeyError on CESM2 and MPI-ESM1-2-LR.
 - Provide a <visualize> block whenever the result still has something to show — a time series, a
   seasonal cycle, a depth profile, a spatial map, or several groups to compare — even when the
   question does not ask for a figure in so many words. Leave it empty only when the answer is a
@@ -243,7 +282,69 @@ Important:
             return "Generate the two code blocks now."
     
     @staticmethod
-    def get_fix_prompt(language: str, code: str, exec_result: Dict, user_query: str, full_specs: Dict, code_type: str) -> str:
+    def get_fix_prompt(language: str, code: str, exec_result: Dict, user_query: str,
+                       full_specs: Dict, code_type: str,
+                       upstream_code: str = "", available_variables: Dict = None) -> str:
+        """
+        Build the repair prompt for one failed code block.
+
+        Only the failed block is rewritten, so the repair step is shown the code
+        that ran before it and the variables that code left in the namespace.
+        Without them a broken visualization block can only guess what `mean_o2`
+        was, and the usual repair is to recompute it - which silently answers the
+        question a second time, by a different route, in the plotting step.
+        """
+        upstream_block = ""
+        variables_block = ""
+        if upstream_code:
+            upstream_block = (
+                f"""
+已经成功执行的上游代码（它定义的变量在当前命名空间中已经可用）：
+<upstream_code>
+{upstream_code}
+</upstream_code>
+""" if language == 'zh' else f"""
+The code that already ran successfully before this block (the variables it defines are
+already in the namespace):
+<upstream_code>
+{upstream_code}
+</upstream_code>
+""")
+        if available_variables:
+            variables_block = (
+                f"""
+当前命名空间中已有的变量（名称 -> 内容摘要），可以直接使用：
+{json.dumps(available_variables, indent=2, ensure_ascii=False, default=str)}
+""" if language == 'zh' else f"""
+Variables already present in the namespace (name -> summary of its contents); use them
+as they are:
+{json.dumps(available_variables, indent=2, ensure_ascii=False, default=str)}
+""")
+
+        # Only rules the prompt can back up: a reuse rule with no list of variables
+        # under it reads as an instruction to invent one.
+        if language == 'zh':
+            focus = ["修复上述具体错误"]
+            if available_variables:
+                focus.append("变量名必须取自上面的可用变量清单；清单里已有的量直接引用，"
+                             "不要重新加载数据或重新计算")
+            else:
+                focus.append("确保变量名与函数调用正确")
+            if upstream_code:
+                focus.append("不要输出上游代码，也不要修改它")
+            focus.append("使用正确的语法、函数签名和库函数")
+        else:
+            focus = ["Fixing the specific error mentioned above"]
+            if available_variables:
+                focus.append("Taking variable names from the list of available variables above; "
+                             "use what is already there instead of reloading the data or "
+                             "recomputing a quantity that exists")
+            else:
+                focus.append("Ensuring proper variable names and function calls")
+            if upstream_code:
+                focus.append("Not reproducing or modifying the upstream code")
+            focus.append("Using correct syntax, function signatures and library functions")
+        focus_block = "\n".join(f"{i}. {line}" for i, line in enumerate(focus, 1))
 
         if language == 'zh':
             return f"""以下{code_type}代码执行失败：
@@ -262,15 +363,13 @@ Important:
 </error_info>
 
 原始任务：{user_query}
-
+{upstream_block}{variables_block}
 可用工具及其规格说明：
 {json.dumps(full_specs, indent=2, ensure_ascii=False)}
 
-请修复代码并在 <execute></execute> 标签内输出修正后的版本。
+请只修复上面这一个 {code_type} 代码块，并在 <execute></execute> 标签内输出修正后的完整版本。
 重点关注：
-1. 修复上述具体错误
-2. 确保正确的变量名和函数调用
-3. 使用正确的语法和库函数
+{focus_block}
 """
         
         else:  # English
@@ -290,15 +389,14 @@ Traceback:
 </error_info>
 
 Original task: {user_query}
-
+{upstream_block}{variables_block}
 Available tools and their specifications:
 {json.dumps(full_specs, indent=2)}
 
-Please fix the code and output the corrected version inside <execute></execute> tags.
+Fix this one {code_type} block only, and output the corrected, complete version inside
+<execute></execute> tags.
 Focus on:
-1. Fixing the specific error mentioned above
-2. Ensuring proper variable names and function calls
-3. Using correct syntax and library functions
+{focus_block}
 """
     
     @staticmethod
