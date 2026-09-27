@@ -1279,17 +1279,26 @@ def compute_enso_nino_index(data: xr.DataArray, nino_region: str = "nino3.4", de
     name="compute_pdo_index",
     description="Compute the Pacific Decadal Oscillation index: the leading EOF of North Pacific sea "
         "surface temperature anomalies.\n"
-        "The global mean anomaly is removed first, so the index measures the North Pacific pattern rather "
-        "than global warming, and cells are weighted by the square root of their area so the EOF is taken "
-        "on a field whose variance is area-proportional.\n"
+        "Pass the GLOBAL field, not a North Pacific subset. The tool does every step of the definition "
+        "itself: it removes the monthly climatology, cuts out the 20N-70N, 110E-100W box, and removes "
+        "the global mean anomaly. That global mean is taken over whatever field it is given, so a field "
+        "already cut to the North Pacific (or to any region) would have the REGIONAL mean removed "
+        "instead, changing the pattern, the explained variance and the index. Such a field is therefore "
+        "rejected: its valid cells must reach south of 20S and cover at least 300 degrees of longitude. "
+        "Removing the monthly climatology beforehand is harmless but unnecessary.\n"
+        "The global mean is removed so the index measures the North Pacific pattern rather than global "
+        "warming, and cells are weighted by the square root of their area so the EOF is taken on a field "
+        "whose variance is area-proportional.\n"
         "The sign of an EOF is arbitrary, so it is fixed by the convention that the positive phase is cool "
         "in the central and western North Pacific. Both the pattern and the index follow it, which makes a "
         "negative correlation between two patterns a real disagreement rather than an arbitrary flip.\n"
         "The EOF is taken over a rectangular latitude-longitude block, so a field on a curvilinear grid "
         "must be regridded first.",
     args={
-        "data": "xr.DataArray, required. Temperature with 'time' and regular 'lat'/'lon' dimensions, "
-            "optionally 'depth', in degrees Celsius.",
+        "data": "xr.DataArray, required. GLOBAL temperature with 'time' and regular 'lat'/'lon' "
+            "dimensions, optionally 'depth', in degrees Celsius - the whole field as loaded (or as "
+            "regridded), not a North Pacific subset, because the global-mean removal is computed over "
+            "every valid cell passed in. The North Pacific box is selected inside the tool.",
         "depth_level": "float or None, optional, default None. Only used when the field has a depth "
             "dimension. None takes the shallowest level, matching CMIP6's tos; a number averages every "
             "level shallower than it, thickness-weighted, which is a different quantity.",
@@ -1332,6 +1341,28 @@ def compute_pdo_index(data: xr.DataArray, depth_level: float = None,
         sst_data = surface_layer(data, depth_level)
     else:
         sst_data = data
+
+    # The global-mean removal below averages over every valid cell passed in. A
+    # field already cut to the North Pacific, or to any region, would silently have
+    # its REGIONAL mean removed instead, which changes the pattern, the explained
+    # variance and the index without anything failing. So the field must actually
+    # be global: its valid cells must reach well into the Southern Hemisphere and
+    # go most of the way round the globe. One time step is enough to tell.
+    valid = sst_data.isel(time=0).transpose('lat', 'lon').notnull().values
+    valid_lats = sst_data['lat'].values[valid.any(axis=1)]
+    valid_lons = np.unique(sst_data['lon'].values[valid.any(axis=0)] % 360)
+    if valid_lats.size and valid_lons.size:
+        gaps = np.diff(np.concatenate([valid_lons, [valid_lons[0] + 360]]))
+        lon_coverage = 360 - float(gaps.max())
+        if float(valid_lats.min()) > -20 or lon_coverage < 300:
+            raise ValueError(
+                f"compute_pdo_index needs the GLOBAL field, but this one only covers latitudes "
+                f"{float(valid_lats.min()):.0f} to {float(valid_lats.max()):.0f} and about {lon_coverage:.0f} "
+                f"degrees of longitude. The tool removes the global mean anomaly over every cell it is given "
+                f"and cuts out the 20N-70N, 110E-100W box itself, so a field cut to a region beforehand would "
+                f"have its regional mean removed instead and give a different PDO. Pass the whole field as "
+                f"loaded (or as regridded to the common grid), without selecting the North Pacific first."
+            )
 
     # The PDO is defined on monthly ANOMALIES. Removing only the time mean, as an
     # EOF of raw SST, leaves the seasonal cycle as by far the largest mode: it
