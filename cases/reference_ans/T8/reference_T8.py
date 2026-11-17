@@ -4,16 +4,10 @@ mapped climatology.
 
 Run from the repository root with the project's conda environment:
 
-    source /home/lorraine/miniconda3/bin/activate base && conda activate jingwei_QA
-    PYTHONPATH=. python cases/reference_ans/T8/reference_T8.py
+    python cases/reference_ans/T8/reference_T8.py
 
 Writes answer_T8.json, answer_T8.md, fig1_dic_bias_maps.png and
 fig2_dic_bias_profile.png next to this file.
-
-Every physical quantity is produced by a tool from src/tools. The model fields
-are converted from mol m-3 to umol/kg with an in-situ density field computed
-from each model's own thetao and so; a constant would err by about the size of
-the biases being measured.
 """
 
 import json
@@ -50,7 +44,7 @@ xr.set_options(keep_attrs=True)
 
 
 def annual_mean(dataset, variable, model, window, depth_range):
-    """Day-weighted annual mean of a monthly model field."""
+    """Day-weighted mean of a monthly model field over the supplied time window."""
     monthly = load_regular_data(dataset, variable, model=model, time_range=window,
                                 depth_range=depth_range, chunk_time=12)
     return temporal_aggregate(monthly, freq="mean", op="mean").compute()
@@ -164,9 +158,6 @@ for model in MODELS:
     dic = annual_mean("cmip6_historical", "dissic", model, YEAR, None)
     converted = to_mass_basis(dic, temperature, salinity)
 
-    # Interpolate onto the named depths, THEN move horizontally: a bias quoted
-    # at a depth needs both products answering at the same depth, and this is
-    # the one place where interpolation rather than a layer mean is correct.
     on_levels = regrid_vertical(converted, target=PROFILE_DEPTHS, method="linear")
     on_grid = regrid_horizontal(on_levels, target="glodap", method="conservative")
 
@@ -219,9 +210,7 @@ stack = np.concatenate([np.abs(bias_field[m].values[np.isfinite(bias_field[m].va
 percentiles = {q: float(np.percentile(stack, q)) for q in (50, 75, 90, 95, 98)}
 print("[fig1] |bias| percentiles (umol/kg): "
       + "  ".join(f"p{q}={v:.0f}" for q, v in percentiles.items()))
-# The 95th percentile: the Arctic and the marginal seas carry biases several
-# times the open-ocean value, and a scale wide enough to hold them leaves the
-# basin-scale pattern flat. The bar extends at both ends, so they are still shown.
+
 vmax = float(np.ceil(percentiles[95] / 10) * 10)
 print(f"[fig1] shared diverging scale +/-{vmax:.0f} umol/kg "
       f"(95th percentile of |bias| = {percentiles[95]:.1f})")

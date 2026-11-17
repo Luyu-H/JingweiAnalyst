@@ -1,21 +1,11 @@
 """
-Reference answer for case T9 - Multi-model assessment of the PDO pattern and
-its decadal statistics.
+Reference answer for case T9 - Multi-model assessment of the PDO pattern and its decadal statistics.
 
 Run from the repository root with the project's conda environment:
 
-    source /home/lorraine/miniconda3/bin/activate base && conda activate jingwei_QA
-    PYTHONPATH=. python cases/reference_ans/T9/reference_T9.py
+    python cases/reference_ans/T9/reference_T9.py
 
-Writes answer_T9.json, answer_T9.md, fig1_pdo_patterns.png and
-fig2_pdo_timeseries.png next to this file.
-
-Every physical quantity is produced by a tool from src/tools.
-
-NOTE: this needs two changes made for it. compute_pdo_index now returns a
-fourth value, the regression pattern in degC per standard deviation, which is
-the only output with a physical amplitude. The CPC reader gained a 'year_rows'
-layout, so load_regular_data can return the published PDO series.
+Writes answer_T9.json, answer_T9.md, fig1_pdo_patterns.png and fig2_pdo_timeseries.png next to this file.
 """
 
 import json
@@ -41,8 +31,8 @@ OUT = Path(__file__).resolve().parent
 MODELS = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
 SOURCES = ["ERSSTv5"] + MODELS
 WINDOW = ["1950-01", "2014-12"]
-SMOOTH_MONTHS = 108          # the 9-year decadal filter of step 6
-MERGE_YEARS = 3              # crossings closer than this count as one transition
+SMOOTH_MONTHS = 108
+MERGE_YEARS = 3
 
 xr.set_options(keep_attrs=True)
 
@@ -50,8 +40,6 @@ xr.set_options(keep_attrs=True)
 # ---------------------------------------------------------------------------
 # Step 1. The PDO of each source, all on one 1-degree grid
 # ---------------------------------------------------------------------------
-# Every source is regridded, the observations included: patterns on different
-# grids cannot be correlated, and the explained variance is grid-dependent.
 index, pattern, variance = {}, {}, {}
 
 for source in SOURCES:
@@ -90,7 +78,7 @@ for source in SOURCES:
         "explained_variance_percent": variance[source],
         "amplitude_degC_per_sd": amplitude(pattern[source]),
         "lag1yr_autocorrelation": float(lagged["correlation"]),
-        "index_sd": float(series.std()),            # 1 by construction; recorded, not reported
+        "index_sd": float(series.std()),
     }
     entry = statistics[source]
     print(f"[2-3] {source:14s} var {entry['explained_variance_percent']:5.2f}%  "
@@ -102,7 +90,6 @@ for source in SOURCES:
 # ---------------------------------------------------------------------------
 # Step 4. The reconstruction against the published index
 # ---------------------------------------------------------------------------
-# A basin-wide pattern index, defined on its own domain: it takes no region.
 published = load_regular_data("cpc_indices", product="pdo", time_range=WINDOW)
 recon_vs_published = float(analyze_correlation(index["ERSSTv5"], published, dim="time",
                                                method="pearson")["correlation"])
@@ -163,7 +150,7 @@ print(f"[fig1] shared diverging scale +/-{vmax:.1f} degC/sd "
 
 lon = pattern["ERSSTv5"]["lon"].values
 lat = pattern["ERSSTv5"]["lat"].values
-# The domain crosses the dateline; relabel eastward so it draws unbroken.
+
 order = np.argsort(np.where(lon < 0, lon + 360.0, lon))
 lon_plot = np.where(lon < 0, lon + 360.0, lon)[order]
 
@@ -282,14 +269,6 @@ answer = {
     "tools_used": [
         "load_regular_data", "regrid_horizontal", "compute_pdo_index",
         "compute_basic_stat", "temporal_aggregate", "analyze_correlation",
-    ],
-    "depends_on_tool_changes": [
-        "compute_pdo_index now returns a fourth value, the regression pattern in degC per "
-        "standard deviation. The unit-norm eigenvector it returned before has no physical "
-        "magnitude, so no amplitude could be reported from the tool as it stood.",
-        "The CPC reader gained a 'year_rows' layout, so load_regular_data can return the "
-        "published PDO file, which is one row per year and one column per month rather than "
-        "the column layout the Nino products use.",
     ],
 }
 

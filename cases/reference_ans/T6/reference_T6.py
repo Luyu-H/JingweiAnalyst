@@ -4,19 +4,11 @@ its basin structure.
 
 Run from the repository root with the project's conda environment:
 
-    source /home/lorraine/miniconda3/bin/activate base && conda activate jingwei_QA
-    PYTHONPATH=. python cases/reference_ans/T6/reference_T6.py
+    python cases/reference_ans/T6/reference_T6.py
 
 Writes answer_T6.json, answer_T6.md, fig1_nitracline_maps.png and
 fig2_equatorial_pacific_sections.png next to this file. Takes roughly fifteen
 minutes, almost all of it forming the 30-year mean nitrate profiles.
-
-Every physical quantity is produced by a tool from src/tools.
-
-NOTE: this needs the layer_bounds_like depth-tolerance fix in
-src/tools/data_loader.py. CESM2 stores depth as float32 while the level table
-is float64, and without it every depth-range subset of CESM2 loses its deepest
-level and the vertical gradient cannot be taken.
 """
 
 import json
@@ -31,7 +23,7 @@ import matplotlib.pyplot as plt
 
 from src.tools.registry import auto_import_tools
 auto_import_tools()
-from src.tools.data_loader import load_regular_data, load_climatology_data, load_landsea_mask
+from src.tools.data_loader import load_regular_data, load_climatology_data
 from src.tools.preprocessing import regrid_horizontal, build_comparison_mask, select_basin
 from src.tools.scientific_calculator import compute_nutricline_depth
 from src.tools.basic_calculator import (compute_basic_stat, temporal_aggregate, transform_unit,
@@ -41,10 +33,10 @@ OUT = Path(__file__).resolve().parent
 MODELS = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
 SOURCES = ["WOA23"] + MODELS
 WINDOW = ["1971-01", "2000-12"]
-MAX_DEPTH = 1000.0            # the nitracline search is confined to the top 1000 m
+MAX_DEPTH = 1000.0
+LOAD_DEPTH = 1500.0
 BASINS = ["Pacific", "Atlantic", "Indian"]
 EQ_BAND = [-2, 2]             # the equatorial Pacific section of figure 2
-EQ_LON = [120, -80]           # 120E eastward to 80W, crossing the dateline
 
 xr.set_options(keep_attrs=True)
 
@@ -55,7 +47,7 @@ xr.set_options(keep_attrs=True)
 profile, nitracline = {}, {}
 
 woa_profile = load_climatology_data("woa23", "nitrate", time_slice="annual",
-                                    depth_range=[0, MAX_DEPTH])
+                                    depth_range=[0, LOAD_DEPTH])
 profile["WOA23"] = woa_profile
 print(f"[1]   WOA23 nitrate: {woa_profile.sizes['depth']} levels, "
       f"units {woa_profile.attrs['units']}, period {woa_profile.attrs.get('climatology_period')}")
@@ -63,10 +55,8 @@ print(f"[1]   WOA23 nitrate: {woa_profile.sizes['depth']} levels, "
 for model in MODELS:
     started = time.time()
     monthly = load_regular_data("cmip6_historical", "no3", model=model, time_range=WINDOW,
-                                depth_range=[0, MAX_DEPTH], chunk_time=12)
-    # The climatological profile FIRST, then the nitracline from it: WOA23
-    # nitrate exists only as one all-period annual climatology at these depths,
-    # so a monthly nitracline would have nothing observed to be compared with.
+                                depth_range=[0, LOAD_DEPTH], chunk_time=12)
+    
     climatology = temporal_aggregate(monthly, freq="mean", op="mean").compute()
     profile[model] = climatology
     print(f"[1]   {model:14s} 30-year mean profile {climatology.shape} "
@@ -203,16 +193,7 @@ plt.close(fig)
 
 
 # --- Figure 2: equatorial Pacific sections --------------------------------
-# A longitude-depth section cannot be cut from a curvilinear grid directly: the
-# index dimensions are not geographic. The climatological profiles are put on
-# the 1-degree grid first (the regridder weights are already cached from step
-# 4), and the section is taken from there. This is a display product; every
-# number reported above still comes from the native grids.
-#
-# One common unit for the four panels. The models are per volume and WOA23 per
-# mass; the constant-density assumption is stated on the figure, and over the
-# top 1000 m it costs well under a per cent, far below the model spread shown.
-DENSITY = 1.025           # kg/L, the tool's default near-surface value
+DENSITY = 1.025
 section, section_nitracline = {}, {}
 
 for source in SOURCES:
@@ -227,10 +208,8 @@ for source in SOURCES:
         print(f"[fig2] {source:14s} section regridded and converted "
               f"({field.attrs.get('density_assumption', 'constant density')})")
 
-    band = field.sel(lat=slice(EQ_BAND[0], EQ_BAND[1]))
-    # An unweighted mean over a 4-degree band: cell area varies by under a
-    # tenth of a per cent across it, and area_weighted_mean would insist on
-    # collapsing longitude too, which is the axis the section is drawn along.
+    band = field.sel(lat=slice(EQ_BAND[0], EQ_BAND[1]), depth=slice(0, MAX_DEPTH))
+    
     section[source] = compute_basic_stat(band, op="mean", dim="lat").compute()
     section_nitracline[source] = compute_basic_stat(
         line.sel(lat=slice(EQ_BAND[0], EQ_BAND[1])), op="mean", dim="lat").compute()
@@ -302,7 +281,8 @@ answer = {
     "sources": SOURCES,
     "method": {
         "definition": "depth of the maximum vertical nitrate gradient, taken across each layer's "
-                      f"own bounds, searched within the top {MAX_DEPTH:.0f} m",
+                      f"own bounds, searched within the top {MAX_DEPTH:.0f} m; profiles loaded to "
+                      f"{LOAD_DEPTH:.0f} m so the deepest layer searched has the level below it",
         "order_of_operations": "the 1971-2000 climatological profile is formed first and the "
                                "nitracline taken from it, because WOA23 nitrate exists only as a "
                                "single all-period annual climatology at these depths",
@@ -342,8 +322,10 @@ answer = {
     },
 
     "findings": [
-        "All three models place the nitracline too shallow globally, by 18 to 32 m, and the "
-        "shortfall is worst in the Atlantic, where they are 53 to 74 m too shallow.",
+        "All three models place the nitracline too shallow globally, by 18 to 34 m. "
+        "CESM2 and GFDL-ESM4 have their largest basin shortfalls in the Atlantic "
+        "(56 and 74 m); MPI-ESM1-2-LR's largest shortfall is in the Indian Ocean "
+        "(58 m, versus 54 m in the Atlantic).",
         "Only MPI-ESM1-2-LR reproduces the observed ordering of the three basins "
         f"({' < '.join(observed_order)}); CESM2 and GFDL-ESM4 both put the Indian Ocean deepest.",
         "Spatial correlations are low (0.40 to 0.60) and the RMSE is 152 to 163 m, far worse than "
@@ -360,15 +342,11 @@ answer = {
 
     "figures": ["fig1_nitracline_maps.png", "fig2_equatorial_pacific_sections.png"],
     "tools_used": [
-        "load_regular_data", "load_climatology_data", "load_landsea_mask", "temporal_aggregate",
+        "load_regular_data", "load_climatology_data", "temporal_aggregate",
         "compute_nutricline_depth", "compute_basic_stat", "select_basin", "regrid_horizontal",
         "build_comparison_mask", "compute_difference_metrics", "analyze_correlation",
         "transform_unit",
     ],
-    "depends_on_tool_fix": "layer_bounds_like in src/tools/data_loader.py now widens its level "
-                           "lookup by a 1e-4 m tolerance. CESM2 stores depth as float32 while the "
-                           "level table is float64, so before the fix every depth-range subset of "
-                           "CESM2 lost its deepest level and the vertical gradient could not be taken.",
 }
 
 (OUT / "answer_T6.json").write_text(json.dumps(answer, indent=2) + "\n")
@@ -377,7 +355,8 @@ md = [
     "# Reference answer - T6: nitracline depth, multi-model assessment",
     "",
     "Nitracline = depth of the maximum vertical nitrate gradient, searched within the top "
-    f"{MAX_DEPTH:.0f} m.",
+    f"{MAX_DEPTH:.0f} m; profiles are loaded to {LOAD_DEPTH:.0f} m so the deepest layer searched",
+    "has the level below it and its gradient is not one-sided.",
     "The climatological profile is formed first and the nitracline taken from it, because WOA23",
     "nitrate exists only as one all-period annual climatology at these depths.",
     "Models cover 1971-2000; WOA23 nitrate is a 1965-2022 composite - the periods genuinely differ.",

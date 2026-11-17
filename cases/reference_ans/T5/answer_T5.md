@@ -10,9 +10,9 @@ Models are CESM2, GFDL-ESM4 and MPI-ESM1-2-LR; observations are WOA23 1971-2000.
 | WOA23 (observed) | 34.63 | - |
 | CESM2 | 34.32 | -0.32 |
 | GFDL-ESM4 | 34.56 | -0.07 |
-| MPI-ESM1-2-LR | 34.36 | -0.28 |
+| MPI-ESM1-2-LR | 34.36 | -0.27 |
 
-## Step 3. Pattern agreement on the shared 1-degree mask (40830 cells)
+## Step 3. Pattern agreement on the shared 1-degree mask (40829 cells)
 
 | Model | RMSE (psu) | spatial correlation |
 |---|---|---|
@@ -27,15 +27,15 @@ Models are CESM2, GFDL-ESM4 and MPI-ESM1-2-LR; observations are WOA23 1971-2000.
 | CESM2 | historical 1950-2014 | -0.00268 | [-0.00693, 0.00157] | 0.245 | NO |
 | CESM2 | ssp245 2071-2100 | -0.0209 | [-0.0255, -0.0164] | 0.910 | yes |
 | GFDL-ESM4 | historical 1950-2014 | -0.0011 | [-0.00361, 0.00141] | 0.064 | NO |
-| GFDL-ESM4 | ssp245 2071-2100 | -0.00534 | [-0.0106, -4.82e-05] | 0.325 | yes |
-| MPI-ESM1-2-LR | historical 1950-2014 | -0.000689 | [-0.00521, 0.00383] | 0.011 | NO |
-| MPI-ESM1-2-LR | ssp245 2071-2100 | -0.0229 | [-0.048, 0.00226] | 0.683 | NO |
+| GFDL-ESM4 | ssp245 2071-2100 | -0.00534 | [-0.0106, -3.86e-05] | 0.324 | yes |
+| MPI-ESM1-2-LR | historical 1950-2014 | -0.000551 | [-0.00504, 0.00393] | 0.007 | NO |
+| MPI-ESM1-2-LR | ssp245 2071-2100 | -0.0231 | [-0.0513, 0.00504] | 0.701 | NO |
 
 | Model | ssp245 / historical slope ratio | interpretable? |
 |---|---|---|
 | CESM2 | 7.8 | NO - denominator not distinguishable from zero |
 | GFDL-ESM4 | 4.9 | NO - denominator not distinguishable from zero |
-| MPI-ESM1-2-LR | 33.2 | NO - denominator not distinguishable from zero |
+| MPI-ESM1-2-LR | 42.0 | NO - denominator not distinguishable from zero |
 
 **Every historical trend has a confidence interval that includes zero**, so none of the three
 is distinguishable from no trend at all. The ssp245 trends are an order of magnitude larger

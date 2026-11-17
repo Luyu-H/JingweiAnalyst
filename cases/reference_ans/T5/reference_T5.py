@@ -4,16 +4,11 @@ historical trend and ssp245 scenario change.
 
 Run from the repository root with the project's conda environment:
 
-    source /home/lorraine/miniconda3/bin/activate base && conda activate jingwei_QA
-    PYTHONPATH=. python cases/reference_ans/T5/reference_T5.py
+    python cases/reference_ans/T5/reference_T5.py
 
 Writes answer_T5.json, answer_T5.md and three figures next to this file.
-Takes roughly half an hour, most of it reading the surface level out of the
+Takes roughly half an hour, most of it reading the 0-10 m levels out of the
 monthly salinity archives.
-
-Every physical quantity is produced by a tool from src/tools. The annual SSS
-field of each model and experiment is computed once and held in memory, because
-every later step is derived from it and the read is what costs the time.
 """
 
 import json
@@ -29,19 +24,18 @@ from matplotlib.colors import TwoSlopeNorm
 
 from src.tools.registry import auto_import_tools
 auto_import_tools()
-from src.tools.data_loader import load_regular_data, load_climatology_data, load_landsea_mask
+from src.tools.data_loader import load_regular_data, load_climatology_data
 from src.tools.preprocessing import regrid_horizontal, build_comparison_mask, select_basin
-from src.tools.scientific_calculator import compute_mixed_layer_depth  # noqa: F401  (tool registry)
 from src.tools.basic_calculator import (compute_basic_stat, temporal_aggregate, fit_1D_trend,
                                         fit_trend_map, compute_difference_metrics,
                                         analyze_correlation)
 
 OUT = Path(__file__).resolve().parent
 MODELS = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
-SURFACE = [0, 10]                      # metres, the 0-10 m layer that defines SSS
+SURFACE = [0, 10]
 HIST_WINDOW = ["1950-01", "2014-12"]
 SSP_WINDOW = ["2071-01", "2100-12"]
-CLIM_YEARS = (1971, 2000)              # the WOA23 normal, for the mean-state comparison
+CLIM_YEARS = (1971, 2000)              # the WOA23 normal
 BASE_YEARS = (1995, 2014)              # the historical baseline for the scenario change
 BASINS = ["Atlantic", "Indian", "Pacific"]
 
@@ -52,8 +46,7 @@ def annual_sss(dataset, model, window):
     """Annual 0-10 m volume-weighted mean salinity fields, on the native grid."""
     salinity = load_regular_data(dataset, "so", model=model, time_range=window,
                                  depth_range=SURFACE, chunk_time=12)
-    # Volume weighting, so that unequal layer thicknesses do not count alike;
-    # with a single level in the layer it reduces to that level, as it should.
+    
     surface = compute_basic_stat(salinity, op="volume_weighted_mean", dim="depth")
     annual = temporal_aggregate(surface, freq="year", op="mean")
     incomplete = annual.attrs.get("incomplete_periods")
@@ -175,10 +168,6 @@ for model in MODELS:
 # ---------------------------------------------------------------------------
 # Step 5. Scenario change by basin
 # ---------------------------------------------------------------------------
-# Which ensemble member each experiment is, read from the files. A scenario run
-# continues the historical member named in its parent_variant_label; where the
-# archive's historical run is a different member, the difference below mixes the
-# forced change with the internal variability between two members.
 members = {(m, label): fields[(m, label)].attrs.get("variant_label", "unknown")
            for m in MODELS for label in ("historical", "ssp245")}
 mismatched = [m for m in MODELS if members[(m, "historical")] != members[(m, "ssp245")]]
@@ -220,10 +209,9 @@ for model in MODELS:
 trend_maps = {}
 for model in MODELS:
     fitted = fit_trend_map(fields[(model, "historical")], dim="year", alpha=0.05)
+
     slope = fitted["slope"]
-    # fit_trend_map's per_decade applies to a date axis; this axis is integer
-    # years, so the slope is per year and is converted here.
-    slope = slope * 10.0
+    assert "decade" in str(slope.attrs.get("units", "")), slope.attrs.get("units")
     slope.attrs = dict(fields[(model, "historical")].attrs)
     significant = fitted["significant"].astype("float64")
     significant.attrs = dict(fields[(model, "historical")].attrs)
@@ -253,9 +241,7 @@ def map_row(fig, axes, values_of, vmax, cmap, label, stipple_of=None):
                              shading="auto")
         if stipple_of is not None:
             flag = np.nan_to_num(stipple_of(model)) > 0.5
-            # Sample the significant cells on a regular lattice, so the stipple
-            # reads as an even texture instead of the diagonal streaks a
-            # flattened every-nth-element thinning produces.
+            
             lattice = np.zeros_like(flag, dtype=bool)
             lattice[::3, ::3] = True
             ys, xs = np.where(flag & lattice)
@@ -438,7 +424,7 @@ answer = {
         "mean, so a non-zero global surface trend is physical rather than a numerical artefact.",
     ],
     "tools_used": [
-        "load_regular_data", "load_climatology_data", "load_landsea_mask", "compute_basic_stat",
+        "load_regular_data", "load_climatology_data", "compute_basic_stat",
         "temporal_aggregate", "regrid_horizontal", "build_comparison_mask",
         "compute_difference_metrics", "analyze_correlation", "fit_1D_trend", "fit_trend_map",
         "select_basin",

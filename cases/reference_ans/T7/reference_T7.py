@@ -4,14 +4,9 @@ Redfield ratio.
 
 Run from the repository root with the project's conda environment:
 
-    source /home/lorraine/miniconda3/bin/activate base && conda activate jingwei_QA
-    PYTHONPATH=. python cases/reference_ans/T7/reference_T7.py
+    python cases/reference_ans/T7/reference_T7.py
 
-Writes answer_T7.json, answer_T7.md, fig1_np_scatter.png and
-fig2_np_departure_maps.png next to this file. Takes roughly fifteen minutes,
-almost all of it forming the 30-year mean nutrient fields.
-
-Every physical quantity is produced by a tool from src/tools.
+Writes answer_T7.json, answer_T7.md, fig1_np_scatter.png and fig2_np_departure_maps.png next to this file. Takes roughly fifteen minutes, almost all of it forming the 30-year mean nutrient fields.
 """
 
 import json
@@ -40,9 +35,9 @@ WINDOW = ["1971-01", "2000-12"]
 DEPTHS = [200, 1000]
 BASINS = ["Pacific", "Atlantic", "Indian"]
 REDFIELD = 16.0
-BAND = 2.0                 # the 16 +/- 2 agreement band
-DENITRIFICATION_NP = 12.0  # below this counts as a denitrification signature
-DENSITY = 1.025            # kg/L, for the mol m-3 -> umol/kg conversion
+BAND = 2.0
+DENITRIFICATION_NP = 12.0
+DENSITY = 1.025
 VOLUME_DIMS = ["depth", "lat", "lon"]
 
 xr.set_options(keep_attrs=True)
@@ -53,8 +48,6 @@ nitrate, phosphate, np_ratio = {}, {}, {}
 # ---------------------------------------------------------------------------
 # Step 1. Climatological nutrient fields and the cell-by-cell N:P
 # ---------------------------------------------------------------------------
-# WOA23 publishes the nutrients only as an all-period composite; there is no
-# 1971-2000 normal for them, unlike temperature and salinity.
 nitrate["WOA23"] = load_climatology_data("woa23", "nitrate", time_slice="annual",
                                          depth_range=DEPTHS)
 phosphate["WOA23"] = load_climatology_data("woa23", "phosphate", time_slice="annual",
@@ -75,8 +68,6 @@ for model in MODELS:
           f"({time.time() - started:.0f} s)")
 
 for source in SOURCES:
-    # Both nutrients of a source share a molar basis, so the density factor
-    # cancels and the ratio is dimensionless and comparable across sources.
     np_ratio[source] = compute_ratio(nitrate[source], phosphate[source])
     print(f"[1]   {source:14s} N:P field, units '{np_ratio[source].attrs.get('units')}', "
           f"valid {int(np_ratio[source].notnull().sum())} cells")

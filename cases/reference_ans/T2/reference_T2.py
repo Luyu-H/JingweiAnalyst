@@ -4,14 +4,10 @@ against the CPC published series.
 
 Run from the repository root with the project's conda environment:
 
-    source /home/lorraine/miniconda3/bin/activate base && conda activate jingwei_QA
-    PYTHONPATH=. python cases/reference_ans/T2/reference_T2.py
+    python cases/reference_ans/T2/reference_T2.py
 
 Writes answer_T2.json, answer_T2.md, fig1_series_overlay.png and
 fig2_scatter.png next to this file.
-
-Every physical quantity is produced by a tool from src/tools; nothing here
-re-implements an index, an anomaly, an error metric or an event rule by hand.
 """
 
 import json
@@ -323,9 +319,8 @@ md = [
     f"| Largest absolute deviation | {max_abs:.4f} degC, at {max_abs_at} |",
     f"| Mean bias (reconstruction - CPC) | {float(diff['bias']):+.4f} degC |",
     "",
-    "CPC publishes the series to 2 decimal places, and the reconstruction sits well inside that",
-    "last digit, so the correlation is quoted to 6 places and the errors to 4; at the 4 and 3",
-    "places of the original draft these would read 1.0000 and 0.007 and say nothing.",
+    "The RMSE is below 0.01 degC, but individual deviations can exceed it.",
+    "Correlation is reported to 6 decimal places and errors to 4 to resolve the small differences.",
     "",
     "## Step 3. El Nino events in the reconstruction, ONI criterion",
     "",

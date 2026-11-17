@@ -4,19 +4,11 @@ and the ssp245 change.
 
 Run from the repository root with the project's conda environment:
 
-    source /home/lorraine/miniconda3/bin/activate base && conda activate jingwei_QA
-    PYTHONPATH=. python cases/reference_ans/T10/reference_T10.py
+    python cases/reference_ans/T10/reference_T10.py
 
 Writes answer_T10.json, answer_T10.md, fig1_omz_thickness_historical.png and
 fig2_omz_thickness_change.png next to this file. Takes roughly half an hour,
 almost all of it reading five full-depth monthly archives of o2, thetao and so.
-
-Every physical quantity is produced by a tool from src/tools. The model oxygen
-is converted from mol m-3 to umol/kg with an in-situ density field from each
-model's own thetao and so; a constant moves the third significant figure.
-
-CESM2 publishes no o2 for the historical experiment, only for ssp245, so it
-appears in the scenario results and nowhere else.
 """
 
 import json
@@ -32,7 +24,7 @@ from matplotlib.colors import TwoSlopeNorm
 
 from src.tools.registry import auto_import_tools
 auto_import_tools()
-from src.tools.data_loader import load_regular_data, load_climatology_data, load_landsea_mask
+from src.tools.data_loader import load_regular_data, load_climatology_data
 from src.tools.preprocessing import regrid_horizontal, select_basin
 from src.tools.scientific_calculator import (compute_potential_density_anomaly,
                                              identify_oxygen_minimum_zone,
@@ -58,16 +50,14 @@ HISTORICAL_MODELS = ["GFDL-ESM4", "MPI-ESM1-2-LR"]
 
 xr.set_options(keep_attrs=True)
 
-oxygen = {}          # label -> oxygen climatology in umol/kg, on the native grid
-oxygen_per_volume = {}   # label -> the SAME field before conversion, in mol m-3
+oxygen = {}
+oxygen_per_volume = {}
 density_note = {}
 
 
 # ---------------------------------------------------------------------------
 # Step 0. The oxygen climatologies, observations and models
 # ---------------------------------------------------------------------------
-# The 1971-2000 climate normal, not the all-period composite: the two differ by
-# about five per cent in OMZ volume, well above the precision asked for.
 oxygen["WOA23"] = load_climatology_data("woa23", "oxygen", time_slice="annual",
                                         period="1971-2000")
 print(f"[0]   WOA23 oxygen: {oxygen['WOA23'].sizes['depth']} levels, "
@@ -87,15 +77,11 @@ for model, experiment, dataset, window in RUNS:
         load_regular_data(dataset, "so", model=model, time_range=window, chunk_time=12),
         freq="mean", op="mean").compute()
 
-    # In-situ density at each cell's own pressure. A constant would move the
-    # third significant figure of every volume reported below.
+    # In-situ density at each cell's own pressure.
     density = compute_potential_density_anomaly(temperature, salinity, ref_pressure=None)
     oxygen[label] = transform_unit(raw, from_unit=raw.attrs["units"], to_unit="umol/kg",
                                    density=density)
-    # Kept for the inventory of step 4, which is a volume integral and therefore
-    # wants the field on its native volume basis: converting to umol/kg and back
-    # would re-enter a density, and convert_concentration_to_content's own
-    # default for that is the CONSTANT 1025, not the in-situ field used here.
+
     oxygen_per_volume[label] = raw
     density_note[label] = oxygen[label].attrs.get("density_assumption", "in-situ density field")
     print(f"[0]   {label:28s} {raw.shape} -> umol/kg  ({time.time() - started:.0f} s)")
@@ -182,10 +168,7 @@ for model in HISTORICAL_MODELS:
 inventory = {}
 for model, experiment, _, _ in RUNS:
     label = f"{model}|{experiment}"
-    # mol m-3 in, so the converter multiplies by cell volume and nothing else.
-    # Passing the umol/kg field instead would apply the function's default
-    # constant density of 1025 kg/m3, undoing the in-situ field of step 0 and
-    # biasing every inventory about 1.2 per cent low.
+
     content = convert_concentration_to_content(oxygen_per_volume[label])
     inventory[label] = float(compute_basic_stat(content, op="sum").compute())
     print(f"[4]   {label:28s} inventory {inventory[label]:.4e} mol")
@@ -353,7 +336,7 @@ answer = {
     "sources": SOURCES,
     "method": {
         "thresholds_umol_per_kg": THRESHOLDS,
-        "criterion": volume["WOA23"][MAIN_THRESHOLD]["criterion"],
+        "criterion": "oxygen < threshold (strictly less than), for each listed threshold",
         "units": "model o2 converted from mol m-3 to umol/kg with an in-situ density field from "
                  "each model's own thetao and so; a constant moves the third significant figure",
         "density_note": density_note,
@@ -397,7 +380,7 @@ answer = {
 
     "figures": ["fig1_omz_thickness_historical.png", "fig2_omz_thickness_change.png"],
     "tools_used": [
-        "load_regular_data", "load_climatology_data", "load_landsea_mask", "temporal_aggregate",
+        "load_regular_data", "load_climatology_data", "temporal_aggregate",
         "compute_potential_density_anomaly", "transform_unit", "identify_oxygen_minimum_zone",
         "compute_exceedance_fraction", "convert_concentration_to_content", "compute_basic_stat",
         "locate_extreme", "select_basin", "regrid_horizontal",

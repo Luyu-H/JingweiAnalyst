@@ -4,16 +4,9 @@ each model's own mlotst output.
 
 Run from the repository root with the project's conda environment:
 
-    source /home/lorraine/miniconda3/bin/activate base && conda activate jingwei_QA
-    PYTHONPATH=. python cases/reference_ans/T4/reference_T4.py
+    python cases/reference_ans/T4/reference_T4.py
 
-Writes answer_T4.json, answer_T4.md, fig1_difference_maps.png and
-fig2_scatter_panels.png next to this file. Takes roughly twenty minutes, most
-of it the 180 monthly MLD computations.
-
-Every physical quantity is produced by a tool from src/tools. Nothing here
-re-implements an MLD, an area weighting or an error metric by hand, and nothing
-is regridded except the difference fields drawn in figure 1.
+Writes answer_T4.json, answer_T4.md, fig1_difference_maps.png and fig2_scatter_panels.png next to this file. Takes roughly twenty minutes.
 """
 
 import json
@@ -43,20 +36,18 @@ YEARS = range(1971, 2001)
 DENSITY_THRESHOLD = 0.03      # kg/m3, the CMIP6 protocol's criterion for mlotst
 LARGE_THRESHOLD = 0.125       # kg/m3, the larger criterion some studies use; sensitivity check only
 SENSITIVITY_MONTH = "1971-03"
-DIFF_THRESHOLD = 20.0         # m, the disagreement the case counts area for
+DIFF_THRESHOLD = 20.0
 
 xr.set_options(keep_attrs=True)
 
-climatology = {}   # (model, month) -> {"mld": field, "mlotst": field}
-metrics = {}       # (model, month) -> dict of numbers
-ocean_area = {}    # model -> total ocean area in m2
-sensitivity = {}   # model -> threshold -> bias and RMSD for SENSITIVITY_MONTH
+climatology = {}
+metrics = {}
+ocean_area = {}
+sensitivity = {}
 
 
 for model in MODELS:
     started = time.time()
-    # Opened once and kept lazy; each month is pulled out of these below, which
-    # avoids reopening the multi-file archives sixty times over.
     thetao = load_regular_data("cmip6_historical", "thetao", model=model,
                                time_range=WINDOW, chunk_time=1)
     salinity = load_regular_data("cmip6_historical", "so", model=model,
@@ -64,9 +55,6 @@ for model in MODELS:
     published = load_regular_data("cmip6_historical", "mlotst", model=model,
                                   time_range=WINDOW, chunk_time=1)
 
-    # The models publish mlotst as sigma-T referenced to the ocean surface, so
-    # the operator is referenced to the shallowest level rather than to the 10 m
-    # of the observational criterion.
     reference_depth = float(thetao["depth"].values[0])
 
     areas = load_regular_data("cmip6_historical", "areacello", model=model)
@@ -78,16 +66,12 @@ for model in MODELS:
             stamp = f"{year}-{month:02d}"
             temp_m = thetao.sel(time=stamp)
             salt_m = salinity.sel(time=stamp)
-            # One MLD per month, averaged afterwards: the MLD of an averaged
-            # profile is not the average of the MLDs.
             mld_m = compute_mixed_layer_depth(
                 temp_m, salt_m, ref_depth=reference_depth, method="density",
                 density_threshold=DENSITY_THRESHOLD).squeeze(drop=True)
             operator_years.append(mld_m.compute())
             published_years.append(published.sel(time=stamp).squeeze(drop=True).compute())
 
-        # skipna=False keeps a cell only where all 30 years are valid, so both
-        # climatologies rest on the same set of columns.
         operator = xr.concat(operator_years, dim="year").mean("year", skipna=False)
         publication = xr.concat(published_years, dim="year").mean("year", skipna=False)
         operator.attrs = dict(operator_years[0].attrs)
@@ -121,10 +105,6 @@ for model in MODELS:
               f"|diff|>{DIFF_THRESHOLD:.0f} m over {entry['area_percent_abs_diff_gt_20m']:5.2f}% "
               f"of {entry['shared_area_percent_of_ocean']:.1f}% shared ocean")
 
-    # Threshold sensitivity, one month: the same operator at the larger
-    # 0.125 kg/m3 some studies use, against the model's own mlotst for March
-    # 1971. This is what backs the statement that 0.03 kg/m3 - the protocol's
-    # value (Griffies et al. 2016, H24) - is the one mlotst is consistent with.
     temp_s = thetao.sel(time=SENSITIVITY_MONTH).compute()
     salt_s = salinity.sel(time=SENSITIVITY_MONTH).compute()
     published_s = published.sel(time=SENSITIVITY_MONTH).squeeze(drop=True).compute()
@@ -141,12 +121,6 @@ for model in MODELS:
     print(f"  {model} done in {time.time() - started:.0f} s "
           f"(reference depth {reference_depth:.2f} m)")
 
-
-# ---------------------------------------------------------------------------
-# Step 6. Which model is most internally consistent
-# ---------------------------------------------------------------------------
-# Ranked on the RMSD averaged over the two months, which penalises disagreement
-# of either sign rather than letting a warm and a cold region cancel.
 mean_rmsd = {m: np.mean([metrics[(m, month)]["rmsd_m"] for month in MONTHS]) for m in MODELS}
 negative_biases = sum(entry["mean_difference_m"] < 0 for entry in metrics.values())
 ranking = sorted(MODELS, key=lambda m: mean_rmsd[m])

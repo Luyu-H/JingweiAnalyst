@@ -13,9 +13,8 @@ climatology from the same field.
 | Largest absolute deviation | 0.0226 degC, at 1992-01 |
 | Mean bias (reconstruction - CPC) | -0.0030 degC |
 
-CPC publishes the series to 2 decimal places, and the reconstruction sits well inside that
-last digit, so the correlation is quoted to 6 places and the errors to 4; at the 4 and 3
-places of the original draft these would read 1.0000 and 0.007 and say nothing.
+The RMSE is below 0.01 degC, but individual deviations can exceed it.
+Correlation is reported to 6 decimal places and errors to 4 to resolve the small differences.
 
 ## Step 3. El Nino events in the reconstruction, ONI criterion
 
