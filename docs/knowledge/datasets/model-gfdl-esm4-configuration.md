@@ -38,7 +38,7 @@ source_id `GFDL-ESM4` (data DOI 10.22033/ESGF/CMIP6.1407). [GFDL; CVs]
 **Archived grid (checked in the local files).** The global `grid` attribute
 reads "ocean data regridded from tripolar - nominal 0.5 deg latitude/longitude
 to 180,360; interpolation method: conserve_order1", with grid_label `gr`. The
-vertical axis is 35 z levels (see `DATA_METADATA.md`).
+vertical axis is 35 z levels.
 
 **Biogeochemistry (COBALTv2)** [GFDL §2.6]
 - 33 tracers covering C, alkalinity, O2, N, P, Fe, Si, calcite and lithogenic
