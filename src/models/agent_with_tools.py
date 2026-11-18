@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
 import yaml
+import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -25,15 +26,14 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.tools.data_openers import dataset_notes, list_datasets
 from src.tools.registry import TOOLS, auto_import_tools
+from src.docs.knowledge_retrieval import KnowledgeBase, KnowledgeRetriever
 from src.models.prompt import PromptTemplates
-from src.models.llm_providers import LLM_KEYS, build_llm
+from src.models.llm_providers import (LLM_KEYS, build_chat_model, build_llm, resolve_provider,
+                                      resolve_settings)
 
 auto_import_tools()
 
-# Specs always handed to the code-generation step, whether or not the planning
-# step listed them: the prompt tells the model to load through these loaders and
-# to weight averages with compute_basic_stat, so it must be able to see their
-# signatures even when the plan forgot to name them.
+# Specs always handed to the code-generation step, whether or not the planning step listed them.
 ALWAYS_AVAILABLE_TOOLS = (
     "load_regular_data",
     "load_climatology_data",
@@ -45,19 +45,76 @@ ALWAYS_AVAILABLE_TOOLS = (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Every setting a run depends on - the model and its endpoint, the loop limits,
-# where results land - lives in this file, so a run is changed by editing YAML
-# rather than the source.
-CONFIG_PATH = REPO_ROOT / "configs" / "agent_with_tools.yaml"
+CONFIG_PATH = REPO_ROOT / "configs" / "agent_full.yaml"
+
+
+def config_chain(path: Optional[Path] = None) -> List[Path]:
+    """
+    The configuration file and every file it `extends`, the base first.
+
+    Each arm of the ablation has its own file that extends another and holds only
+    what differs, so a setting shared by every arm is changed in one place.
+    """
+    path = (Path(path) if path is not None else CONFIG_PATH).resolve()
+    chain: List[Path] = []
+    while path is not None:
+        if not path.exists():
+            raise FileNotFoundError(f"Agent configuration not found: {path}")
+        if path in chain:
+            raise ValueError(f"Configuration files extend each other in a cycle: {path}")
+        chain.insert(0, path)
+        with open(path, "r", encoding="utf-8") as f:
+            parent = (yaml.safe_load(f) or {}).get("extends")
+        path = (path.parent / parent).resolve() if parent else None
+    return chain
+
+
+def _merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Mappings merge key by key; any other value replaces the one it overrides."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
-    """Read the runtime configuration, configs/agent_with_tools.yaml by default."""
-    path = Path(path) if path is not None else CONFIG_PATH
-    if not path.exists():
-        raise FileNotFoundError(f"Agent configuration not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    """
+    Read the runtime configuration, configs/agent_full.yaml by default.
+    """
+    config: Dict[str, Any] = {}
+    for file in config_chain(path):
+        with open(file, "r", encoding="utf-8") as f:
+            layer = yaml.safe_load(f) or {}
+        layer.pop("extends", None)
+        config = _merge(config, layer)
+    return config
+
+
+def config_path_from_argv(default: Path) -> Path:
+    """The --config of a batch run's command line, the arm's default file without one."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Run the case batch under one configuration.")
+    parser.add_argument("--config", type=Path, default=default,
+                        help=f"configuration file (default: {default.relative_to(REPO_ROOT)})")
+    path = parser.parse_args().config
+    return path if path.is_absolute() else Path.cwd() / path
+
+
+def check_arm(config: Dict[str, Any], allowed: Tuple[str, ...], path: Path) -> str:
+    """
+    The configuration's `arm`, refused when this agent class does not implement it.
+
+    Keeps a no-tools configuration from being run by the tool agent (or the other
+    way round), which would file the results under an arm they do not belong to.
+    """
+    arm = config.get("arm")
+    if arm not in allowed:
+        raise ValueError(f"{path} declares arm {arm!r}; this entry point runs {', '.join(allowed)}. "
+                         f"See configs/README.md for which module runs which arm.")
+    return arm
 
 
 def resolve_path(value: str) -> Path:
@@ -69,11 +126,6 @@ def resolve_path(value: str) -> Path:
 def slugify(text: str) -> str:
     """
     A model id as a directory name.
-
-    Vendors write model ids with characters a path cannot take: an
-    openai_compatible endpoint may serve "Qwen/Qwen3-235B", and a version may
-    carry a colon. Everything outside letters, digits, dot, dash and underscore
-    becomes a single dash.
     """
     return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-") or "model"
 
@@ -184,9 +236,10 @@ class RunBundle:
                 f"{result.get('hint', '')}\n\n{result.get('traceback', '')}\n"
             )
 
-    def write_rerun_harness(self, datasets: List[str], figure_dpi: int = 150) -> None:
+    def write_rerun_harness(self, datasets: List[str], figure_dpi: int = 150,
+                            template: str = RERUN_HARNESS) -> None:
         alias = f"namespace[\"selected_data\"] = {datasets[0]!r}" if len(datasets) == 1 else ""
-        script = (RERUN_HARNESS
+        script = (template
                   .replace("__REPO__", str(REPO_ROOT))
                   .replace("__DATASETS__", repr(datasets))
                   .replace("__ALIAS__", alias)
@@ -230,7 +283,12 @@ class ConversationSession:
 
 class AgentWithTools:
     """An agent that can select and call provided tools to answer scientific questions with multi-turn conversation support."""
-    
+
+    # The prompts of planning, code generation, repair and the answer. A class
+    # attribute so that a variant of the agent (src/models/ablation_tools) can swap
+    # them while every other step stays exactly this agent's.
+    prompts = PromptTemplates
+
     def __init__(self, tools: Dict[str, Dict], data_list: List[Dict[str, str]],
                  api_key: Optional[str] = None, config: Optional[Dict[str, Any]] = None,
                  config_path: Optional[Path] = None, **overrides):
@@ -240,7 +298,7 @@ class AgentWithTools:
             - api_key: the provider key; read from the environment variable named in
               the configuration when left out
             - config / config_path: an already-loaded configuration, or another YAML
-              file to read instead of configs/agent_with_tools.yaml
+              file to read instead of configs/agent_full.yaml
             - overrides: single settings from the 'agent' or 'llm' section, by their
               configured name, for a caller that needs to deviate for one run
         """
@@ -254,7 +312,8 @@ class AgentWithTools:
         for key, value in overrides.items():
             if key in LLM_KEYS:
                 llm_cfg[key] = value
-            elif key in observation_cfg or key in ("max_array_elements", "max_value_chars"):
+            elif key in observation_cfg or key in ("max_array_elements", "max_value_chars",
+                                                   "materialize_max_mb", "materialize_total_mb"):
                 observation_cfg[key] = value
             else:
                 agent_cfg[key] = value
@@ -284,6 +343,10 @@ class AgentWithTools:
         self.figure_dpi = agent_cfg.get("figure_dpi", 150)
         self.max_array_elements = observation_cfg.get("max_array_elements", 50)
         self.max_value_chars = observation_cfg.get("max_value_chars", 800)
+        self.materialize_max_mb = observation_cfg.get("materialize_max_mb", 2048)
+        self.materialize_total_mb = observation_cfg.get("materialize_total_mb", 16384)
+
+        self._setup_knowledge(dict(self.config.get("knowledge") or {}), llm_cfg, api_key)
 
         # The settings as they ended up, overrides included. Written to each
         # turn's bundle so a reader never has to reconstruct them from the YAML.
@@ -295,16 +358,137 @@ class AgentWithTools:
             "context_history_turns": self.context_history_turns,
             "figure_dpi": self.figure_dpi,
             "observation": {"max_array_elements": self.max_array_elements,
-                            "max_value_chars": self.max_value_chars},
+                            "max_value_chars": self.max_value_chars,
+                            "materialize_max_mb": self.materialize_max_mb,
+                            "materialize_total_mb": self.materialize_total_mb},
         }
 
+    def _setup_knowledge(self, knowledge_cfg: Dict[str, Any], llm_cfg: Dict[str, Any],
+                         api_key: Optional[str]) -> None:
+        """
+        Load the knowledge base and the model that selects from it (the 'knowledge'
+        section of the configuration).
+        """
+        self.knowledge_enabled = bool(knowledge_cfg.get("enabled", False))
+        self.knowledge_base: Optional[KnowledgeBase] = None
+        self.knowledge_retriever: Optional[KnowledgeRetriever] = None
+        self.selector_llm, self.selector_llm_settings = self.llm, self.llm_settings
+        prefilter = dict(knowledge_cfg.get("prefilter") or {})
+        selector = dict(knowledge_cfg.get("selector") or {})
+        condense = dict(knowledge_cfg.get("condense") or {})
+        injection = dict(knowledge_cfg.get("injection") or {})
+        plan_check = dict(knowledge_cfg.get("plan_check") or {})
+
+        self.knowledge_settings = {
+            "enabled": self.knowledge_enabled,
+            "root": str(resolve_path(knowledge_cfg.get("root", "docs/knowledge"))),
+            "validate_on_start": bool(knowledge_cfg.get("validate_on_start", True)),
+            "max_candidates": prefilter.get("max_candidates"),
+            "severity_weights": prefilter.get("severity_weights"),
+            "backtick_only_variables": list(prefilter.get("backtick_only_variables") or []),
+            "dataset_aliases": dict(prefilter.get("dataset_aliases") or {}),
+            "selector_mode": selector.get("mode", "llm"),
+            "max_selected": int(selector.get("max_selected", 8)),
+            "fallback_top_k": int(selector.get("fallback_top_k", 4)),
+            "retries": int(selector.get("retries", 1)),
+            "condense_enabled": bool(condense.get("enabled", True)),
+            "source_sections": condense.get("source_sections") or {
+                "must": ["key_points", "implications", "common_mistakes"],
+                "should": ["key_points", "implications", "common_mistakes"],
+                "info": ["key_points", "implications"]},
+            "max_notes_per_fragment": int(condense.get("max_notes_per_fragment", 2)),
+            "condense_max_chars": int(condense.get("max_chars", 3600)),
+            "always_allowed_numbers": list(condense.get("always_allowed_numbers") or []),
+            "max_chars": int(injection.get("max_chars", 16000)),
+            "sections": injection.get("sections") or {},
+            "on_uncited_must": plan_check.get("on_uncited_must", "warn"),
+        }
+        if not self.knowledge_enabled:
+            return
+        if self.knowledge_settings["selector_mode"] not in ("llm", "lexical"):
+            raise ValueError(f"knowledge.selector.mode must be 'llm' or 'lexical', not "
+                             f"{self.knowledge_settings['selector_mode']!r} ({CONFIG_PATH})")
+
+        self.knowledge_base = KnowledgeBase(
+            Path(self.knowledge_settings["root"]),
+            severity_weights=self.knowledge_settings["severity_weights"],
+            backtick_only_variables=self.knowledge_settings["backtick_only_variables"],
+            dataset_aliases=self.knowledge_settings["dataset_aliases"],
+            always_allowed_numbers=self.knowledge_settings["always_allowed_numbers"],
+        )
+        if self.knowledge_settings["validate_on_start"]:
+            problems = self.knowledge_base.check()
+            if problems:
+                raise ValueError(
+                    "The knowledge base failed its checks (python -m src.docs.knowledge_index "
+                    "--check):\n" + "\n".join(f"  - {p}" for p in problems))
+        self.knowledge_retriever = KnowledgeRetriever(self.knowledge_base, self.knowledge_settings)
+        print(f"[System] Knowledge base: {len(self.knowledge_base.fragments)} fragments from "
+              f"{self.knowledge_settings['root']}")
+
+        override = selector.get("llm")
+        if self.knowledge_settings["selector_mode"] == "llm" and override:
+            self.selector_llm, self.selector_llm_settings = self._build_selector_llm(
+                llm_cfg, dict(override), api_key)
+            print(f"[System] Knowledge selector: {self.selector_llm_settings['model']} "
+                  f"({self.selector_llm_settings['provider']})")
+
+    def _build_selector_llm(self, llm_cfg: Dict[str, Any], override: Dict[str, Any],
+                            api_key: Optional[str]):
+        """
+        The selector's model: the 'llm' section with the override's settings on top.
+        """
+        merged = dict(llm_cfg)
+        if "provider" in override and resolve_provider(override["provider"])[0] != self.provider:
+            for key in ("model_name", "base_url", "api_key_env", "extra_params"):
+                if key not in override:
+                    merged.pop(key, None)
+            api_key = None
+        merged.update(override)
+        settings = resolve_settings(merged)
+        if settings == self.llm_settings:
+            return self.llm, self.llm_settings
+        return build_chat_model(settings, api_key, hint=str(CONFIG_PATH)), settings
+
+    def _retrieve_knowledge(self, user_query: str, context_summary: str, language: str,
+                            bundle: Optional["RunBundle"]) -> Tuple[str, Dict[str, Any]]:
+        """
+        The knowledge for this question, condensed for the planner
+        (src/docs/knowledge_retrieval.py does the work).
+
+        Returns the text for the planning prompt ("" when nothing applies, which
+        leaves that prompt as it is without retrieval) and the record written to the
+        bundle's knowledge.json. The selection and condensing calls go through _ask,
+        so they are recorded under prompts/ like every other exchange.
+        """
+        if not self.knowledge_enabled:
+            return "", {"enabled": False}
+
+        def ask(name: str, system: str, human: str):
+            response, seconds = self._ask(bundle, name, system, human, llm=self.selector_llm)
+            return response.content, seconds
+
+        text, record = self.knowledge_retriever.retrieve(user_query, context_summary, language, ask)
+        if self.knowledge_settings["selector_mode"] == "llm":
+            record["selector_model"] = self.selector_llm_settings["model"]
+
+        for stage in ("selection", "condensing_run"):
+            reason = (record.get(stage) or {}).get("fallback_reason")
+            if reason:
+                print(f"[Warning] Knowledge {stage.split('_')[0]} fell back: {reason}")
+        by_status: Dict[str, List[str]] = {}
+        for entry in record.get("selected", []):
+            by_status.setdefault(entry["status"], []).append(entry["id"])
+        print(f"[System] Knowledge for planning ({record['injected_chars']} chars): "
+              f"{', '.join(record['injected_ids']) or 'none'}")
+        for status, label in (("not_applicable", "judged not applicable"),
+                              ("summary_fallback", "given as summary only"),
+                              ("dropped", "dropped for lack of room")):
+            if by_status.get(status):
+                print(f"[Info] Knowledge {label}: {', '.join(by_status[status])}")
+        return text, record
+
     def _environment_snapshot(self) -> Dict[str, Any]:
-        """
-        What a later reader needs to tell whether a rerun stands on the same ground:
-        the code version, the dataset registry's fingerprint, the library versions
-        and the model settings. A result whose numbers cannot be tied to these is
-        not reproducible, only repeatable by luck.
-        """
         def git(*args) -> Optional[str]:
             try:
                 done = subprocess.run(["git", "-C", str(REPO_ROOT), *args],
@@ -323,11 +507,12 @@ class AgentWithTools:
             except Exception:
                 continue
 
-        config_digests = {}
-        for name in ("datasets.yaml", "default_paths.yaml", "agent_with_tools.yaml"):
-            path = REPO_ROOT / "configs" / name
-            if path.exists():
-                config_digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        # The data registry, and every file of this arm's configuration chain.
+        config_files = [REPO_ROOT / "configs" / name for name in ("datasets.yaml", "default_paths.yaml")]
+        if self.config_path.exists():
+            config_files += config_chain(self.config_path)
+        config_digests = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in config_files if path.exists()}
 
         return {
             "python": sys.version.split()[0],
@@ -341,18 +526,14 @@ class AgentWithTools:
             # Everything that reached the client, so a later reader knows which
             # vendor, endpoint and sampling settings produced these numbers.
             "llm": {key: value for key, value in self.llm_settings.items() if key != "kind"},
+            # The fragments the planner could have been shown, so a result can be
+            # tied to the version of the knowledge base it was planned against.
+            "knowledge": self.knowledge_base.digest() if self.knowledge_base else None,
         }
 
     def _configuration_snapshot(self) -> Dict[str, Any]:
         """
         Everything the agent was configured with, as a record of its own.
-
-        The manifest says what the turn did; this says under which settings. It is
-        kept in a separate file because it is the same for every turn of a session
-        and because it is what a reader copies to repeat the run: the resolved
-        model settings, every agent-side limit, the overrides a caller passed, and
-        the configuration file itself - content as well as digest, so the record
-        can still be read on a machine that does not have that file.
         """
         config_file: Dict[str, Any] = {"path": str(self.config_path)}
         if self.config_path.exists():
@@ -364,10 +545,17 @@ class AgentWithTools:
 
         return {
             "recorded_at": datetime.now().isoformat(),
+            # Which arm of the ablation this is (configs/README.md), as its file names it.
+            "arm": self.config.get("arm"),
             # What actually reached the client, after the provider's defaults and
             # any override were applied - not what the file says.
             "llm": self.llm_settings,
             "agent": self.agent_settings,
+            "knowledge": {**self.knowledge_settings,
+                          "selector_llm": (self.selector_llm_settings
+                                           if self.knowledge_enabled
+                                           and self.knowledge_settings["selector_mode"] == "llm"
+                                           else None)},
             "overrides_from_caller": self.config_overrides,
             "config_file": config_file,
             "always_available_tools": list(ALWAYS_AVAILABLE_TOOLS),
@@ -375,10 +563,14 @@ class AgentWithTools:
             "registered_datasets": sorted(self.data_index),
         }
 
-    def _ask(self, bundle: Optional["RunBundle"], name: str, system: str, human: str):
-        """One LLM exchange, timed and recorded in the bundle."""
+    def _ask(self, bundle: Optional["RunBundle"], name: str, system: str, human: str, llm=None):
+        """One LLM exchange, timed and recorded in the bundle; the agent's own model unless llm is given."""
         started = datetime.now()
-        response = self.llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
+        response = (llm or self.llm).invoke([SystemMessage(content=system), HumanMessage(content=human)])
+        if not isinstance(response.content, str):
+            # A model that thinks before answering (claude-sonnet-5-5 by default) returns a
+            # list of content blocks, thinking first; every caller parses the answer text.
+            response.content = str(response.text)
         seconds = (datetime.now() - started).total_seconds()
         if bundle is not None:
             bundle.record_exchange(name, system, human, response.content, seconds)
@@ -397,13 +589,25 @@ class AgentWithTools:
                 }
         return specs
 
+    def _code_reference(self, selected_tools: List[str],
+                        selected_datasets: List[str]) -> Dict[str, Any]:
+        """
+        What the code-generation and repair steps are given to program against: the
+        full specs of the tools the plan selected, plus the ones always handed over.
+        """
+        return self._specs_for(list(selected_tools) + list(ALWAYS_AVAILABLE_TOOLS))
+
+    def _write_rerun_harness(self, bundle: "RunBundle", datasets: List[str]) -> None:
+        """The bundle's code/run.py, which re-executes the turn's code without the agent."""
+        bundle.write_rerun_harness(datasets, self.figure_dpi)
+
+    def _sandbox_builtins(self):
+        """The builtins the generated code runs with."""
+        return __builtins__
+
     def _specs_used_by(self, code: str) -> Dict[str, Any]:
         """
         Specs of every registered tool the code actually calls.
-
-        The sandbox exposes all registered tools, but the code-generation step is
-        only shown the ones the plan named. When generated code reaches for another
-        one, the fix step needs its signature to repair the call.
         """
         called = [name for name in self.tools_meta
                   if re.search(rf"\b{re.escape(name)}\s*\(", code)]
@@ -422,7 +626,7 @@ class AgentWithTools:
 
     def _safe_execute_tool(self, code: str, context: dict = None, code_type: str = "compute") -> Dict[str, Any]:
         """Safely execute generated code in a sandboxed environment with registered tools."""
-        sandbox_globals = {"__builtins__": __builtins__}
+        sandbox_globals = {"__builtins__": self._sandbox_builtins()}
         
         registered_count = 0
         for name, meta in self.tools_meta.items():
@@ -441,16 +645,10 @@ class AgentWithTools:
             sandbox_globals[name] = func
             registered_count += 1
         
-        # The scientific stack the generated code is told it may use. Every tool
-        # takes and returns xr.DataArray, so xarray and pandas belong here.
         sandbox_globals.update({"np": np, "pd": pd, "xr": xr, "plt": plt})
         plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC']
         plt.rcParams['axes.unicode_minus'] = False
         
-        # Every attempt starts from a clean canvas. A failed attempt can leave a
-        # half-drawn figure open, and _save_visualizations walks whatever is open
-        # when it runs, so without this the discarded attempt's figure would be
-        # saved beside the good one and reported as a result.
         plt.close("all")
 
         print(f"[Info] Successfully registered {registered_count} tools to sandbox")
@@ -463,16 +661,8 @@ class AgentWithTools:
         if context:
             sandbox_globals.update(context)
             
-        # One namespace for globals and locals. With two dicts, a function defined
-        # in the generated code cannot see names bound at top level (those land in
-        # locals, which a function body never consults) and dies with NameError.
         predefined = set(sandbox_globals)
         try:
-            # xarray drops attrs on reductions and arithmetic by default, which
-            # strips the source_dataset/grid_type tags the weighted statistics and
-            # derived-quantity tools need to find the right grid. Generated code
-            # routinely does `da.mean(dim="time")` before a weighted mean, so the
-            # tags are kept for the duration of the generated code.
             with xr.set_options(keep_attrs=True):
                 exec(code, sandbox_globals)
             output = {k: v for k, v in sandbox_globals.items() if k not in predefined}
@@ -524,14 +714,78 @@ class AgentWithTools:
                                    if np.issubdtype(array.dtype, np.floating) else array.tolist())
         return described
 
+    def _materialize_outputs(self, output: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Compute the lazy arrays a successful compute block left behind, once, and
+        put the computed arrays back in their place.
+        """
+        per_array = self.materialize_max_mb * 1024 ** 2
+        budget = self.materialize_total_mb * 1024 ** 2
+        found: Dict[int, Tuple[str, Any]] = {}
+
+        def collect(obj: Any, path: str, depth: int) -> None:
+            if depth > 4:
+                return
+            if isinstance(obj, (xr.DataArray, xr.Dataset)):
+                if dask.is_dask_collection(obj) and id(obj) not in found:
+                    found[id(obj)] = (path, obj)
+            elif isinstance(obj, dict):
+                for key, value in obj.items():
+                    collect(value, f"{path}[{key!r}]", depth + 1)
+            elif isinstance(obj, (list, tuple)):
+                for i, value in enumerate(obj):
+                    collect(value, f"{path}[{i}]", depth + 1)
+
+        for name, value in output.items():
+            if not name.startswith("_") and not callable(value) and not isinstance(value, types.ModuleType):
+                collect(value, name, 0)
+        if not found:
+            return {"materialized": 0}
+
+        chosen, kept_lazy, total = [], [], 0
+        for path, obj in sorted(found.values(), key=lambda item: item[1].nbytes):
+            if obj.nbytes <= per_array and total + obj.nbytes <= budget:
+                chosen.append(obj)
+                total += obj.nbytes
+            else:
+                kept_lazy.append(f"{path} ({obj.nbytes / 1024 ** 2:.0f} MB)")
+        if not chosen:
+            return {"materialized": 0, "kept_lazy": kept_lazy}
+
+        started = datetime.now()
+        try:
+            computed = dask.compute(*chosen)
+        except Exception as e:
+            return {"materialized": 0, "kept_lazy": kept_lazy,
+                    "failed": f"{type(e).__name__}: {e}"[:300]}
+        replacement = {id(obj): new for obj, new in zip(chosen, computed)}
+
+        def replace(obj: Any, depth: int) -> Any:
+            if depth > 4:
+                return obj
+            if isinstance(obj, (xr.DataArray, xr.Dataset)):
+                return replacement.get(id(obj), obj)
+            if isinstance(obj, dict):
+                for key in list(obj):
+                    obj[key] = replace(obj[key], depth + 1)
+                return obj
+            if isinstance(obj, list):
+                obj[:] = [replace(value, depth + 1) for value in obj]
+                return obj
+            if isinstance(obj, tuple):
+                items = [replace(value, depth + 1) for value in obj]
+                return type(obj)(*items) if hasattr(obj, "_fields") else tuple(items)
+            return obj
+
+        for name in list(output):
+            output[name] = replace(output[name], 0)
+        return {"materialized": len(chosen), "megabytes": round(total / 1024 ** 2, 1),
+                "seconds": round((datetime.now() - started).total_seconds(), 1),
+                "kept_lazy": kept_lazy}
+
     def _summarize_value(self, value: Any, max_chars: Optional[int] = None) -> Any:
         """
         Render one result variable for the solution step.
-
-        The loaders hand back lazy dask-backed DataArrays, whose repr shows the task
-        graph and no values at all, so a plain str() would leave the final answer
-        with no numbers in it. Arrays are therefore materialised and reduced to a
-        compact numeric summary, with small ones listed in full.
         """
         if max_chars is None:
             max_chars = self.max_value_chars
@@ -579,13 +833,6 @@ class AgentWithTools:
     def _loop_local_names(code: str) -> set:
         """
         Names that only a loop assigned, which therefore hold its last iteration.
-
-        `for m in models: dm = compute_difference_metrics(...)` leaves `dm` bound to
-        the last model alone. Reported as an ordinary result it reads as a property
-        of the analysis, and the final answer then states one model's number as if
-        it held for all of them. A name the code also assigns outside the loop is a
-        different matter - `metrics = {}` filled in the loop keeps every model - so
-        those are kept.
         """
         try:
             tree = ast.parse(code)
@@ -635,13 +882,6 @@ class AgentWithTools:
                                  limit: int = 12) -> List[str]:
         """
         Find failures the generated code caught and stored instead of raising.
-
-        A `try/except` that records the exception and carries on leaves the
-        interpreter exit status clean, so the run reads as a success and the
-        repair budget is never spent - while part of the answer is quietly
-        missing. This walks the result namespace for the two shapes that
-        actually occur: an exception object kept in a variable, and an error
-        string parked under a key such as 'error'.
         """
         found: List[str] = []
 
@@ -717,11 +957,13 @@ class AgentWithTools:
                 for name in names if name in self.data_index
             ],
             "selected_tools": record.get("selected_tools", []),
+            "knowledge": record.get("knowledge"),
             "code_iterations": {"compute": steps(compute_iterations),
                                 "visualization": steps(vis_iterations)},
             "figures": [os.path.basename(path) for path in record.get("visualization_paths", [])],
             "files": {
                 "query": "query.txt",
+                "knowledge_retrieval": "knowledge.json",
                 "plan": "plan.md",
                 "prompts_sent_to_the_model": "prompts/",
                 "final_compute_code": "code/compute.py",
@@ -739,9 +981,6 @@ class AgentWithTools:
     def _save_visualizations(self, turn_id: str, out_dir: Optional[Path] = None) -> List[str]:
         """
         Save every matplotlib figure the visualization code left open.
-
-        Questions that want one panel per basin or per model produce several
-        figures, and savefig writes only the current one, so they are walked here.
         """
         paths = []
         try:
@@ -763,10 +1002,6 @@ class AgentWithTools:
     def _save_session(self, session: ConversationSession):
         """
         Save session history beside the turns it summarises.
-
-        The session id already carries the case, the model and the time, so the
-        history goes inside that session's own directory rather than back at the
-        top of result_dir under a second timestamp.
         """
         fname = self.result_dir / session.session_id / "session_history.json"
         fname.parent.mkdir(parents=True, exist_ok=True)
@@ -803,9 +1038,6 @@ class AgentWithTools:
         """
         iteration_history = []
         current_code = initial_code
-        # A run that only swallowed errors is still worth more than nothing. It is
-        # kept here so that if every later repair raises outright, the partial
-        # answer is returned rather than lost to the retry it triggered.
         best_partial: Optional[Dict[str, Any]] = None
 
         for iteration in range(self.max_code_iterations):
@@ -813,10 +1045,20 @@ class AgentWithTools:
             
             exec_result = self._safe_execute_tool(current_code, context, code_type)
 
-            # A caught-and-stored exception leaves the exit status clean, so without
-            # this the run counts as a success and the repair budget goes unspent
-            # while part of the answer is missing. Detected before the attempt is
-            # recorded, so the audit bundle does not file it as a clean success.
+            # The results of a compute block are computed here, once, and those
+            # computed arrays serve both the summary and the visualization block.
+            materialized = None
+            if exec_result["success"] and code_type == "compute":
+                materialized = self._materialize_outputs(exec_result["output"])
+                if materialized.get("materialized"):
+                    print(f"[Info] Computed {materialized['materialized']} lazy result array(s) "
+                          f"({materialized['megabytes']} MB) in {materialized['seconds']} s")
+                if materialized.get("kept_lazy"):
+                    print(f"[Info] Left lazy (over the size limit): {', '.join(materialized['kept_lazy'])}")
+                if materialized.get("failed"):
+                    print(f"[Warning] Computing the results together failed ({materialized['failed']}); "
+                          f"they stay lazy and are computed one by one for the summary")
+
             swallowed = (self._detect_swallowed_errors(exec_result["output"])
                          if exec_result["success"] else [])
             retries_left = iteration < self.max_code_iterations - 1
@@ -855,6 +1097,8 @@ class AgentWithTools:
             }
             if swallowed:
                 iteration_record["swallowed_errors"] = swallowed
+            if materialized:
+                iteration_record["materialized_results"] = materialized
 
             if exec_result["success"]:
                 if swallowed:
@@ -862,8 +1106,7 @@ class AgentWithTools:
                     # it, but carry the failures into the observation so neither the
                     # answer nor a reader can miss them.
                     exec_result["swallowed_errors"] = swallowed
-                # Summarised once here and reused by the caller, so lazy arrays are
-                # materialised a single time rather than on every read.
+
                 exec_result["summary"] = self._summarize_outputs(exec_result["output"], current_code)
                 iteration_record["output"] = exec_result["summary"]
                 omitted = sorted(self._loop_local_names(current_code)
@@ -896,11 +1139,11 @@ class AgentWithTools:
                 specs_for_fix = dict(full_specs)
                 specs_for_fix.update(self._specs_used_by(current_code))
 
-                fix_prompt = PromptTemplates.get_fix_prompt(
+                fix_prompt = self.prompts.get_fix_prompt(
                     language, current_code, exec_result, user_query, specs_for_fix, code_type,
                     upstream_code=upstream_code, available_variables=available_variables
                 )
-                system_content = PromptTemplates.get_fix_system_message(language)
+                system_content = self.prompts.get_fix_system_message(language)
                 
                 fix_response, _ = self._ask(
                     bundle, f"fix_{code_type}_iter{iteration + 2}", system_content, fix_prompt
@@ -927,13 +1170,6 @@ class AgentWithTools:
                        label: Optional[str] = None) -> str:
         """
         Create a new conversation session.
-
-        The session id is the directory every turn of the session is written to, so
-        it carries the model that produced those turns: a run of the same case under
-        two models is then two directories side by side, distinguishable without
-        opening either. Pass `label` for what the session is (a case id, say) and
-        the id becomes "<label>_<model>_<timestamp>"; pass `session_id` to name the
-        directory yourself.
         """
         if session_id is None:
             session_id = "_".join([
@@ -965,6 +1201,138 @@ class AgentWithTools:
         Returns:
             Dict, the result record including plan, selected data/tools, generated code, observation, and solution.
         """
+        session, bundle, result_record, started_at, context_summary = self._open_turn(
+            user_query, session_id)
+        language = result_record["language"]
+        
+        tool_overview = {
+            k: (v.get("summary") or v["description"].strip().split("\n")[0])
+            for k, v in self.tools_meta.items()
+        }
+        
+        data_overview = {
+            data["name"]: {"description": data.get("description", "")}
+            for data in self.data_list
+        }
+
+        # Step 0: Knowledge retrieval. 
+        knowledge_text, knowledge_record = self._retrieve_knowledge(
+            user_query, context_summary, language, bundle)
+        bundle.write_json("knowledge.json", knowledge_record)
+
+        # Step 1: Planning, including selecting data and tools
+        system_prompt_1 = self.prompts.get_planning_prompt(
+            language, tool_overview, data_overview, context_summary, knowledge=knowledge_text
+        )
+        planning_input = self.prompts.get_planning_input(language, user_query)
+
+        planning_response, planning_seconds = self._ask(
+            bundle, "planning", system_prompt_1, planning_input
+        )
+        print("\n=== Plan & Selection ===\n", planning_response.content)
+        result_record["plan"] = planning_response.content
+
+        plan_match = (re.search(r"<plan>(.*?)</plan>", planning_response.content, re.S)
+                      or re.search(r"<plan>(.*?)(?=<selected_data>|<selected_tools>|\Z)",
+                                   planning_response.content, re.S))
+        plan_text = plan_match.group(1).strip() if plan_match else ""
+        bundle.write("plan.md", f"# Plan\n\n{plan_text or planning_response.content}\n")
+
+        # Step 1b: Which of the fragments the planner was shown does the plan cite?
+        # Checked against plan_text, since that alone travels on to the later steps.
+        if knowledge_text:
+            knowledge_record["plan_check"] = self.knowledge_base.check_plan(
+                plan_text, knowledge_record["injected_ids"])
+            uncited_must = knowledge_record["plan_check"]["uncited_must"]
+            if uncited_must and self.knowledge_settings["on_uncited_must"] == "warn":
+                print(f"[Warning] The plan does not cite these must-fragments it was shown: "
+                      f"{', '.join(uncited_must)}")
+            repeated = knowledge_record["plan_check"]["repeated_notes"]
+            if repeated:
+                print(f"[Info] The plan repeats notes for: "
+                      f"{', '.join(f'{i} x{n}' for i, n in repeated.items())}")
+            bundle.write_json("knowledge.json", knowledge_record)
+        result_record["knowledge"] = {
+            "selected": {s["id"]: s["status"] for s in knowledge_record.get("selected", [])},
+            "selection_fallback": (knowledge_record.get("selection") or {}).get("fallback_reason"),
+            "condensing_fallback": (knowledge_record.get("condensing_run") or {}).get("fallback_reason"),
+            "injected_chars": knowledge_record.get("injected_chars"),
+            "plan_check": knowledge_record.get("plan_check"),
+        } if knowledge_record.get("enabled") else None
+
+        # Extract the selected datasets.
+        selected_data_match = re.search(r"<selected_data>(.*?)</selected_data>", planning_response.content, re.S)
+        requested = [d.strip() for d in selected_data_match.group(1).split(",")] if selected_data_match else []
+        requested = [d for d in requested if d]
+
+        selected_datasets = [name for name in requested if name in self.data_index]
+        unknown = [name for name in requested if name not in self.data_index]
+        if unknown:
+            print(f"[Warning] Planning step named unregistered datasets: {unknown}")
+
+        if not selected_datasets:
+            # The turn stops rather than substituting another dataset: against a
+            # registry of unlike products, a substitution quietly answers a
+            # different question than the one that was asked.
+            message = (f"No registered dataset was selected (requested: {requested or 'none'}; "
+                       f"available: {sorted(self.data_index)})")
+            print(f"[Error] {message}")
+            result_record["error"] = message
+            return self._close_turn_early(session, bundle, result_record, started_at)
+
+        # Only the description: the code-generation step addresses datasets by id,
+        # so handing it the root path would contradict the prompt's own rule.
+        dataset_specs = {
+            name: {"description": self.data_index[name].get("description", "")}
+            for name in selected_datasets
+        }
+
+        print(f"[System] Selected datasets: {selected_datasets}")
+        result_record["selected_data"] = {
+            "name": selected_datasets,
+            "path": [self.data_index[name]["path"] for name in selected_datasets]
+        }
+
+        selected_tool_match = re.search(r"<selected_tools>(.*?)</selected_tools>", planning_response.content, re.S)
+        selected_tool_names = [t.strip() for t in selected_tool_match.group(1).split(",")] if selected_tool_match else []
+        result_record["selected_tools"] = selected_tool_names
+
+        # Step 2: Generate executable code
+        full_specs = self._code_reference(selected_tool_names, selected_datasets)
+
+        system_prompt_2 = self.prompts.get_code_generation_prompt(
+            language, full_specs, user_query, dataset_specs, self.dataset_notes, plan=plan_text
+        )
+        exec_input = self.prompts.get_code_generation_input(language)
+        
+        exec_response, _ = self._ask(bundle, "code_generation", system_prompt_2, exec_input)
+        print("\n=== Generated Code ===\n", exec_response.content)
+        result_record["generated_code"] = exec_response.content
+
+        # The generated code addresses datasets by id. `selected_data` is a
+        # convenience alias for the single-dataset case.
+        code_context = {"selected_datasets": selected_datasets}
+        if len(selected_datasets) == 1:
+            code_context["selected_data"] = selected_datasets[0]
+
+        executed = self._run_generated_code(exec_response.content, code_context, full_specs,
+                                            user_query, language, bundle, result_record)
+        if executed is None:
+            return self._close_turn_early(session, bundle, result_record, started_at)
+        observation_parts, compute_iterations, final_compute = executed
+        return self._answer_and_finish(session, bundle, result_record, started_at,
+                                       observation_parts, compute_iterations, final_compute,
+                                       user_query, language, plan_text)
+
+    def _open_turn(self, user_query: str, session_id: Optional[str]):
+        """
+        Start a turn: pick the language, find or open the session, and open the
+        turn's bundle before the first model call.
+
+        Returns the session, the bundle, the turn's result record (which carries
+        the session id, the language and the turn number), the start time and the
+        summary of the conversation so far.
+        """
         # The configuration can pin the answer's language; 'auto' reads it off the question.
         language = self.language if self.language in ("zh", "en") else self._detect_language(user_query)
         print(f"[System] Language: {'Chinese' if language == 'zh' else 'English'}"
@@ -987,7 +1355,6 @@ class AgentWithTools:
         # The bundle is opened before the first model call, so that even a turn
         # that crashes halfway leaves its prompts and attempts on disk.
         turn_number = session.turn_count + 1
-        turn_id = f"{session_id}_turn{turn_number}"
         bundle = RunBundle(self.result_dir / session_id / f"turn{turn_number:02d}")
         started_at = datetime.now()
 
@@ -1002,111 +1369,38 @@ class AgentWithTools:
         bundle.write_json("agent_config.json", self._configuration_snapshot())
 
         context_summary = session.get_context_summary()
-        
-        # The planner only has to choose; it is shown one line per tool. The full
-        # entry — arguments, return contract, caveats — goes to the code step for
-        # the tools the plan selected, which is where it can actually be used.
-        tool_overview = {
-            k: (v.get("summary") or v["description"].strip().split("\n")[0])
-            for k, v in self.tools_meta.items()
-        }
-        
-        # Datasets are offered by registry id only: an id is what the loaders take,
-        # and showing the root path alongside it invites a path in the answer.
-        data_overview = {
-            data["name"]: {"description": data.get("description", "")}
-            for data in self.data_list
-        }
+        return session, bundle, result_record, started_at, context_summary
 
-        # Step 1: Planning, including selecting data and tools
-        system_prompt_1 = PromptTemplates.get_planning_prompt(
-            language, tool_overview, data_overview, context_summary
-        )
-        planning_input = PromptTemplates.get_planning_input(language, user_query)
+    def _close_turn_early(self, session: ConversationSession, bundle: RunBundle,
+                          result_record: Dict[str, Any], started_at: datetime) -> Dict[str, Any]:
+        """End a turn that stopped before any code ran; its record carries the reason."""
+        bundle.write_json("manifest.json", self._manifest(result_record, started_at, [], []))
+        session.add_turn(result_record)
+        return result_record
 
-        planning_response, planning_seconds = self._ask(
-            bundle, "planning", system_prompt_1, planning_input
-        )
-        print("\n=== Plan & Selection ===\n", planning_response.content)
-        result_record["plan"] = planning_response.content
+    def _run_generated_code(self, generated: str, code_context: Dict[str, Any],
+                            full_specs: Dict[str, Any], user_query: str, language: str,
+                            bundle: RunBundle, result_record: Dict[str, Any]):
+        """
+        Execute the <compute> and <visualize> blocks of a code-generation answer,
+        each with its repair loop, and gather what they produced.
 
-        plan_match = re.search(r"<plan>(.*?)</plan>", planning_response.content, re.S)
-        plan_text = plan_match.group(1).strip() if plan_match else ""
-        bundle.write("plan.md", f"# Plan\n\n{plan_text or planning_response.content}\n")
-
-        # Extract the selected datasets. A dataset is a registry id (woa23,
-        # cmip6_historical, ...) holding many variables and, for CMIP6, several
-        # models; the id is what the loaders take, so the id is what is carried
-        # forward rather than a file path.
-        selected_data_match = re.search(r"<selected_data>(.*?)</selected_data>", planning_response.content, re.S)
-        requested = [d.strip() for d in selected_data_match.group(1).split(",")] if selected_data_match else []
-        requested = [d for d in requested if d]
-
-        selected_datasets = [name for name in requested if name in self.data_index]
-        unknown = [name for name in requested if name not in self.data_index]
-        if unknown:
-            print(f"[Warning] Planning step named unregistered datasets: {unknown}")
-
-        if not selected_datasets:
-            # The turn stops rather than substituting another dataset: against a
-            # registry of unlike products, a substitution quietly answers a
-            # different question than the one that was asked.
-            message = (f"No registered dataset was selected (requested: {requested or 'none'}; "
-                       f"available: {sorted(self.data_index)})")
-            print(f"[Error] {message}")
-            result_record["error"] = message
-            bundle.write_json("manifest.json", self._manifest(result_record, started_at, [], []))
-            session.add_turn(result_record)
-            return result_record
-
-        # Only the description: the code-generation step addresses datasets by id,
-        # so handing it the root path would contradict the prompt's own rule.
-        dataset_specs = {
-            name: {"description": self.data_index[name].get("description", "")}
-            for name in selected_datasets
-        }
-
-        print(f"[System] Selected datasets: {selected_datasets}")
-        result_record["selected_data"] = {
-            "name": selected_datasets,
-            "path": [self.data_index[name]["path"] for name in selected_datasets]
-        }
-
-        selected_tool_match = re.search(r"<selected_tools>(.*?)</selected_tools>", planning_response.content, re.S)
-        selected_tool_names = [t.strip() for t in selected_tool_match.group(1).split(",")] if selected_tool_match else []
-        result_record["selected_tools"] = selected_tool_names
-
-        # Step 2: Generate executable code
-        full_specs = self._specs_for(list(selected_tool_names) + list(ALWAYS_AVAILABLE_TOOLS))
-
-        system_prompt_2 = PromptTemplates.get_code_generation_prompt(
-            language, full_specs, user_query, dataset_specs, self.dataset_notes, plan=plan_text
-        )
-        exec_input = PromptTemplates.get_code_generation_input(language)
-        
-        exec_response, _ = self._ask(bundle, "code_generation", system_prompt_2, exec_input)
-        print("\n=== Generated Code ===\n", exec_response.content)
-        result_record["generated_code"] = exec_response.content
-
+        Returns the observation parts, the compute iterations and the compute
+        code that finally ran; None when the answer has no <compute> block, with
+        the reason in result_record.
+        """
+        turn_id = f"{result_record['session_id']}_turn{result_record['turn_number']}"
         # Step 3: Extract and execute the computation code
-        compute_match = re.search(r"<compute>(.*?)</compute>", exec_response.content, re.S)
+        compute_match = re.search(r"<compute>(.*?)</compute>", generated, re.S)
         if not compute_match:
             print("[Error] No <compute> code block found.")
             result_record["error"] = "No computation code found"
-            bundle.write("code/raw_response.txt", exec_response.content)
-            bundle.write_json("manifest.json", self._manifest(result_record, started_at, [], []))
-            session.add_turn(result_record)
-            return result_record
+            bundle.write("code/raw_response.txt", generated)
+            return None
         
         compute_code = compute_match.group(1).strip()
 
-        # The generated code addresses datasets by id. `selected_data` is a
-        # convenience alias for the single-dataset case.
-        code_context = {"selected_datasets": selected_datasets}
-        if len(selected_datasets) == 1:
-            code_context["selected_data"] = selected_datasets[0]
-
-        bundle.write_rerun_harness(selected_datasets, self.figure_dpi)
+        self._write_rerun_harness(bundle, code_context.get("selected_datasets", []))
 
         compute_result, compute_iterations = self._execute_with_retry(
             compute_code,
@@ -1116,13 +1410,9 @@ class AgentWithTools:
             user_query=user_query,
             language=language,
             bundle=bundle,
-            # Nothing ran before this block; the repair step is told only what the
-            # sandbox pre-binds, so it does not invent a dataset id of its own.
             available_variables={name: self._summarize_value(value)
                                  for name, value in code_context.items()}
         )
-        # The code that actually ran, not the first draft: this is what a reader
-        # must audit and what code/run.py re-executes.
         final_compute = compute_iterations[-1]["code"] if compute_iterations else compute_code
         bundle.write("code/compute.py", final_compute + "\n")
 
@@ -1139,9 +1429,6 @@ class AgentWithTools:
                 "status": "success",
                 "results": compute_obs
             }
-            # Reported, never dropped: the code ran to completion but caught these
-            # on the way, so some requested quantity is missing. The answer step is
-            # told, and told to say so.
             if compute_result.get("swallowed_errors"):
                 computation_part["status"] = "success_with_caught_failures"
                 computation_part["caught_failures"] = compute_result["swallowed_errors"]
@@ -1154,7 +1441,7 @@ class AgentWithTools:
             observation_parts.append(computation_part)
 
             # Step 4: Extract and execute the visualization code (if any)
-            visualize_match = re.search(r"<visualize>(.*?)</visualize>", exec_response.content, re.S)
+            visualize_match = re.search(r"<visualize>(.*?)</visualize>", generated, re.S)
             if visualize_match:
                 visualize_code = visualize_match.group(1).strip()
                 
@@ -1162,9 +1449,6 @@ class AgentWithTools:
                     vis_context = dict(code_context)
                     vis_context.update(compute_result["output"])
                     
-                    # A visualization failure is nearly always a name or a shape:
-                    # the block is handed variables it did not create. So the repair
-                    # step gets the code that created them and a summary of each.
                     vis_variables = {name: self._summarize_value(value)
                                      for name, value in code_context.items()}
                     vis_variables.update(compute_result.get("summary", {}))
@@ -1234,16 +1518,19 @@ class AgentWithTools:
                 "error": compute_result['error'],
                 "iterations": len(compute_iterations)
             })
+        return observation_parts, compute_iterations, final_compute
 
+    def _answer_and_finish(self, session: ConversationSession, bundle: RunBundle,
+                           result_record: Dict[str, Any], started_at: datetime,
+                           observation_parts: List[Dict[str, Any]],
+                           compute_iterations: List[Dict[str, Any]], final_compute: str,
+                           user_query: str, language: str, plan_text: str = "") -> Dict[str, Any]:
+        """Write the observation, ask for the final answer, and close the turn."""
         observation_text = json.dumps(observation_parts, indent=2, ensure_ascii=False)
         result_record["observation"] = observation_text
         bundle.write_json("observation.json", observation_parts)
 
-        # Step 5: Generate final answer. The question, the plan and the code that
-        # actually ran all go in, so that the methodology is reported from the code
-        # rather than guessed from the names of the result variables.
-        # A run that caught failures still produced numbers, so the answer is written
-        # from them - the observation carries the instruction to declare what is missing.
+        # Step 5: Generate final answer.
         has_computation_success = observation_parts[0]["status"] in (
             "success", "success_with_caught_failures")
         has_visualization = any(p.get("type") == "visualization" and p.get("status") == "success" 
@@ -1254,11 +1541,11 @@ class AgentWithTools:
             executed_code += "\n\n# --- visualization ---\n" + \
                 result_record["visualization_iterations"][-1]["code"]
 
-        solution_prompt = PromptTemplates.get_solution_prompt(
+        solution_prompt = self.prompts.get_solution_prompt(
             language, observation_text, has_computation_success, has_visualization,
             user_query=user_query, plan=plan_text, executed_code=executed_code
         )
-        final_input = PromptTemplates.get_solution_input(language)
+        final_input = self.prompts.get_solution_input(language)
 
         final_response, _ = self._ask(bundle, "solution", solution_prompt, final_input)
         print("\n=== Final Solution ===\n", final_response.content)
@@ -1274,82 +1561,80 @@ class AgentWithTools:
             result_record.get("visualization_iterations", [])
         ))
         print(f"[System] Audit bundle written to {bundle.root}")
-
         return result_record
     
 
+def run_tests_from_folder(folder_path, agent):
+    """
+    Read all JSON files inside folder_path.
+    Each JSON file contains an array of test items.
+    For each item: create a new agent session and run the query.
+    """
+
+    json_files = [
+        os.path.join(folder_path, f)
+        for f in os.listdir(folder_path)
+        if f.endswith(".json")
+    ]
+
+    print(f"Found {len(json_files)} test files.")
+
+    all_results = []   # collect everything
+
+    for json_file in json_files:
+        print(f"\n=== Loading test file: {json_file} ===")
+        with open(json_file, "r") as f:
+            test_items = json.load(f)
+
+        if not isinstance(test_items, list):
+            raise ValueError(f"JSON file {json_file} must contain a list/array.")
+
+        for idx, item in enumerate(test_items):
+            query = item.get("query")
+
+            if query is None:
+                print(f"Skipping item {idx} because no 'query' field.")
+                continue
+
+            print(f"\n--- Running test case {idx+1}/{len(test_items)} ---")
+            print(f"Query: {query}")
+
+            # The case's own id when it has one, so the directory says which
+            # case, which model and when - T3_deepseek-reasoner_20260922_193101.
+            label = item.get("case_id") or Path(json_file).stem
+            session_id = agent.create_session(label=label)
+
+            try:
+                result = agent.run(query, session_id=session_id)
+                all_results.append({
+                    "file": json_file,
+                    "index": idx,
+                    "query": query,
+                    "result": result
+                })
+            except Exception as e:
+                print(f"Error running test case {idx}: {e}")
+            finally:
+                agent.end_session(session_id)
+
+    return all_results
+
+
 if __name__ == "__main__":
-    # Built from configs/datasets.yaml so this catalogue cannot drift from what
-    # the loader tools actually read.
+    # Built from configs/datasets.yaml.
     data_list = list_datasets()
 
-
-    def run_tests_from_folder(folder_path, agent):
-        """
-        Read all JSON files inside folder_path.
-        Each JSON file contains an array of test items.
-        For each item: create a new agent session and run the query.
-        """
-
-        json_files = [
-            os.path.join(folder_path, f)
-            for f in os.listdir(folder_path)
-            if f.endswith(".json")
-        ]
-
-        print(f"Found {len(json_files)} test files.")
-
-        all_results = []   # collect everything
-
-        for json_file in json_files:
-            print(f"\n=== Loading test file: {json_file} ===")
-            with open(json_file, "r") as f:
-                test_items = json.load(f)
-
-            if not isinstance(test_items, list):
-                raise ValueError(f"JSON file {json_file} must contain a list/array.")
-
-            for idx, item in enumerate(test_items):
-                query = item.get("query")
-
-                if query is None:
-                    print(f"Skipping item {idx} because no 'query' field.")
-                    continue
-
-                print(f"\n--- Running test case {idx+1}/{len(test_items)} ---")
-                print(f"Query: {query}")
-
-                # The case's own id when it has one, so the directory says which
-                # case, which model and when - T1_deepseek-reasoner_20260922_193101.
-                label = item.get("case_id") or Path(json_file).stem
-                session_id = agent.create_session(label=label)
-
-                try:
-                    result = agent.run(query, session_id=session_id)
-                    all_results.append({
-                        "file": json_file,
-                        "index": idx,
-                        "query": query,
-                        "result": result
-                    })
-                except Exception as e:
-                    print(f"Error running test case {idx}: {e}")
-                finally:
-                    agent.end_session(session_id)
-
-        return all_results
-
-    # Model, limits, output directory and the batch below all come from
-    # configs/agent_with_tools.yaml; the API key comes from the environment
-    # variable that file names, so no key is ever committed.
-    config = load_config()
-    agent = AgentWithTools(TOOLS, data_list, config=config)
+    config_path = config_path_from_argv(CONFIG_PATH)
+    config = load_config(config_path)
+    arm = check_arm(config, ("full", "no_knowledge"), config_path)
+    agent = AgentWithTools(TOOLS, data_list, config_path=config_path)
 
     batch = config.get("batch_run") or {}
     folder = resolve_path(batch.get("test_folder", "cases"))
     repeats = int(batch.get("repeats", 1))
-    print(f"[System] Running {folder} x{repeats} with {agent.model_name} "
-          f"({agent.provider}; results -> {agent.result_dir})")
+    print(f"[System] Arm {arm}: running {folder} x{repeats} with {agent.model_name} "
+          f"({agent.provider}; knowledge {'on' if agent.knowledge_enabled else 'off'}; "
+          f"results -> {agent.result_dir})")
 
     for _ in range(repeats):
         results = run_tests_from_folder(str(folder), agent)

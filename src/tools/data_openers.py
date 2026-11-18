@@ -1,24 +1,8 @@
-# Internal readers: open_cmip6, open_woa23, open_glodap, open_seanoe_mld, open_ersst,
-# open_cpc_index. None of them is registered in src/tools/registry, so none is in the
-# agent's namespace: every one is reachable through a load_* tool in data_loader.py, which
-# is the only entry point the agent has. Registering them too would offer the planning step
-# a second, shorter-looking route that skips the subsetting and the dataset-kind checks the
-# loaders do.
-#
-# One opener per data source, each doing a single job: read the raw files
-# correctly and normalise them.
-#   - resolve the file layout (chunked files, variable prefixes, time-slice
-#     numbering, member ids)
-#   - correct each product's own metadata defects (non-CF time units, units
-#     written under the attribute name `unit`, mislabelled units)
-#   - converge on one coordinate contract: longitude -180~180, latitude
-#     ascending, depth in metres positive down and ascending, monthly time axes
-#     stamped on the first of the month as datetime64
-# Subsetting (time, space, named regions) does not happen here; that is
-# src/tools/data_loader.py.
-#
-# Every path, variable prefix, level count and grid convention is read from
-# configs/datasets.yaml; nothing is hard-coded here.
+# Internal readers: open_cmip6, open_woa23, open_glodap, open_seanoe_mld, open_ersst, open_cpc_index. 
+
+# None of them is registered in src/tools/registry. Every one is reachable through a load_* tool in data_loader.py, which is the only entry point the agent has. 
+
+# Every path, variable prefix, level count and grid convention is read from configs/datasets.yaml.
 
 import os
 import re
@@ -38,28 +22,11 @@ CONFIG_PATH = os.path.normpath(
 
 SEASON_ORDER = ["winter", "spring", "summer", "autumn"]
 
-# ONI's three-month overlapping seasons map to their centre month: DJF 1950
-# is centred on January 1950.
 ONI_SEASON_TO_CENTER_MONTH = {
     "DJF": 1, "JFM": 2, "FMA": 3, "MAM": 4, "AMJ": 5, "MJJ": 6,
     "JJA": 7, "JAS": 8, "ASO": 9, "SON": 10, "OND": 11, "NDJ": 12,
 }
 
-
-# ---------------------------------------------------------------------------
-# Unit normalisation
-#
-# The same physical unit is spelled differently in every product: degrees
-# Celsius is 'degC' in CMIP6 and ERSSTv5, 'degrees_celsius' in WOA23 and the
-# misspelled 'degrees celcius' in GLODAP; practical salinity is '1' in WOA23,
-# '0.001' in CMIP6 and an empty string in GLODAP. Units are therefore compared
-# after normalisation, never literally.
-#
-# What normalisation cannot remove is the molar basis: WOA23 and GLODAP report
-# per unit mass (umol kg-1), CMIP6 per unit volume (mol m-3). The two convert
-# into each other only through in-situ density, so molar_basis leaves that
-# judgement to the caller.
-# ---------------------------------------------------------------------------
 
 UNIT_EQUIVALENTS = {
     # temperature
@@ -88,8 +55,6 @@ UNIT_EQUIVALENTS = {
     "mm s-1": "mm s-1", "mm/s": "mm s-1", "mms^-1": "mm s-1",
 }
 
-# Molar basis. Converting between mass and volume basis multiplies or divides
-# by seawater density; it is not a decimal conversion.
 MASS_BASIS = {"umol kg-1", "mmol kg-1"}
 VOLUME_BASIS = {"mol m-3", "mmol m-3"}
 
@@ -103,7 +68,6 @@ def normalize_units(units: str) -> str:
 
 
 def molar_basis(units: str) -> str:
-    """'mass', 'volume' or None — which basis a concentration unit is on."""
     canonical = normalize_units(units)
     if canonical in MASS_BASIS:
         return "mass"
@@ -135,13 +99,7 @@ def get_dataset_cfg(dataset: str) -> dict:
 
 def list_datasets() -> list:
     """
-    Describe the registered datasets for the agent's planning step, as
-    [{"name", "path", "description"}].
-
-    The name is the dataset id the loader tools take, not a file path, since a
-    single dataset holds many variables (and, for CMIP6, several models). Built
-    from configs/datasets.yaml so the agent's catalogue cannot drift from what
-    the openers actually read.
+    Describe the registered datasets for the agent's planning step, as [{"name", "path", "description"}].
     """
     entries = []
     for name, cfg in load_dataset_config()["datasets"].items():
@@ -172,12 +130,7 @@ def list_datasets() -> list:
 
 def dataset_notes() -> dict:
     """
-    The registry's cross-dataset conventions (longitude, depth, grid, time, unit
-    basis, climatology periods), as {topic: note}.
-
-    These are the rules a caller has to respect when combining two products, so
-    the agent injects them into its code-generation prompt rather than restating
-    them in a docstring that could drift from configs/datasets.yaml.
+    The registry's cross-dataset conventions (longitude, depth, grid, time, unit basis, climatology periods), as {topic: note}.
     """
     return load_dataset_config().get("cross_dataset_notes", {}) or {}
 
@@ -221,10 +174,6 @@ def resolve_variable(ds_cfg: dict, variable: str) -> str:
 def to_lon180(obj, lon_name: str = "lon", sort: bool = True):
     """
     Convert a longitude coordinate to the -180~180 convention.
-
-    Handles every convention present in the registry (0~360, 20.5~379.5) with the
-    same expression. 1-D coordinates are re-sorted ascending; 2-D curvilinear
-    coordinates keep their native layout (they cannot be sorted).
     """
     lon = obj[lon_name]
     converted = ((lon + 180) % 360) - 180
@@ -239,13 +188,6 @@ def to_lon180(obj, lon_name: str = "lon", sort: bool = True):
 def snap_coords(obj, names=("lat", "lon", "depth"), decimals=6):
     """
     Round 1-D coordinates to a fixed precision, as float64.
-
-    Grids that are nominally identical do not compare equal cell by cell:
-    WOA23 stores its coordinates as float32, GFDL-ESM4's float64 latitudes
-    carry ~1e-16 of representation error, and the modulo in to_lon180 adds
-    ~5e-14 of its own. Any of that is enough for xarray's alignment to drop
-    the offending cells silently when two products are combined, so every
-    opener snaps its coordinates onto the same values.
     """
     updates = {}
     for name in names:
@@ -288,9 +230,6 @@ def normalize_monthly_time(obj, time_name: str = "time"):
     Put a monthly time axis on a common footing: plain datetime64 stamped on the
     first day of each month, whatever calendar (noleap, 365_day,
     proleptic_gregorian) or day-of-month convention the file used.
-
-    Monthly means carry no information in the day-of-month, so this is lossless,
-    and it makes CMIP6, ERSSTv5 and the CPC indices align exactly.
     """
     if time_name not in obj.coords:
         return obj
@@ -298,12 +237,15 @@ def normalize_monthly_time(obj, time_name: str = "time"):
     if np.issubdtype(obj[time_name].dtype, np.datetime64):
         index = pd.DatetimeIndex(values)
         years, months = index.year, index.month
+        calendar = obj[time_name].encoding.get("calendar", "proleptic_gregorian")
     else:  # cftime objects
         years = [t.year for t in values]
         months = [t.month for t in values]
+        calendar = getattr(values[0], "calendar", None) or "standard"
     stamps = pd.to_datetime([f"{y:04d}-{m:02d}-01" for y, m in zip(years, months)])
     obj = obj.assign_coords({time_name: stamps})
     obj[time_name].attrs["stamp_convention"] = "month_start"
+    obj[time_name].attrs["source_calendar"] = str(calendar)
     return obj
 
 
@@ -319,11 +261,6 @@ def fix_unit_attribute(obj):
     return obj
 
 
-# The attributes that identify which grid a field lives on. A derived quantity
-# stays on the same grid as the field it came from, so it has to keep these or
-# the grid-aware tools downstream (area and volume weighting, layer thickness)
-# can no longer tell what it is — an OMZ thickness map that cannot be
-# area-averaged is of little use.
 PROVENANCE_ATTRS = (
     "source_dataset", "model", "experiment", "variant_label", "grid_type",
     "y_dim", "x_dim", "lat_coord", "lon_coord",
@@ -332,15 +269,6 @@ PROVENANCE_ATTRS = (
     "region", "region_geofeature",
 )
 
-# The horizontal vector components the CMIP6 archive holds, and which grid axis
-# each runs along. Their CMOR standard names are sea_water_x/y_velocity and
-# ocean_mass_x/y_transport: x-ward and y-ward along the model's own grid lines,
-# which on the displaced-pole (CESM2) and bipolar (MPI-ESM1-2-LR) grids are not
-# east and north. They also sit on the velocity points of a staggered grid, not
-# on the tracer points areacello and the tracer masks describe; checked on the
-# local files, CESM2's u/v points are offset by a median 0.22 deg in latitude and
-# 0.56 deg in longitude, and MPI's C-grid puts uo/umo on x-faces and vo/vmo on
-# y-faces. wo and wmo, the vertical components, sit on the tracer points.
 HORIZONTAL_VECTOR_COMPONENTS = {"uo": "x", "umo": "x", "vo": "y", "vmo": "y"}
 
 
@@ -375,10 +303,6 @@ def _woa_period(var_cfg: dict, ds_cfg: dict, period, time_slice: str) -> str:
     """
     Pick the climatology period: the one requested, or else the first period in
     the registry's priority order that provides the requested time slice.
-
-    That order prefers the normal with all three time slices over the newest
-    one, so that a variable's annual, monthly and seasonal fields share a
-    baseline and their anomalies stay comparable.
     """
     periods = var_cfg["periods"]
     if period is not None:
@@ -407,9 +331,7 @@ def woa23_files(variable: str, time_slice: str = "annual", period: str = None) -
     Resolve which WOA23 files hold one variable's time slice.
 
     Returns the file list as [(nn, path)] along with the resolved variable name,
-    the period actually chosen and its config. Shared by open_woa23, which reads
-    the fields, and load_depth_levels, which needs the depth bounds those files
-    carry (the bounds differ between time slices, so the file matters).
+    the period actually chosen and its config.
     """
     ds_cfg = get_dataset_cfg("woa23")
     variable = resolve_variable(ds_cfg, variable)
@@ -501,11 +423,6 @@ def open_woa23(variable: str, time_slice: str = "annual", period: str = None,
         da, "woa23", ds_cfg,
         climatology_period=period_cfg.get("climatology_years", period),
         woa_field=field, woa_period=period, woa_time_slice=time_slice,
-        # The vertical axis depends on the variable, and not only through the
-        # number of levels: the deepest layer of a monthly or seasonal axis is
-        # closed at the level itself, so nitrate's 800 m layer is 25 m thick
-        # where temperature's is 50 m. Recording the variable here keeps that
-        # recoverable after a calculation has renamed the field.
         woa_variable=variable,
         original_units=da.attrs.get("units"),
     )
@@ -558,8 +475,6 @@ def open_glodap(variable: str, field: str = "main") -> xr.DataArray:
         raise KeyError(f"Field '{var_name}' not in {os.path.basename(path)}. Available: {list(ds.data_vars)}")
     da = ds[var_name]
 
-    # Input_mean / Input_std carry a hard-coded units attribute that is wrong for
-    # every variable; the main variable's units are the authoritative ones.
     if field in ("input_mean", "input_std"):
         da.attrs["units"] = ds[variable].attrs.get("units", "")
         da.attrs["units_note"] = "corrected from the main variable; the file's own units attribute is wrong"
@@ -602,8 +517,6 @@ def open_seanoe_mld(version: str = None, variable: str = "mld_dr003") -> xr.Data
     if not os.path.exists(path):
         raise FileNotFoundError(f"SEANOE file not found: {path}")
 
-    # The time axis says 'days since 1-1-1' under the non-CF attribute name
-    # `unit`, so CF decoding neither fires nor would be meaningful.
     ds = xr.open_dataset(path, decode_times=False)
     ds = fix_unit_attribute(ds)
     ds = ds.assign_coords(month=("time", np.arange(1, 13))).swap_dims({"time": "month"})
@@ -820,18 +733,11 @@ def available_cmip6_variables(experiment: str, model: str) -> list:
 def _cmip6_files(ds_cfg: dict, experiment: str, model: str, variable: str):
     """
     Locate the files for one variable, returning (files, variant, experiment_used).
-
-    Variant labels are read off the filenames rather than assumed: they are not
-    uniform across this archive (historical/CESM2/phycos is r6i1p1f1,
-    historical/MPI-ESM1-2-LR/ph is r10i1p1f1, most of ssp245/CESM2 is r10i1p1f1
-    while its fixed fields are r1i1p1f1).
     """
     var_dir = os.path.join(ds_cfg["root"], model, variable)
     used_experiment = experiment
 
     if not os.path.isdir(var_dir) and variable in ds_cfg.get("fixed_fields", []):
-        # ssp245/GFDL-ESM4 ships no Ofx fields; the grid is identical to
-        # historical, so borrow them from there.
         fallback = ds_cfg.get("fixed_field_fallback")
         if fallback:
             fallback_cfg = get_dataset_cfg(fallback)
@@ -859,10 +765,7 @@ def _cmip6_files(ds_cfg: dict, experiment: str, model: str, variable: str):
     return files, (variants.pop() if variants else "unknown"), used_experiment
 
 
-# CESM2 labels `lev` as centimetres but its `lev_bnds` as metres, in the same
-# file, so level centres and their bounds must each be converted according to
-# the units they actually declare. Taking the bounds to share the level's units
-# makes every CESM2 layer 100 times too thin.
+# CESM2 labels `lev` as centimetres but its `lev_bnds` as metres.
 DEPTH_UNIT_TO_METRES = {
     "m": 1.0, "meter": 1.0, "meters": 1.0, "metre": 1.0, "metres": 1.0,
     "cm": 0.01, "centimeter": 0.01, "centimeters": 0.01, "centimetre": 0.01, "centimetres": 0.01,
@@ -897,20 +800,6 @@ def cmip6_ocean_mask(ds_cfg: dict, experiment: str, model: str, model_cfg: dict,
     """
     The model's ocean mask, for the models whose fixed fields ship unmasked.
 
-    CESM2 publishes areacello, volcello and deptho over its whole global grid,
-    land included, while GFDL-ESM4 and MPI-ESM1-2-LR mask theirs to ocean. This
-    project is ocean-only, so the registry names a mask source for such models
-    and the fixed fields are masked on the way out, making all three behave the
-    same.
-
-    Pass `level_bounds_m` for a 3-D field: the land/sea split alone is not
-    enough there, because CESM2's volcello also fills every level below the sea
-    floor — summed raw it comes to the ocean area times the full 5500 m column,
-    about 148% of the real ocean volume. Cells below deptho are dropped as well,
-    which reproduces the model's own 3-D ocean extent exactly (it agrees with
-    thetao's valid cells to the last cell) and brings the volume in line with
-    the other two models.
-
     Returns (mask_values, source_name), or (None, None) when no masking applies.
     """
     source = model_cfg.get("ocean_mask_from")
@@ -934,14 +823,40 @@ def cmip6_ocean_mask(ds_cfg: dict, experiment: str, model: str, model_cfg: dict,
     return (above_floor & land_sea[None, :, :]), f"{source} and deptho"
 
 
+def drop_cyclic_halo(obj, model_cfg: dict):
+    """
+    Drop the halo columns a model writes at both ends of its grid to close it cyclically.
+    """
+    west, east = (int(v) for v in (model_cfg.get("cyclic_halo") or (0, 0)))
+    x_dim = model_cfg["x_dim"]
+    if not (west or east) or x_dim not in obj.dims:
+        return obj
+    n = obj.sizes[x_dim]
+    interior = n - west - east
+    # Halo column k at the west end repeats interior column (interior + k); halo
+    # column k at the east end repeats interior column (west + k).
+    pairs = [(k, interior + k) for k in range(west)] + [(n - east + k, west + k) for k in range(east)]
+    present = obj.coords if isinstance(obj, xr.DataArray) else obj.variables
+    for name in (model_cfg["lat_coord"], model_cfg["lon_coord"]):
+        if name not in present or x_dim not in obj[name].dims:
+            continue
+        coord = obj[name]
+        for halo, original in pairs:
+            a = np.asarray(coord.isel({x_dim: halo}).values, dtype="float64")
+            b = np.asarray(coord.isel({x_dim: original}).values, dtype="float64")
+            gap = np.abs(((a - b + 180.0) % 360.0) - 180.0) if name == model_cfg["lon_coord"] else np.abs(a - b)
+            if not np.all(gap[np.isfinite(gap)] < 1e-6):
+                raise ValueError(
+                    f"The registry says column {halo} of this grid is a halo copy of column {original}, but their "
+                    f"'{name}' values differ by up to {np.nanmax(gap):.3g}. Check cyclic_halo in "
+                    f"configs/datasets.yaml before dropping any column."
+                )
+    return obj.isel({x_dim: slice(west, n - east)})
+
+
 def open_cmip6_grid_file(experiment: str, model: str, variable: str = "thetao"):
     """
     Open one chunk file of a CMIP6 variable for its grid metadata alone.
-
-    The cell corner bounds and level bounds are data variables, so selecting the
-    DataArray in open_cmip6 drops them; load_areas and load_depth_levels need
-    them and open the file through here instead. Returns (dataset, info) with
-    the raw, un-normalised coordinates — the caller decides what to convert.
     """
     ds_cfg = get_dataset_cfg(f"cmip6_{experiment}")
     if model not in ds_cfg["models"]:
@@ -955,7 +870,10 @@ def open_cmip6_grid_file(experiment: str, model: str, variable: str = "thetao"):
         "model_cfg": ds_cfg["models"][model],
         "source_file": files[0],
     }
-    return xr.open_dataset(files[0], use_cftime=True), info
+    # The same columns as the fields themselves, or a grid read from here no
+    # longer lines up cell for cell with the data it describes.
+    ds = drop_cyclic_halo(xr.open_dataset(files[0], use_cftime=True), ds_cfg["models"][model])
+    return ds, info
 
 
 def cmip6_experiments() -> list:
@@ -1037,22 +955,12 @@ def open_cmip6(experiment: str, model: str, variable: str, chunk_time: int = 12)
 
     if variable not in ds:
         raise KeyError(f"Variable '{variable}' not in {os.path.basename(files[0])}. Available: {list(ds.data_vars)}")
-    da = ds[variable]
+    da = drop_cyclic_halo(ds[variable], model_cfg)
 
-    # Fixed grid fields are masked to ocean for the models that ship them
-    # unmasked, so that areas, volumes and depths mean the same thing across
-    # models. Data variables are already NaN over land and are left alone.
     depth_coord = model_cfg["depth_coord"]
     ocean_mask, mask_source = (None, None)
     if variable in ds_cfg.get("fixed_fields", []):
-        # The three models disagree on how a fixed field marks land: CESM2
-        # leaves areacello and volcello unmasked and writes 0 in deptho,
-        # GFDL-ESM4 writes 0 in areacello, MPI-ESM1-2-LR uses NaN throughout.
-        # None of these fields can legitimately be zero (the smallest real
-        # values are 6e4 m2, 3e2 m3 and 9.5 m), so a zero means no ocean.
         da = da.where(da != 0)
-        # The mask must be looked up in the experiment the field came from,
-        # which is not the requested one when a fixed field was borrowed.
         mask_cfg = get_dataset_cfg(f"cmip6_{used_experiment}")
         ocean_mask, mask_source = cmip6_ocean_mask(
             mask_cfg, used_experiment, model, model_cfg,
@@ -1088,9 +996,6 @@ def open_cmip6(experiment: str, model: str, variable: str, chunk_time: int = 12)
         borrowed_from=used_experiment if used_experiment != experiment else None,
         original_units=da.attrs.get("units"),
         ocean_masked_with=mask_source,
-        # Which file describes this field's points, carried onto everything
-        # derived from it: a velocity-point field regridded against the tracer
-        # corner mesh lands half a cell out of place.
         cmip6_variable=variable,
         grid_point="velocity" if variable in HORIZONTAL_VECTOR_COMPONENTS else "tracer",
         vector_component=HORIZONTAL_VECTOR_COMPONENTS.get(variable),

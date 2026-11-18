@@ -139,23 +139,23 @@ def build_grid_polygons(latitudes, longitudes):
     """
     grid_polygons = []
     grid_areas = []
-    # append 360 deg to the longitude
-    longitudes = np.append(longitudes, 360)
-    # adjust latitudes by half the difference between two consecutive latitudes
+
+    inter_lon_diff = longitudes[1] - longitudes[0]
+    longitudes = longitudes - inter_lon_diff / 2
+    longitudes = np.append(longitudes, longitudes[-1] + inter_lon_diff)
     inter_lat_diff = latitudes[1] - latitudes[0]
-    latitudes = latitudes - (inter_lat_diff) / 2
-    # append an extra latitude at the end
+    latitudes = latitudes - inter_lat_diff / 2
     latitudes = np.append(latitudes, latitudes[-1] + inter_lat_diff)
     num_lat = len(latitudes)
     num_long = len(longitudes)
     for j in range(num_long-1):
         for i in range(0, num_lat-1):
-            polygon = Polygon([(longitudes[j], latitudes[i]), 
-                               (longitudes[j], latitudes[i + 1]), 
-                               (longitudes[j+1], latitudes[i + 1]), 
+            polygon = Polygon([(longitudes[j], latitudes[i]),
+                               (longitudes[j], latitudes[i + 1]),
+                               (longitudes[j+1], latitudes[i + 1]),
                                (longitudes[j+1], latitudes[i])])
             grid_polygons.append(polygon)
-            grid_areas.append(calculate_grid_area(latitudes[i], latitudes[i - 1], longitudes[j], longitudes[j+1]))
+            grid_areas.append(calculate_grid_area(latitudes[i], latitudes[i + 1], longitudes[j], longitudes[j+1]))
     return grid_polygons, grid_areas
 
 def get_intersection_areas(gdf: gpd.GeoDataFrame, grid_polygons: List[shapely.Polygon], grid_areas: List[float], 
@@ -176,6 +176,10 @@ def get_intersection_areas(gdf: gpd.GeoDataFrame, grid_polygons: List[shapely.Po
         - dict: A dictionary where the keys are the names and the values are numpy arrays of the areas of intersection with each grid cell.
     """
     intersection_areas = {}
+    # Only cells whose bounding box meets the object's can intersect it, so an STR-tree picks those out and every other cell keeps an area of 0, which is what intersecting it would have given. This is the same computation as a loop over all 64800 cells, at a small fraction of the cost.
+    cells = np.asarray(grid_polygons, dtype=object)
+    tree = shapely.STRtree(cells)
+    grid_areas = np.asarray(grid_areas, dtype="float64")
     for idx, obj in tqdm.tqdm(gdf.iterrows(), total=gdf.shape[0], desc=f"Building cache for {progress_name}"):
         obj_name = obj[name_col]
         if include_admin:
@@ -187,12 +191,11 @@ def get_intersection_areas(gdf: gpd.GeoDataFrame, grid_polygons: List[shapely.Po
                     
         obj_polygon = obj['geometry'].buffer(0)
 
-        areas = []
-        for idx, cell_polygon in enumerate(grid_polygons):
-            intersection = obj_polygon.intersection(cell_polygon)
-            areas.append(intersection.area * grid_areas[idx] if not intersection.is_empty else 0)
-        
-        areas = np.array(areas)
+        areas = np.zeros(len(cells))
+        candidates = tree.query(obj_polygon)
+        if candidates.size:
+            overlap = shapely.area(shapely.intersection(cells[candidates], obj_polygon))
+            areas[candidates] = overlap * grid_areas[candidates]
         intersection_areas[obj_name] = areas.reshape(num_lons, num_lats)
     return intersection_areas
 

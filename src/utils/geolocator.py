@@ -1,6 +1,5 @@
 import os
 import numpy as np
-import geopandas as gpd
 from shapely.geometry import Point
 
 from src.utils.geo_processor import build_caches, get_nearest_grid_point, get_name_col, load_and_preprocess_ne_df
@@ -17,8 +16,6 @@ class Geolocator:
             - natural_earth_path (str): Path to the directory containing the Natural Earth dataset.
         """
         build_caches(latitudes, longitudes, cache_dir, natural_earth_path)
-
-        self.country_df = gpd.read_file(os.path.join(natural_earth_path, '10m_cultural', 'ne_10m_admin_0_countries.shp'))
 
         # exclude the countries in the list
         self.country_df = load_and_preprocess_ne_df(natural_earth_path, 'country')

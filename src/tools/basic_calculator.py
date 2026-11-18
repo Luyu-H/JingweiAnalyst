@@ -1,8 +1,5 @@
-# tools: compute_basic_stat, temporal_aggregate, fit_1D_trend, transform_unit, 
-# fit_multivariate_relation, analyze_correlation, detect_outliers, compute_difference_metrics,
-# detect_threshold_events, compute_exceedance_fraction, fit_trend_map, locate_extreme
+# tools: compute_basic_stat, temporal_aggregate, fit_1D_trend, transform_unit, fit_multivariate_relation, analyze_correlation, detect_outliers, compute_difference_metrics, detect_threshold_events, compute_exceedance_fraction, fit_trend_map, locate_extreme
 
-import re
 import xarray as xr
 import numpy as np
 import pandas as pd
@@ -17,7 +14,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 
 from src.tools.registry import register_tools
-from src.tools.data_loader import areas_like, layer_thickness_like, volumes_like
+from src.tools.data_loader import areas_like, volumes_like
 from src.tools.data_openers import carry_provenance, molar_basis, normalize_units
 
 
@@ -37,12 +34,6 @@ def _missing_dims_message(data, missing):
 def _alias_dims(data, dims):
     """
     Dimension names as the array actually spells them.
-
-    A question is asked about latitude and longitude, but the curvilinear models
-    index their grids by nlat/nlon (CESM2) or j/i (MPI-ESM1-2-LR), and their
-    lat/lon are 2-D fields over those indices. Writing ['lat', 'lon'] is what
-    anyone means by "over the horizontal", so it is translated here rather than
-    rejected.
     """
     alias = {"lat": data.attrs.get("y_dim"), "lon": data.attrs.get("x_dim")}
     return [d if d in data.dims else (alias.get(d) or d) for d in dims]
@@ -56,13 +47,6 @@ def _horizontal_names(data):
 def _resolve_weighted_dims(data, dim, required, op):
     """
     Which dimensions a weighted mean should reduce over.
-
-    Accepts the geographic names on the curvilinear models, whose grids are
-    indexed by nlat/nlon or j/i, because a question is asked about latitude and
-    longitude rather than about grid indices. Refuses a reduction that leaves
-    out an axis the weights vary along: averaging over depth alone with area
-    weights, or over longitude alone, would apply a weight that does not belong
-    to the axis being collapsed.
     """
     if dim is None:
         return None
@@ -83,27 +67,24 @@ def _resolve_weighted_dims(data, dim, required, op):
 
 @register_tools(
     name="compute_basic_stat",
-    description="Reduce a field along chosen dimensions with one basic statistic, weighted in space but "
-        "never in time.\n"
-        "It weights in SPACE, never in time: a mean taken over a time axis here gives a 28-day February the "
-        "same weight as a 31-day January, so reduce time with temporal_aggregate first.\n"
-        "Use a WEIGHTED mean for any physical average. A plain mean is only right when every element "
-        "represents the same amount of ocean, which is rarely true: cells shrink towards the poles, and "
-        "layer thicknesses vary by more than an order of magnitude with depth. The weights are taken from "
-        "the grid the data came from, so the field must still be on its original grid and levels — "
-        "subsetting is fine, regridding or averaging over depth beforehand is not.",
+    description="Reduce a field along chosen dimensions with one basic statistic, weighted in space "
+        "but never in time.\n"
+        "Over a time axis every step counts the same, whatever its length; temporal_aggregate is the "
+        "tool that weights by month length.\n"
+        "The weighted operators take their weights from the grid the data came from, so the field must "
+        "still be on its original grid and levels — subsetting is fine, regridding or averaging over "
+        "depth beforehand is not.",
     args={
         "data": "xr.DataArray, required. Input field.",
         "op": "str, required. The statistic to apply:\n"
             "- 'mean', 'median', 'min', 'max', 'sum', 'count' (non-missing elements), 'std' (standard "
-            "deviation about the mean, ddof=0).\n"
+            "deviation about the mean, ddof=0). These are unweighted.\n"
             "- 'area_weighted_mean' for a horizontal average, weighting each cell by its area.\n"
-            "- 'volume_weighted_mean' whenever depth is among the dimensions averaged, weighting each cell "
-            "by its volume. This is the correct operator for the mean temperature or concentration of a "
-            "depth range.\n"
+            "- 'volume_weighted_mean' for an average over dimensions that include depth, weighting "
+            "each cell by its volume.\n"
             "- 'argmax'/'argmin' return WHERE the extreme falls rather than what it is: the coordinate "
-            "label at which it occurs, one per remaining column. They reduce a single dimension. For the "
-            "one extreme of a whole field, use locate_extreme.",
+            "label at which it occurs, one per remaining column. They reduce a single dimension. For "
+            "the one extreme of a whole field, use locate_extreme.",
         "dim": "str or list of str, optional. Dimension(s) to reduce. If None, every dimension is reduced. "
             "A weighted mean must include the dimensions its weights vary along: the horizontal pair for "
             "'area_weighted_mean', and 'depth' for 'volume_weighted_mean'. On a curvilinear grid you may "
@@ -131,9 +112,6 @@ def compute_basic_stat(data: xr.DataArray, op: str, dim: str | list[str] | None 
         result = data.std(dim=dim)
 
     elif op in ("argmax", "argmin"):
-        # idxmax/idxmin give the coordinate LABEL of the extreme, which is the
-        # answer to "which month" or "which year"; argmax on the bare array
-        # would give a position, which means nothing without the axis.
         requested = _alias_dims(data, [dim] if isinstance(dim, str) else list(dim or data.dims))
         if len(requested) != 1:
             raise ValueError(
@@ -156,10 +134,6 @@ def compute_basic_stat(data: xr.DataArray, op: str, dim: str | list[str] | None 
         return result
 
     elif op in ("area_weighted_mean", "volume_weighted_mean"):
-        # The weights come from the grid the data itself records, so ERSSTv5 is
-        # weighted on its 2-degree cells and a curvilinear model with its own
-        # areacello. Weighting every product with the 1-degree grid instead
-        # leaves ERSSTv5 with no cell in common and silently empties the result.
         if op == "area_weighted_mean":
             full_weights = areas_like(data)
             required = tuple(d for d in full_weights.dims if d in data.dims)
@@ -178,9 +152,6 @@ def compute_basic_stat(data: xr.DataArray, op: str, dim: str | list[str] | None 
 
         reduce_dims = _resolve_weighted_dims(data, dim, required, op)
 
-        # Land and below-sea-floor cells carry area but no value, and the models
-        # disagree on whether areacello is masked at all (CESM2's is not), so the
-        # weights are masked with the field itself before they are summed.
         weights = full_weights.where(data.notnull())
         result = (data * weights).sum(dim=reduce_dims, skipna=True) / weights.sum(dim=reduce_dims)
         result.attrs = dict(data.attrs)
@@ -195,13 +166,6 @@ def compute_basic_stat(data: xr.DataArray, op: str, dim: str | list[str] | None 
     return result
 
 
-# The two season conventions in use here. They are NOT interchangeable: the same
-# label covers a different three months, so a composite built with one and an
-# anomaly built with the other are offset by a month.
-#   meteorological — DJF/MAM/JJA/SON, the climate-science default
-#   woa            — calendar quarters, which is how WOA23's seasonal
-#                    climatology files are defined, so compute_anomaly_vs_woa23(freq='season')
-#                    necessarily uses this one
 SEASON_CONVENTIONS = {
     "meteorological": {"resample": "QS-DEC",
                        "labels": {12: "DJF", 3: "MAM", 6: "JJA", 9: "SON"}},
@@ -210,27 +174,42 @@ SEASON_CONVENTIONS = {
 }
 
 
+_FIXED_FEBRUARY = {"noleap": 28, "365_day": 28, "all_leap": 29, "366_day": 29}
+
+
+def _month_lengths(time: xr.DataArray) -> xr.DataArray:
+    """
+    Days in the month of each time step, in the calendar the data were made on.
+    """
+    calendar = str(time.attrs.get("source_calendar", "")).lower()
+    gregorian = time.dt.days_in_month.astype("float64")
+    if not np.issubdtype(time.dtype, np.datetime64):
+        return gregorian                      # cftime: already in its own calendar
+    if calendar == "360_day":
+        return xr.full_like(gregorian, 30.0)
+    if calendar in _FIXED_FEBRUARY:
+        return gregorian.where(time.dt.month != 2, float(_FIXED_FEBRUARY[calendar]))
+    return gregorian
+
+
 @register_tools(
     name="temporal_aggregate",
-    description="Aggregate a time series in time: a DAY-WEIGHTED long-term mean, or annual, seasonal or "
-        "climatological-monthly values, or a running window.\n"
-        "This is the only tool that weights by month length, and the only correct way to reduce monthly data "
-        "along time; compute_basic_stat does not weight in time.\n"
-        "Do not hand-roll the weighting as (data * weights).sum('time') / weights.sum(): xarray's sum skips "
-        "missing values, so an all-land column returns 0.0 rather than NaN, the land mask is lost, and that "
-        "zero then spreads into neighbouring ocean cells the moment the field is regridded.\n"
-        "Means are weighted by the number of days in each month, using the dataset's own calendar: "
-        "calendar months are 28 to 31 days long, so averaging them with equal weight is not a time "
-        "average. Weighting applies to op='mean' only; a median, minimum, maximum or standard deviation of "
-        "unequal-length months has no weighted equivalent.\n"
-        "Only a field with a real time axis can be aggregated; a climatology is already a long-term mean.",
+    description="Aggregate a time series in time: a DAY-WEIGHTED long-term mean, or annual, seasonal "
+        "or climatological-monthly values, or a running window.\n"
+        "This is the only tool that weights by month length; compute_basic_stat does not weight in "
+        "time. Means are weighted by the number of days in each month in the dataset's own calendar, "
+        "with each cell's weights masked to the months it has data, so a cell missing at every step "
+        "stays missing. Model time axes are stamped on Gregorian month starts, but the model's own "
+        "calendar is recorded on the time coordinate ('source_calendar') and is the one used: a "
+        "365-day model's February counts 28 days in every year. Weighting applies to op='mean' only; a median, minimum, maximum or standard "
+        "deviation is taken over the steps as they are.\n"
+        "Only a field with a real time axis can be aggregated; a climatology has none.",
     args={
         "data": "xr.DataArray, required. A field with a 'time' dimension.",
         "freq": "str, optional, default 'year'. What to aggregate to:\n"
-            "- 'mean': ONE field for the whole window, the time dimension removed. This is the "
-            "climatology of a period — the 1971-2000 mean state of a model, the field a bias or an "
-            "RMSE is measured on. Use it rather than compute_basic_stat(op='mean', dim='time'), "
-            "which gives every month the same weight and so is not a time average.\n"
+            "- 'mean': ONE field for the whole window, the time dimension removed: the mean state of "
+            "the period. compute_basic_stat(op='mean', dim='time') instead gives every step the same "
+            "weight.\n"
             "- 'year': one value per calendar year.\n"
             "- 'season': one value per seasonal period (see season_convention).\n"
             "- 'climatology': one value per calendar month, across all years.\n"
@@ -238,9 +217,8 @@ SEASON_CONVENTIONS = {
             "axis keeps every step, and each value is the statistic over the `window` steps around it.",
         "op": "str, optional, default 'mean'. 'mean' (day-weighted), 'median', 'min', 'max' or 'std'.",
         "season_convention": "str, optional, default 'meteorological'. Which three months each season "
-            "covers: 'meteorological' gives DJF/MAM/JJA/SON, the usual climate definition; 'woa' gives the "
-            "calendar quarters JFM/AMJ/JAS/OND used by some observational climatologies. The two are "
-            "offset by a month and must not be mixed.",
+            "covers: 'meteorological' gives DJF/MAM/JJA/SON; 'woa' gives the calendar quarters "
+            "JFM/AMJ/JAS/OND, on which the WOA23 seasonal fields are built.",
         "window": "int, required for freq='rolling', ignored otherwise. Number of time steps in the "
             "window, in the units of the time axis. An odd window is centred exactly; an even one leans "
             "one step towards the past.",
@@ -267,8 +245,6 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean',
                        season_convention: str = 'meteorological', window: int = None,
                        center: bool = True) -> xr.DataArray:
     if 'time' not in data.dims:
-        # WOA23 and SEANOE are climatologies: they have no real time axis, and
-        # carry 'month' or 'season' instead. There is nothing to aggregate there.
         for climatology_dim in ('month', 'season'):
             if climatology_dim in data.dims:
                 raise ValueError(
@@ -288,16 +264,12 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean',
             f"season_convention must be one of {sorted(SEASON_CONVENTIONS)}, got '{season_convention}'"
         )
 
-    # Month length in the dataset's own calendar, so a 365-day model is weighted
-    # on its own terms rather than on the Gregorian calendar's.
-    days = data['time'].dt.days_in_month.astype('float64')
+    days = _month_lengths(data['time'])
 
     def aggregate(group):
         if op != 'mean':
             return getattr(group, op)(dim='time', skipna=True)
         weights = days.sel(time=group['time'])
-        # Masking the weights with the field keeps a month that is missing at one
-        # cell from counting towards that cell's denominator.
         valid = weights.where(group.notnull())
         return (group * valid).sum(dim='time', skipna=True) / valid.sum(dim='time')
 
@@ -314,9 +286,7 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean',
             raise ValueError(
                 f"A window of {window} steps does not fit in a series of {data.sizes['time']} steps."
             )
-        # min_periods=window leaves the ends NaN rather than averaging a partial
-        # window: a 3-month mean built from 2 months is a different statistic,
-        # and CPC's own series simply starts one step in.
+
         rolling = data.rolling(time=window, center=center, min_periods=window)
         result = getattr(rolling, op)(skipna=True)
         result.attrs = data.attrs.copy()
@@ -327,9 +297,6 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean',
         return result
 
     if freq == 'mean':
-        # One field for the whole window. aggregate() already weights each month
-        # by its length in the dataset's own calendar, so this is a true time
-        # mean and not the arithmetic mean of 12-per-year unequal months.
         result = aggregate(data)
         months_per_year = data['time'].dt.year.to_series().value_counts()
         incomplete = sorted(int(y) for y, n in months_per_year.items() if n != 12)
@@ -351,7 +318,7 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean',
         return result
 
     if freq == 'year':
-        result = data.resample(time='1YE').map(aggregate)
+        result = data.resample(time='1YS').map(aggregate)
         months_per_year = data['time'].dt.year.to_series().value_counts()
         incomplete = sorted(int(y) for y, n in months_per_year.items() if n != 12)
         result['time'] = result['time'].dt.year
@@ -404,22 +371,17 @@ def temporal_aggregate(data: xr.DataArray, freq: str = 'year', op: str = 'mean',
 def effective_sample_size(residuals: np.ndarray) -> tuple:
     """
     Sample size and lag-1 autocorrelation adjusted for serial correlation.
-
-    A monthly ocean series is nowhere near independent from one step to the
-    next, so the nominal sample size badly overstates the information it holds.
-    Treating the residuals as AR(1) gives n_eff = n (1 - r1) / (1 + r1), the
-    standard correction for trend confidence intervals in climate work
-    (Santer et al. 2008, J. Geophys. Res.). With r1 = 0.9 that is a twentieth of
-    the nominal count, and an uncorrected p-value is meaningless at that point.
     """
-    n = residuals.size
+    residuals = np.asarray(residuals, dtype="float64")
+    valid = np.isfinite(residuals)
+    n = int(valid.sum())
     if n < 3:
         return float(n), 0.0
-    centred = residuals - residuals.mean()
-    denominator = float(np.sum(centred ** 2))
+    centred = np.where(valid, residuals - residuals[valid].mean(), np.nan)
+    denominator = float(np.nansum(centred ** 2))
     if denominator <= 0:
         return float(n), 0.0
-    r1 = float(np.sum(centred[:-1] * centred[1:]) / denominator)
+    r1 = float(np.nansum(centred[:-1] * centred[1:]) / denominator)
     r1 = min(max(r1, 0.0), 0.99)        # negative autocorrelation is not used to inflate n
     n_eff = n * (1.0 - r1) / (1.0 + r1)
     return max(float(n_eff), 3.0), r1
@@ -428,11 +390,6 @@ def effective_sample_size(residuals: np.ndarray) -> tuple:
 def _aicc(residual_sum_squares: float, n: int, k: int) -> float:
     """
     Small-sample corrected Akaike information criterion.
-
-    Model choice cannot be made on R2: adding a parameter can never lower it, so
-    a quadratic always beats a straight line and a four-parameter sinusoid beats
-    both. AICc scores fit against the number of parameters spent on it, so a
-    more complex model has to earn its place.
     """
     if residual_sum_squares <= 0 or n <= k + 2:
         return np.inf
@@ -443,40 +400,33 @@ def _aicc(residual_sum_squares: float, n: int, k: int) -> float:
 @register_tools(
     name="fit_1D_trend",
     description="Fit a trend to one series and report its magnitude with its uncertainty.\n"
-        "For the usual question — is this quantity changing, and how fast — use method='linear' or "
-        "method='theil_sen'. Both return the slope with a confidence interval and a p-value, and the "
-        "interval is what should be quoted: a slope without one cannot be called significant.\n"
-        "The significance accounts for SERIAL CORRELATION. A monthly ocean series is strongly "
-        "autocorrelated, so the number of steps overstates the independent information by a large factor; "
-        "the effective sample size is estimated from the lag-1 autocorrelation of the residuals and used "
-        "for the interval and the p-value. The unadjusted values are returned alongside.\n"
-        "On a date axis the fit runs in years, so a linear slope is a rate per YEAR whatever the sampling "
-        "frequency; multiply by 10 to report it per decade. For a trend at every cell of a field, use "
-        "fit_trend_map.",
+        "method='linear' and method='theil_sen' return the slope with a confidence interval and a "
+        "p-value, both computed with an effective sample size estimated from the lag-1 autocorrelation "
+        "of the residuals, leaving out pairs of steps separated by a missing value (as fit_trend_map "
+        "does); the unadjusted values are returned alongside.\n"
+        "On a date axis the fit runs in years, so a linear slope is a rate per YEAR whatever the "
+        "sampling frequency; multiply by 10 to express it per decade. For a trend at every cell of a "
+        "field, use fit_trend_map.",
     args={
         "data": "xr.DataArray, required. A strictly one-dimensional series. A 'time' coordinate is used as "
             "the x axis in years; any other numeric coordinate is used in its own units.",
         "method": "str, optional. The model to fit:\n"
-            "'linear' (y = a*x + b) — the standard choice for a trend;\n"
-            "'theil_sen' (median-of-slopes) — the same question, resistant to outliers and to non-normal "
-            "residuals;\n"
-            "'quadratic' — for an accelerating change;\n"
+            "'linear' (y = a*x + b);\n"
+            "'theil_sen' (median of pairwise slopes, resistant to outliers and to non-normal "
+            "residuals);\n"
+            "'quadratic' — an accelerating change;\n"
             "'exponential' — only attempted when every value is positive;\n"
-            "'sinusoidal' — for a cyclic signal.\n"
-            "If None, every applicable model is fitted and the best by AICc is returned. Note that "
-            "automatic selection answers 'which curve describes this series', NOT 'what is the trend': a "
-            "seasonal series will legitimately select the sinusoid. Ask for 'linear' or 'theil_sen' "
-            "explicitly when the question is about a trend.",
+            "'sinusoidal' — a cyclic signal.\n"
+            "If None, every applicable model is fitted and the one with the lowest AICc is returned.",
         "alpha": "float, optional, default 0.05. Significance level, so the default gives a 95 percent "
             "confidence interval."
     },
     returns="dict:\n"
         "'trend' (for 'linear' and 'theil_sen'): {slope, slope_se, ci95_low, ci95_high, p_value, "
-        "p_value_unadjusted, n, n_effective, lag1_autocorr, units, significant}. The slope is per x unit "
-        "(per YEAR on a date axis). Quote it with its interval, and call it significant only if the "
-        "interval excludes zero.\n"
-        "'metrics': {rmse, mae, r2, adj_r2, aicc, n}. adj_r2 and aicc, unlike r2, are comparable between "
-        "models with different numbers of parameters.\n"
+        "p_value_unadjusted, n, n_effective, lag1_autocorr, units, significant}. The slope is per x "
+        "unit (per YEAR on a date axis); 'significant' is True when the interval excludes zero.\n"
+        "'metrics': {rmse, mae, r2, adj_r2, aicc, n}. adj_r2 and aicc, unlike r2, are comparable "
+        "between models with different numbers of parameters.\n"
         "'fitted_data': the fitted values on the input's coordinates.\n"
         "'equation': the fitted model written out, stating what x runs in.\n"
         "'params'/'param_std': fitted parameters and their standard errors.\n"
@@ -513,8 +463,7 @@ def fit_1D_trend(data: xr.DataArray, method: str = None, alpha: float = 0.05) ->
 
     y_all = data.values.astype(float)
 
-    # Fit on the finite points only: a single gap otherwise propagates through
-    # every candidate model and leaves nothing to choose from.
+    # Fit on the finite points only: a single gap otherwise propagates through every candidate model and leaves nothing to choose from.
     finite = np.isfinite(x_all) & np.isfinite(y_all)
     x, y = x_all[finite], y_all[finite]
     if x.size < 3:
@@ -535,8 +484,7 @@ def fit_1D_trend(data: xr.DataArray, method: str = None, alpha: float = 0.05) ->
     models = {
         "linear": (linear, [0.0, float(np.mean(y))], ["a", "b"]),
         "quadratic": (quadratic, [0.0, 0.0, float(np.mean(y))], ["a", "b", "c"]),
-        # One cycle per year, expressed in whatever x runs in: 2*pi per year on a
-        # date axis, 2*pi/12 on a bare monthly index.
+        # One cycle per year, expressed in whatever x runs in: 2*pi per year on a date axis, 2*pi/12 on a bare monthly index.
         "sinusoidal": (sinusoidal,
                        [float(np.std(y)), 2 * np.pi if x_unit == "year" else 2 * np.pi / 12,
                         0.0, float(np.mean(y))],
@@ -630,19 +578,17 @@ def fit_1D_trend(data: xr.DataArray, method: str = None, alpha: float = 0.05) ->
         "all_methods_aicc": all_aicc,
     }
 
-    # A straight line is the only shape whose slope IS the trend, so that is
-    # where the confidence interval and the significance test belong.
     if method in ("linear", "theil_sen"):
         slope = float(chosen["params"][0])
         residuals = chosen["residuals"]
         n = int(x.size)
-        n_eff, lag1 = effective_sample_size(residuals)
+        residuals_on_axis = np.full(y_all.shape, np.nan)
+        residuals_on_axis[finite] = residuals
+        n_eff, lag1 = effective_sample_size(residuals_on_axis)
 
         spread = float(np.sum((x - x.mean()) ** 2))
         rss = float(np.sum(residuals ** 2))
         se_nominal = np.sqrt(rss / max(n - 2, 1) / spread) if spread > 0 else np.nan
-        # The same standard error with the residual degrees of freedom reduced to
-        # the effective sample size, which is what serial correlation leaves.
         se_effective = np.sqrt(rss / max(n_eff - 2, 1) / spread) if spread > 0 else np.nan
 
         dof = max(n_eff - 2, 1)
@@ -658,10 +604,7 @@ def fit_1D_trend(data: xr.DataArray, method: str = None, alpha: float = 0.05) ->
             tau, p_mk = stats.kendalltau(x, y)
             p_adjusted = float(p_mk)
             result["mann_kendall_tau"] = float(tau)
-            # Unlike the least-squares interval above, neither the Theil-Sen
-            # interval nor the Mann-Kendall p-value knows about serial
-            # correlation, so both are optimistic on a monthly series. Say so
-            # rather than let the two methods appear to disagree.
+            
             result["autocorrelation_warning"] = (
                 f"the Theil-Sen interval and the Mann-Kendall p-value assume independent samples, but the "
                 f"lag-1 autocorrelation is {lag1:.2f}, leaving an effective sample size of {n_eff:.0f} of "
@@ -702,13 +645,6 @@ def fit_1D_trend(data: xr.DataArray, method: str = None, alpha: float = 0.05) ->
 def _density_in_kg_per_litre(density):
     """
     A density argument as kg/L, whichever of the three forms it arrives in.
-
-    A field can be handed over either as the anomaly sigma that
-    compute_potential_density_anomaly returns (about 25 kg/m3) or as an absolute
-    density (about 1025 kg/m3). Telling them apart matters by a factor of forty,
-    so it is decided from the array's own metadata first and from its magnitude
-    only as a fallback, and the decision is reported rather than assumed
-    silently.
     """
     if not isinstance(density, xr.DataArray):
         value = float(density)
@@ -742,17 +678,14 @@ def _density_in_kg_per_litre(density):
 @register_tools(
     name="transform_unit",
     description="Convert a field from one unit to another within the same physical category.\n"
-        "The conversion that matters most is between molar bases: some products report concentrations per "
-        "unit MASS (umol kg-1) and others per unit VOLUME (mol m-3), and the two cannot be compared, "
-        "differenced or evaluated against each other until one has been converted.\n"
-        "That conversion needs seawater density. The default is a constant, which is the mean surface "
-        "value and errs by about a percent in the deep ocean and in fresh polar water — enough to rival "
-        "the differences such a comparison sets out to measure. Pass a density field for anything below "
-        "the surface; compute_potential_density_anomaly with ref_pressure=None produces one.\n"
-        "Pass that field EXACTLY as returned. Do not add 1000 to make it absolute first: whether the array "
-        "is an anomaly or an absolute density is read from its own long_name BEFORE its magnitude, so a "
-        "pre-converted field still labelled 'anomaly' has 1000 added a second time and every converted "
-        "value comes out about half its true size.",
+        "Between the two molar bases, per unit MASS (umol kg-1) and per unit VOLUME (mol m-3), the "
+        "conversion goes through seawater density: a constant (the default) or a density field, "
+        "applied cell by cell.\n"
+        "Pass a density field EXACTLY as compute_potential_density_anomaly returned it. Do not add "
+        "1000 to make it absolute first: whether the array is an anomaly or an absolute density is "
+        "read from its own long_name BEFORE its magnitude, so a pre-converted field still labelled "
+        "'anomaly' has 1000 added a second time and every converted value comes out about half its "
+        "true size.",
     args={
         "data": "xr.DataArray, required. The field to convert.",
         "from_unit": "str, required, case-insensitive. The unit the data is in; passing the array's own "
@@ -769,9 +702,8 @@ def _density_in_kg_per_litre(density):
             "result."
     },
     returns="xr.DataArray with converted values and its 'units' attribute updated. attrs record "
-        "'original_units' and, for a mass/volume conversion, 'density_assumption' — whether a constant or "
-        "a field was used, and how it was interpreted. Quote that line when converted concentrations are "
-        "reported."
+        "'original_units' and, for a mass/volume conversion, 'density_assumption' — whether a constant "
+        "or a field was used, and how it was interpreted."
 )
 def transform_unit(data: xr.DataArray, from_unit: str, to_unit: str, density=1.025) -> xr.DataArray:
     std_from = normalize_units(from_unit)
@@ -798,10 +730,7 @@ def transform_unit(data: xr.DataArray, from_unit: str, to_unit: str, density=1.0
             f"{category_of[std_to]} unit; there is no conversion between the two."
         )
 
-    # Factors onto each category's base unit. Concentration uses mmol m-3 as its
-    # base, which is the same number as umol L-1, and the mass-basis entries are
-    # the only ones that depend on density: 1 umol kg-1 x 1025 kg m-3 is
-    # 1025 umol m-3, i.e. 1.025 mmol m-3.
+    # Factors onto each category's base unit.
     to_base = {
         "mmol m-3": 1.0, "mol m-3": 1000.0,
         "umol kg-1": density, "mmol kg-1": 1000.0 * density,
@@ -833,13 +762,6 @@ def transform_unit(data: xr.DataArray, from_unit: str, to_unit: str, density=1.0
 def spatial_block_labels(template: xr.DataArray, block_degrees: float = 10.0):
     """
     A block label for every cell, so that validation can hold out whole regions.
-
-    Neighbouring ocean cells are near-duplicates of one another, so a random
-    train/test split puts a cell's own neighbours in the training set and the
-    validation score then measures interpolation between adjacent cells rather
-    than the model's ability to generalise. Grouping cells into blocks of a few
-    degrees and holding out whole blocks is the standard remedy for spatially
-    autocorrelated data. Returns None when the field has no lat/lon to group by.
     """
     lat_name = template.attrs.get("lat_coord", "lat")
     lon_name = template.attrs.get("lon_coord", "lon")
@@ -856,12 +778,6 @@ def spatial_block_labels(template: xr.DataArray, block_degrees: float = 10.0):
 def variance_inflation_factors(X: np.ndarray, names) -> dict:
     """
     VIF for each predictor: how much collinearity inflates its coefficient's variance.
-
-    Ocean tracers are strongly collinear by construction — nitrate and phosphate
-    track each other at close to the Redfield ratio — and collinear predictors
-    give coefficients that are individually meaningless and unstable in sign
-    even while the fit as a whole is excellent. Above about 5 the individual
-    coefficients should not be interpreted; above 10 the collinearity is severe.
     """
     vif = {}
     for j, name in enumerate(names):
@@ -882,10 +798,6 @@ def ols_inference(X: np.ndarray, y: np.ndarray, names) -> dict:
     """
     Full-sample ordinary-least-squares inference: per-coefficient standard
     errors, t statistics and p-values, plus the overall F test.
-
-    These are only valid for an unpenalised least-squares fit. Ridge and lasso
-    deliberately bias their coefficients, so a t or F test computed from them
-    does not mean what it appears to, and none is reported for those.
     """
     n, k = X.shape
     design = np.column_stack([np.ones(n), X])
@@ -919,18 +831,14 @@ def ols_inference(X: np.ndarray, y: np.ndarray, names) -> dict:
 
 @register_tools(
     name="fit_multivariate_relation",
-    description="Fit a statistical model predicting one variable from one or more others, and report the "
-        "coefficients with diagnostics.\n"
-        "Use it for a relationship between variables rather than a change over time: the stoichiometric "
-        "slope between two nutrients, the dependence of a tracer on temperature and salinity, an empirical "
-        "predictor built from several fields. With a single predictor it is an ordinary regression, "
-        "returning the slope, the intercept and R2.\n"
-        "Validation holds out whole spatial blocks by default. Neighbouring ocean cells are near-"
-        "duplicates, so a random split scores a model against its own neighbours and reports a skill it "
-        "does not have.\n"
-        "Ocean tracers are often strongly collinear, which makes individual coefficients unreliable even "
-        "when the fit is good; the variance inflation factors in the diagnostics say when that is "
-        "happening.",
+    description="Fit a statistical model predicting one variable from one or more others, and report "
+        "the coefficients with diagnostics.\n"
+        "Use it for a relationship between variables rather than a change over time: the "
+        "stoichiometric slope between two nutrients, the dependence of a tracer on temperature and "
+        "salinity, an empirical predictor built from several fields. With a single predictor it is an "
+        "ordinary regression, returning the slope, the intercept and R2.\n"
+        "Validation holds out whole spatial blocks by default (validation='blocked'). The diagnostics "
+        "include a variance inflation factor for each predictor.",
     args={
         "target": "xr.DataArray, required. The variable to be predicted.",
         "predictors": "list[xr.DataArray], required. One or more predictor fields, on the same "
@@ -943,15 +851,16 @@ def ols_inference(X: np.ndarray, y: np.ndarray, names) -> dict:
         "standardize": "bool, optional. Whether to standardise predictors. Defaults to True for ridge and "
             "lasso, whose penalties are scale-dependent.",
         "validation": "str, optional, default 'blocked'. 'blocked' holds out whole spatial regions; "
-            "'random' splits cells at random, which is only appropriate for data with no spatial "
-            "structure.",
-        "block_degrees": "float, optional, default 10.0. Size of the held-out blocks in degrees, which "
-            "should exceed the correlation length scale of the field."
+            "'random' splits cells at random.",
+        "block_degrees": "float, optional, default 10.0. Size of the held-out blocks in degrees."
     },
     returns="dict:\n"
         "'coefficients': the fitted coefficients, including the intercept, for the linear family; None for "
-        "tree-based models. These are the raw coefficients and are NOT comparable between predictors.\n"
-        "'metrics': {rmse, mae, r2, adj_r2, train_r2, test_r2}.\n"
+        "tree-based models. They come from a fit to ALL valid samples; the held-out split is used only "
+        "for the validation score. These are the raw coefficients and are NOT comparable between "
+        "predictors.\n"
+        "'metrics': {rmse, mae, r2, adj_r2, train_r2, test_r2}. rmse, mae and r2 are for the full-sample "
+        "fit; train_r2 and test_r2 are the validation scores on the held-out split.\n"
         "'diagnostics': residual statistics; 'vif' per predictor with a warning when collinearity is "
         "severe; how the held-out set was chosen; and, for method='linear', coefficient standard errors, "
         "p-values and the F test.\n"
@@ -996,9 +905,7 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
         raise ValueError(f"Insufficient data: {n_samples} samples for {n_features} features. "
                         f"Need at least {n_features + 1} valid samples.")
     
-    # Validation split. Whole spatial blocks are held out where the field has
-    # lat/lon, because a random split over a gridded field validates against a
-    # cell's own neighbours and reports a score that is far too optimistic.
+    # Validation split.
     groups = spatial_block_labels(target, block_degrees)
     split_kind = "random"
     if groups is not None and validation == "blocked":
@@ -1020,22 +927,25 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
         if validation == "blocked":
             split_kind = "random (no lat/lon coordinates to block by)"
     
-    def fit_single_method(method_name, alpha_val=alpha, standardize_val=None):
+    def fit_single_method(method_name, alpha_val=alpha, standardize_val=None, full_sample=False):
+        # full_sample fits on every valid sample instead of the training split;
+        # its test score is then in-sample and is not used.
+        X_fit, y_fit = (X_clean, y_clean) if full_sample else (X_train, y_train)
         if standardize_val is None:
             standardize_val = method_name in ["ridge", "lasso"]
         scaler = StandardScaler() if standardize_val else None
         if scaler:
-            X_train_scaled = scaler.fit_transform(X_train)
+            X_train_scaled = scaler.fit_transform(X_fit)
             X_test_scaled = scaler.transform(X_test)
             X_clean_scaled = scaler.transform(X_clean)
         else:
-            X_train_scaled = X_train
+            X_train_scaled = X_fit
             X_test_scaled = X_test
             X_clean_scaled = X_clean
-        
+
         if method_name == "linear":
             model = LinearRegression()
-            model.fit(X_train_scaled, y_train)
+            model.fit(X_train_scaled, y_fit)
             y_pred = model.predict(X_clean_scaled)
             y_train_pred = model.predict(X_train_scaled)
             y_test_pred = model.predict(X_test_scaled)
@@ -1043,7 +953,7 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
             
         elif method_name == "ridge":
             model = Ridge(alpha=alpha_val)
-            model.fit(X_train_scaled, y_train)
+            model.fit(X_train_scaled, y_fit)
             y_pred = model.predict(X_clean_scaled)
             y_train_pred = model.predict(X_train_scaled)
             y_test_pred = model.predict(X_test_scaled)
@@ -1051,7 +961,7 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
             
         elif method_name == "lasso":
             model = Lasso(alpha=alpha_val, max_iter=5000)
-            model.fit(X_train_scaled, y_train)
+            model.fit(X_train_scaled, y_fit)
             y_pred = model.predict(X_clean_scaled)
             y_train_pred = model.predict(X_train_scaled)
             y_test_pred = model.predict(X_test_scaled)
@@ -1064,7 +974,7 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
             X_clean_poly = poly.transform(X_clean_scaled)
             
             model = LinearRegression()
-            model.fit(X_train_poly, y_train)
+            model.fit(X_train_poly, y_fit)
             
             y_pred = model.predict(X_clean_poly)
             y_train_pred = model.predict(X_train_poly)
@@ -1075,7 +985,7 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
             
         elif method_name == "random_forest":
             model = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
-            model.fit(X_train_scaled, y_train)
+            model.fit(X_train_scaled, y_fit)
             y_pred = model.predict(X_clean_scaled)
             y_train_pred = model.predict(X_train_scaled)
             y_test_pred = model.predict(X_test_scaled)
@@ -1122,11 +1032,12 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
     else:
         fit_result = fit_single_method(method, standardize_val=standardize)
         all_methods_scores = {method: fit_result["test_r2"]}
-    
-    y_pred = fit_result["y_pred"]
+
+    full_result = fit_single_method(method, standardize_val=standardize, full_sample=True)
+    y_pred = full_result["y_pred"]
     y_train_pred = fit_result["y_train_pred"]
     y_test_pred = fit_result["y_test_pred"]
-    extra_data = fit_result["extra_data"]
+    extra_data = full_result["extra_data"]
     model = extra_data["model"]
     scaler = extra_data.get("scaler")
     
@@ -1165,10 +1076,6 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
                 terms.append(f"{sign}{coef:.4f}*{name}")
         equation = f"y = {' '.join(terms)}"
         
-        # A raw coefficient is not an importance: it carries the units of its
-        # predictor, so phosphate at a sixteenth of nitrate's magnitude gets a
-        # coefficient sixteen times larger for the same physical effect.
-        # Standardising by each predictor's spread makes them comparable.
         y_spread = float(np.std(y_clean)) or 1.0
         for i, name in enumerate(predictor_names):
             feature_importance[name] = float(abs(coefs[i]) * np.std(X_clean[:, i]) / y_spread)
@@ -1223,9 +1130,6 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
             f"even though the fit as a whole may be good."
         )
 
-    # Significance tests belong to an unpenalised least-squares fit only, and to
-    # one fitted on the data it is being tested against, so they come from a
-    # full-sample OLS rather than from the 80 percent training fit above.
     if method == "linear":
         diagnostics.update(ols_inference(X_clean, y_clean, predictor_names))
     elif method in ("ridge", "lasso"):
@@ -1269,16 +1173,6 @@ def fit_multivariate_relation(target: xr.DataArray, predictors: List[xr.DataArra
 def _area_weighted_correlation(var1, var2, dims, method, lag, detrend, min_periods):
     """
     Pattern correlation between two maps, weighting each cell by its area.
-
-    An unweighted correlation over lat/lon treats every cell as one observation,
-    and a 1-degree grid has as many cells in the 5 degrees around a pole as in
-    5 degrees of the tropics while they cover a fortieth of the ocean. The
-    weighted form is the standard pattern correlation of model evaluation.
-
-    The p-value here is the naive one: neighbouring ocean cells are not
-    independent, so the number of cells overstates the evidence just as the
-    number of months does along time, and there is no single accepted correction
-    for a 2-D field. Read the coefficient, not the p-value.
     """
     if method != "pearson":
         raise ValueError(
@@ -1361,15 +1255,10 @@ def _area_weighted_correlation(var1, var2, dims, method, lag, detrend, min_perio
 @register_tools(
     name="analyze_correlation",
     description="Correlate two fields, with optional lead-lag analysis and significance testing.\n"
-        "Along time the p-value is corrected for SERIAL CORRELATION: monthly ocean series are strongly "
-        "autocorrelated, so an uncorrected test uses far too many degrees of freedom and declares weak "
-        "correlations highly significant. The uncorrected value is returned alongside so the difference is "
-        "visible.\n"
-        "Set detrend=True when both series contain a long-term trend, since two independently rising "
-        "series correlate through their trends alone.\n"
-        "Across space, use weighting='area' for a pattern correlation between two maps: cells shrink "
-        "towards the poles, and an unweighted correlation counts a polar cell as heavily as a tropical one "
-        "many times its size.",
+        "Along time the p-value uses an effective sample size estimated from the lag-1 "
+        "autocorrelations of the two series; the uncorrected value is returned alongside.\n"
+        "detrend=True removes a straight line from both series before correlating. weighting='area' "
+        "weights each cell by its area in a correlation across the horizontal dimensions.",
     args={
         "var1": "xr.DataArray, required. The first field.",
         "var2": "xr.DataArray, required. The second field, aligned with the first.",
@@ -1380,10 +1269,9 @@ def _area_weighted_correlation(var1, var2, dims, method, lag, detrend, min_perio
             "correlate ranks, which detects a monotonic but non-linear relationship and resists outliers.",
         "lag": "int, optional, default 0. Time lag in steps for lead-lag analysis. Positive means var2 "
             "leads var1; negative means var1 leads var2. Requires 'time' among the correlation dimensions.",
-        "detrend": "bool, optional, default False. Remove a least-squares straight line from both series "
-            "before correlating, so a shared trend cannot manufacture the correlation.",
-        "min_periods": "int, optional, default 10. Minimum number of valid pairs required; correlations "
-            "from a handful of points are unstable.",
+        "detrend": "bool, optional, default False. Remove a least-squares straight line from both "
+            "series before correlating.",
+        "min_periods": "int, optional, default 10. Minimum number of valid pairs required.",
         "weighting": "str, optional, default 'none'. 'area' weights each cell by its area, for a pattern "
             "correlation. It applies only over the horizontal dimensions, only to 'pearson', and not with "
             "a lag or with detrending; the weights come from the grid the fields are on, so put them on a "
@@ -1391,12 +1279,11 @@ def _area_weighted_correlation(var1, var2, dims, method, lag, detrend, min_perio
     },
     returns="dict of xr.DataArray, each shaped by the dimensions not correlated over:\n"
         "'correlation': the coefficient, -1 to 1.\n"
-        "'pvalue': two-tailed. Along time this is corrected for serial correlation and is the one to "
-        "quote; across space no correction exists, so read the coefficient rather than the p-value.\n"
+        "'pvalue': two-tailed. Along time it is corrected for serial correlation; across space it is "
+        "not.\n"
         "'pvalue_unadjusted': the naive value assuming every sample is independent.\n"
         "'n_samples': valid data pairs.\n"
-        "'n_effective': independent samples after accounting for autocorrelation. When it is much smaller "
-        "than n_samples, the correlation rests on that many independent observations."
+        "'n_effective': independent samples after accounting for autocorrelation."
 )
 def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, List[str]] = "time",
                         method: str = "pearson", lag: int = 0, detrend: bool = False,
@@ -1445,19 +1332,12 @@ def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, 
             var1_aligned = var1_aligned.isel(time=slice(None, -abs(lag)))
             var2_aligned = var2_aligned.isel(time=slice(abs(lag), None))
 
-        # The two windows are now paired by POSITION: by construction their time
-        # labels differ by `lag` steps, and xarray's exact join inside apply_ufunc
-        # below rejects arrays whose labels disagree. Put var2 on var1's time axis
-        # (labels do not survive into a correlation anyway) so the pairing stands.
         stale = [c for c in var2_aligned.coords if "time" in var2_aligned[c].dims]
         var2_aligned = var2_aligned.drop_vars(stale)
         var2_aligned = var2_aligned.assign_coords(
             {c: var1_aligned[c] for c in var1_aligned.coords if "time" in var1_aligned[c].dims}
         )
 
-    # The serial-correlation correction is only meaningful along an ordered axis
-    # such as time; across a flattened spatial block the lag-1 statistic has no
-    # single interpretation, so the sample size is left alone there.
     correct_serial = dims_to_correlate == ["time"]
 
     def correlation_func(x, y):
@@ -1491,9 +1371,6 @@ def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, 
         if not correct_serial or abs(corr) >= 1.0:
             return float(corr), float(p_naive), float(p_naive), int(n), float(n)
 
-        # Effective sample size from the lag-1 autocorrelation of both series.
-        # Two series that each persist from month to month share far fewer
-        # independent samples than they have time steps.
         def lag1(values):
             centred = values - values.mean()
             denominator = float(np.sum(centred ** 2))
@@ -1509,16 +1386,10 @@ def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, 
         p_adjusted = float(2 * (1 - stats.t.cdf(abs(t_stat), max(n_eff - 2, 1))))
         return float(corr), p_adjusted, float(p_naive), int(n), float(n_eff)
 
-    # CMIP6 arrays arrive chunked along time (12 months per chunk), and a core
-    # dimension of apply_ufunc cannot span multiple dask chunks, so the
-    # correlation dimensions are gathered into one chunk first. Everything else
-    # stays chunked, so a global field is still processed block by block.
     def gather_core_dims(array):
         if array.chunks is None:
             return array
-        # unify_chunks first: a field's 2-D coordinates are chunked differently
-        # from the field itself, and asking for chunksizes across the two raises
-        # rather than answering.
+        
         array = array.unify_chunks()
         split = [d for d in dims_to_correlate if len(array.chunksizes.get(d, ())) > 1]
         return array.chunk({d: -1 for d in split}) if split else array
@@ -1538,9 +1409,6 @@ def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, 
     )
 
     remaining_dims = [d for d in var1_aligned.dims if d not in dims_to_correlate]
-    # Every coordinate that still fits the remaining axes, not just the ones
-    # named after them: a curvilinear grid carries its latitude and longitude as
-    # 2-D fields, and dropping them leaves a map that cannot be located.
     remaining_coords = {
         name: coord for name, coord in var1_aligned.coords.items()
         if set(coord.dims).issubset(remaining_dims)
@@ -1548,8 +1416,6 @@ def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, 
 
     def wrap(values, name, attrs):
         result = xr.DataArray(values, coords=remaining_coords, dims=remaining_dims, name=name, attrs=attrs)
-        # A correlation map lives on the same grid as its inputs, so it keeps
-        # their grid identity and can be area-weighted like any other field.
         return carry_provenance(result, var1_aligned)
 
     correlation = wrap(
@@ -1596,13 +1462,11 @@ def analyze_correlation(var1: xr.DataArray, var2: xr.DataArray, dim: Union[str, 
 
 @register_tools(
     name="detect_outliers",
-    description="Flag values that are unusual against a distribution, for quality control or for finding "
-        "extreme events.\n"
-        "Run it on ANOMALIES whenever the axis being scanned is time. A raw ocean series is dominated by "
-        "its seasonal cycle, so every summer maximum sits in the tail of the distribution and the "
-        "'outliers' returned are simply the warm season.\n"
-        "It asks whether a value is unusual, not whether a stated threshold was crossed: for a physical "
-        "criterion use compute_exceedance_fraction or detect_threshold_events.",
+    description="Flag values that are unusual against a distribution, for quality control or for "
+        "finding extreme events.\n"
+        "It asks whether a value is unusual against the distribution along `dim`, not whether a stated "
+        "threshold was crossed: for a physical criterion use compute_exceedance_fraction or "
+        "detect_threshold_events.",
     args={
         "data": "xr.DataArray, required. The field to scan.",
         "method": "str, optional, default 'zscore'. 'zscore' (standard deviations from the mean; assumes "
@@ -1634,9 +1498,6 @@ def detect_outliers(data: xr.DataArray, method: str = "zscore", threshold: float
         }
         threshold = default_thresholds[method]
     
-    # The parentheses matter: without them this read as
-    # (method == 'percentile' and threshold <= 0) or threshold >= 100, which
-    # rejected a perfectly valid z-score threshold with the percentile message.
     if method == 'percentile':
         if not 0 < threshold < 100:
             raise ValueError(
@@ -1714,11 +1575,6 @@ def detect_outliers(data: xr.DataArray, method: str = "zscore", threshold: float
 def _coord_label(values):
     """
     One coordinate value, in a form worth printing.
-
-    A time stamp becomes 'YYYY-MM' rather than the nanosecond count that
-    datetime64.item() returns, which is what makes 'the largest departure
-    happened in February 1998' readable; a numeric coordinate stays a number so
-    a latitude can still be computed with.
     """
     array = np.asarray(values)
     if np.issubdtype(array.dtype, np.datetime64):
@@ -1733,16 +1589,14 @@ def _coord_label(values):
 
 @register_tools(
     name="compute_difference_metrics",
-    description="Measure how far one field is from another: bias, RMSE, the largest single departure and "
-        "where it happens.\n"
-        "This is the arithmetic behind 'how well does this reproduce the reference', computed in one pass "
-        "over the elements the two actually share, so every number describes the same sample.\n"
-        "Over the horizontal the metrics are area-weighted by default, since an unweighted RMSE counts a "
-        "polar cell as heavily as a tropical one many times its size. Along time they are unweighted. The "
-        "weights come from the grid the fields are on, so two fields on different grids must be put on a "
-        "common one first.\n"
-        "The correlation is deliberately left out: use analyze_correlation, with weighting='area' for a "
-        "pattern correlation.",
+    description="Measure how far one field is from another: bias, RMSE, the largest single departure "
+        "and where it happens.\n"
+        "Every metric is computed in one pass over the elements the two fields share, so all of them "
+        "describe the same sample.\n"
+        "Over the horizontal the metrics are area-weighted by default; along time they are unweighted. "
+        "The weights come from the grid the fields are on, so two fields on different grids must be "
+        "put on a common one first.\n"
+        "The correlation is not included: use analyze_correlation.",
     args={
         "data": "xr.DataArray, required. The field being assessed. The sign of the bias follows it: "
             "bias = mean(data - reference).",
@@ -1755,20 +1609,19 @@ def _coord_label(values):
             "dimensions are among those reduced and leaves everything else unweighted; 'area' insists on "
             "it and fails if the grid cannot be identified; 'none' weights every element equally."
     },
-    returns="dict. Scalars come back as floats, a partial reduction as xr.DataArray on the dimensions left "
-        "over.\n"
+    returns="dict. Scalars come back as floats, a partial reduction as xr.DataArray on the dimensions "
+        "left over.\n"
         "'bias': mean(data - reference), the systematic offset.\n"
         "'mae', 'rmse': mean absolute error and root mean square error.\n"
-        "'centered_rmse': RMSE with the bias removed, i.e. the disagreement in pattern alone. "
-        "rmse^2 = bias^2 + centered_rmse^2, so the two together say whether a field is merely offset or "
+        "'centered_rmse': RMSE with the bias removed, i.e. the disagreement in pattern alone. rmse^2 = "
+        "bias^2 + centered_rmse^2, so the two together say whether a field is merely offset or "
         "actually shaped differently.\n"
-        "'max_abs_error' and 'max_abs_error_at': the largest single departure and the coordinates where it "
-        "occurs; the location is None when the reduction leaves dimensions behind.\n"
-        "'std_data', 'std_reference', 'std_ratio': the two spreads over the same sample and their ratio — "
-        "above 1 the field varies too much, below 1 too little.\n"
-        "'mean_data', 'mean_reference': the weighted means over the shared sample, so the bias can be "
-        "reported with the two numbers it came from. Quote these rather than means computed separately, "
-        "which cover different elements.\n"
+        "'max_abs_error' and 'max_abs_error_at': the largest single departure and the coordinates "
+        "where it occurs; the location is None when the reduction leaves dimensions behind.\n"
+        "'std_data', 'std_reference', 'std_ratio': the two spreads over the same sample and their "
+        "ratio — above 1 the field varies too much, below 1 too little.\n"
+        "'mean_data', 'mean_reference': the weighted means over the shared sample, the two numbers the "
+        "bias came from.\n"
         "'n_valid', 'weighting': the sample size and what the weights were.\n"
         "'difference': the field data - reference itself, on the shared sample and carrying the grid "
         "identity, ready to map or to pass to compute_exceedance_fraction."
@@ -1801,10 +1654,6 @@ def compute_difference_metrics(data: xr.DataArray, reference: xr.DataArray,
         raise ValueError(_missing_dims_message(data_aligned, missing))
 
     difference = data_aligned - reference_aligned
-    # Binary arithmetic drops attrs, and with them the grid identity that lets
-    # the areas be found and a curvilinear model's dimensions be called lat/lon.
-    # The difference is handed back with them restored, so the caller never has
-    # to subtract the two fields again by hand.
     difference_field = carry_provenance(difference.rename("difference"), data_aligned)
     difference_field.attrs.setdefault("units", data.attrs.get("units", ""))
     difference_field.attrs.setdefault(
@@ -1850,9 +1699,6 @@ def compute_difference_metrics(data: xr.DataArray, reference: xr.DataArray,
     absolute = abs(difference)
     max_abs_error = absolute.max(dim=reduce_dims, skipna=True)
 
-    # Where the worst disagreement sits is only a single place when the whole
-    # field has been reduced to one number; a per-cell RMSE map has one such
-    # place per cell, which is a field of its own and not this tool's business.
     location = None
     if max_abs_error.ndim == 0 and n_valid > 0:
         flattened = absolute.stack(_point=reduce_dims)
@@ -1890,12 +1736,9 @@ def compute_difference_metrics(data: xr.DataArray, reference: xr.DataArray,
 
 @register_tools(
     name="detect_threshold_events",
-    description="Find the episodes in a series that cross a threshold and stay across it, and report each "
-        "one's timing, duration and peak.\n"
-        "This is how events are defined operationally rather than by eye: a warm or cold phase of a "
-        "climate index, a marine heatwave, a hypoxic spell, any run that has to persist to count. The "
-        "persistence requirement is the point — a single step beyond the threshold is noise, and "
-        "min_duration is what separates an event from a wobble.\n"
+    description="Find the episodes in a series that cross a threshold and stay across it, and report "
+        "each one's timing, duration and peak.\n"
+        "A run counts as an event only when it lasts at least min_duration consecutive steps.\n"
         "Missing values break a run rather than being skipped over, so a gap cannot join two separate "
         "episodes into one.",
     args={
@@ -1907,10 +1750,12 @@ def compute_difference_metrics(data: xr.DataArray, reference: xr.DataArray,
         "direction": "str, optional, default 'above'. 'above' keeps runs at or above the threshold, "
             "'below' keeps runs at or below it.",
         "min_duration": "int, optional, default 5. How many consecutive steps the series must stay across "
-            "the threshold to count as an event. 1 returns every crossing, however brief."
+            "the threshold to count as an event. 1 returns every run, however brief."
     },
     returns="pandas.DataFrame, one row per event in chronological order, with columns 'start', 'end', "
         "'duration' (steps), 'peak_value' (the most extreme value reached), 'peak_time' and 'mean_value'. "
+        "A run already across the threshold at the first valid step starts there, so its 'start' is the "
+        "edge of the record, not a crossing; the same holds for an 'end' at the last valid step. "
         "An empty frame means no run met the criterion. To rank by intensity, sort on the absolute peak. "
         "DataFrame.attrs records the criterion used."
 )
@@ -1973,18 +1818,17 @@ def detect_threshold_events(data: xr.DataArray, threshold: float, direction: str
     name="compute_exceedance_fraction",
     description="Measure what proportion of a domain lies beyond a threshold, by area, by volume or by "
         "count.\n"
-        "Writing the comparison by hand gets this wrong twice: missing cells compare as False, so land "
-        "lands in the denominator, and a proportion of the ocean is a proportion of its AREA, not of its "
-        "cells. This excludes missing data and weights each cell by its area or volume on the grid the "
-        "field is on.\n"
-        "Every comparison is applied to the deviation from `reference`, which is zero unless set. Writing "
-        "d = x - reference, the four are: 'greater' d > threshold, 'less' d < threshold, 'abs_greater' "
-        "|d| > threshold, 'abs_less' |d| < threshold. So 'abs_less' with reference=16 and threshold=2 is "
-        "the band 14 < x < 18, while 'abs_greater' with the same numbers is everything outside it. The "
-        "inequalities are STRICT, and the test actually used is returned in 'criterion'.\n"
+        "Missing data are left out of the numerator and the denominator, and each cell is weighted by "
+        "its area or volume on the grid the field is on.\n"
+        "Every comparison is applied to the deviation from `reference`, which is zero unless set. "
+        "Writing d = x - reference, the four are: 'greater' d > threshold, 'less' d < threshold, "
+        "'abs_greater' |d| > threshold, 'abs_less' |d| < threshold. So 'abs_less' with reference=16 "
+        "and threshold=2 is the band 14 < x < 18, while 'abs_greater' with the same numbers is "
+        "everything outside it. The inequalities are STRICT, and the test actually used is returned in "
+        "'criterion'.\n"
         "It answers a different question from its neighbours: detect_outliers asks whether a value is "
-        "unusual against a distribution, detect_threshold_events asks whether a threshold was held long "
-        "enough to count as an episode, and this asks how much of the domain is beyond it.",
+        "unusual against a distribution, detect_threshold_events asks whether a threshold was held "
+        "long enough to count as an episode, and this asks how much of the domain is beyond it.",
     args={
         "data": "xr.DataArray, required. The field to test — a difference, an anomaly, a concentration, an "
             "index. It must still carry the attrs its loader set if the weights are to be found.",
@@ -2008,22 +1852,20 @@ def detect_threshold_events(data: xr.DataArray, threshold: float, direction: str
     returns="dict:\n"
         "'fraction_percent' and 'fraction': the answer, in percent and as a proportion. A float when "
         "everything is reduced, otherwise a DataArray on the dimensions left over.\n"
-        "'exceeding_amount', 'total_amount': the weighted amounts behind the fraction — square metres for "
-        "area weighting, cubic metres for volume, a count of elements when unweighted. Report the amount "
-        "alongside the percentage when the question is about how much ocean.\n"
+        "'exceeding_amount', 'total_amount': the weighted amounts behind the fraction — square metres "
+        "for area weighting, cubic metres for volume, a count of elements when unweighted.\n"
         "'n_exceeding', 'n_valid': element counts, with missing data already excluded.\n"
         "'mask': the test as a field of 1 where the criterion is met, 0 where it is not and NaN where "
         "there is no data — ready to stipple over a map.\n"
-        "'weighting', 'criterion': what the weights were, and the exact test with its numbers filled in."
+        "'weighting', 'criterion': what the weights were, and the exact test with its numbers filled "
+        "in."
 )
 def compute_exceedance_fraction(data: xr.DataArray, threshold: float,
                                 comparison: str = "abs_greater",
                                 dim: Union[str, List[str], None] = None,
                                 weighting: str = "auto",
                                 reference: float = 0.0) -> Dict[str, Any]:
-    # Every test is on the deviation from the reference, so a band around a
-    # physical constant needs no arithmetic on the field itself — which would
-    # drop the attributes the weighting depends on.
+
     tests = {
         "greater": (lambda deviation: deviation > threshold, "{d} > {t}", "x > {hi}"),
         "less": (lambda deviation: deviation < threshold, "{d} < {t}", "x < {hi}"),
@@ -2053,8 +1895,6 @@ def compute_exceedance_fraction(data: xr.DataArray, threshold: float,
         raise ValueError(_missing_dims_message(data, missing))
 
     valid = data.notnull()
-    # The flag is NaN where the data is, so missing cells fall out of both the
-    # numerator and the denominator instead of counting as 'not exceeding'.
     deviation = data - reference if reference else data
     flag = tests[comparison][0](deviation).astype("float64").where(valid)
 
@@ -2131,17 +1971,13 @@ def compute_exceedance_fraction(data: xr.DataArray, threshold: float,
 @register_tools(
     name="fit_trend_map",
     description="Fit a linear trend at every cell of a field and report where it is significant.\n"
-        "This is the gridded counterpart of fit_1D_trend. The model is always the straight line, because a "
-        "map is read as a rate and every cell must be estimated the same way.\n"
-        "The significance accounts for SERIAL CORRELATION, by the same arithmetic fit_1D_trend uses: the "
-        "effective sample size comes from the lag-1 autocorrelation of each cell's own residuals. Without "
-        "it a monthly field is significant almost everywhere, which says more about the persistence of the "
-        "ocean than about any trend.\n"
-        "On a date axis the slope is reported PER DECADE by default, while fit_1D_trend reports per YEAR; "
-        "set per_decade=False when the two are quoted side by side.\n"
-        "Running it on the raw field is fine over whole years, but the seasonal cycle inflates the lag-1 "
-        "autocorrelation and makes the test conservative; removing the seasonal cycle first gives a "
-        "sharper test and the same trend.",
+        "This is the gridded counterpart of fit_1D_trend, always with a straight line. The "
+        "significance uses the same effective sample size as fit_1D_trend, from the lag-1 "
+        "autocorrelation of each cell's own residuals.\n"
+        "On a date axis, and on a numeric axis in years such as the integer 'year' axis that "
+        "temporal_aggregate(freq='year') returns, the slope is reported PER DECADE by default, while "
+        "fit_1D_trend reports per YEAR; set per_decade=False when the two are quoted side by side. "
+        "Read the returned 'units' rather than scaling the slope yourself: it already says per decade.",
     args={
         "data": "xr.DataArray, required. A field with a time axis and any number of other dimensions. "
             "Every cell is fitted independently; cells with too little data come back missing.",
@@ -2150,23 +1986,22 @@ def compute_exceedance_fraction(data: xr.DataArray, threshold: float,
         "alpha": "float, optional, default 0.05. Significance level, so the default gives a 95 percent "
             "interval and marks 'significant' where that interval excludes zero.",
         "per_decade": "bool, optional, default True. Report the slope per decade rather than per year. "
-            "Only applies on a date axis.",
+            "Applies on a date axis and on a numeric axis whose unit is the year (its 'units' "
+            "attribute, or failing that its name, e.g. the 'year' axis of annual means); the slope is "
+            "then already per decade and must not be multiplied by 10 again.",
         "min_periods": "int, optional, default 10. Cells with fewer valid steps are left missing rather "
             "than fitted."
     },
-    returns="dict of xr.DataArray on the input's dimensions with the fitted one removed, all carrying the "
-        "grid identity so they can be averaged or regridded directly:\n"
+    returns="dict of xr.DataArray on the input's dimensions with the fitted one removed, all carrying "
+        "the grid identity so they can be averaged or regridded directly:\n"
         "'slope': the trend, in the units named by 'units'. This is the map to draw.\n"
         "'ci95_low', 'ci95_high', 'slope_se': the confidence interval and standard error, "
         "serial-correlation corrected.\n"
-        "'significant': True where the interval excludes zero — the mask to stipple with. Draw the slope "
-        "everywhere and mark this, rather than blanking the insignificant cells: a coherent pattern that "
-        "misses significance is still worth seeing.\n"
+        "'significant': True where the interval excludes zero.\n"
         "'p_value' and 'p_value_unadjusted': corrected, and assuming independence.\n"
-        "'r2': variance explained at that cell. Low r2 with a significant slope is normal for a noisy "
-        "field — a real drift buried in variability.\n"
-        "'n', 'n_effective', 'lag1_autocorr': the sample size, how many independent steps it amounts to, "
-        "and the autocorrelation behind that reduction.\n"
+        "'r2': variance explained at that cell.\n"
+        "'n', 'n_effective', 'lag1_autocorr': the sample size, how many independent steps it amounts "
+        "to, and the autocorrelation behind that reduction.\n"
         "'units' (str): what the slope is in."
 )
 def fit_trend_map(data: xr.DataArray, dim: str = "time", alpha: float = 0.05,
@@ -2201,9 +2036,6 @@ def fit_trend_map(data: xr.DataArray, dim: str = "time", alpha: float = 0.05,
 
     x = xr.DataArray(elapsed, dims=[dim], coords={dim: data[dim]} if coord is not None else None)
 
-    # Ordinary least squares written as sums, so the whole map is fitted with
-    # array arithmetic instead of a Python loop over a hundred thousand cells.
-    # Each cell uses its own valid steps, so a gap costs that cell alone.
     valid = data.notnull()
     n = valid.sum(dim)
     x_valid = x.where(valid)
@@ -2358,9 +2190,6 @@ def locate_extreme(data: xr.DataArray, op: str = "max",
         for name, coord in point.coords.items() if coord.ndim == 0
     }
 
-    # Say it in geographic terms wherever they exist: a model's index pair locates
-    # nothing, and MPI-ESM1-2-LR spells its 2-D coordinates 'latitude'/'longitude'
-    # rather than 'lat'/'lon', so the names come from the array's own metadata.
     geographic = (data.attrs.get("lat_coord", "lat"), data.attrs.get("lon_coord", "lon"))
     preferred = [name for name in ("time", "depth") + geographic if name in coordinates]
     spoken = preferred or list(coordinates)

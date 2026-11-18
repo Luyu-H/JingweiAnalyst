@@ -1,13 +1,4 @@
 """
-Which language model the agent talks to, and how it is built.
-
-The agent uses a chat model in one way only - `invoke([SystemMessage, HumanMessage])`
-returning a message whose `.content` is text - so any LangChain chat model can drive
-it. What differs between vendors is the client class, the endpoint, the environment
-variable holding the key, and a handful of argument names. That knowledge lives in
-the table below rather than in the agent, so adding a vendor is a table entry and
-switching vendor is one line of configs/agent_with_tools.yaml.
-
 Three kinds of client cover the field:
 
   openai_compatible  one endpoint speaking the OpenAI chat-completions protocol,
@@ -17,9 +8,6 @@ Three kinds of client cover the field:
                      Moonshot, ...) are all this kind, so they need no extra package.
   anthropic          Claude, through langchain-anthropic.
   google             Gemini, through langchain-google-genai.
-
-The two native clients are imported only when they are actually asked for, so the
-project keeps working with langchain-openai alone.
 """
 
 import os
@@ -73,9 +61,6 @@ PROVIDERS: Dict[str, ProviderSpec] = {
         package="langchain-anthropic",
         import_name="langchain_anthropic",
         aliases=("claude",),
-        # The client's own default is 1024 tokens, which truncates generated code
-        # mid-function; the agent then repairs a syntax error that was never the
-        # model's mistake.
         defaults={"max_tokens": 8192},
     ),
     "google": ProviderSpec(
@@ -130,10 +115,6 @@ def resolve_provider(name: str) -> Tuple[str, ProviderSpec]:
 def resolve_settings(llm_cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     Turn the `llm` section into exactly what will reach the client.
-
-    Whatever the configuration leaves out falls back to the provider's entry above,
-    so a section naming only a provider and a model is enough. The result doubles as
-    the record written into each run's manifest.
     """
     llm_cfg = dict(llm_cfg or {})
     name, spec = resolve_provider(llm_cfg.get("provider", "deepseek"))
@@ -155,8 +136,6 @@ def resolve_settings(llm_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "provider": name,
         "kind": spec.kind,
         "model": model,
-        # None means "do not send it": the reasoning models reject any temperature
-        # but their own, and a default of 0.0 would make them fail on every call.
         "temperature": llm_cfg.get("temperature"),
         "base_url": base_url,
         "api_key_env": llm_cfg.get("api_key_env") or spec.api_key_env,
@@ -168,8 +147,6 @@ def resolve_api_key(settings: Dict[str, Any], api_key: Optional[str] = None,
                     hint: Optional[str] = None) -> str:
     """
     The key comes from the caller or from the environment variable the settings name.
-
-    It is deliberately never read out of the YAML file, which is committed.
     """
     if api_key:
         return api_key
@@ -241,8 +218,6 @@ def build_llm(llm_cfg: Dict[str, Any], api_key: Optional[str] = None,
 
 
 if __name__ == "__main__":
-    # python -m src.models.llm_providers - what can be configured, and whether the
-    # key and client for each provider are actually present on this machine.
     import importlib.util
 
     header = (f"{'provider':<18} {'default model':<20} {'key variable':<20} "

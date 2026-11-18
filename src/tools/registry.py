@@ -22,10 +22,6 @@ def register_tools(name: str, description: str, args: Dict[str, str], returns: s
     """
     def decorator(func: Callable):
         tool_name = name or func.__name__
-        # The decorator applies to whatever is defined directly below it, so a
-        # helper accidentally placed between the two registers under the tool's
-        # name and the tool itself disappears from the agent's namespace. It
-        # runs at import, where it is cheap, and fails loudly.
         if tool_name != func.__name__:
             raise RuntimeError(
                 f"register_tools(name='{tool_name}') is decorating '{func.__name__}'. The decorator binds "
@@ -50,8 +46,7 @@ def auto_import_tools(package: str = "src.tools"):
     Args:
         package: Dotted package name holding the tool modules.
     """
-    # Resolve against the repository root rather than the process working
-    # directory, so importing the agent from anywhere still finds the tools.
+    # Resolve against the repository root rather than the process working directory, so importing the agent from anywhere still finds the tools.
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     package_path = os.path.join(repo_root, *package.split("."))
     if not os.path.isdir(package_path):

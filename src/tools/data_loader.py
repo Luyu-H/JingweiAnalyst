@@ -1,33 +1,11 @@
-# tools: load_regular_data, load_climatology_data, load_data_with_geolocator,
-#        load_areas, load_volumes_for_cmip6, load_depth_levels, load_basin_mask, load_landsea_mask
-#
-# This file does subsetting only: it cuts the globally normalised fields that
-# src/tools/data_openers.py returns down to a time, space or named region. File
-# layout and per-product metadata defects are the openers' business, not this
-# file's.
-#
+# tools: load_regular_data, load_climatology_data, load_data_with_geolocator, load_areas, load_volumes_for_cmip6, load_depth_levels, load_basin_mask, load_landsea_mask
+
 # Two entry points, by the kind of data:
 #   load_regular_data         anything with a real time axis: the gridded records
 #                             (CMIP6 historical and ssp245, ERSSTv5) and the
 #                             ungridded published index series (CPC/NCEI)
 #   load_climatology_data     climatologies (WOA23, GLODAP, SEANOE MLD)
 #   load_data_with_geolocator either gridded kind, selected by named region
-#
-# Two paths through the grids:
-#   regular grids (WOA23, GLODAP, SEANOE, ERSST, GFDL-ESM4) are sliced by
-#     coordinate value with .sel
-#   curvilinear grids (CESM2, MPI-ESM1-2-LR) have index dimensions that are not
-#     geographic, so they are selected with a 2-D mask and the index dimensions
-#     are then trimmed to the mask's bounding rectangle.
-#
-# The grid quantities (load_areas, load_depth_levels) likewise split into model
-# and non-model paths:
-#   model data: areas come from the model's own published areacello, preferring
-#     this experiment, then the same model's other experiment, then a
-#     computation from the cell corners in the data file, then an error; depth
-#     levels come from that variable's own lev/lev_bnds.
-#   non-model data: each product's own grid information, using its bounds where
-#     it publishes them and deriving them from the spacing where it does not.
 
 import os
 
@@ -62,10 +40,7 @@ PATHS_CONFIG = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "configs", "default_paths.yaml")
 )
 
-# Geolocator grid. The Natural Earth geometries are converted to 0~360 by
-# src/utils/geo_processor.fix_longitudes_and_split, so the grid they are
-# intersected against must be 0~360 as well — intersecting them with a
-# -180~180 grid silently drops every cell west of the prime meridian.
+# Geolocator grid.
 GEOLOCATOR_LATS = np.arange(-89.5, 90.5, 1.0)
 GEOLOCATOR_LONS = np.arange(0.5, 360.5, 1.0)
 
@@ -74,10 +49,7 @@ GEOLOCATOR_LONS = np.arange(0.5, 360.5, 1.0)
 # Subsetting primitives, called only by the loaders below
 # ---------------------------------------------------------------------------
 
-# How closely a stored depth coordinate must match the dataset's own level
-# definitions to count as the same level. It absorbs float32 storage and the
-# centimetre-to-metre scaling CESM2 needs, and is far below any real level
-# spacing, so it can never match the wrong level.
+# How closely a stored depth coordinate must match the dataset's own level definitions to count as the same level. 
 DEPTH_MATCH_TOL = 1e-4
 
 
@@ -85,10 +57,6 @@ def normalize_lon_range(lon_range):
     """
     Accept a longitude window in any convention and return it as
     (low, high, wraps) in the -180~180 convention, or None for a full circle.
-
-    Handles 0~360 input ([120, 150]), signed input ([-120, -90]), windows that
-    cross the prime meridian ([350, 10]) and windows that cross the dateline
-    ([160, -150] or [190, 210]).
     """
     low, high = float(lon_range[0]), float(lon_range[1])
     if abs(high - low) >= 360:
@@ -130,15 +98,6 @@ def trim_to_mask(da, mask, y_dim, x_dim):
 def mask_1deg_to_grid(mask_1deg, da, grid_type, lat_coord, lon_coord):
     """
     Put a 1-degree (lat, lon) boolean mask onto whatever grid `da` lives on.
-
-    Regular grids use a nearest-neighbour coordinate lookup, which is exact for
-    the 1-degree products and nearest-cell for ERSSTv5's 2-degree grid.
-    Curvilinear grids use direct index arithmetic on the 2-D lat/lon fields,
-    which is the same nearest-cell answer without building an interpolator.
-
-    Note that this must reindex rather than select: a nearest-neighbour `sel`
-    hands back the mask's own coordinate values, which silently align to nothing
-    on any grid whose cells do not coincide with the 1-degree centres.
     """
     if grid_type == "regular":
         return mask_1deg.reindex(
@@ -156,13 +115,6 @@ def mask_1deg_to_grid(mask_1deg, da, grid_type, lat_coord, lon_coord):
 def subset_regular(da, lat_range=None, lon_range=None):
     """
     Slice a regular grid by latitude and longitude.
-
-    A window that crosses the dateline is taken in two pieces and rejoined with
-    the western piece shifted by +360, so the result stays geographically
-    contiguous AND keeps a monotonically increasing longitude axis (160 ... 210
-    rather than 160 ... 180, -180 ... -150). Concatenating the pieces without
-    that shift leaves an axis that xarray refuses to index, so any later .sel on
-    the result would fail.
     """
     check_ascending("lat", lat_range)
     if lat_range is not None:
@@ -196,11 +148,6 @@ def subset_curvilinear(da, lat_range=None, lon_range=None):
 def check_ascending(name, value_range):
     """
     Reject a reversed latitude or depth window.
-
-    Longitude windows are allowed to read high-to-low, because that is how a
-    window crossing the dateline is written ([160, -150]); latitude and depth
-    have no such wrap, so a reversed pair is a mistake, and slicing with one
-    would otherwise hand back an empty array without saying why.
     """
     if value_range is None:
         return
@@ -318,7 +265,7 @@ def require_kind(dataset: str, expected, tool: str, alternative: str):
             "that is defined on its own domain rather than on a region box.",
         "model": "str, required for multi-model datasets. Which model to read.",
         "product": "str, required for a dataset that publishes several series of the same quantity. "
-            "Which one to read; they differ in baseline period and are not interchangeable. Default is "
+            "Which one to read; the registry lists each product with its baseline period. Default is "
             "the dataset's operational series.",
         "field": "str, optional, default 'anomaly' where it applies. Which published field to read: "
             "'anomaly' for the departure from the baseline climatology, or 'total' for the absolute "
@@ -344,9 +291,6 @@ def load_regular_data(dataset: str, variable: str = None, model: str = None, tim
     dataset = require_kind(dataset, ("timeseries", "index"), "load_regular_data",
                            "load_climatology_data")
     if get_dataset_cfg(dataset)["kind"] == "index":
-        # A published index is one number per month, already area-averaged over a
-        # fixed box. Silently ignoring a spatial window would hand back the whole
-        # series as though it had been cut down to the region asked for.
         given = [name for name, value in (("depth_range", depth_range), ("lat_range", lat_range),
                                           ("lon_range", lon_range)) if value is not None]
         if given:
@@ -597,10 +541,6 @@ def cell_areas_from_bounds(lat_bnds, lon_bnds):
     """
     Areas of a regular lat/lon grid on the WGS84 ellipsoid, equivalent to
     MATLAB's areaquad.
-
-    Every cell in a latitude band that spans the same longitude width has the
-    same area, so a uniform grid needs one geodesic solve per band instead of
-    one per cell (180 rather than 64800 on the 1-degree grid).
     """
     lat_bnds = np.asarray(lat_bnds, dtype="float64")
     lon_bnds = np.asarray(lon_bnds, dtype="float64")
@@ -630,8 +570,7 @@ def cell_areas_from_bounds(lat_bnds, lon_bnds):
 def cell_areas_from_vertices(lat_vertices, lon_vertices):
     """
     Areas of a curvilinear grid from its per-cell corner vertices, shaped
-    (ny, nx, 4). One geodesic solve per cell, so this is slow on a full model
-    grid; it is only the fallback for a model that ships no areacello.
+    (ny, nx, 4).
     """
     lat_vertices = np.asarray(lat_vertices, dtype="float64")
     lon_vertices = np.asarray(lon_vertices, dtype="float64")
@@ -676,11 +615,6 @@ def default_1deg_areas():
 def model_areas(dataset, model, variable, lat_range, lon_range):
     """
     Areas for a CMIP6 model, preferring the model's own published cell areas.
-
-    Looks for areacello in the requested experiment, then for the same model in
-    any other experiment (the grid is identical across experiments), and only
-    then falls back to computing areas from the cell corner bounds carried by
-    the data file itself.
     """
     experiment = dataset.replace("cmip6_", "")
     others = [e for e in cmip6_experiments() if e != experiment]
@@ -801,13 +735,13 @@ def observational_areas(dataset, lat_range, lon_range):
 @register_tools(
     name="load_areas",
     description="Load the area of each grid cell in square metres.\n"
-        "You usually do NOT need this to take an average: an area-weighted mean assembles the right areas "
-        "for whatever grid the data is on and masks them to the valid cells. Reach for it when you want "
-        "the area field itself — to report the size of a region, to turn a per-square-metre quantity into "
-        "a total, or to weight something by hand.\n"
-        "Say which grid you mean, because the areas must match the data being weighted cell for cell. A "
-        "model's own published cell areas are used where they exist, which is the only correct weighting "
-        "on a curvilinear grid. Areas are computed on the WGS84 ellipsoid.",
+        "You usually do NOT need this to take an average: an area-weighted mean assembles the right "
+        "areas for whatever grid the data is on and masks them to the valid cells. Reach for it when "
+        "you want the area field itself — to report the size of a region, to turn a per-square-metre "
+        "quantity into a total, or to weight something by hand.\n"
+        "Say which grid you mean, because the areas must match the data being weighted cell for cell. "
+        "A model's own published cell areas are used where they exist; areas that have to be computed "
+        "are computed on the WGS84 ellipsoid.",
     args={
         "lat_range": "list[float, float], optional. [min, max] in degrees North. Default is global.",
         "lon_range": "list[float, float], optional. [min, max] in degrees East, either convention; a "
@@ -818,12 +752,9 @@ def observational_areas(dataset, lat_range, lon_range):
         "variable": "str, optional, default 'thetao'. Only consulted when a model publishes no cell areas "
             "of its own: it says which variable's file to take the cell corner bounds from."
     },
-    returns="xr.DataArray of cell areas in m2, already masked to ocean, on the requested grid and matching "
-        "what the loaders return for it so the two multiply directly. attrs['area_source'] records where "
-        "the areas came from, which is worth reporting when they feed an integral.\n"
-        "Ocean area differs between models by a per cent or so, because a coarser grid resolves the "
-        "coastline differently. That is a property of the model, not an error to correct: state the area "
-        "each integral was taken over rather than rescaling one model to match another."
+    returns="xr.DataArray of cell areas in m2, already masked to ocean, on the requested grid and "
+        "matching what the loaders return for it so the two multiply directly. attrs['area_source'] "
+        "records where the areas came from."
 )
 def load_areas(lat_range: list = None, lon_range: list = None, dataset: str = None,
                model: str = None, variable: str = "thetao") -> xr.DataArray:
@@ -847,10 +778,6 @@ def model_volumes(dataset, model, variable, time_range, depth_range, lat_range, 
                   strict_time: bool = True):
     """
     Volumes for a CMIP6 model, preferring the model's own published cell volumes.
-
-    Same search as model_areas: volcello in the requested experiment, then the
-    same model in another experiment, then a computation from the model's own
-    cell areas and layer bounds.
     """
     experiment = dataset.replace("cmip6_", "")
     others = [e for e in cmip6_experiments() if e != experiment]
@@ -871,9 +798,6 @@ def model_volumes(dataset, model, variable, time_range, depth_range, lat_range, 
         break
 
     if volumes is None:
-        # Nothing published: rebuild the volumes from the model's own cell areas
-        # and layer bounds, clipping the deepest layer at the sea floor where
-        # the model publishes a bathymetry.
         areas = load_areas(dataset=dataset, model=model, variable=variable)
         _, depth_bnds = load_depth_levels(dataset=dataset, model=model, variable=variable)
         thickness = xr.DataArray(
@@ -897,8 +821,6 @@ def model_volumes(dataset, model, variable, time_range, depth_range, lat_range, 
             note += ", WITHOUT clipping the bottom layer (this model publishes no deptho), so cells at the sea floor are overestimated"
 
         volumes = areas * thickness
-        # Broadcasting appends the new axis, so put depth back in front to match
-        # the layout a published volcello comes in.
         volumes = volumes.transpose("depth", *[d for d in volumes.dims if d != "depth"])
         volumes.name = "volcello"
         volumes.attrs = dict(areas.attrs)
@@ -908,9 +830,7 @@ def model_volumes(dataset, model, variable, time_range, depth_range, lat_range, 
 
     if time_range is not None:
         if "time" not in volumes.coords:
-            # A fixed field has no window to take. For a caller who asked for one
-            # that is a mistake worth reporting; for volumes_like, which derives
-            # the window from the data it is weighting, there is nothing to do.
+            # A fixed field has no window to take.
             if strict_time:
                 raise ValueError(
                     f"volcello for {model} is a fixed field with no time axis; drop time_range. "
@@ -926,12 +846,11 @@ def model_volumes(dataset, model, variable, time_range, depth_range, lat_range, 
 @register_tools(
     name="load_volumes_for_cmip6",
     description="Load the volume of each grid cell of a model in cubic metres.\n"
-        "You usually do NOT need this to take a volume-weighted average, which assembles the right volumes "
-        "itself. Reach for it to report the volume of a region, to turn a per-cubic-metre quantity into a "
-        "total, or to weight something by hand.\n"
-        "A model's own published cell volumes are used where they exist, because they alone account for "
-        "the partial cells at the sea floor; otherwise volumes are rebuilt from cell areas and layer "
-        "thicknesses.",
+        "You usually do NOT need this to take a volume-weighted average, which assembles the right "
+        "volumes itself. Reach for it to report the volume of a region, to turn a per-cubic-metre "
+        "quantity into a total, or to weight something by hand.\n"
+        "A model's own published cell volumes are used where they exist; otherwise volumes are rebuilt "
+        "from cell areas and layer thicknesses.",
     args={
         "dataset": "str, required. The experiment's dataset id.",
         "model": "str, required. Which model's grid to describe.",
@@ -1054,15 +973,6 @@ def load_depth_levels(depth_range: list = None, dataset: str = None, model: str 
         bounds_values = bounds_values[keep, :]
         if depth_values.size == 0:
             raise ValueError(f"depth_range {depth_range} selects no levels from '{dataset}'.")
-        # The layers are returned whole, not cut back to the requested window.
-        # Each level stands for a layer that reaches past it, so a request for
-        # the top 100 m of WOA23 keeps the 100 m level and its layer down to
-        # 112.5 m. Trimming the end layers instead would have to trim the top
-        # one at the shallowest CENTRE rather than at the sea surface wherever
-        # the caller passes a level range rather than the user's own window,
-        # which cuts the surface layer in half on the models, whose first level
-        # sits at 2.5 or 5 m. Whole layers keep every product on the same
-        # footing; the returns note says to report the column actually covered.
 
     depth_attrs = {
         "standard_name": "depth", "bounds": "depth_bnds", "positive": "down",
@@ -1089,17 +999,6 @@ def load_depth_levels(depth_range: list = None, dataset: str = None, model: str 
 
 # ---------------------------------------------------------------------------
 # 5. Grid quantities taken from the data's own provenance
-#
-# The openers stamp source_dataset, model and grid_type into the attrs, so the
-# calculation tools never have to ask the caller which dataset a field came
-# from: the functions below read the attrs and pick the matching grid.
-#
-# These must reindex rather than sel(method='nearest'). A nearest-neighbour sel
-# returns the GRID FIELD's own coordinate values, and when those do not
-# coincide with the data's, xarray's inner join in the next operation empties
-# the result instead of raising. ERSSTv5's 2-degree centres (-88, -86, ...)
-# share not one value with a 1-degree area field's (-87.5, -86.5, ...), so that
-# silent failure would be the default rather than an edge case.
 # ---------------------------------------------------------------------------
 
 def dataset_of(da: xr.DataArray) -> tuple:
@@ -1118,11 +1017,6 @@ def dataset_of(da: xr.DataArray) -> tuple:
 def unmatched_labels(source_values, target_values, tolerance):
     """
     Which of `target_values` have no neighbour in `source_values` within tolerance.
-
-    reindex(method='nearest', tolerance=...) fills the misses with NaN instead of
-    reporting them, so a grid field that lines up over PART of an array is
-    accepted and the cells it missed silently drop out of the weighting. Catching
-    the misses here turns that into an error.
     """
     source = np.unique(np.asarray(source_values, dtype="float64"))
     target = np.asarray(target_values, dtype="float64")
@@ -1139,12 +1033,6 @@ def unmatched_labels(source_values, target_values, tolerance):
 def _align_horizontal(field, da):
     """
     Put a grid field (areas, volumes) onto exactly `da`'s horizontal coordinates.
-
-    Reindex rather than sel(method='nearest'): a nearest-neighbour sel hands
-    back the FIELD's own coordinate values, and when those do not coincide with
-    the data's, the inner join in the next arithmetic quietly empties the
-    result instead of raising. ERSSTv5's 2-degree centres share not one value
-    with the 1-degree grid, so that failure is the default, not an edge case.
     """
     if da.attrs.get("grid_type") == "curvilinear":
         y_dim, x_dim = da.attrs["y_dim"], da.attrs["x_dim"]
@@ -1157,10 +1045,7 @@ def _align_horizontal(field, da):
                 da[lat_coord].values, da[lon_coord].values,
             )
             field = field.isel({y_dim: y_slice, x_dim: x_slice})
-        # Horizontal coordinates only. A volume field also carries depth, and the
-        # data has usually been cut to a depth range by now, so copying every
-        # shared coordinate would try to staple a 40-level axis onto a 9-level
-        # array. Depth is matched separately, after this call.
+
         horizontal = {y_dim, x_dim}
         return field.assign_coords({
             c: da[c] for c in field.coords
@@ -1173,11 +1058,7 @@ def _align_horizontal(field, da):
             f"{list(da.coords)}. Grid weighting cannot be applied after the horizontal dimensions have "
             f"been aggregated away — weight first, then reduce."
         )
-    # A dateline-crossing subset comes back from subset_regular on a continuous
-    # axis running past 180 (160 ... 210), so the window stays contiguous and the
-    # axis monotonic. Those labels are by construction absent from the dataset's
-    # own -180~180 grid, so match on the wrapped values and put the array's own
-    # labels back afterwards; for an ordinary axis the wrap is the identity.
+
     targets = {
         "lat": np.asarray(da["lat"].values, dtype=float),
         "lon": ((np.asarray(da["lon"].values, dtype=float) + 180.0) % 360.0) - 180.0,
@@ -1198,17 +1079,10 @@ def _align_horizontal(field, da):
 def areas_like(da: xr.DataArray) -> xr.DataArray:
     """
     Cell areas on the grid `da` actually lives on, aligned to its coordinates.
-
-    Picks the dataset's own grid from the provenance attrs, so ERSSTv5 gets
-    2-degree areas and a curvilinear model gets its published areacello rather
-    than the 1-degree default.
     """
     dataset, model = dataset_of(da)
     areas = _align_horizontal(load_areas(dataset=dataset, model=model), da)
     if da.attrs.get("grid_point") == "velocity":
-        # areacello describes tracer cells. The velocity points of the same
-        # (j, i) sit half a cell away, so the areas are close enough to weight
-        # an average with, but they are not the face widths a transport needs.
         areas.attrs["area_source"] = (
             f"{areas.attrs.get('area_source', 'cell areas')}, tracer-cell areas applied to the "
             f"velocity points of the same index (offset by half a cell)"
@@ -1219,11 +1093,6 @@ def areas_like(da: xr.DataArray) -> xr.DataArray:
 def volumes_like(da: xr.DataArray) -> xr.DataArray:
     """
     Cell volumes in m3 for `da`, on its own grid and its own depth levels.
-
-    A CMIP6 model's published volcello is preferred, because it accounts for the
-    partial cells at the sea floor that cell area times layer thickness cannot.
-    Everywhere else the volume is the cell area times the dataset's own layer
-    thickness.
     """
     dataset, model = dataset_of(da)
     if not dataset.startswith("cmip6_"):
@@ -1243,20 +1112,10 @@ def volumes_like(da: xr.DataArray) -> xr.DataArray:
     if "time" in da.coords and da["time"].size:
         stamps = np.atleast_1d(da["time"].values)
         time_range = [str(stamps.min())[:10], str(stamps.max())[:10]]
-    # Straight to model_volumes rather than through load_volumes_for_cmip6: that
-    # tool rejects a time_range for the models whose volcello is a fixed field
-    # (every model but GFDL-ESM4), and this window comes from the data being
-    # weighted, not from a caller who could drop it.
     volumes = model_volumes(dataset, model, "thetao", time_range, None, None, None,
                             strict_time=False)
 
     if "time" in volumes.dims:
-        # GFDL-ESM4 publishes volcello monthly rather than as a fixed field. Its
-        # free surface makes the cells breathe slightly, so the concurrent
-        # volumes are the right weight; only when the data carries no time axis
-        # of its own does a representative step have to stand in. Averaging the
-        # whole 1850-2014 record instead would read 1980 global 3-D fields to
-        # produce a weight that differs from any of them.
         if "time" in da.dims:
             volumes = volumes.sel(time=da["time"], method="nearest")
             volumes = volumes.assign_coords(time=da["time"])
@@ -1281,11 +1140,6 @@ def volumes_like(da: xr.DataArray) -> xr.DataArray:
 def _locate_block(full_lat, full_lon, sub_lat, sub_lon):
     """
     Where a trimmed curvilinear block sits inside the model's full grid.
-
-    Both trims that produce one (a lat/lon box and a named region) take a
-    contiguous window with isel and leave the 2-D lat/lon values untouched, so
-    the block is found by matching its top-left cell and then verifying the
-    whole window. Returns the (y, x) slices that reproduce it.
     """
     ny, nx = sub_lat.shape
     corners = np.argwhere(
@@ -1306,39 +1160,16 @@ def _locate_block(full_lat, full_lon, sub_lat, sub_lon):
 def layer_bounds_like(da: xr.DataArray) -> xr.DataArray:
     """
     The upper and lower boundary of each of `da`'s layers, in metres.
-
-    The vertical grids are not shared between products — GLODAP's 33 levels are
-    far thicker than WOA23's standard levels at the same depths, and every CMIP6
-    model has its own — so the bounds come from the dataset the array records,
-    not from a default. The levels are then required to match exactly, because a
-    near-miss here silently rescales every inventory and every OMZ thickness:
-    taking WOA23's bounds for GLODAP counts the top 500 m as 230 m.
     """
     if "depth" not in da.coords:
         raise ValueError("This array has no 'depth' coordinate, so it has no layer boundaries.")
     dataset, model = dataset_of(da)
     depths = np.atleast_1d(da["depth"].values).astype("float64")
 
-    # The stored depth coordinate can be float32 while the level table is
-    # float64: CESM2's lev is in centimetres and scaling it to metres leaves the
-    # two differing in the last few bits (984.705859 against 984.7059375). An
-    # exact range filter then drops the deepest level of any subset and the
-    # check below reports a grid mismatch that is not one. Widen the request by
-    # the same tolerance that check uses; level spacings are metres, so 0.1 mm
-    # cannot reach a neighbouring level.
     pad = DEPTH_MATCH_TOL
     kwargs = {"dataset": dataset, "model": model,
               "depth_range": [float(depths.min()) - pad, float(depths.max()) + pad]}
     if dataset == "woa23":
-        # The monthly and seasonal axes are not truncations of the annual one:
-        # their deepest layer is closed at the level itself, so the time slice
-        # the data was loaded with decides the bounds.
-        # Both of these come from the attributes rather than being guessed. The
-        # WOA23 axes of different variables and time slices SHARE THEIR LEVEL
-        # CENTRES over the range they have in common and differ only in how the
-        # deepest layer closes — nitrate's monthly 800 m layer is 25 m thick
-        # where temperature's is 50 m — so a wrong axis passes the level check
-        # below unnoticed and silently rescales the bottom of every integral.
         variable = da.attrs.get("woa_variable")
         time_slice = da.attrs.get("woa_time_slice")
         if variable is None or time_slice is None:
@@ -1381,20 +1212,8 @@ def cell_thickness_like(da: xr.DataArray) -> xr.DataArray:
     """
     The thickness of water in each of `da`'s cells, in metres.
 
-    For a CMIP6 model this is volcello / areacello, which is what the protocol
-    recommends where cells are not full (Griffies et al. 2016, Appendix B1.1):
-    the layer bounds give the thickness of a FULL cell, and the cells at the sea
-    floor are not full. The difference is large for GFDL-ESM4, whose fields were
-    remapped from hybrid layers onto z levels and carry values in bottom cells
-    that are only partly water: over the whole ocean, area x layer-bound
-    thickness comes to 1.53e18 m3 against 1.33e18 m3 from its own volcello, and
-    14 per cent of its cells differ by more than one per cent. MPI-ESM1-2-LR's
-    partial bottom steps differ by up to half a layer in 3 per cent of cells;
-    CESM2's two agree.
-
-    Observational products have no partial cells, so their layer bounds are
-    used. The result is aligned to `da` and may carry horizontal dimensions (and
-    time, for GFDL-ESM4, whose volcello is monthly) as well as depth.
+    For a CMIP6 model this is volcello / areacello. Observational 
+    products have no partial cells, so their layer bounds are used. 
     """
     dataset, _ = dataset_of(da)
     if not dataset.startswith("cmip6_"):
@@ -1412,7 +1231,6 @@ def cell_thickness_like(da: xr.DataArray) -> xr.DataArray:
     return thickness
 
 
-# https://www.ncei.noaa.gov/data/oceans/woa/WOA23/DOCUMENTATION/WOA23_Product_Documentation.pdf#page=15&zoom=100,93,86
 BASIN_NAMES = {
     1: "Atlantic Ocean",
     2: "Pacific Ocean",

@@ -1,8 +1,4 @@
 # tools: regrid_horizontal, regrid_vertical, select_basin, build_comparison_mask
-#
-# Preprocessing steps that put a field on a different grid before it can be
-# compared with anything else. Nothing here changes what a field means: the
-# values are the same field, carried onto another set of cells.
 
 import numpy as np
 import xarray as xr
@@ -12,14 +8,9 @@ from src.tools.data_openers import PROVENANCE_ATTRS, open_cmip6_grid_file
 from src.tools.data_loader import bounds_from_centres, load_areas
 
 
-# Building the ESMF weights for a curvilinear model takes seconds, and a
-# multi-model comparison regrids the same pair of grids over and over. The
-# weights depend only on the two grids and the method, so they are kept.
+# Building the ESMF weights for a curvilinear model takes seconds, and a multi-model comparison regrids the same pair of grids over and over. The weights depend only on the two grids and the method, so they are kept.
 _REGRIDDER_CACHE = {}
 
-# The observational grids a field can be put onto by name. 'woa23' is the
-# 1-degree grid WOA23, GLODAP and SEANOE share, and is the usual meeting point
-# for a model-observation comparison.
 _NAMED_TARGETS = {
     "woa23": "woa23",
     "1deg": "woa23",
@@ -42,18 +33,7 @@ def _corners_from_vertices(vertex_lat, vertex_lon):
     Assemble a curvilinear grid's (ny+1, nx+1) corner mesh from CMIP6's per-cell
     vertices, which are stored as (ny, nx, 4).
 
-    A single shared corner mesh is only possible because neighbouring cells
-    share the corners between them, but the models do not agree on the order
-    their four vertices are written in: CESM2 starts at the south-west corner
-    and winds anticlockwise, while MPI-ESM1-2-LR winds the other way on a grid
-    whose j index runs southward. The winding is therefore worked out from the
-    vertices themselves — which rotation makes every cell's corners coincide
-    with its neighbours' — rather than assumed, because the wrong one produces a
-    plausible-looking mesh describing cells that are not the model's.
-
-    Returns (corner_lat, corner_lon, note). A handful of cells may still
-    disagree where the grid closes on itself (the periodic seam and the fold
-    over the Arctic); how many is reported in the note so it can be stated.
+    Returns (corner_lat, corner_lon, note).
     """
     vertex_lat = np.asarray(vertex_lat, dtype="float64")
     vertex_lon = np.asarray(vertex_lon, dtype="float64")
@@ -66,8 +46,6 @@ def _corners_from_vertices(vertex_lat, vertex_lon):
         """Distance between two vertices in degrees, insensitive to the 0/360 seam."""
         return np.maximum(np.abs(lat_a - lat_b), np.abs((lon_a - lon_b + 180.0) % 360.0 - 180.0))
 
-    # The four vertices in index order: the corner shared with the previous cell
-    # in both directions, then along i, then the far corner, then along j.
     best = None
     for first in range(4):
         for winding in (1, -1):
@@ -108,15 +86,6 @@ def _corners_from_vertices(vertex_lat, vertex_lon):
 def _open_grid_file(experiment, model, preferred_variable, grid_point="tracer"):
     """
     One of a model's files, opened for its grid geometry alone.
-
-    The field being regridded is often a DERIVED one — a mixed layer depth, a
-    nutricline, a trend map — whose name is no CMIP6 variable, so asking for a
-    file of that name fails. The variable it was derived from (recorded in its
-    `cmip6_variable` attribute) is tried first. Only TRACER-point variables can
-    stand in for one another: on the staggered grids of CESM2 and
-    MPI-ESM1-2-LR, uo/vo/umo/vmo sit on velocity points offset from the tracer
-    points, so a velocity-point field has no substitute and must be described by
-    its own file.
     """
     if grid_point == "velocity":
         candidates = [preferred_variable]
@@ -165,13 +134,6 @@ def _regular_grid(lat, lon, with_bounds):
 def _source_grid(data, method):
     """
     The grid `data` sits on, described the way xESMF wants it.
-
-    A rectilinear field is described from its own coordinates, so a spatial
-    subset regrids just as well as a global field. A curvilinear model is taken
-    from its own grid file instead: conservative regridding needs the corner
-    mesh, which only the file carries, and the centres must come from the same
-    place and in the same longitude convention as the corners or the cells they
-    describe are not the model's cells.
     """
     y_dim, x_dim = _horizontal_dims(data)
     needs_bounds = method == "conservative"
@@ -287,10 +249,7 @@ def _get_regridder(source_grid, target_grid, method, periodic):
                 "Regridding needs xESMF (with ESMPy). Install it with "
                 "'conda install -c conda-forge xesmf'."
             ) from exc
-        # A model grid closes on itself over the Arctic, and the cells along that
-        # fold collapse to zero area. ESMF refuses to build conservative weights
-        # when it meets one, which would fail the whole regridding over a handful
-        # of cells; they are skipped instead and simply contribute nothing.
+        
         _REGRIDDER_CACHE[key] = xesmf.Regridder(
             source_grid, target_grid, method, periodic=periodic, ignore_degenerate=True,
             unmapped_to_nan=True,
@@ -301,19 +260,13 @@ def _get_regridder(source_grid, target_grid, method, periodic):
 @register_tools(
     name="regrid_horizontal",
     description="Put a field on another horizontal grid so two products can be compared cell by cell.\n"
-        "A difference map, a pattern correlation or an RMSE needs both fields on the same cells. Model "
-        "grids are often curvilinear, with index dimensions that are not geographic, and observational "
-        "products come on grids of their own; moving one onto the other is what makes them comparable.\n"
-        "Regrid only for the cell-by-cell comparison. An average, a trend or an integral belongs on the "
-        "field's own grid with its own cell areas, because regridding replaces those with the target's.\n"
-        "Regrid the GLOBAL field and subset afterwards. 'conservative' reads the source grid's geometry "
-        "from the dataset's own file, which describes the whole grid, so a curvilinear field already cut "
-        "to a box can no longer be located on it and is refused; 'bilinear' works from the field's own 2-D "
-        "coordinates and does accept one.\n"
-        "Horizontal vector components (uo, vo, umo, vmo) of CESM2 and MPI-ESM1-2-LR are refused: they are "
-        "x-ward/y-ward along the model's grid lines, not eastward/northward, and sit on velocity points "
-        "rather than tracer points. Work with them on the native grid.\n"
-        "The result carries the target grid's identity, so later weighting uses the target's cell areas.",
+        "Regrid the GLOBAL field and subset afterwards. 'conservative' reads the source grid's "
+        "geometry from the dataset's own file, which describes the whole grid, so a curvilinear field "
+        "already cut to a box can no longer be located on it and is refused; 'bilinear' works from the "
+        "field's own 2-D coordinates and does accept one.\n"
+        "Horizontal vector components (uo, vo, umo, vmo) of CESM2 and MPI-ESM1-2-LR are refused.\n"
+        "The result carries the target grid's identity, so later weighting uses the target's cell "
+        "areas.",
     args={
         "data": "xr.DataArray, required. The field to move, on a regular or a curvilinear grid. Other "
             "dimensions (time, depth) pass through untouched. It must still carry the attrs its loader set, "
@@ -321,12 +274,11 @@ def _get_regridder(source_grid, target_grid, method, periodic):
         "target": "str or xr.DataArray, optional, default 'woa23'. The grid to move onto: a registered "
             "observational grid by name ('woa23', '1deg', 'glodap', 'seanoe_mld', 'ersst'), or a DataArray "
             "on a regular grid to use as a template. The target must be rectilinear.",
-        "method": "str, optional, default 'conservative'. 'conservative' area-averages the source cells "
-            "that overlap each target cell, conserving the field's area integral; it is the right choice "
-            "going to a coarser grid and before any area-weighted step. 'bilinear' interpolates between "
-            "cell centres, and is the fallback when a model's corner mesh is unusable. 'nearest_s2d' "
-            "copies the nearest source cell, for masks and other categorical fields. 'patch' is a "
-            "higher-order smooth interpolation.",
+        "method": "str, optional, default 'conservative'. 'conservative' area-averages the source "
+            "cells that overlap each target cell, conserving the field's area integral; it needs the "
+            "source grid's corner mesh. 'bilinear' interpolates between cell centres and needs no "
+            "corner mesh. 'nearest_s2d' copies the nearest source cell. 'patch' is a higher-order "
+            "smooth interpolation.",
         "skipna": "bool, optional, default True. Ignore missing cells instead of letting them spread. Land "
             "is missing in every ocean field, so with skipna=False every coastal target cell comes back "
             "empty.",
@@ -335,10 +287,9 @@ def _get_regridder(source_grid, target_grid, method, periodic):
             "valid data contributes)."
     },
     returns="xr.DataArray on the target grid, with ('lat', 'lon') in place of the source's horizontal "
-        "dimensions and everything else unchanged. Missing data stays missing. attrs record the method and "
-        "the source grid, and carry the TARGET grid's identity so later weighting uses the target's areas. "
-        "State the method whenever a regridded RMSE or pattern correlation is quoted: the number depends "
-        "on it."
+        "dimensions and everything else unchanged. Missing data stays missing. attrs record the method "
+        "and the source grid, and carry the TARGET grid's identity so later weighting uses the "
+        "target's areas."
 )
 def regrid_horizontal(data: xr.DataArray, target="woa23", method: str = "conservative",
                       skipna: bool = True, na_thres: float = 0.5) -> xr.DataArray:
@@ -351,9 +302,6 @@ def regrid_horizontal(data: xr.DataArray, target="woa23", method: str = "conserv
         raise ValueError(f"na_thres must lie between 0 and 1, got {na_thres}.")
     component = data.attrs.get("vector_component")
     if component and data.attrs.get("grid_type") == "curvilinear":
-        # CMOR's sea_water_x/y_velocity and ocean_mass_x/y_transport run along
-        # the model's grid lines, not east and north, and a scalar regrid of one
-        # component on its own cannot turn it (Griffies et al. 2016, OMIP C3).
         raise ValueError(
             f"This field is the {component}-ward component of a vector on {data.attrs.get('model')}'s "
             f"curvilinear grid ({data.attrs.get('cmip6_variable', data.name)}). It points along the model's "
@@ -368,23 +316,14 @@ def regrid_horizontal(data: xr.DataArray, target="woa23", method: str = "conserv
     source_grid, (y_dim, x_dim), source_note = _source_grid(data, method)
     target_grid, identity, target_name = _target_grid(target, method)
 
-    # ESMF wraps the source grid round the globe only when told to, and a
-    # longitude subset must not be wrapped: its two edges are not neighbours.
-    # Conservative regridding intersects cells and needs no wrapping at all.
     span = float(np.nanmax(source_grid["lon"].values) - np.nanmin(source_grid["lon"].values))
     periodic = method != "conservative" and span > 350.0
 
     regridder = _get_regridder(source_grid, target_grid, method, periodic)
 
-    # xESMF matches the field to the grid by the shape of its last two
-    # dimensions, so the horizontal pair has to be the trailing one.
     ordered = data.transpose(*[d for d in data.dims if d not in (y_dim, x_dim)], y_dim, x_dim)
     regridded = regridder(ordered, keep_attrs=True, skipna=skipna, na_thres=na_thres)
 
-    # The field now lives on the target's cells, so it must answer to the
-    # target's grid identity: areas_like and the weighted means read these attrs
-    # to decide which cell areas to use, and leaving the source's behind would
-    # weight a 1-degree field with a curvilinear model's areacello.
     source_identity = ", ".join(
         f"{key}={data.attrs[key]}" for key in ("source_dataset", "model", "experiment", "grid_type")
         if key in data.attrs
@@ -401,14 +340,7 @@ def regrid_horizontal(data: xr.DataArray, target="woa23", method: str = "conserv
     return regridded
 
 
-# Which WOA23 basin codes make up each ocean. The three great oceans are codes
-# 1-3, but the mask gives every marginal sea and deep basin a code of its own,
-# so an "Atlantic" written as code 1 alone quietly drops the Gulf of Mexico, the
-# Caribbean, the Mediterranean and the whole north-west Atlantic shelf. The
-# groupings below fold each marginal sea into the ocean it opens onto; they are
-# reported in the result's attrs so a basin mean can be reproduced exactly.
-# The Southern and Arctic Oceans stay separate: they are oceans in their own
-# right, and folding them into their neighbours would double-count them.
+# Which WOA23 basin codes make up each ocean.
 BASIN_GROUPS = {
     "Atlantic": {
         "main": [1],
@@ -464,11 +396,6 @@ def _basin_codes(basin, include_marginal_seas):
                if include_marginal_seas else ", main basin only; marginal seas excluded")
         )
         if key in ("Atlantic", "Pacific", "Indian"):
-            # WOA23 gives the Southern and Arctic Oceans codes of their own, so
-            # the three main oceans stop at their boundaries. A basin number
-            # changes with that choice as much as with the marginal seas, and
-            # other partitions (OMIP's region mask, or the Atlantic-Arctic /
-            # Indo-Pacific split used for overturning) draw it differently.
             description += ("; the Southern Ocean (WOA23 code 10) and the Arctic Ocean (code 11) are "
                             "separate basins and are NOT included")
         return codes, description
@@ -486,16 +413,14 @@ def _basin_codes(basin, include_marginal_seas):
 @register_tools(
     name="select_basin",
     description="Keep the part of a field that lies in one ocean basin and blank the rest.\n"
-        "This is what a per-basin number needs — an Atlantic mean, a Pacific bias, an Indian Ocean RMSE. "
-        "It masks a field you already have, so a difference, a trend map or any other computed quantity "
-        "can be split by basin, which a loader that cuts a region while reading cannot do.\n"
-        "Marginal seas each carry their own code in the mask, so an ocean taken as its main code alone "
-        "silently excludes a large part of what the name usually means. They are folded into the ocean "
-        "they open onto by default; either choice is defensible as long as it is stated, and the codes "
-        "used are recorded in the result.\n"
+        "This is what a per-basin number needs — an Atlantic mean, a Pacific bias, an Indian Ocean "
+        "RMSE. It masks a field you already have, so a difference, a trend map or any other computed "
+        "quantity can be split by basin, which a loader that cuts a region while reading cannot do.\n"
+        "Marginal seas each carry their own code in the mask. By default they are folded into the "
+        "ocean they open onto; the codes used are recorded in the result.\n"
         "The mask is defined on a 1-degree grid but is carried onto whatever grid the field is on by "
-        "nearest cell, so a curvilinear model can be split on its own grid and weighted with its own cell "
-        "areas, with no regridding.",
+        "nearest cell, so a curvilinear model can be split on its own grid and weighted with its own "
+        "cell areas, with no regridding.",
     args={
         "data": "xr.DataArray, required. Any field with horizontal dimensions — loaded, derived or "
             "differenced. It must still carry the attrs its loader set, which is how its grid is "
@@ -507,16 +432,15 @@ def _basin_codes(basin, include_marginal_seas):
             "sub-basins into it. Ignored when a single named sea or explicit codes are requested. The "
             "Southern and Arctic Oceans are always separate basins, never folded into their neighbours.",
         "depth_dependent": "bool, optional, default False. The mask labels every standard level "
-            "separately, because a marginal sea stops at its sill and below that depth the water belongs "
-            "to the open ocean. False applies the surface labels through the whole water column, which is "
-            "what a named ocean usually means. True applies each level's own labels, which is what a "
-            "water-mass analysis wants; the field must then have a 'depth' dimension."
+            "separately: a marginal sea's label stops at its sill, and below that depth the water "
+            "carries the open ocean's code. False applies the surface labels through the whole water "
+            "column; True applies each level's own labels, and the field must then have a 'depth' "
+            "dimension."
     },
     returns="xr.DataArray with the same dimensions, coordinates and grid as the input, and everything "
-        "outside the basin set to NaN. Because the grid is untouched, a later area-weighted mean uses the "
-        "same cell areas as the global field and masks them to the basin automatically. attrs record "
-        "'basin', 'basin_codes' and 'basin_definition' — state the definition with any basin number, "
-        "because it is part of the answer."
+        "outside the basin set to NaN. Because the grid is untouched, a later area-weighted mean uses "
+        "the same cell areas as the global field and masks them to the basin automatically. attrs "
+        "record 'basin', 'basin_codes' and 'basin_definition'."
 )
 def select_basin(data: xr.DataArray, basin, include_marginal_seas: bool = True,
                  depth_dependent: bool = False) -> xr.DataArray:
@@ -554,8 +478,7 @@ def select_basin(data: xr.DataArray, basin, include_marginal_seas: bool = True,
     in_basin = codes_on_grid.isin(codes)
 
     if "depth" in in_basin.dims:
-        # mask_1deg_to_grid works one horizontal field at a time, so the levels
-        # are carried across one by one and stacked back together.
+        # mask_1deg_to_grid works one horizontal field at a time, so the levels are carried across one by one and stacked back together.
         levels = [
             mask_1deg_to_grid(in_basin.isel(depth=i), data, grid_type, lat_coord, lon_coord)
             for i in range(in_basin.sizes["depth"])
@@ -585,14 +508,9 @@ _NAMED_DEPTH_TARGETS = ("glodap", "woa23")
 
 @register_tools(
     name="regrid_vertical",
-    description="Interpolate a field onto another set of depth levels so profiles can be compared level by "
-        "level.\n"
-        "Vertical grids differ between products, and rarely line up. A bias asked for 'at 100, 500 and "
-        "1000 m' cannot be answered by selecting levels, because each product would answer at a different "
-        "depth, and those differ most where the gradients are steepest.\n"
-        "This is for comparison, not for budgets: an integral or a volume-weighted mean belongs on the "
-        "field's own levels with its own layer thicknesses, because interpolation does not conserve the "
-        "vertical integral.",
+    description="Interpolate a field onto another set of depth levels so profiles can be compared "
+        "level by level.\n"
+        "Interpolation does not conserve the vertical integral.",
     args={
         "data": "xr.DataArray, required. A field with a 'depth' dimension in metres, positive downward. "
             "Other dimensions pass through untouched.",
@@ -603,8 +521,8 @@ _NAMED_DEPTH_TARGETS = ("glodap", "woa23")
             "levels, which suits a smooth profile. 'nearest' takes the closer level without averaging, for "
             "a mask or a categorical field.",
         "fill_surface": "bool, optional, default True. Give target depths above the field's shallowest "
-            "level that level's value, since a model's first level is its surface. Nothing is ever "
-            "extrapolated downwards: below a column's deepest valid level the result is missing."
+            "level that level's value. Nothing is ever extrapolated downwards: below a column's "
+            "deepest valid level the result is missing."
     },
     returns="xr.DataArray on the target levels, with every other dimension, coordinate and the grid "
         "identity unchanged. Missing below each column's deepest valid level, and wherever a gap in the "
@@ -645,12 +563,18 @@ def regrid_vertical(data: xr.DataArray, target="glodap", method: str = "linear",
     if np.any(levels < 0):
         raise ValueError(f"Depths are positive downward; {levels[levels < 0].tolist()} are negative.")
 
-    # interp needs the whole profile in one chunk, and a lazily-read model field
-    # is chunked along time, not depth, so only this axis is gathered.
+    # interp needs the whole profile in one chunk, and a lazily-read model field is chunked along time, not depth, so only this axis is gathered.
     if data.chunks is not None and len(data.chunksizes.get("depth", ())) > 1:
         data = data.chunk({"depth": -1})
 
     interpolated = data.interp(depth=levels, method=method, kwargs={"fill_value": np.nan})
+
+    native = np.asarray(data["depth"].values, dtype="float64")
+    on_level = [lv for lv in levels if np.any(np.isclose(native, lv, rtol=0.0, atol=1e-6))]
+    if on_level:
+        exact = data.sel(depth=on_level, method="nearest").assign_coords(depth=on_level)
+        exact = exact.reindex(depth=levels)
+        interpolated = exact.where(exact.notnull(), interpolated)
 
     shallowest = float(np.asarray(data["depth"].values).min())
     surface_note = "no extrapolation"
@@ -690,36 +614,27 @@ def _mask_horizontal_dims(field, index):
 @register_tools(
     name="build_comparison_mask",
     description="Build the one set of cells on which several fields can be scored against each other.\n"
-        "A model is only comparable with an observation, or with another model, where BOTH have data, and "
-        "several models are only rankable against each other where ALL of them do. Left to itself each "
-        "pair covers a different set of cells, so a bias, an RMSE or a pattern correlation from one pair "
-        "describes a different piece of ocean from the next and the ranking between them means nothing. "
-        "This returns a single mask to apply to every field before the metrics are taken.\n"
-        "Give it the fields already on a common grid: regrid first, because cells can only be intersected "
-        "once they are the same cells. Curvilinear index dimensions (nlat/nlon, j/i) are refused for that "
-        "reason.\n"
-        "It is for fields on DIFFERENT grids. Two fields already sharing one grid - an operator diagnostic "
-        "against its own model's published field - need no intersection: use `a.notnull() & b.notnull()`, "
-        "or require every time step valid with `.mean(dim, skipna=False)`. Reaching for this tool there "
-        "only imports a grid check that cannot pass on a curvilinear model.\n"
-        "With ocean_only it also drops the cells the WOA23 land-sea mask calls land. That mask is NOT a "
-        "0/1 field — 1 means land and ocean is (value > 1) — which is the usual way this step is got "
-        "wrong; the check is done here so it does not have to be written out each time.\n"
-        "ocean_only defaults to True and is right only when WOA23 IS part of the comparison. It is "
-        "applied whenever the fields share the WOA23 1-degree geometry, which GLODAP and any other "
-        "1-degree product also do, so a GLODAP-against-models comparison silently inherits WOA23's "
-        "coastline. That costs about 900 cells, nearly all of them on the Antarctic shelf where GLODAP "
-        "has data and WOA23 calls it land, and because those are the hardest cells to match it makes "
-        "every model look better than it is. Pass ocean_only=False when the reference is not WOA23.",
+        "It returns a single mask, True where every field given has data, to apply to each field "
+        "before the metrics are taken.\n"
+        "Give it the fields already on a common grid: regrid first, because cells can only be "
+        "intersected once they are the same cells. Curvilinear index dimensions (nlat/nlon, j/i) are "
+        "refused for that reason.\n"
+        "It is for fields on DIFFERENT grids. Two fields already sharing one grid - an operator "
+        "diagnostic against its own model's published field - need no intersection: use `a.notnull() & "
+        "b.notnull()`, or require every time step valid with `.mean(dim, skipna=False)`. Reaching for "
+        "this tool there only imports a grid check that cannot pass on a curvilinear model.\n"
+        "With ocean_only (the default) it also drops the cells the WOA23 land-sea mask calls land, "
+        "reading that mask the right way: it is NOT a 0/1 field, 1 means land and ocean is (value > "
+        "1). The check is made on the grid: it is applied whenever the fields share the WOA23 1-degree "
+        "geometry, which GLODAP and any other 1-degree product also do.",
     args={
         "fields": "list[xr.DataArray], required. Two or more fields, all on the same rectilinear grid, "
             "usually a model climatology regridded onto an observational grid together with the "
             "observational field itself. A cell survives only where every one of them has data.",
         "ocean_only": "bool, optional, default True. Also require the cell to be ocean in the WOA23 "
-            "1-degree land-sea mask. Use True when WOA23 is one of the fields; pass False otherwise, "
-            "including for GLODAP, because the check is on the GRID and any 1-degree product passes it, "
-            "so a comparison WOA23 takes no part in is silently scored on WOA23's ocean. It is skipped, "
-            "with a note in attrs, only on a grid that is not 1-degree.",
+            "1-degree land-sea mask. The check is on the GRID, so it applies to the fields of any "
+            "1-degree product, whether or not WOA23 is among them; it is skipped, with a note in "
+            "attrs, only on a grid that is not 1-degree.",
         "extra_mask": "xr.DataArray, optional. A further boolean condition to intersect, on the same "
             "grid — a basin, a latitude band, a depth-sufficiency test. False or NaN cells are dropped.",
         "reduce_other_dims": "str, optional, default 'all'. What to do when a field carries time or depth "
@@ -728,11 +643,9 @@ def _mask_horizontal_dims(field, index):
             "somewhere. Pass a field already reduced to a map to avoid the question."
     },
     returns="xr.DataArray of booleans with dims (lat, lon) on the shared grid, True on the cells every "
-        "field covers. Apply it with .where(mask) to each field before measuring, so that every metric "
-        "and every model rests on an identical sample.\n"
-        "attrs record how many cells each field contributed, how many survived and what was intersected, "
-        "which is worth quoting alongside the metrics: a mask much smaller than the individual fields "
-        "means the products disagree about where the ocean is, not that the models are poor."
+        "field covers. Apply it with .where(mask) to each field before measuring.\n"
+        "attrs record how many cells each field contributed, how many survived and what was "
+        "intersected."
 )
 def build_comparison_mask(fields: list, ocean_only: bool = True, extra_mask: xr.DataArray = None,
                           reduce_other_dims: str = "all") -> xr.DataArray:
@@ -788,8 +701,6 @@ def build_comparison_mask(fields: list, ocean_only: bool = True, extra_mask: xr.
 
     ocean_note = "not requested"
     if ocean_only:
-        # Imported here rather than at module import time, because the mask is
-        # read from a file and most regridding never needs it.
         from src.tools.data_loader import load_landsea_mask
         landsea = load_landsea_mask()
         if (np.array_equal(np.asarray(mask["lat"].values), np.asarray(landsea["lat"].values))
@@ -799,12 +710,7 @@ def build_comparison_mask(fields: list, ocean_only: bool = True, extra_mask: xr.
             mask = mask & (landsea > 1)
             dropped = before_ocean - int(mask.sum())
             ocean_note = f"WOA23 landsea_01, ocean = (value > 1); it removed {dropped} cells"
-            # The guard above compares COORDINATES, so any product on the same
-            # 1-degree geometry passes it - GLODAP among them. Applying WOA23's
-            # coastline to a comparison WOA23 takes no part in silently scores the
-            # models on someone else's ocean, and it drops the Antarctic shelf,
-            # which is where the hardest cells are. Say so rather than leave it in
-            # an attr nobody reads.
+
             sources = {str(f.attrs.get("source_dataset", "")).lower() for f in fields}
             if dropped and not any("woa" in s for s in sources):
                 ocean_note += (" - WARNING: no input field comes from WOA23, so this is a third "
@@ -851,8 +757,7 @@ def build_comparison_mask(fields: list, ocean_only: bool = True, extra_mask: xr.
         ),
         **notes,
     }
-    # The metrics taken afterwards weight by cell area, which they find through
-    # the grid identity the loaders attached; carry it across from the fields.
+    
     for field in fields:
         for attr in PROVENANCE_ATTRS:
             if attr in field.attrs and attr not in mask.attrs:

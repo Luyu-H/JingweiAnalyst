@@ -1,14 +1,52 @@
 import json
-from typing import Dict, Any
+from typing import Dict
 
 
 class PromptTemplates:
     """Collection of all prompt templates for the agent."""     
     
     @staticmethod
-    def get_planning_prompt(language: str, tool_overview: Dict, data_overview: Dict, context_summary: str) -> str:
-
+    def get_planning_prompt(language: str, tool_overview: Dict, data_overview: Dict, context_summary: str,
+                            knowledge: str = "") -> str:
+        """
+        Build the planning system prompt.
+        """
         if language == 'zh':
+            knowledge_block = f"""
+为本问题检索到的领域知识（按 [片段id] (severity) 分组）：
+<domain_knowledge>
+{knowledge}
+</domain_knowledge>
+""" if knowledge else ""
+            plan_rules = """
+计划的写法：
+1. 计划写成编号步骤，每一步写明需要哪些数据、变量、模式和工具；最后写一节 "Other notes:"，每条一行，
+   只放答案必须声明的注意事项。
+2. 不要自行添加计算约束。步骤里用到的每个定义、权重、掩膜、阈值、插值、筛选或订正，都必须来自问题，
+   或来自上面给出的材料（数据集说明、工具说明，以及领域知识——如果有的话）；它们都没有写的，不要自己
+   设计（例如额外的掩膜、按部分层厚加权、筛选阈值）。
+3. 优先使用工具：上面列出的工具能完成的步骤，计划用该工具及其算子，不要手写计算；只有没有工具覆盖的
+   部分才计划自己写代码。
+4. 中间量不要四舍五入：后面的步骤使用前面步骤未经取整的结果，只在报告数值时按问题要求的精度取整。
+5. 步骤、步骤下的注意事项和 Other notes 全部写在 <plan> 标签内；标签外的内容不会传给后续步骤。
+"""
+            knowledge_rules = """
+领域知识的使用规则：
+1. 优先级：用户在问题里明确给出的定义和步骤最优先，其次是数据集说明与工具说明，最后才是知识片段。
+   知识片段用来决定问题没有规定的选择、找出需要说明的注意事项；某个片段与问题规定的做法冲突时，
+   照问题的做法执行，并把差异写进 Other notes，让最终答案能够解释。
+2. 在某条知识【第一次起作用】的那一步下面加一行 "- 注意 [片段id]：……"，写出它能直接
+   执行的内容（公式、阈值、单位换算、工具参数或检查方法）。整个计划中每个片段只能有【一行】这样的注意
+   事项（在某一步下或在 Other notes 中，二者选一）。后面的步骤若也依赖它，只在该步的正文里写上
+   "[片段id]"，不要再加注意事项行，也不要复述内容——下一步会读到整个计划。不要把知识原文抄进计划。
+3. Other notes 中还要写出问题定义与协议定义的差异；来自知识片段的条目格式为 "- [片段id] ……"。
+4. severity 为 must 的片段都必须至少引用一次（在某一步或 Other notes 中）。severity 为 should 或 info
+   的片段若最终没有用上，可以不写。
+""" if knowledge else ""
+            plan_format = ("<plan>编号步骤：每一步需要哪些数据、变量、模式和工具，步骤下列出对应的知识注意事项，"
+                           "最后是 Other notes</plan>" if knowledge else
+                           "<plan>编号步骤：每一步需要哪些数据、变量、模式和工具，最后是 Other notes</plan>")
+
             return f"""你是一个海洋科学数据分析助手，支持对话历史功能。
 
 {context_summary}
@@ -18,7 +56,7 @@ class PromptTemplates:
 
 可用数据集：
 {json.dumps(data_overview, indent=2, ensure_ascii=False)}
-
+{knowledge_block}
 数据选择规则：
 1. <selected_data> 里只能填上面出现的数据集 ID（如 woa23、cmip6_historical），不要填文件路径，
    也不要自己拼接变量名。一个数据集 ID 下含多个变量，CMIP6 还含多个模式，这些在下一步选择。
@@ -30,9 +68,9 @@ class PromptTemplates:
    load_data_with_geolocator 三者之一（命名海域用 load_data_with_geolocator），没有别的读取入口。
    cpc_indices 这类已发布的指数序列也走 load_regular_data，用 product 选序列、variable 选区域。
 5. 区域平均、全球平均不要自己手算权重，选 compute_basic_stat 并使用其加权算子。
-
+{plan_rules}{knowledge_rules}
 分析用户的问题并选择合适的数据和工具。严格按照以下格式输出：
-<plan>关于需要哪些数据、变量、模式和工具的逐步推理</plan>
+{plan_format}
 <selected_data>您将使用的数据集 ID，用逗号分隔</selected_data>
 <selected_tools>您将使用的工具名称，用逗号分隔</selected_tools>
 
@@ -40,6 +78,51 @@ class PromptTemplates:
 """
         
         else:  # English
+            knowledge_block = f"""
+Domain knowledge retrieved for this question (grouped by [fragment-id] (severity)):
+<domain_knowledge>
+{knowledge}
+</domain_knowledge>
+""" if knowledge else ""
+            plan_rules = """
+How to write the plan:
+1. Write the plan as numbered steps, each naming the datasets, variables, models and tools it needs.
+   End it with an "Other notes:" section, one line each, holding only the caveats the answer must
+   state.
+2. Add no computational constraint of your own. Every definition, weighting, mask, threshold,
+   interpolation, filter or correction a step applies must come from the question or from what is
+   given above (the dataset and tool descriptions, and any domain knowledge); do not devise one that
+   none of them states (an extra mask, a partial-layer weighting, a screening threshold).
+3. Prefer the tools: when a listed tool performs a step, plan that tool and its operator rather than a
+   hand-written computation; plan your own code only for what no tool covers.
+4. Do not round intermediate values: later steps use the unrounded results of earlier ones, and a
+   value is rounded only where it is reported, to the precision the question asks for.
+5. The steps, any notes under them and Other notes all go inside the <plan> tags; nothing outside them
+   is passed on to the later steps.
+"""
+            knowledge_rules = """
+How to use the domain knowledge:
+1. Priority: definitions and procedures the user states explicitly in the question come first, the
+   dataset and tool descriptions second, the knowledge fragments last. Use the fragments to settle
+   choices the question leaves open and to find the caveats that must be stated. When a fragment
+   conflicts with what the question prescribes, follow the question and record the difference under
+   Other notes so the answer can explain it.
+2. Under the step where a piece of knowledge FIRST matters, add one line "- Note [fragment-id]: ..."
+   carrying what to do (the formula, threshold, unit conversion, tool argument or check). Each
+   fragment gets exactly ONE such note line in the whole plan, under a step or under Other notes, not
+   both. A later step that also depends on it names "[fragment-id]" inline in its own text, with no
+   further note line and no restatement - the next stage reads the whole plan. Do not copy the
+   knowledge text into the plan.
+3. Other notes also hold the differences between the question's definition and the protocol; a line
+   that comes from a fragment takes the form "- [fragment-id] ...".
+4. Cite every fragment of severity must at least once, in a step or under Other notes. Fragments of
+   severity should or info that end up unused may be left out.
+""" if knowledge else ""
+            plan_format = ("<plan>numbered steps: the datasets, variables, models and tools each step needs, "
+                           "with the knowledge notes under each step, then Other notes</plan>" if knowledge else
+                           "<plan>numbered steps: the datasets, variables, models and tools each step needs, "
+                           "then Other notes</plan>")
+
             return f"""You are an oceanographic data analysis assistant with conversation history support.
 
 {context_summary}
@@ -49,7 +132,7 @@ Available tools:
 
 Available datasets:
 {json.dumps(data_overview, indent=2)}
-
+{knowledge_block}
 Data selection rules:
 1. <selected_data> must contain dataset IDs exactly as listed above (e.g. woa23, cmip6_historical).
    Never put a file path there, and never invent a name. One dataset ID holds many variables, and
@@ -66,9 +149,9 @@ Data selection rules:
    load_regular_data, with 'product' choosing the series and 'variable' the region.
 5. Do not plan to compute area or volume weights by hand: select compute_basic_stat and use its
    weighted operators.
-
+{plan_rules}{knowledge_rules}
 Analyze the user's question and select appropriate data and tools. Follow this format strictly:
-<plan>step-by-step reasoning about which datasets, variables, models and tools are needed</plan>
+{plan_format}
 <selected_data>comma-separated list of dataset IDs you will use</selected_data>
 <selected_tools>comma-separated list of tool names you will use</selected_tools>
 
@@ -81,18 +164,174 @@ IMPORTANT: Your response MUST contain all required XML tags, and tags must be pr
             return f"用户问题：{user_query}\n\n现在输出您的推理和选择。"
         else:
             return f"User question: {user_query}\n\nNow output your reasoning and selections."
-    
+
+    @staticmethod
+    def get_knowledge_selection_prompt(language: str, candidates, context_summary: str,
+                                       max_selected: int) -> str:
+        """
+        Build the system prompt for choosing knowledge fragments before planning.
+        """
+        rows = []
+        for c in candidates:
+            matched = "; ".join(f"{k}: {', '.join(map(str, v))}" for k, v in c.get("signals", {}).items())
+            rows.append(f"- {c['id']} | {c['type']} | {c['severity']} | score {c['score']}"
+                        f"{' | matched ' + matched if matched else ''}\n  {c['summary']}")
+        catalogue = "\n".join(rows)
+        context_block = f"\n{context_summary}\n" if context_summary else ""
+
+        if language == 'zh':
+            return f"""你负责在制定分析计划之前，从项目知识库中挑出与用户问题相关的知识片段。
+{context_block}
+候选片段（id | 类型 | severity | 词法预筛分数 | 命中的词；下一行是摘要）：
+{catalogue}
+
+severity 含义：must = 忽略会算出错误的数值；should = 忽略会导致误导性的比较或解读；info = 解读结果的背景。
+
+选择规则：
+1. 选可能改变这道题的做法或结论表述的片段：它约束某个计算步骤（单位、加权、定义、网格、时间平均的
+   顺序），或者答案必须声明它带来的注意事项。
+2. 依据摘要判断片段是否适用，不要依据词语重合。预筛分数只是参考：问题提到某个词，不代表那个片段适用。
+3. 这一步的目标是不漏：下一步会通读所选片段的全文，删掉不适用的部分。拿不准某个 must 或 should 片段
+   是否适用时，选上它；所有数据处理都会遇到的通用事项，排在针对本题变量、数据集和方法的片段之后。
+4. 最多选 {max_selected} 个。一个都不适用时，输出空标签。
+5. 不准编造：只能从上面的候选列表中选 id；理由只能依据该片段的摘要和问题原文，不要把摘要没有写的内容
+   归到片段名下，也不要声称问题里写了它没写的东西。
+
+严格按以下格式输出，每行一个片段，冒号后写一句适用理由：
+<selected_knowledge>
+片段id: 理由
+</selected_knowledge>
+"""
+        else:
+            return f"""Before an analysis is planned, you choose the fragments of the project's knowledge base that
+apply to the user's question.
+{context_block}
+Candidate fragments (id | type | severity | lexical prefilter score | matched terms; the summary follows):
+{catalogue}
+
+Severity: must = ignoring it produces a wrong number; should = ignoring it produces a misleading
+comparison or interpretation; info = background for interpreting the result.
+
+Selection rules:
+1. Choose the fragments that may change how this question is computed or how its result must be
+   stated: the fragment constrains a computation step (units, weighting, a definition, the grid, the
+   order of time averaging), or the answer has to state the caveat it raises.
+2. Judge applicability from the summary, not from word overlap. The prefilter score is a hint only:
+   a question mentioning a word does not make the fragment about that word apply.
+3. The aim of this step is not to miss: the next step reads the full text of what you choose and
+   drops what does not apply. When unsure whether a must or should fragment applies, include it.
+   Rank generic points that every data read runs into below fragments about this question's own
+   variables, datasets and methods.
+4. Choose at most {max_selected}. If none applies, output the tags empty.
+5. Invent nothing: choose only ids from the candidate list above, and ground each reason in that
+   fragment's summary and the question's own words. Do not attribute to a fragment anything its
+   summary does not say, and do not claim the question says something it does not.
+
+Follow this format strictly, one fragment per line, with a one-sentence reason after the colon:
+<selected_knowledge>
+fragment-id: reason
+</selected_knowledge>
+"""
+
+    @staticmethod
+    def get_knowledge_selection_input(language: str, user_query: str) -> str:
+        if language == 'zh':
+            return f"用户问题：{user_query}\n\n现在输出选中的知识片段。"
+        else:
+            return f"User question: {user_query}\n\nNow output the fragments you choose."
+
+    @staticmethod
+    def get_knowledge_condense_prompt(language: str, sources: str, context_summary: str,
+                                      max_notes: int, max_chars: int) -> str:
+        """
+        Build the system prompt that condenses the selected fragments into notes.
+
+        sources is the full text of each selected fragment, headed by its id. The
+        planner sees only the notes, so they carry what to do, not why. Numbers and
+        `names` are to be quoted: src/docs/knowledge_retrieval.py checks every one
+        against the fragment and the question, and a fragment whose notes fail falls
+        back to its summary.
+        """
+        context_block = f"\n{context_summary}\n" if context_summary else ""
+
+        if language == 'zh':
+            return f"""你负责把知识片段压缩成简短的注意事项，交给数据分析的规划步骤。规划步骤只看得到你写的注意事项，看不到片段原文。
+{context_block}
+为本问题选出的片段（每段以 [片段id] 开头）：
+<fragments>
+{sources}
+</fragments>
+
+规则：
+1. 每个片段只保留会改变【这道题】的计算方式或结论表述的内容。每个片段最多 {max_notes} 条，每条一行，
+   最重要的一条写在最前面。
+2. 每条都要能直接执行：写出要用的公式、阈值、单位换算、加权方式、工具参数或检查方法，或者答案必须
+   声明的注意事项。不写背景、不写原文的论证，也不写本题不涉及的变量、模式或步骤。
+3. 不准编造，内容必须服从片段原文：每条注意事项都要能在片段原文中找到依据；不要添加片段没有说的数字、
+   工具参数、规则或例外，也不要写与原文相反的结论。数字、公式、变量名和工具名按片段原文照抄，变量名和
+   工具名放在反引号里。可以引用问题本身定义的量（问题里的阈值、时段、区域）。
+4. 只有当问题原文确实写出了与片段不同的定义或步骤时，才写一条说明：按问题的做法执行，并在答案中说明
+   差异；这条说明要引用问题的原话。问题没有写到的地方，按片段执行，不要声称"问题规定了"什么。
+5. 读完全文后发现某个片段不适用于本题，写 "[片段id] 不适用：原因"，不要为它写注意事项。
+6. 全部输出控制在约 {max_chars} 个字符以内。
+
+严格按以下格式输出：
+<knowledge_notes>
+[片段id]
+- 注意事项
+- 注意事项
+[片段id] 不适用：原因
+</knowledge_notes>
+"""
+        else:
+            return f"""You condense knowledge fragments into short notes for the planning step of a data analysis. The
+planner sees only your notes, not the fragments.
+{context_block}
+Fragments selected for this question (each headed by its [fragment-id]):
+<fragments>
+{sources}
+</fragments>
+
+Rules:
+1. For each fragment keep only what changes how THIS question is computed or how its result must be
+   stated. Write at most {max_notes} notes per fragment, one line each, the most important first.
+2. Each note is actionable: the formula, threshold, unit conversion, weighting, tool argument or check
+   to apply, or the caveat the answer must state. Leave out background, the source's reasoning, and
+   points about variables, models or steps this question does not involve.
+3. Invent nothing; the notes must follow the fragment text. Every note must be backed by what the
+   fragment says: add no number, tool argument, rule or exception the fragment does not contain, and
+   never state the opposite of what it says. Copy numbers, formulas, variable names and tool names
+   exactly as the fragment writes them, and put variable and tool names in backticks. You may refer
+   to quantities the question itself defines (its thresholds, periods, regions).
+4. Only where the question's text actually states a definition or procedure that differs from the
+   fragment, write a note saying so, quoting the question's words: the question's version is
+   followed and the difference is stated in the answer. Where the question is silent, follow the
+   fragment, and never claim the question prescribes something it does not say.
+5. If, having read it, a fragment does not apply to this question, write
+   "[fragment-id] not applicable: <reason>" and no notes for it.
+6. Keep the whole answer under about {max_chars} characters.
+
+Follow this format strictly:
+<knowledge_notes>
+[fragment-id]
+- note
+- note
+[fragment-id] not applicable: reason
+</knowledge_notes>
+"""
+
+    @staticmethod
+    def get_knowledge_condense_input(language: str, user_query: str) -> str:
+        if language == 'zh':
+            return f"用户问题：{user_query}\n\n现在输出压缩后的注意事项。"
+        else:
+            return f"User question: {user_query}\n\nNow write the notes."
+
     @staticmethod
     def get_code_generation_prompt(language: str, full_specs: Dict, user_query: str,
                                    dataset_specs: Dict, conventions: Dict, plan: str = "") -> str:
         """
         Build the code-generation system prompt.
-
-        dataset_specs carries the full registry entry of every dataset the planning
-        step picked (variables, models, time span, climatology period), and
-        conventions carries the registry's cross-dataset rules. Without them this
-        step would only see tool signatures and would have to guess which model or
-        variable names actually exist.
         """
         dataset_ids = list(dataset_specs.keys())
 
@@ -163,7 +402,9 @@ IMPORTANT: Your response MUST contain all required XML tags, and tags must be pr
   `vmax = float(np.nanpercentile(np.abs(np.concatenate([...])), 98))`，绝不要取绝对值最大值。
   近岸或边缘海常有比信号大一个量级的单点，`vmax = nanmax(abs(...))` 会把整个色标让给那一个格点，
   于是每个子图都渲染成一片空白。差值/距平用以零为中心的发散色图，量值用顺序色图；若做了截断，
-  在色标标签里说明。
+  用 `extend='both'`（或 'max'/'min'）让色标两端显示箭头，并在图标题里说明截断方式。
+- 色标标签只写物理量和单位，例如 "SSS bias (psu)"，控制在 40 个字符以内。竖直色标的标签比色标本身长时，
+  保存的图片里两端会被裁掉。截断分位数、"共用色标"、数据来源等说明写进总标题或子图标题，不要写进色标标签。
 - 给多个子图共用的 colorbar (`fig.colorbar(..., ax=axes)`) 之后，不要再调用 tight_layout()：
   它不知道这个 colorbar 的存在，会把子图铺到 colorbar 上。要么用
   `plt.subplots(..., constrained_layout=True)` 且完全不调 tight_layout，要么在添加 colorbar 之前调。
@@ -172,6 +413,13 @@ IMPORTANT: Your response MUST contain all required XML tags, and tags must be pr
 - 曲线网格上的场，其二维坐标并不叫 lat/lon。请用 `da.attrs.get("lat_coord", "lat")` /
   `da.attrs.get("lon_coord", "lon")` 读出坐标名，不要直接索引 `da.coords["lat"]`——
   在 CESM2 和 MPI-ESM1-2-LR 上会抛 KeyError。
+- 画曲线网格上的场（CESM2、MPI-ESM1-2-LR 的原生输出）的地图时，先用
+  `regrid_horizontal(field, target="woa23")` 放到规则网格上（仅用于显示，所有汇报的数值仍在原生网格上算），
+  再用一维 lon/lat 画 `pcolormesh`。不要把它的二维坐标直接交给 `pcolormesh`/`contourf`：模式经度在网格
+  接缝处回绕跳变，会把场抹成横向条带并画错位置。
+- 画跨日界线的区域（如北太平洋 110E-100W、赤道太平洋 120E-280E）时，用连续的 0-360 经度轴：仅为作图，
+  对规则网格场的副本做 `p = da.assign_coords(lon=da.lon % 360).sortby("lon")`，再把 x 轴范围设成该区域。
+  在 -180..180 的经度轴上，这个区域会被劈成子图两端的两条，中间一大片空白。
 - 只要结果还有可展示的维度就必须给出 <visualize>：时间序列、季节循环、垂向廓线、空间分布图、
   多组对比，都属于此列，即使用户没有明说要图也要画。只有当答案就是一个标量或一张几行的表格、
   确实无图可画时，才把 <visualize> 留空。
@@ -257,8 +505,12 @@ Important:
   absolute value. A single coastal or marginal-sea cell is routinely an order of magnitude larger
   than the signal, and `vmax = nanmax(abs(...))` then hands the whole scale to that one cell so
   every panel renders as uniform white. Use a diverging map centred on zero for a difference or
-  anomaly and a sequential map for a magnitude, and say in the colourbar label when values are
-  clipped.
+  anomaly and a sequential map for a magnitude. When values are clipped, pass `extend='both'` (or
+  'max'/'min') so the colourbar shows arrows, and say how they were clipped in the figure title.
+- Keep a colourbar label to the quantity and its units, e.g. "SSS bias (psu)", under about 40
+  characters. A vertical colourbar label longer than the bar is cut off at both ends in the saved
+  image. Notes such as the clipping percentile, "shared scale" or the data source go in the figure
+  or panel title, never in the colourbar label.
 - Do NOT call tight_layout() after attaching a colorbar to several axes (`fig.colorbar(..., ax=axes)`)
   — it does not know about that colorbar and will lay the panels over it. Either build the figure
   with `plt.subplots(..., constrained_layout=True)` and add no tight_layout at all, or call
@@ -268,6 +520,16 @@ Important:
 - A field on a curvilinear grid has 2-D coordinates that are NOT called lat/lon. Read the names off
   the array with `da.attrs.get("lat_coord", "lat")` / `da.attrs.get("lon_coord", "lon")` rather than
   indexing `da.coords["lat"]`, which raises KeyError on CESM2 and MPI-ESM1-2-LR.
+- To map a field on a curvilinear grid (CESM2 or MPI-ESM1-2-LR native output), first put it on a
+  regular grid with `regrid_horizontal(field, target="woa23")` (for display only; every reported
+  number stays on the native grid) and draw it with `pcolormesh` on the 1-D lon/lat. Do not hand its
+  2-D coordinates to `pcolormesh`/`contourf`: the model longitude wraps and jumps at the grid seam,
+  which smears the field into horizontal bands and puts it in the wrong place.
+- To map a region that crosses the dateline (the North Pacific 110E-100W, the equatorial Pacific
+  120E-280E), use a continuous 0-360 longitude axis: for the plot only, on a copy of the regular-grid
+  field, `p = da.assign_coords(lon=da.lon % 360).sortby("lon")`, then set the x limits to the region.
+  On a -180..180 axis the region is split into two strips at the panel's edges with empty space
+  between them.
 - Provide a <visualize> block whenever the result still has something to show — a time series, a
   seasonal cycle, a depth profile, a spatial map, or several groups to compare — even when the
   question does not ask for a figure in so many words. Leave it empty only when the answer is a
@@ -287,12 +549,6 @@ Important:
                        upstream_code: str = "", available_variables: Dict = None) -> str:
         """
         Build the repair prompt for one failed code block.
-
-        Only the failed block is rewritten, so the repair step is shown the code
-        that ran before it and the variables that code left in the namespace.
-        Without them a broken visualization block can only guess what `mean_o2`
-        was, and the usual repair is to recompute it - which silently answers the
-        question a second time, by a different route, in the plotting step.
         """
         upstream_block = ""
         variables_block = ""
