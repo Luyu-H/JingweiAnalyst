@@ -1,0 +1,975 @@
+# exchange 5: solution
+# elapsed: 43.0 s
+
+===== SYSTEM =====
+
+The user's question:
+Check whether a mixed layer depth (MLD) computed from each CMIP6 model's own temperature and salinity reproduces the mlotst field that the same model publishes. This is an internal consistency test: both quantities come from the same simulation, so any disagreement is a property of the diagnostic, not of the model's physics.
+
+Data to use:
+- CMIP6 historical `thetao`, `so` and `mlotst` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12.
+- Each model's own published cell areas (areacello).
+
+Expected numerical results, comparing the 1971-2000 March and September climatologies of the operator MLD with those of the published mlotst, for each of the six model-and-month combinations. The operator MLD is the mixed layer depth computed offline from the model's own thetao and so with the density criterion that defines mlotst, the crossing depth interpolated between the bracketing levels. For each model and calendar month, both climatologies cover only the cells where both fields are defined in all 30 instances of that month (the 30 Marches, or the 30 Septembers):
+- The mean difference, operator MLD minus mlotst, in metres to 1 decimal place.
+- The root-mean-square difference, in metres to 1 decimal place.
+- The spatial Pearson correlation between the two fields, to 3 decimal places.
+- The percentage of the area where both fields are defined on which the absolute difference exceeds 20 m, to 1 decimal place, and the area where both fields are defined as a percentage of the model's total ocean area, to 1 decimal place.
+- The ranking of the three models from most to least internally consistent, with the criterion used, the regions where the disagreement concentrates, and why the operator and mlotst are not expected to agree exactly.
+
+Expected visualizations:
+- Figure 1, a 3-by-2 panel of global maps of operator MLD minus mlotst, rows CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, columns March and September, all six panels drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only) with one shared diverging colour scale centred on zero.
+- Figure 2, a 3-by-2 panel of scatter plots in the same layout, operator MLD on the x axis against mlotst on the y axis, one point per ocean cell, with logarithmic axes of identical range and ticks in every panel, a dashed y = x reference line, and each panel annotated with its bias, root-mean-square difference and correlation.
+
+The analysis plan:
+1. Load the data with `load_regular_data` from cmip6_historical, for each of CESM2, GFDL-ESM4 and MPI-ESM1-2-LR. Variables are `thetao`, `so` and `mlotst`, monthly, 1971-01 to 2000-12, global. Each model's own `areacello` is needed for the area weights (the question names it explicitly).
+   - Note [cmip6-grid-labels]: GFDL-ESM4 is on the regridded `gr` grid, and CESM2 and MPI-ESM1-2-LR are on `gn`. Compare each model on its own grid with its own `areacello`. Use `regrid_horizontal` only to put curvilinear fields on a regular lon-lat grid for the Figure 1 maps, not for any metric.
+   - Note [missing-values-and-land-cells]: Build each field's valid mask from the field itself, because the `thetao`, `so` and `mlotst` masks can differ within a model. Use NaN-aware reductions. A value near 1e20 means an unmasked fill value.
+
+2. Use `load_depth_levels` for each model to get its shallowest level, which is the `ref_depth`. Use `load_areas` to obtain `areacello` for the area weights and for the total ocean area. Use `load_volumes_for_cmip6` only if a cell-volume field is needed for masking.
+
+3. Compute the operator MLD for every monthly March and September profile (30 of each per model), using `compute_mixed_layer_depth` on `thetao` and `so`. The criterion is a density increase of 0.03 kg m-3, with the crossing depth interpolated between the bracketing levels.
+   - Note [cmip6-mlotst-definition]: Use 0.03 kg m-3 and set `ref_depth` to each model's shallowest level, not the 10 m default. Compute the MLD of each monthly profile first, then average the MLDs over the 30 Marches or Septembers. Never average T and S first. Exclude columns where no crossing is found and report how much area this removes. The models encode no-crossing columns differently (GFDL-ESM4 and MPI give roughly the full column depth, CESM2 gives 0 m in many Arctic-shelf cells), so do not use a single fill value.
+   - Note [cmip6-thetao-potential-temperature]: `thetao` is potential temperature, so use the potential-temperature route for density.
+   - Note [cmip6-so-practical-salinity]: `so` is Practical Salinity, so do not rescale it. Convert S_P to S_A before any gsw routine that expects S_A.
+   - Note [monthly-means-are-time-averages]: The operator MLD is computed from monthly-mean states, while `mlotst` is the time mean of instantaneous diagnostics, so say which order was used. Do the climatologies with `temporal_aggregate` (climatological-monthly, a plain mean over years), not with `compute_basic_stat(op='mean')`.
+
+4. Build the 1971-2000 March and September climatologies of the operator MLD and of `mlotst`, per model, with `temporal_aggregate`.
+   - Note [common-comparison-mask]: Use `build_comparison_mask` with `ocean_only=False` to select the cells where both fields are valid in all 30 instances of that month. Apply it to both fields with `.where(mask)` before any metric. Report the mask cell count, the mask area, and its share of the model's total ocean area.
+
+5. Compute the metrics for each of the six model-month combinations on the shared mask.
+   - Note [omip-weighted-means-and-integrals]: Use `compute_difference_metrics` (operator MLD minus `mlotst`, area-weighted by the model's own `areacello`) for the mean difference and the RMSE. Report `mean_data`/`mean_reference` and the bias. Use `analyze_correlation` with `weighting='area'` for the spatial Pearson correlation. The coverage is a percentage of the model's total ocean area.
+   - Note [missing-values-and-land-cells]: Use `compute_exceedance_fraction` with an area basis and a threshold of |difference| > 20 m for the percentage of shared area. The denominator is the area where both fields are defined.
+   - Report the mean difference and RMSE in m to 1 dp, the correlation to 3 dp, and both percentages to 1 dp.
+
+6. Rank the models from most to least internally consistent. Use RMSE (with correlation and the >20 m area share as supporting criteria), and state the criterion. Locate where the disagreement concentrates, using `locate_extreme` and the difference maps (for example deep-convection and sea-ice regions such as the Southern Ocean, the North Atlantic and the Arctic shelves). Use `select_basin` with `load_basin_mask` if a basin breakdown is needed.
+
+7. Make Figure 1, a 3×2 panel of global maps of the difference (rows CESM2, GFDL-ESM4, MPI-ESM1-2-LR, columns March and September). Use a common lon-lat frame, with curvilinear fields regridded for display only, and one shared diverging colour scale centred on zero.
+
+8. Make Figure 2, a 3×2 scatter panel, with operator MLD on x and `mlotst` on y, one point per shared-mask ocean cell. Use log axes with identical range and ticks in every panel, a dashed y = x line, and an annotation of bias, RMSE and correlation in each panel.
+
+Other notes:
+- State that the operator MLD was computed from monthly-mean thetao and so, whereas `mlotst` is the time mean of instantaneous diagnostics, and that the operator is nonlinear, so exact agreement is not expected. Other reasons for disagreement are the vertical interpolation and the reference depth, the equation-of-state differences, and the encoding of no-crossing columns.
+- Report the area removed by excluding no-crossing columns for each model.
+- Report the mask size and coverage for each model-month, since a small mask means the products disagree about where data are defined.
+
+The code that actually ran and produced the results below:
+<executed_code>
+ds = "cmip6_historical"
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+month_names = {3: "March", 9: "September"}
+time_range = ["1971-01", "2000-12"]
+basins = ["Atlantic", "Pacific", "Indian", "Southern", "Arctic"]
+BIG = 1e10  # anything above this is an unmasked fill value (about 1e20)
+
+results = {}        # (model, month name) -> dict of reported numbers
+diff_native = {}    # native-grid difference fields (shared mask applied)
+diff_map = {}       # difference regridded to a regular grid, for display only
+scatter = {}        # (model, month name) -> (x, y) arrays, one point per shared cell
+model_info = {}     # per-model reference depth and total ocean area
+basin_tables = {}
+
+for model in models:
+    levels, bounds = load_depth_levels(dataset=ds, model=model, variable="thetao")
+    ref_depth = float(np.asarray(levels)[0])  # shallowest level of this model
+
+    thetao = load_regular_data(dataset=ds, variable="thetao", model=model, time_range=time_range)
+    so = load_regular_data(dataset=ds, variable="so", model=model, time_range=time_range)
+    mlotst = load_regular_data(dataset=ds, variable="mlotst", model=model, time_range=time_range)
+    if "depth" in mlotst.dims:
+        mlotst = mlotst.isel(depth=0, drop=True)
+
+    # put so on thetao's vertical grid only if the two differ
+    if (so.sizes["depth"] != thetao.sizes["depth"]) or (
+            not np.allclose(so["depth"].values, thetao["depth"].values)):
+        so = so.interp(depth=thetao["depth"])
+
+    # the model's own areacello, on the model's own grid
+    area = load_areas(dataset=ds, model=model, variable="thetao")
+    total_area = float(area.sum().compute())
+    model_info[model] = {"ref_depth_m": ref_depth, "total_ocean_area_m2": total_area,
+                         "area_source": area.attrs.get("area_source")}
+
+    for mnum, mname in month_names.items():
+        idx = np.flatnonzero(thetao["time"].dt.month.values == mnum)
+        t_m = thetao.isel(time=idx)
+        s_m = so.isel(time=idx)
+        idx2 = np.flatnonzero(mlotst["time"].dt.month.values == mnum)
+        mlot_m = mlotst.isel(time=idx2)
+        assert len(idx) == 30 and len(idx2) == 30
+
+        # MLD of each monthly-mean profile (density criterion 0.03 kg m-3, reference depth = shallowest level)
+        mld = compute_mixed_layer_depth(t_m, s_m, ref_depth=ref_depth, method="density",
+                                        density_threshold=0.03, temperature_type="auto").compute()
+        mld = mld.where(mld < BIG)
+        mlot_m = mlot_m.where(mlot_m < BIG).compute()
+        mlot_m = mlot_m.assign_coords(time=mld["time"])
+        mld = mld.assign_attrs({**mlot_m.attrs, "units": "m", "long_name": "operator MLD (sigma0 +0.03)"})
+
+        # area removed by excluding no-crossing columns (ocean at the surface in all 30 months, but no crossing found)
+        ocean_surf = t_m.isel(depth=0).notnull().all("time").compute()
+        nocross = ocean_surf & mld.isnull().any("time")
+        nocross_area = float(area.where(nocross).sum().compute())
+
+        # climatologies: MLD of each monthly profile first, then the mean over the 30 instances
+        mld_clim = temporal_aggregate(mld, freq="mean").compute()
+        mlot_clim = temporal_aggregate(mlot_m, freq="mean").compute()
+
+        # shared mask: both fields valid in all 30 instances (same grid per model, so no regridding needed)
+        mask = (mld.notnull() & mlot_m.notnull()).all("time")
+        a = mld_clim.where(mask)
+        b = mlot_clim.where(mask)
+        mask_cells = int(mask.sum().compute())
+        mask_area = float(area.where(mask).sum().compute())
+
+        met = compute_difference_metrics(a, b)  # operator MLD minus mlotst, area-weighted by own areacello
+        diff = met["difference"]
+        corr = analyze_correlation(a, b, dim=["lat", "lon"], weighting="area")
+        exc = compute_exceedance_fraction(diff, threshold=20.0, comparison="abs_greater", dim=["lat", "lon"])
+        ext = locate_extreme(diff, op="abs_max")
+
+        # basin breakdown of the disagreement
+        rows = []
+        for bname in basins:
+            dB = select_basin(diff, basin=bname)
+            if int(dB.notnull().sum().compute()) == 0:
+                continue
+            mB = float(compute_basic_stat(dB, op="area_weighted_mean", dim=["lat", "lon"]).compute())
+            r2 = float(compute_basic_stat(dB ** 2, op="area_weighted_mean", dim=["lat", "lon"]).compute())
+            eB = compute_exceedance_fraction(dB, threshold=20.0, comparison="abs_greater", dim=["lat", "lon"])
+            rows.append({"basin": bname, "mean_diff_m": mB, "rmse_m": float(np.sqrt(r2)),
+                         "pct_area_abs_diff_gt_20m": float(eB["fraction_percent"]),
+                         "area_Mkm2": float(eB["total_amount"]) / 1e12})
+        basin_tables[(model, mname)] = pd.DataFrame(rows)
+
+        key = (model, mname)
+        results[key] = {
+            "mean_diff_m": float(met["bias"]),
+            "rmse_m": float(met["rmse"]),
+            "centered_rmse_m": float(met["centered_rmse"]),
+            "mean_operator_m": float(met["mean_data"]),
+            "mean_mlotst_m": float(met["mean_reference"]),
+            "corr": float(corr["correlation"]),
+            "pct_abs_diff_gt_20m": float(exc["fraction_percent"]),
+            "mask_cells": mask_cells,
+            "mask_area_m2": mask_area,
+            "mask_pct_of_ocean_area": 100.0 * mask_area / total_area,
+            "nocross_area_removed_m2": nocross_area,
+            "nocross_area_removed_pct_of_ocean": 100.0 * nocross_area / total_area,
+            "std_ratio": float(met["std_ratio"]),
+            "max_abs_diff_m": ext["value"],
+            "max_abs_diff_where": ext["coordinates"],
+            "n_valid": met["n_valid"],
+        }
+        diff_native[key] = diff
+
+        # regrid for display only (all numbers above remain on the native grid)
+        diff_map[key] = regrid_horizontal(diff, target="woa23", method="conservative").compute()
+
+        # scatter data: one point per shared-mask cell; log axes need positive values
+        xv = a.values.ravel()
+        yv = b.values.ravel()
+        ok = np.isfinite(xv) & np.isfinite(yv)
+        pos = ok & (xv > 0) & (yv > 0)
+        scatter[key] = (xv[pos], yv[pos])
+        results[key]["n_points_scatter"] = int(pos.sum())
+        results[key]["n_points_nonpositive_dropped_from_scatter"] = int(ok.sum() - pos.sum())
+
+    del thetao, so, mlotst
+
+summary = pd.DataFrame(results).T
+summary.index.names = ["model", "month"]
+
+# ranking: mean RMSE over the two months (criterion), correlation and >20 m share as supporting criteria
+rank_tbl = summary.reset_index().groupby("model")[["rmse_m", "corr", "pct_abs_diff_gt_20m", "mean_diff_m"]].mean()
+rank_tbl = rank_tbl.sort_values("rmse_m")
+rank_tbl["rank"] = np.arange(1, len(rank_tbl) + 1)
+ranking_criterion = ("Lowest mean (March, September) area-weighted RMSE of operator MLD minus mlotst on the shared mask; "
+                     "higher correlation and a smaller >20 m area share are supporting criteria.")
+
+caveats = ("Operator MLD is computed from monthly-mean thetao and so, whereas mlotst is the time mean of instantaneous "
+           "diagnostics; the MLD criterion is nonlinear, so exact agreement is not expected. Other causes: vertical "
+           "interpolation and reference depth, equation-of-state differences, and differing encodings of no-crossing columns.")
+
+print(pd.DataFrame(model_info).T)
+print(summary.round(3).to_string())
+print(rank_tbl.round(3))
+print(ranking_criterion)
+print(caveats)
+for k, v in basin_tables.items():
+    print(k)
+    print(v.round(2).to_string(index=False))
+
+# --- visualization ---
+keys = [(m, mn) for m in models for mn in ["March", "September"]]
+
+# ---------- Figure 1: difference maps ----------
+pooled = np.concatenate([np.abs(diff_map[k].values.ravel()) for k in keys])
+vmax = float(np.nanpercentile(pooled, 98))
+fig1, axes1 = plt.subplots(3, 2, figsize=(14, 11), constrained_layout=True)
+mesh = None
+for i, m in enumerate(models):
+    for j, mn in enumerate(["March", "September"]):
+        ax = axes1[i, j]
+        d = diff_map[(m, mn)]
+        ax.set_facecolor("0.85")
+        mesh = ax.pcolormesh(d["lon"].values, d["lat"].values, d.values, cmap="RdBu_r",
+                             vmin=-vmax, vmax=vmax, shading="auto")
+        ax.set_xlim(-180, 180)
+        ax.set_ylim(-90, 90)
+        ax.set_aspect("equal")
+        r = results[(m, mn)]
+        ax.set_title(f"{m}, {mn}  (bias {r['mean_diff_m']:.1f} m, RMSE {r['rmse_m']:.1f} m)", fontsize=10)
+        if j == 0:
+            ax.set_ylabel("Latitude (°N)")
+        if i == 2:
+            ax.set_xlabel("Longitude (°E)")
+cb = fig1.colorbar(mesh, ax=axes1, orientation="horizontal", fraction=0.04, pad=0.03, extend="both")
+cb.set_label("Operator MLD - mlotst (m)")
+fig1.suptitle(f"Operator MLD minus mlotst, 1971-2000 climatology, shared mask "
+              f"(colour scale clipped at the 98th percentile of |difference| = {vmax:.0f} m)", fontsize=12)
+
+# ---------- Figure 2: scatter plots ----------
+lim = (1, 1e4)
+ticks = [1, 10, 100, 1000, 10000]
+fig2, axes2 = plt.subplots(3, 2, figsize=(10, 14), constrained_layout=True)
+for i, m in enumerate(models):
+    for j, mn in enumerate(["March", "September"]):
+        ax = axes2[i, j]
+        x, y = scatter[(m, mn)]
+        ax.scatter(x, y, s=1, alpha=0.25, color="tab:blue", rasterized=True)
+        ax.plot(lim, lim, "k--", lw=1)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlim(lim)
+        ax.set_ylim(lim)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        ax.set_xticklabels([str(t) for t in ticks])
+        ax.set_yticklabels([str(t) for t in ticks])
+        ax.set_aspect("equal")
+        r = results[(m, mn)]
+        ax.text(0.04, 0.96, f"bias = {r['mean_diff_m']:.1f} m\nRMSE = {r['rmse_m']:.1f} m\nr = {r['corr']:.3f}",
+                transform=ax.transAxes, va="top", ha="left", fontsize=9,
+                bbox=dict(facecolor="white", alpha=0.85, edgecolor="0.6"))
+        ax.set_title(f"{m}, {mn}", fontsize=10)
+        ax.set_xlabel("Operator MLD (m)")
+        ax.set_ylabel("mlotst (m)")
+        ax.grid(True, which="major", alpha=0.3)
+fig2.suptitle("mlotst vs operator MLD, one point per shared-mask ocean cell", fontsize=12)
+</executed_code>
+
+Here are the results of code execution:
+
+Status Summary:
+- Computation: Success
+- Visualization: Generated
+
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "ds": "cmip6_historical",
+      "models": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "month_names": {
+        "3": "March",
+        "9": "September"
+      },
+      "time_range": [
+        "1971-01",
+        "2000-12"
+      ],
+      "basins": [
+        "Atlantic",
+        "Pacific",
+        "Indian",
+        "Southern",
+        "Arctic"
+      ],
+      "BIG": 10000000000.0,
+      "results": {
+        "('CESM2', 'March')": {
+          "mean_diff_m": -4.483843293921109,
+          "rmse_m": 7.452441564755171,
+          "centered_rmse_m": 5.952649316027003,
+          "mean_operator_m": 56.115082104623525,
+          "mean_mlotst_m": 60.59892539854464,
+          "corr": 0.9978563842713027,
+          "pct_abs_diff_gt_20m": 2.653375893755566,
+          "mask_cells": 82360,
+          "mask_area_m2": 347588616257536.0,
+          "mask_pct_of_ocean_area": 96.41535784573558,
+          "nocross_area_removed_m2": 12923069005824.0,
+          "nocross_area_removed_pct_of_ocean": 3.5846465171301234,
+          "std_ratio": 0.9923756309587677,
+          "max_abs_diff_m": -372.87397794030664,
+          "max_abs_diff_where": {
+            "lat": 59.71015313359534,
+            "lon": -58.58602289971043,
+            "nlat": 351.0,
+            "nlon": 301.0
+          },
+          "n_valid": 82360,
+          "n_points_scatter": 82360,
+          "n_points_nonpositive_dropped_from_scatter": 0
+        },
+        "('CESM2', 'September')": {
+          "mean_diff_m": -2.5805905026366576,
+          "rmse_m": 5.1050289056558515,
+          "centered_rmse_m": 4.40475567561774,
+          "mean_operator_m": 71.64872659107529,
+          "mean_mlotst_m": 74.22931709371196,
+          "corr": 0.9979417727427462,
+          "pct_abs_diff_gt_20m": 0.1619942417696506,
+          "mask_cells": 84146,
+          "mask_area_m2": 352793713967104.0,
+          "mask_pct_of_ocean_area": 97.85916622960447,
+          "nocross_area_removed_m2": 7717970247680.0,
+          "nocross_area_removed_pct_of_ocean": 2.140837842403518,
+          "std_ratio": 1.0274729489322534,
+          "max_abs_diff_m": -51.2325007227972,
+          "max_abs_diff_where": {
+            "lat": -75.48100513760106,
+            "lon": -56.31249154912547,
+            "nlat": 8.0,
+            "nlon": 306.0
+          },
+          "n_valid": 84146,
+          "n_points_scatter": 84146,
+          "n_points_nonpositive_dropped_from_scatter": 0
+        },
+        "('GFDL-ESM4', 'March')": {
+          "mean_diff_m": -9.556836456901824,
+          "rmse_m": 21.423158619019645,
+          "centered_rmse_m": 19.173382455544335,
+          "mean_operator_m": 31.968852249852013,
+          "mean_mlotst_m": 41.52568870675385,
+          "corr": 0.9454333853147623,
+          "pct_abs_diff_gt_20m": 6.269374069982517,
+          "mask_cells": 42122,
+          "mask_area_m2": 351071331418112.0,
+          "mask_pct_of_ocean_area": 97.21980526938256,
+          "nocross_area_removed_m2": 10039628660736.0,
+          "nocross_area_removed_pct_of_ocean": 2.7802063456193418,
+          "std_ratio": 0.9640388959549165,
+          "max_abs_diff_m": 814.171376834003,
+          "max_abs_diff_where": {
+            "lat": 54.5,
+            "lon": -10.5
+          },
+          "n_valid": 42122,
+          "n_points_scatter": 42122,
+          "n_points_nonpositive_dropped_from_scatter": 0
+        },
+        "('GFDL-ESM4', 'September')": {
+          "mean_diff_m": -8.019875664561384,
+          "rmse_m": 14.277462182648813,
+          "centered_rmse_m": 11.812176827539751,
+          "mean_operator_m": 46.57593151173542,
+          "mean_mlotst_m": 54.5958071762968,
+          "corr": 0.9870122049569224,
+          "pct_abs_diff_gt_20m": 7.5045815315917235,
+          "mask_cells": 43259,
+          "mask_area_m2": 355866393968640.0,
+          "mask_pct_of_ocean_area": 98.5476694545149,
+          "nocross_area_removed_m2": 5244533080064.0,
+          "nocross_area_removed_pct_of_ocean": 1.4523330136729944,
+          "std_ratio": 1.0498049083791343,
+          "max_abs_diff_m": 432.4582416723267,
+          "max_abs_diff_where": {
+            "lat": -37.5,
+            "lon": 139.5
+          },
+          "n_valid": 43259,
+          "n_points_scatter": 43259,
+          "n_points_nonpositive_dropped_from_scatter": 0
+        },
+        "('MPI-ESM1-2-LR', 'March')": {
+          "mean_diff_m": -2.544039273114794,
+          "rmse_m": 6.823263240789414,
+          "centered_rmse_m": 6.331254628224478,
+          "mean_operator_m": 44.32168881495747,
+          "mean_mlotst_m": 46.86572808807227,
+          "corr": 0.9947716097372672,
+          "pct_abs_diff_gt_20m": 1.538802918531541,
+          "mask_cells": 32978,
+          "mask_area_m2": 349568663289856.0,
+          "mask_pct_of_ocean_area": 96.75298532641912,
+          "nocross_area_removed_m2": 11731464093696.0,
+          "nocross_area_removed_pct_of_ocean": 3.2470135126889663,
+          "std_ratio": 1.0395054706746438,
+          "max_abs_diff_m": -433.69010489650293,
+          "max_abs_diff_where": {
+            "j": 57.0,
+            "i": 96.0,
+            "latitude": 53.95812561288555,
+            "longitude": -51.7878125135465
+          },
+          "n_valid": 32978,
+          "n_points_scatter": 32978,
+          "n_points_nonpositive_dropped_from_scatter": 0
+        },
+        "('MPI-ESM1-2-LR', 'September')": {
+          "mean_diff_m": -2.432872808176709,
+          "rmse_m": 14.31573206478162,
+          "centered_rmse_m": 14.107491431977,
+          "mean_operator_m": 69.60463373634042,
+          "mean_mlotst_m": 72.03750654451713,
+          "corr": 0.9831789392508199,
+          "pct_abs_diff_gt_20m": 3.489694253110857,
+          "mask_cells": 34894,
+          "mask_area_m2": 352539841134592.0,
+          "mask_pct_of_ocean_area": 97.57534258152457,
+          "nocross_area_removed_m2": 8760269471744.0,
+          "nocross_area_removed_pct_of_ocean": 2.4246516140158847,
+          "std_ratio": 1.001638969401242,
+          "max_abs_diff_m": -697.8056783589495,
+          "max_abs_diff_where": {
+            "j": 192.0,
+            "i": 45.0,
+            "latitude": -72.18304424314971,
+            "longitude": -139.0802324083832
+          },
+          "n_valid": 34894,
+          "n_points_scatter": 34894,
+          "n_points_nonpositive_dropped_from_scatter": 0
+        }
+      },
+      "diff_native": {
+        "('CESM2', 'March')": {
+          "type": "DataArray",
+          "dims": {
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "cmip6_historical",
+          "size": 122880,
+          "n_valid": 82360,
+          "min": -372.87397794030664,
+          "max": 166.23394779419834,
+          "mean": -4.083143898469786,
+          "std": 6.374185316280147
+        },
+        "('CESM2', 'September')": {
+          "type": "DataArray",
+          "dims": {
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "cmip6_historical",
+          "size": 122880,
+          "n_valid": 84146,
+          "min": -51.2325007227972,
+          "max": 20.11679636586163,
+          "mean": -2.439295158124862,
+          "std": 4.067819538839342
+        },
+        "('GFDL-ESM4', 'March')": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "cmip6_historical",
+          "size": 64800,
+          "n_valid": 42122,
+          "min": -626.5736912502297,
+          "max": 814.171376834003,
+          "mean": -9.522105375081578,
+          "std": 21.038809993028607
+        },
+        "('GFDL-ESM4', 'September')": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "cmip6_historical",
+          "size": 64800,
+          "n_valid": 43259,
+          "min": -196.9634319890334,
+          "max": 432.4582416723267,
+          "mean": -7.564249662614537,
+          "std": 12.896806387640105
+        },
+        "('MPI-ESM1-2-LR', 'March')": {
+          "type": "DataArray",
+          "dims": {
+            "j": 220,
+            "i": 254
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "cmip6_historical",
+          "size": 55880,
+          "n_valid": 32978,
+          "min": -433.69010489650293,
+          "max": 173.45800839847914,
+          "mean": -2.15352904340209,
+          "std": 13.504610990963878
+        },
+        "('MPI-ESM1-2-LR', 'September')": {
+          "type": "DataArray",
+          "dims": {
+            "j": 220,
+            "i": 254
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "cmip6_historical",
+          "size": 55880,
+          "n_valid": 34894,
+          "min": -697.8056783589495,
+          "max": 75.79624045448912,
+          "mean": -4.672967245176077,
+          "std": 19.976582092398107
+        }
+      },
+      "diff_map": {
+        "('CESM2', 'March')": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 40539,
+          "min": -205.582802542996,
+          "max": 114.73395576549784,
+          "mean": -3.968086330469256,
+          "std": 5.556696124008924
+        },
+        "('CESM2', 'September')": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 41564,
+          "min": -32.61582355512954,
+          "max": 19.457240387011524,
+          "mean": -2.33415687243707,
+          "std": 4.015866820939494
+        },
+        "('GFDL-ESM4', 'March')": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 42122,
+          "min": -626.5736912502297,
+          "max": 814.171376834003,
+          "mean": -9.522105375081578,
+          "std": 21.038809993028607
+        },
+        "('GFDL-ESM4', 'September')": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 43259,
+          "min": -196.9634319890334,
+          "max": 432.4582416723267,
+          "mean": -7.564249662614537,
+          "std": 12.896806387640105
+        },
+        "('MPI-ESM1-2-LR', 'March')": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 40687,
+          "min": -191.43479841056939,
+          "max": 115.13425535545541,
+          "mean": -2.2463805593131063,
+          "std": 6.184611107299704
+        },
+        "('MPI-ESM1-2-LR', 'September')": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "operator MLD (sigma0 +0.03)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 41320,
+          "min": -401.9079227851665,
+          "max": 69.15525848717371,
+          "mean": -3.471717324517667,
+          "std": 17.094817790049714
+        }
+      },
+      "scatter": {
+        "('CESM2', 'March')": [
+          {
+            "type": "ndarray",
+            "shape": [
+              82360
+            ],
+            "size": 82360,
+            "n_valid": 82360,
+            "min": 5.162514227826433,
+            "max": 1890.428236429438,
+            "mean": 61.898141367394786,
+            "std": 114.95509207806869
+          },
+          {
+            "type": "ndarray",
+            "shape": [
+              82360
+            ],
+            "size": 82360,
+            "n_valid": 82360,
+            "min": 5.172881126403809,
+            "max": 1903.8141723632812,
+            "mean": 65.98128526586457,
+            "std": 115.75825163487056
+          }
+        ],
+        "('CESM2', 'September')": [
+          {
+            "type": "ndarray",
+            "shape": [
+              84146
+            ],
+            "size": 84146,
+            "n_valid": 84146,
+            "min": 5.176631991358441,
+            "max": 416.67641081389837,
+            "mean": 68.48866239676931,
+            "std": 62.546721383731565
+          },
+          {
+            "type": "ndarray",
+            "shape": [
+              84146
+            ],
+            "size": 84146,
+            "n_valid": 84146,
+            "min": 5.216787099838257,
+            "max": 403.73697967529296,
+            "mean": 70.92795755489419,
+            "std": 60.95571257016214
+          }
+        ],
+        "('GFDL-ESM4', 'March')": [
+          {
+            "type": "ndarray",
+            "shape": [
+              42122
+            ],
+            "size": 42122,
+            "n_valid": 42122,
+            "min": 2.5170435383044363,
+            "max": 1567.256638671965,
+            "mean": 37.64773136041817,
+            "std": 60.692947272013015
+          },
+          {
+            "type": "ndarray",
+            "shape": [
+              42122
+            ],
+            "size": 42122,
+            "n_valid": 42122,
+            "min": 0.9927991151809692,
+            "max": 1563.10146484375,
+            "mean": 47.16983673549974,
+            "std": 62.26439674451179
+          }
+        ],
+        "('GFDL-ESM4', 'September')": [
+          {
+            "type": "ndarray",
+            "shape": [
+              43259
+            ],
+            "size": 43259,
+            "n_valid": 43259,
+            "min": 2.5153469751859063,
+            "max": 664.2550095574973,
+            "mean": 49.8701624657035,
+            "std": 74.36766192885949
+          },
+          {
+            "type": "ndarray",
+            "shape": [
+              43259
+            ],
+            "size": 43259,
+            "n_valid": 43259,
+            "min": 0.9601655781269074,
+            "max": 746.5199869791667,
+            "mean": 57.434412128318044,
+            "std": 71.21015001175854
+          }
+        ],
+        "('MPI-ESM1-2-LR', 'March')": [
+          {
+            "type": "ndarray",
+            "shape": [
+              32978
+            ],
+            "size": 32978,
+            "n_valid": 32978,
+            "min": 6.070026343543001,
+            "max": 1216.9636721756674,
+            "mean": 70.27146033077437,
+            "std": 115.53830070989012
+          },
+          {
+            "type": "ndarray",
+            "shape": [
+              32978
+            ],
+            "size": 32978,
+            "n_valid": 32978,
+            "min": 6.070362917582194,
+            "max": 1168.7266764322917,
+            "mean": 72.42498937417646,
+            "std": 109.95013718791046
+          }
+        ],
+        "('MPI-ESM1-2-LR', 'September')": [
+          {
+            "type": "ndarray",
+            "shape": [
+              34894
+            ],
+            "size": 34894,
+            "n_valid": 34894,
+            "min": 6.053519093924252,
+            "max": 768.8999213935596,
+            "mean": 65.57186605773357,
+            "std": 75.80836358833483
+          },
+          {
+            "type": "ndarray",
+            "shape": [
+              34894
+            ],
+            "size": 34894,
+            "n_valid": 34894,
+            "min": 6.063059457143148,
+            "max": 991.2354305267334,
+            "mean": 70.24483330290964,
+            "std": 80.76732689230387
+          }
+        ]
+      },
+      "model_info": {
+        "CESM2": {
+          "ref_depth_m": 5.0,
+          "total_ocean_area_m2": 360511669534720.0,
+          "area_source": "areacello published by cmip6_historical"
+        },
+        "GFDL-ESM4": {
+          "ref_depth_m": 2.5,
+          "total_ocean_area_m2": 361110918135808.0,
+          "area_source": "areacello published by cmip6_historical"
+        },
+        "MPI-ESM1-2-LR": {
+          "ref_depth_m": 6.0,
+          "total_ocean_area_m2": 361300131577856.0,
+          "area_source": "areacello published by cmip6_historical"
+        }
+      },
+      "basin_tables": {
+        "('CESM2', 'March')": "      basin  mean_diff_m     rmse_m  pct_area_abs_diff_gt_20m   area_Mkm2\n0  Atlantic    -6.073555  12.300531                 11.069630   74.686604\n1   Pacific    -4.806238   6.176465                  0.229431  152.087778\n2    Indian    -3.226450   4.008226                  0.258495   58.926561\n3  Southern    -3.200096   3.408726                  0.000000   44.428857\n4    Arctic    -0.803640   4.714117                  0.810888    9.584049",
+        "('CESM2', 'September')": "      basin  mean_diff_m    rmse_m  pct_area_abs_diff_gt_20m   area_Mkm2\n0  Atlantic    -2.339918  5.318476                  0.253367   76.128379\n1   Pacific    -3.565685  5.444185                  0.085072  153.261479\n2    Indian    -2.662337  6.024668                  0.383396   58.780042\n3  Southern     0.351711  1.905808                  0.009486   44.116256\n4    Arctic    -2.494445  2.703775                  0.000000   11.306530",
+        "('GFDL-ESM4', 'March')": "      basin  mean_diff_m     rmse_m  pct_area_abs_diff_gt_20m   area_Mkm2\n0  Atlantic   -12.687988  34.326980                 15.560286   73.971475\n1   Pacific    -8.596568  17.682203                  5.195256  153.094847\n2    Indian    -7.541342   7.881222                  0.211672   59.130174\n3  Southern   -11.101223  11.849085                  0.848595   44.716469\n4    Arctic   -11.092202  25.887038                 10.891998   10.280127",
+        "('GFDL-ESM4', 'September')": "      basin  mean_diff_m     rmse_m  pct_area_abs_diff_gt_20m   area_Mkm2\n0  Atlantic    -8.921667  12.404350                  7.210127   76.535663\n1   Pacific    -8.916197  11.471150                  5.219797  154.185266\n2    Indian    -7.902810  18.107955                 12.474312   58.859574\n3  Southern    -4.813429  19.964629                 12.093652   43.620330\n4    Arctic    -6.537980   7.183894                  0.715869   11.984367",
+        "('MPI-ESM1-2-LR', 'March')": "      basin  mean_diff_m     rmse_m  pct_area_abs_diff_gt_20m   area_Mkm2\n0  Atlantic    -2.212827  10.567215                  4.087303   73.824557\n1   Pacific    -3.105077   5.784728                  1.088102  152.478201\n2    Indian    -2.688019   3.384744                  0.039876   58.966789\n3  Southern    -0.992633   1.413358                  0.004727   44.947659\n4    Arctic    -1.176739  13.862854                  5.378256    8.980481",
+        "('MPI-ESM1-2-LR', 'September')": "      basin  mean_diff_m     rmse_m  pct_area_abs_diff_gt_20m   area_Mkm2\n0  Atlantic     0.028941   8.915457                  4.395476   75.698153\n1   Pacific    -1.149555   5.584532                  1.492274  153.646113\n2    Indian    -0.984702   6.597104                  1.483291   58.619815\n3  Southern   -13.989096  37.419356                 13.679389   41.841685\n4    Arctic    -1.399864   2.153462                  0.000000   11.815520"
+      },
+      "summary": "                        mean_diff_m  ... n_points_nonpositive_dropped_from_scatter\nmodel         month                  ...                                          \nCESM2         March       -4.483843  ...                                         0\n              September   -2.580591  ...                                         0\nGFDL-ESM4     March       -9.556836  ...                                         0\n              September   -8.019876  ...                                         0\nMPI-ESM1-2-LR March       -2.544039  ...                                         0\n              September   -2.432873  ...                                         0\n\n[6 rows x 18 columns]",
+      "rank_tbl": "                  rmse_m      corr pct_abs_diff_gt_20m mean_diff_m  rank\nmodel                                                                   \nCESM2           6.278735  0.997899            1.407685   -3.532217     1\nMPI-ESM1-2-LR  10.569498  0.988975            2.514249   -2.488456     2\nGFDL-ESM4       17.85031  0.966223            6.886978   -8.788356     3",
+      "ranking_criterion": "Lowest mean (March, September) area-weighted RMSE of operator MLD minus mlotst on the shared mask; higher correlation and a smaller >20 m area share are supporting criteria.",
+      "caveats": "Operator MLD is computed from monthly-mean thetao and so, whereas mlotst is the time mean of instantaneous diagnostics; the MLD criterion is nonlinear, so exact agreement is not expected. Other causes: vertical interpolation and reference depth, equation-of-state differences, and differing encodings of no-crossing columns."
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/claude-sonnet-5-5_kbstripped_full_20261024/T4_claude-sonnet-5-5_20261024_192622/turn01/figures/visualization_T4_claude-sonnet-5-5_20261024_192622_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/claude-sonnet-5-5_kbstripped_full_20261024/T4_claude-sonnet-5-5_20261024_192622/turn01/figures/visualization_T4_claude-sonnet-5-5_20261024_192622_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Please provide a clear scientific summary inside <solution></solution> tags.
+
+Describe the methodology strictly from the <executed_code> above, never by inferring it from variable
+names: the baseline period, the source of any climatology, the weighting, the units, the region and
+time range, the range of lags — all of it must match the tools and arguments the code actually
+called. Do not report a step the code did not take. Where a variable name in the observation is
+ambiguous, the code decides what it means.
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
+4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, tool choice, computation and visualization attempts
+3. Suggestions for how to reformulate the query
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+
+## 1. Direct answer
+
+For all three models, the MLD computed offline from each model's own monthly-mean `thetao` and `so` reproduces the published `mlotst` closely in pattern. Spatial correlations are 0.945–0.998. The operator MLD is systematically shallower than `mlotst`, with a negative mean difference in all six model-month cases. Agreement is best for CESM2 and worst for GFDL-ESM4. The remaining differences concentrate in deep-convection and sea-ice-edge regions.
+
+## 2. What was actually done
+
+- **Data:** `load_regular_data` from `cmip6_historical` for `thetao`, `so` and `mlotst`, monthly, 1971-01 to 2000-12, global. Each model was kept on its own grid, and metrics were never computed on a regridded field. If `mlotst` had a depth dimension, its first level was taken. If `so` was on a different vertical grid from `thetao`, it was interpolated to the `thetao` depths.
+- **Reference depth:** each model's shallowest `thetao` level from `load_depth_levels`.
+  - CESM2: 5.0 m
+  - GFDL-ESM4: 2.5 m
+  - MPI-ESM1-2-LR: 6.0 m
+- **Areas:** `load_areas`, which returns each model's own published `areacello`. Total ocean areas are 3.605×10¹⁴ m² (CESM2), 3.611×10¹⁴ m² (GFDL-ESM4) and 3.613×10¹⁴ m² (MPI-ESM1-2-LR).
+- **Operator MLD:** for each model, the 30 Marches and 30 Septembers were selected. `compute_mixed_layer_depth` was called with `method="density"`, `density_threshold=0.03` (kg m⁻³), `ref_depth` set to the model's shallowest level, and `temperature_type="auto"`. The density and salinity handling is done inside that tool; the script does not convert salinity itself. This was applied to each monthly-mean profile, so **monthly-mean T and S were used and the MLD was computed first**. The 30 MLDs were then averaged with `temporal_aggregate(freq="mean")`, a plain mean over years. `mlotst`, the time mean of instantaneous diagnostics, was averaged over the same 30 months in the same way. Values ≥1e10 (unmasked fill) were set to NaN in both fields.
+- **No-crossing columns:** I take them to be NaN in the tool's output, so they drop out of the mask. The code defines the "area removed" as cells that are ocean at the surface in all 30 months but have a NaN operator MLD in at least one month. The script has no per-model handling of no-crossing encodings (such as 0 m in CESM2). The scatter step found no non-positive values among shared-mask cells (0 dropped).
+- **Shared mask:** a cell is kept only if both the operator MLD and `mlotst` are non-NaN in all 30 instances of that month. This was built directly from the two fields and applied with `.where(mask)`; `build_comparison_mask` was not called. Because both fields are on the same grid within a model, no regridding was needed.
+- **Metrics:**
+  - `compute_difference_metrics(operator, mlotst)` gives bias and RMSE.
+  - `analyze_correlation(..., weighting="area")` gives the spatial correlation.
+  - `compute_exceedance_fraction(diff, threshold=20, comparison="abs_greater")` gives the >20 m share.
+  - Area weights were not passed explicitly in these calls, so the weighting is handled inside the tools.
+  - `locate_extreme(op="abs_max")` finds the largest difference.
+  - `select_basin` with Atlantic, Pacific, Indian, Southern and Arctic gives a basin breakdown.
+
+## 3. Key numerical results (operator MLD − `mlotst`, 1971–2000 climatology, shared mask)
+
+| Model | Month | Mean diff (m) | RMSE (m) | Correlation | Area with \|diff\| > 20 m (% of shared area) | Shared area (% of model ocean area) |
+|---|---|---|---|---|---|---|
+| CESM2 | March | −4.5 | 7.5 | 0.998 | 2.7 | 96.4 |
+| CESM2 | September | −2.6 | 5.1 | 0.998 | 0.2 | 97.9 |
+| GFDL-ESM4 | March | −9.6 | 21.4 | 0.945 | 6.3 | 97.2 |
+| GFDL-ESM4 | September | −8.0 | 14.3 | 0.987 | 7.5 | 98.5 |
+| MPI-ESM1-2-LR | March | −2.5 | 6.8 | 0.995 | 1.5 | 96.8 |
+| MPI-ESM1-2-LR | September | −2.4 | 14.3 | 0.983 | 3.5 | 97.6 |
+
+**Mask sizes** (March / September, in native-grid cells):
+
+| Model | March cells | September cells |
+|---|---|---|
+| CESM2 | 82,360 | 84,146 |
+| GFDL-ESM4 | 42,122 | 43,259 |
+| MPI-ESM1-2-LR | 32,978 | 34,894 |
+
+The shared mask covers 96–98.5% of each model's ocean area, so the two products agree closely on where data are defined.
+
+**Area removed by excluding no-crossing columns** (% of model ocean area, March / September):
+- CESM2: 3.6 / 2.1
+- GFDL-ESM4: 2.8 / 1.5
+- MPI-ESM1-2-LR: 3.2 / 2.4
+
+For example, CESM2 March removes about 1.29×10¹³ m², and the shared area plus the removed area account for essentially all of the ocean area.
+
+**Mean fields (March / September):**
+
+| Model | Operator MLD (m) | `mlotst` (m) |
+|---|---|---|
+| CESM2 | 56.1 / 71.6 | 60.6 / 74.2 |
+| GFDL-ESM4 | 32.0 / 46.6 | 41.5 / 54.6 |
+| MPI-ESM1-2-LR | 44.3 / 69.6 | 46.9 / 72.0 |
+
+## 4. Ranking and where the disagreement sits
+
+**Criterion:** the lowest mean of the March and September area-weighted RMSE, with correlation and the >20 m area share as supporting criteria.
+
+| Rank | Model | Mean RMSE (m) | Mean correlation | Mean >20 m share (%) |
+|---|---|---|---|---|
+| 1 | CESM2 | 6.3 | 0.998 | 1.4 |
+| 2 | MPI-ESM1-2-LR | 10.6 | 0.989 | 2.5 |
+| 3 | GFDL-ESM4 | 17.9 | 0.966 | 6.9 |
+
+All three criteria give the same order. In March alone, MPI-ESM1-2-LR (6.8 m) is marginally lower than CESM2 (7.5 m). MPI's September RMSE (14.3 m) is much larger, which is why it ranks second overall.
+
+**Where the differences concentrate** (from `locate_extreme` and the basin tables):
+- **North Atlantic and Labrador Sea in March** (deep convection):
+  - CESM2 has its largest difference (−373 m) at about 59.7°N, 58.6°W. The Atlantic basin RMSE is 12.3 m, with 11% of the area above 20 m.
+  - MPI's March maximum (−434 m) is at about 54°N, 51.8°W.
+  - GFDL-ESM4's March maximum (+814 m) is at 54.5°N, 10.5°W. Its Atlantic RMSE is 34.3 m, with 15.6% of the area above 20 m.
+- **Arctic in March:** GFDL-ESM4 has an RMSE of 25.9 m with 10.9% of the area above 20 m. MPI has an RMSE of 13.9 m with 5.4% above 20 m.
+- **Southern Ocean in September:**
+  - MPI has an RMSE of 37.4 m and a bias of −14.0 m, with 13.7% of the area above 20 m. Its largest difference (−698 m) is at about 72°S, 139°W.
+  - GFDL-ESM4 has an RMSE of 20.0 m, with 12.1% of the area above 20 m.
+  - GFDL-ESM4's largest September difference (+432 m) is at about 37.5°S, 139.5°E.
+  - CESM2's Southern Ocean September RMSE is only 1.9 m.
+- **GFDL-ESM4 Indian Ocean in September:** RMSE of 18.1 m, with 12.5% of the area above 20 m.
+
+**Why exact agreement is not expected:**
+- The operator MLD was computed from monthly-mean `thetao` and `so`, whereas `mlotst` is the time mean of instantaneous diagnostics. The threshold criterion is nonlinear, so the MLD of the mean profile is not the mean of the MLDs.
+- Vertical interpolation and the reference depth differ.
+- The equation of state may differ.
+- No-crossing columns are encoded differently across models.
+
+The consistently negative bias is plausibly linked to the monthly-mean averaging, but that was not tested separately.
+
+## 5. Visualizations
+
+- **Figure 1** is a 3×2 grid of difference maps, with rows CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, and columns March and September.
+  - Each native-grid difference field (shared mask applied) was conservatively regridded to the `woa23` 1° longitude-latitude grid with `regrid_horizontal`, for display only.
+  - The maps are drawn with `pcolormesh` on a common frame (−180 to 180°E, −90 to 90°N, equal aspect, grey background for missing cells). They are plain longitude-latitude axes, not a map projection.
+  - All panels share one `RdBu_r` colour scale centred on zero, with limits set to ± the 98th percentile of the pooled |difference|. The colourbar extends at both ends.
+  - Panel titles give each case's bias and RMSE, computed on the native grid.
+- **Figure 2** is a 3×2 grid of scatter plots in the same layout, with operator MLD on x and `mlotst` on y.
+  - Each point is one shared-mask cell on the native grid.
+  - All axes are logarithmic with range 1–10⁴ m, ticks at 1, 10, 100, 1000 and 10000, and equal aspect.
+  - Each panel has a dashed y = x line and an annotation of bias, RMSE and correlation.
+
+## 6. Caveats
+
+- The metrics are area-weighted means on the native grid of each model. Cell counts are not comparable across models because the grids differ.
+- Figure 1 uses the regridded field for display only. GFDL-ESM4 is already on a regular 1° grid, so its displayed field is effectively the native one.
+- No-crossing columns are excluded only to the extent that the tool returns NaN for them. The script has no model-specific treatment of 0 m or full-column-depth encodings, so any such values that fall inside the shared mask would still be counted.
+</solution>

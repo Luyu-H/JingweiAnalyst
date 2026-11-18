@@ -1,0 +1,478 @@
+# exchange 2: knowledge_condensing
+# elapsed: 14.9 s
+
+===== SYSTEM =====
+You condense knowledge fragments into short notes for the planning step of a data analysis. The
+planner sees only your notes, not the fragments.
+
+Fragments selected for this question (each headed by its [fragment-id]):
+<fragments>
+### [anomaly-baselines-and-climate-indices] Anomalies and climate indices: which climatology to remove, which baseline, which season convention
+(type: method; severity: must)
+#### Key points
+- CPC changed the base period of its Oceanic Niño Index because, with a warming
+  trend in the Niño-3.4 region since 1950, episodes defined against a fixed base
+  period "are increasingly incorporating longer-term trends that do not reflect
+  interannual ENSO variability". The ONI now uses centred 30-year base periods,
+  each applied to successive 5-year spans of the record. [CPC ONI change]
+  The same index therefore exists on several baselines; `configs/datasets.yaml`
+  lists the local CPC products and the baseline of each.
+- The WOA23 seasonal climatologies are calendar quarters: winter January–March,
+  spring April–June, summer July–September, autumn October–December. [WOA23
+  documentation]
+#### Implications for this project
+- Which climatology is removed decides what an anomaly means.
+  - Against the field's **own** climatology (`compute_anomaly_vs_own_climatology`,
+    and `compute_enso_nino_index` on model output) whatever bias the field
+    carries cancels. This is what an index, a trend, a composite or a comparison
+    between two products needs.
+  - Against the **observed** climatology (`compute_anomaly_vs_woa23`) the
+    field's bias against observations stays inside the anomaly. This answers
+    "how far is this field from the observed ocean". An observed climatology
+    forced on a model index puts the model's mean-state bias into the index
+    (see `cmip6-tos-bulk-top-cell`).
+- The baseline is part of the answer. An anomaly is defined only relative to
+  the period its climatology came from, and two series built on different
+  baselines differ by an offset (one constant per calendar month) even when
+  their variability is identical. Compute an index on the baseline of any
+  published series it is compared with (`base_period`), and state the
+  climatology and baseline used; the tools record both in the result's attrs.
+  The CPC products in the registry differ in baseline and are not
+  interchangeable.
+- Niño 3.4 is the standard region for ENSO monitoring. A monthly index is
+  matched against the climatology of its own calendar month, which removes the
+  seasonal cycle.
+- Seasons: DJF/MAM/JJA/SON is the usual (meteorological) climate definition,
+  while the WOA23 seasonal fields are the calendar quarters JFM/AMJ/JAS/OND.
+  The two are offset by a month and must not be mixed in one comparison
+  (`season_convention` of `temporal_aggregate`; `freq='season'` of
+  `compute_anomaly_vs_woa23` uses the WOA23 quarters).
+- Events are defined operationally by persistence, not by eye: a warm or cold
+  phase of a climate index, a marine heatwave or a hypoxic spell counts only
+  when the series stays beyond the threshold for a minimum number of
+  consecutive steps. A single step beyond the threshold is noise;
+  `min_duration` of `detect_threshold_events` is what separates an event from
+  a wobble.
+- Scan a time series for outliers on its anomalies, not on its raw values. A
+  raw ocean series is dominated by its seasonal cycle, so every summer maximum
+  sits in the tail of the distribution and the "outliers" returned are simply
+  the warm season.
+#### Common mistakes
+- Reading the offset between a reconstructed index and a published one built on
+  another baseline as an error of the reconstruction.
+- Comparing seasonal means built on the DJF and the JFM conventions.
+
+### [omip-weighted-means-and-integrals] How OMIP defines global and regional means and integrals of ocean fields
+(type: method; severity: should)
+#### Key points
+- Spatial integrals "are computed using all grid points within the region or
+  line. There is no sub-sampling." [OMIP-phys A2, C1]
+- Global mean of a 3-D tracer T [OMIP-phys H12.1]:
+  - Boussinesq model, **volume-weighted**: ⟨T⟩ = Σ T dA dz / Σ dA dz (Eq. H29)
+  - non-Boussinesq model, **mass-weighted**: ⟨T⟩ = Σ ρ T dA dz / Σ ρ dA dz
+    (Eq. H28)
+  The same forms hold for salinity (Eqs. H35–H36).
+- Global mean SST and SSS are **area-weighted over the top level**:
+  tosga = Σ θ(k=1) dA / Σ dA (Eq. H34, likewise sosga, Eq. H37).
+  [OMIP-phys H13, H18]
+- Because the terms of these averages vary in time, OMIP computes the official
+  global means online each time step (products of time-dependent terms).
+  [OMIP-phys H12.1, H17]
+- MPIOM (MPI-ESM1.2) is hydrostatic and Boussinesq. [MPI §4]
+#### Implications for this project
+- Offline, with monthly fields: a global mean of `thetao` is
+  Σ thetao · volcello / Σ volcello over valid ocean cells. A surface mean is
+  Σ tos · areacello / Σ areacello. Unweighted `mean()` over (y, x) on a
+  curvilinear grid is wrong. On a regular grid, unweighted means over latitude
+  are also wrong.
+- The weight must be restricted to the **same cells** as the valid data
+  (NaN-aware weights). Otherwise the denominator counts land or missing cells.
+- Volume weighting and mass weighting differ only through density variations.
+  In-situ density varies by no more than about 2 % around 1035 kg m-3 over
+  most of the ocean (OMIP-phys G3). For a Boussinesq model the volume-weighted
+  form is the protocol form. The papers read here confirm the Boussinesq formulation only
+  for MPIOM. For the other two models, state the assumption.
+- A mean over a region follows the same rule, with the region mask applied on
+  the model's own grid.
+- Use a weighted mean for any physical average. A plain mean is right only
+  when every element represents the same amount of ocean, which is rarely
+  true: cells shrink towards the poles, and layer thicknesses vary by more than
+  an order of magnitude with depth. With the tools: `compute_basic_stat` with
+  `op='area_weighted_mean'` for a horizontal mean, and
+  `op='volume_weighted_mean'` for any mean whose dimensions include depth (the
+  mean temperature or concentration of a depth range). Its plain `op='mean'`
+  weights every element equally.
+- The same holds for every statistic taken over a map, not only for means: an
+  unweighted RMSE, bias or pattern correlation counts a polar cell as heavily
+  as a tropical one many times its size. `compute_difference_metrics` weights
+  by area by default; `analyze_correlation` needs `weighting='area'` for a
+  pattern correlation between two maps.
+- A share of the ocean beyond a threshold is a share of its area (or volume),
+  not of its cells, and missing cells must stay out of the denominator.
+  `compute_exceedance_fraction` does both and returns the amount behind the
+  percentage (m2 or m3), which belongs next to the percentage when the question
+  is how much ocean.
+- The mean of a ratio is not the ratio of the means. Averaging a cell-by-cell
+  ratio such as N:P weights every cell's composition by its volume alone; the
+  ratio of the two volume-weighted means weights each cell by its content and
+  is pulled towards the richest water. Both are defensible, so state which one
+  is reported. `compute_ratio` gives the cell-by-cell ratio; the ratio of means
+  is the weighted mean of each field, divided.
+#### Common mistakes
+- Averaging a depth profile level by level with equal weight. Level thickness
+  varies from 10 m to 250 m or more.
+- Dividing an area-weighted sum by the total area of the region including
+  land.
+
+### [cmip6-tos-bulk-top-cell] CMIP6 tos is the bulk temperature of the top model cell, including under sea ice
+(type: concept; severity: should)
+#### Key points
+- `tos` is the "temperature of upper boundary of the liquid ocean, including
+  temperatures below sea-ice and floating ice shelves" (CMOR). Under sea ice it
+  is the water temperature just below the ice, not the ice-surface temperature.
+  [CMOR Omon; OMIP-phys H13]
+- Model surface tracers are **bulk values averaged over the top grid cell**,
+  which is generally at least a metre thick. They are not skin values. [OMIP-phys H13]
+- "In nearly all ocean climate models, the surface temperature is given by the
+  prognostic temperature in the upper-most ocean grid cell." [OMIP-phys H13]
+- `tos` is surface potential temperature, which equals surface in-situ
+  temperature and differs from surface Conservative Temperature. [OMIP-phys H13]
+- Top-cell thickness of the three native ocean grids, according to the CMIP6 source
+  registry [CVs source_id]:
+
+  | model | ocean component | top grid cell |
+  |---|---|---|
+  | CESM2 | POP2, 60 levels | 0–10 m |
+  | GFDL-ESM4 | GFDL-OM4p5 (MOM6), 75 levels | 0–2 m |
+  | MPI-ESM1-2-LR | MPIOM1.63, 40 levels | 0–12 m |
+
+  The CESM2 paper itself evaluates SST as "0‐ to 10‐m average in the ocean"
+  against ERSSTv5. [CESM2 §7]
+#### Implications for this project
+- Using the first level of `thetao` as a substitute for `tos` (needed for
+  ssp245, where `tos` is missing; see `configs/datasets.yaml`) reproduces the
+  model's own SST definition, because tos is the top-cell prognostic
+  temperature. Minor differences are possible where the archived vertical grid
+  differs from the native grid. GFDL-ESM4's archived `thetao` has been
+  regridded to 35 z levels, the first centred at 2.5 m. Checked on GFDL-ESM4,
+  1990–1999: a Niño3.4 index from the top level of `thetao` matches the one
+  from `tos` to an RMS of 0.005 °C. A 0–10 m thickness-weighted average
+  (two levels) departs by 0.031 °C. `compute_enso_nino_index` and
+  `compute_pdo_index` therefore take the top level by default
+  (`depth_level=None`), the like-for-like substitute where `tos` is missing.
+  A `depth_level` of 10 m instead averages two levels in GFDL-ESM4 but one in
+  CESM2 and MPI-ESM1-2-LR, so it is not the same quantity across models.
+- A model's first level stands for its surface. A value asked for at 0 m,
+  above every model's shallowest level centre, is that shallowest level's value
+  (`regrid_vertical` with `fill_surface=True`).
+- An ENSO index from a model is its anomaly from its **own** climatology.
+  Subtracting an observed climatology puts the model's mean-state bias into
+  the index, which is then not an ENSO index (`compute_enso_nino_index` with
+  `climatology='woa23'` on model output does exactly that).
+- Sea-ice-covered cells carry the under-ice water temperature (near freezing).
+  They are not missing. A global-mean SST therefore includes polar values near
+  −1.8 °C. Observational products that also report under-ice SST near freezing
+  are comparable. If a product masks sea ice, the ocean masks must be made
+  consistent before comparing.
+
+### [cmip6-experiments-historical-ssp245] What the CMIP6 historical and ssp245 experiments are
+(type: dataset; severity: should)
+#### Key points
+| experiment | description | years | parent | activity |
+|---|---|---|---|---|
+| historical | "all-forcing simulation of the recent past" | 1850–2014 (min 165 yr) | piControl (or past1000/past2k) | CMIP |
+| ssp245 | "Future scenario with medium radiative forcing by the end of century. Following approximately RCP4.5 global forcing pathway but with new forcing based on SSP2. **Concentration-driven**" | 2015–2100 (min 86 yr) | historical | ScenarioMIP |
+| piControl | "pre-industrial control" | ≥ 500 yr | piControl-spinup | CMIP |
+| esm-hist | historical with **CO2 emission-driven**, atmospheric CO2 calculated | 1850–2014 | esm-piControl | CMIP |
+
+[CVs experiment_id]
+
+- The coupled historical run differs from the forced ocean-only OMIP runs
+  (omip1) "only" in initialisation and forcing. omip1 is initialised from
+  observations and forced by reanalysis, while historical is coupled after a
+  spin-up. [OMIP-BGC §2]
+#### Implications for this project
+- Both local experiments are **concentration-driven** (not esm-hist). Atmospheric
+  CO2 is prescribed, so ocean carbon uptake differences between models do not
+  feed back on atmospheric CO2.
+- Coupled runs have their own internal variability. A given model year (e.g.
+  the 1997 El Niño year) is **not** expected to match the observed year.
+  Compare statistics (means, variances, spectra, trends over long windows),
+  not individual years or event timing.
+- A single member per model (see `historical-ssp245-member-continuity`)
+  cannot separate forced change from internal variability. Short-window trends
+  should carry that caveat.
+
+### [cmip6-grid-labels] CMIP6 grid labels gn / gr and what they imply for the three local models
+(type: dataset; severity: should)
+#### Key points
+- Grid labels [CVs grid_label]:
+  - `gn`: "data reported on a model's native grid"
+  - `gr`: "regridded data reported on the data provider's preferred target grid"
+  - `gr1`, `gr2`, …: other regridded grids. `gnz`: zonal mean on the native
+    latitude grid. `gm`: global mean.
+- OMIP: structured-grid models should archive on the native grid. The same
+  variable on native and spherical grids keeps the same CMOR name, and the
+  two "can never coexist in the same file". GFDL described its plan to coarsen
+  ocean output to a 1° spherical grid to reduce archive size. [OMIP-phys A3.3–A3.4]
+- Models with a moving vertical coordinate (z\*, isopycnal, hybrid) have
+  **time-dependent cell thickness and volume**. [OMIP-phys B1.2]
+#### Checked in the local files
+`grid_label` and `grid` global attributes of `thetao`, read on 2026-09-24:
+
+| model | grid_label | grid attribute | nominal_resolution |
+|---|---|---|---|
+| CESM2 | gn | "native gx1v7 displaced pole grid (384x320 latxlon)" | 100 km |
+| GFDL-ESM4 | **gr** | "ocean data regridded from tripolar - nominal 0.5 deg latitude/longitude to 180,360; interpolation method: conserve_order1" | 1x1 degree |
+| MPI-ESM1-2-LR | gn | "gn" | 250 km |
+#### Implications for this project
+- GFDL-ESM4 values are already remapped, so "native-grid" numbers for GFDL
+  are numbers on its 1° archive grid. The land–sea mask is the regridded one,
+  and budgets are only approximately conservative. The native hybrid layers
+  (75) were remapped to 35 z levels, which is why `volcello` is monthly for
+  GFDL-ESM4.
+- Resolution differs by a factor of about 2.5 between CESM2 (100 km) and MPI
+  (250 km). Features narrower than the coarse grid (boundary currents,
+  equatorial undercurrent, coastal upwelling) are not comparable in amplitude.
+- Within one model, variables can sit at different staggered points on the
+  same gn grid (see `velocity-components-are-grid-relative`).
+
+### [omip-native-grid-vs-regridded] When to work on the native grid and when regridding is acceptable
+(type: method; severity: should)
+#### Key points
+- Two aims conflict: spherical-grid output is easy to map and difference,
+  while native-grid output preserves conservation for budgets. "regridding …
+  generally involves a land–sea mask distinct from the model native mask. When
+  changing the land–sea mask it is difficult to ensure conservation even when
+  using 'conservative' regridding methods." [OMIP-phys A3]
+- The loss of conservation "may be of minor consequence for many metric-based
+  analysis purposes. However, it sacrifices the needs of budget analyses."
+  Regridding "merely for visualization purposes and/or to produce difference
+  maps" can ignore non-conservation. [OMIP-phys A3, A3.2]
+- Structured-grid models archive on their native grid. The standard spherical
+  targets are the 1° or ¼° grids of the World Ocean Atlas. [OMIP-phys A3.3]
+- In the vertical, models on z, z\*, p or p\* need no regridding. Coarsening to
+  the 33 WOA standard levels is allowed, but "care should be given to models
+  that do not share the same 5500 m depth as the World Ocean Atlas".
+  [OMIP-phys A4, C2]
+- For transports across sections (overturning, passages, heat transport) on
+  non-spherical grids, compute along a native-grid "zig-zag" path that
+  approximates the section rather than regridding fluxes. [OMIP-phys C4]
+#### Implications for this project
+- A good pattern for model-versus-observation work: compute every **number**
+  (global and basin means, inventories, integrals) on each source's native grid
+  with its own weights. Regrid to the WOA 1° grid only for **maps, pattern
+  correlation and RMSE on a common mask**. Say which numbers come from which
+  grid. The exception is an analysis whose result depends on the grid and is
+  compared between sources, such as an EOF mode with its explained variance
+  and its regression pattern (see `eof-modes-and-pdo-index`): put every
+  source, the observations included, on one common grid before the analysis,
+  and take its numbers there.
+- After regridding a field for a cell-by-cell comparison, build one shared
+  valid-data mask for all sources before computing pattern statistics. Coastal
+  cells otherwise differ between the sources (see `common-comparison-mask`,
+  which also says when a pair's own shared cells are the sample instead, as
+  for the patterns of a variability mode).
+- Regrid only for the cell-by-cell comparison. An average, a trend or an
+  integral belongs on the field's own grid with its own cell areas, because
+  regridding replaces those with the target's.
+- Method in `regrid_horizontal`: 'conservative' is the right choice going to a
+  coarser grid and before any area-weighted step; 'bilinear' is the fallback
+  when a model's corner mesh is unusable; 'nearest_s2d' is for masks and other
+  categorical fields. A regridded RMSE or pattern correlation depends on the
+  method, so state the method whenever one is quoted.
+- Vertical interpolation onto another level set changes layer-integrated
+  quantities. Integrate thickness-weighted quantities (inventories, OMZ
+  thickness) on the original levels.
+- Values at fixed depths (a bias "at 100, 500 and 1000 m") need each product
+  interpolated to those depths (`regrid_vertical`), not the nearest level
+  selected: vertical grids differ between products and rarely line up, so each
+  product would answer at a different depth, and the products differ most
+  where the gradients are steepest. This interpolation is for comparison, not
+  for budgets.
+- Diagnostics located at a vertical extremum, such as a nutricline (the depth of
+  the maximum vertical gradient), are quantised by the vertical grid. Where the
+  profile is smooth, in the subtropical gyres especially, the maximum can jump
+  between levels, so read such a map together with the gradient itself.
+#### Common mistakes
+- Computing a global inventory after regridding to 1° and comparing it with
+  the native-grid value as if they should agree.
+- Regridding velocity components as scalars (see
+  `velocity-components-are-grid-relative`).
+
+### [cmip6-static-grid-fields] Meaning of the CMIP6 ocean grid fields areacello, volcello, deptho, sftof (and the absent thkcello/masscello)
+(type: concept; severity: should)
+#### Key points
+- **areacello**: "Horizontal area of ocean grid cells" (m2, cell_methods
+  `area: sum`). This is the area of a **tracer** cell, and it "should be zero or
+  missing over land". All CMIP6 ocean models have fixed horizontal grids, so
+  the area is static. [CMOR Ofx; OMIP-phys B, G7]
+- **volcello**: "Ocean Grid-Cell Volume" (m3, `area: sum`). This is an
+  extensive field. It exists as a fixed field (Ofx) and as a time-varying one
+  (Omon). [CMOR Ofx, Omon]
+- **deptho**: "sea floor depth for present day relative to z=0 geoid.
+  Reported as missing for land grid cells." It is the bottom "from the
+  perspective of the model tracer fields". [CMOR Ofx; OMIP-phys G5]
+- **sftof**: "Percentage of horizontal area occupied by ocean" (%). [CMOR Ofx]
+- **thkcello** (cell thickness, m) and **masscello** (mass per area, kg m-2)
+  are part of the request. For models with static cells,
+  masscello = rhozero × thkcello, where rhozero is the model's Boussinesq
+  reference density. That density is not the same in all models: OMIP
+  suggests 1035 kg m-3, and early GFDL models used 1000 kg m-3. Where cell
+  thickness varies in time, both are monthly fields. [CMOR Ofx/Omon; OMIP-phys
+  B1–B2, G3]
+- For full cells, thickness can be taken as the difference of the layer
+  depth bounds. That fails at partial top and bottom cells. [OMIP-phys B1.1]
+#### Implications for this project
+- None of the three models' local archive has `thkcello`, `masscello` or `rhozero`.
+  The layer thickness that respects partial bottom cells is
+  **volcello / areacello**. The `lev_bnds` difference is right only for full
+  cells. Checked on the local historical files (January 2000, cells where
+  `thetao` is valid):
+  - **GFDL-ESM4**: area × layer-bound thickness gives 1.53e18 m3 against
+    1.33e18 m3 from `volcello`, and 14 % of cells differ by more than 1 %.
+    Its remapped z levels carry values in bottom cells that are only partly
+    water.
+  - **MPI-ESM1-2-LR**: partial bottom steps differ by up to ±50 % in 3.3 % of
+    cells.
+  - **CESM2**: the two agree within 0.6 %.
+  `cell_thickness_like` in `src/tools/data_loader.py` returns volcello /
+  areacello for CMIP6 fields. `identify_oxygen_minimum_zone` and the depth
+  averages use it.
+- `deptho` is model bathymetry, not true bathymetry. Deciding "is this level
+  above the model sea floor" should use `deptho` or the fill pattern of the
+  field itself, not an external topography.
+- GFDL-ESM4's `volcello` varies in time because its native vertical coordinate
+  moves (see `cmip6-grid-labels` and `configs/datasets.yaml`). The loaders
+  already handle the time axis.
+- On a curvilinear grid the model's own `areacello` is the only correct area
+  weight, and the published `volcello` alone accounts for the partial cells at
+  the sea floor. `load_areas` and `load_volumes_for_cmip6` use them where the
+  model publishes them and record the origin in `attrs['area_source']` and
+  `attrs['volume_source']`, which is worth reporting when they feed an
+  integral.
+- Total ocean area differs between models by a per cent or so, because a
+  coarser grid resolves the coastline differently. That is a property of the
+  model, not an error to correct: state the area each integral was taken over
+  rather than rescaling one model to match another.
+
+### [model-gfdl-esm4-reported-biases] GFDL-ESM4 ocean biases and variability as reported in its description paper
+(type: dataset; severity: info)
+Each number below comes with the period and reference data set the paper used.
+It is context for interpreting results, not a target value.
+#### Key points
+**Surface (against WOA13)** [GFDL §4.9]
+- SST: RMS 0.68 °C and mean bias −0.07 °C. Cold biases in the **subtropical
+  gyres** and an "**extreme cold bias** in ESM4.1 subpolar North Atlantic". Warm
+  biases in **eastern boundary current** regions, the **Southern Ocean** and the
+  Labrador Sea.
+- SSS: RMSE 0.47 ppt. High bias in the **Arctic**. Low bias in the equatorial and
+  south-east Atlantic (Benguela). Low bias in Oceania. High bias off the north-east US
+  coast and in the Bay of Bengal (weak freshwater input).
+- MLD (0.03 kg m-3 criterion relative to the upper 10 m, monthly min and max
+  against WOA13): pattern r² = 0.68 (min) and 0.51 (max). There is a **shallow bias
+  in the tropics and subtropics** against the 15–25 m bands in WOA13. Deep winter
+  mixing occurs along east Siberia, where observations show none.
+
+**Interior** [GFDL §4.10]
+- "Diffuse thermocline" bias: warm at the thermocline base and in the deep
+  Atlantic and Indian basins, cold in the upper thermocline (notably the
+  Pacific).
+- NADW is too warm and salty, leaving a salt deficit in the Pacific
+  thermocline. Red Sea (200–400 m) and Mediterranean (600–1000 m) overflows are
+  too strong and too shallow.
+- AMOC at 24°N is shallower than observed and ends at 3000 m. AABW transport
+  into the southern Indo-Pacific is weak.
+
+**Biogeochemistry (tropical 30°S–30°N, 1990–2009)** [GFDL §4.11]
+- Good agreement for PO4, O2, DIC and Alk−DIC in the upper
+  nutricline/oxycline. In the tropical Atlantic, PO4 and O2 are underestimated
+  in the main nutricline/oxycline, and there are mid-depth biases linked to the
+  shallow AMOC.
+- "the signature of **excess remineralization in the abyss** in all four
+  variables" in both basins.
+
+**ENSO** [GFDL §4.12]
+- Slightly **stronger** than observed, with a **longer period (~4 years**
+  against ~3.3 in observations and CM4.0). The warmest eastern-equatorial
+  anomalies sit slightly farther west. Tropical mixed layers are shallower than
+  observed, and there is an equatorial Pacific subsurface cold bias.
+#### Implications for this project
+- Tropical and subtropical MLD biases and the diffuse thermocline affect
+  nutricline and oxycline depths. A GFDL-ESM4 nutricline or oxygen bias is
+  consistent with these documented physical biases.
+- Abyssal DIC and nutrients that are too high and O2 that is too low are
+  expected in GFDL-ESM4.
+</fragments>
+
+Rules:
+1. For each fragment keep only what changes how THIS question is computed or how its result must be
+   stated. Write at most 2 notes per fragment, one line each, the most important first.
+2. Each note is actionable: the formula, threshold, unit conversion, weighting, tool argument or check
+   to apply, or the caveat the answer must state. Leave out background, the source's reasoning, and
+   points about variables, models or steps this question does not involve.
+3. Invent nothing; the notes must follow the fragment text. Every note must be backed by what the
+   fragment says: add no number, tool argument, rule or exception the fragment does not contain, and
+   never state the opposite of what it says. Copy numbers, formulas, variable names and tool names
+   exactly as the fragment writes them, and put variable and tool names in backticks. You may refer
+   to quantities the question itself defines (its thresholds, periods, regions).
+4. Only where the question's text actually states a definition or procedure that differs from the
+   fragment, write a note saying so, quoting the question's words: the question's version is
+   followed and the difference is stated in the answer. Where the question is silent, follow the
+   fragment, and never claim the question prescribes something it does not say.
+5. If, having read it, a fragment does not apply to this question, write
+   "[fragment-id] not applicable: <reason>" and no notes for it.
+6. Keep the whole answer under about 3600 characters.
+
+Follow this format strictly:
+<knowledge_notes>
+[fragment-id]
+- note
+- note
+[fragment-id] not applicable: reason
+</knowledge_notes>
+
+
+===== USER =====
+User question: Assess the ENSO amplitude simulated by three CMIP6 historical runs against ERSSTv5 observations over 1950-01 to 2014-12.
+
+Data to use:
+- CMIP6 historical variable `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1950-01 to 2014-12, each on its own native grid with its own published cell areas.
+- ERSSTv5 monthly SST over the same window, on its native 2-degree grid.
+
+Expected numerical results, based on the monthly Nino 3.4 index of each of the four sources over 1950-01 to 2014-12: the SST anomaly over 5S-5N, 170W-120W, each source relative to a 1950-2014 monthly climatology. Standard deviations are population standard deviations (ddof = 0).
+- For each source, the standard deviation of its Nino 3.4 anomaly over all 780 months, in degrees Celsius to 2 decimal places.
+- For each model, the amplitude bias (model minus ERSSTv5 standard deviation) in degrees Celsius to 2 decimal places and the amplitude ratio (model divided by ERSSTv5) to 2 decimal places, and the ranking of the three models from smallest to largest absolute amplitude bias.
+- For each source, the standard deviation of the anomaly for each of the 12 calendar months, in degrees Celsius to 2 decimal places (48 values).
+- For each source, the calendar month of largest standard deviation and its value, the calendar month of smallest standard deviation, and the largest-to-smallest ratio to 2 decimal places; and whether each model reproduces the observed peak month and strength of seasonal phase locking.
+- For each source, the number and the percentage (to 1 decimal place) of months whose Nino 3.4 anomaly strictly exceeds 1.0 degrees Celsius in absolute value.
+
+Expected visualizations:
+- Figure 1, a line plot of the seasonal cycle of amplitude: calendar month (January to December) on the x axis, standard deviation in degrees Celsius on the y axis, four curves on one axis, the observations visually distinct from the three models, and each curve's peak month marked.
+- Figure 2, four stacked panels sharing one time axis over 1950-2014, in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, each showing that source's Nino 3.4 anomaly series on an identical y-axis range that contains every series, with the +1.0 and -1.0 degrees Celsius levels marked and each panel annotated with its standard deviation and exceedance percentage.
+
+Now write the notes.
+
+===== RESPONSE =====
+<knowledge_notes>
+[anomaly-baselines-and-climate-indices]
+- Build each model's index with `compute_enso_nino_index` on its own output and do not pass `climatology='woa23'`: the anomaly must come from the field's own 1950-2014 monthly climatology, else the model's mean-state bias enters the index and it is no longer an ENSO index.
+- Match each month against the climatology of its own calendar month (this removes the seasonal cycle) and state the climatology and baseline used — the tools record both in the result's attrs; the exceedance metric here counts months with |anomaly| > 1.0, so persistence (`min_duration`) plays no role.
+[omip-weighted-means-and-integrals]
+- The Nino 3.4 average over 5S-5N, 170W-120W must be area-weighted on each source's grid with weights restricted to the same valid cells as the data (NaN-aware); an unweighted `mean()` over (y, x) is wrong on a curvilinear grid.
+[cmip6-tos-bulk-top-cell]
+- `tos` is the bulk temperature of the top model cell, not a skin value, and is archived for these historical runs, so use it directly with the default `depth_level=None` — no first-level `thetao` substitute is needed.
+- The model-minus-ERSSTv5 amplitude difference is therefore a bulk-top-cell-versus-observation comparison; do not describe `tos` as a skin temperature.
+[cmip6-experiments-historical-ssp245]
+- Coupled historical runs have their own internal variability: compare only statistics (the index standard deviation, the seasonal-cycle statistics), never individual years or event timing — a model's peak month or El Nino year need not match the observed one.
+- With a single member per model, differences in amplitude between models and ERSSTv5 cannot be split into forced versus internal-variability parts; state this caveat.
+[cmip6-grid-labels]
+- GFDL-ESM4 is `gr`: its values are already remapped to a 1x1 degree grid with a regridded land–sea mask, so label its numbers as taken on that archive grid.
+- Horizontal resolution differs about 2.5x between CESM2 (100 km) and MPI-ESM1-2-LR (250 km); features narrower than the coarse grid are not comparable in amplitude.
+[omip-native-grid-vs-regridded]
+- Compute every number (regional index, its standard deviation, per-month standard deviations) on each source's own grid with its own cell areas; the two cell-by-cell comparisons here need no regridding, so no regrid method is quoted.
+[cmip6-static-grid-fields]
+- Use each model's published `areacello` as the area weight (it is the tracer-cell area, zero or missing over land) and report the origin recorded in `attrs['area_source']` when it feeds the regional average.
+[model-gfdl-esm4-reported-biases]
+- GFDL-ESM4's ENSO is reported slightly stronger than observed with a longer period (~4 years against ~3.3), so a positive amplitude bias for GFDL-ESM4 is consistent with its documentation; these are context, not target values.
+</knowledge_notes>

@@ -1,0 +1,1460 @@
+# exchange 5: solution
+# elapsed: 79.1 s
+
+===== SYSTEM =====
+
+The user's question:
+Assess the nitrate-to-phosphate stoichiometry of intermediate water, 200 to 1000 m, in three CMIP6 models against the WOA23 observed climatology, and test whether the models reproduce the low-N:P signal left by denitrification.
+
+Data to use:
+- CMIP6 historical `no3` and `po4` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12, with each model's own volcello.
+- WOA23 nitrate and phosphate, the annual objectively analysed climatology.
+- The WOA23 basin mask (basinmask_01).
+
+Expected numerical results, for the 200-1000 m layer of each of the four sources (the three models' 1971-2000 climatologies and WOA23):
+- The mean N:P, to 2 decimal places, reported two ways and clearly labelled: the mean of the cell-by-cell N:P ratio (the headline value), and the ratio of the mean nitrate to the mean phosphate.
+- The ordinary least-squares regression NO3 = a * PO4 + b over all valid cells, each cell weighted equally, with model concentrations expressed in micromoles per kilogram at a constant density of 1025 kg/m3: the slope a to 2 decimal places, the intercept b in micromoles per kilogram to 2 decimal places, and the R-squared to 3 decimal places.
+- The percentage of water volume with N:P strictly between 14 and 18, to 1 decimal place.
+- For each of the four sources, the headline mean N:P in the Pacific, Atlantic and Indian Oceans (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded), to 2 decimal places.
+- The percentage of water volume with N:P below 12, globally and within the Pacific and the Indian Ocean, to 1 decimal place.
+- Whether each source's stoichiometry sits at, above or below Redfield, and whether each model reproduces the observed low-N:P volume and its basin distribution.
+
+Expected visualizations:
+- Figure 1, a 4-panel scatter of nitrate (y) against phosphate (x) in micromoles per kilogram over 200-1000 m, one panel per source in the order WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, with identical axis ranges and ticks, each panel showing its own fitted regression line and the Redfield 16:1 line through the origin, distinguishable from one another, and annotated with a, b and R-squared.
+- Figure 2, a 2-by-2 panel of global maps of the 200-1000 m mean N:P minus 16 for the four sources, drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only), on one shared diverging colour scale centred on zero.
+
+The analysis plan:
+1. **Load the model fields.** `load_regular_data` for `cmip6_historical`, models CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, variables `no3`, `po4` and `volcello`, monthly, 1971-01 to 2000-12. Use `load_volumes_for_cmip6` for each model's `volcello` (and `areacello`) on its archive grid, and `load_depth_levels` for each model's `lev` levels and layer boundaries.
+
+2. **Load the observations.** `load_climatology_data` for `woa23`, variables `nitrate` and `phosphate`, annual objectively analysed climatology on the 1° grid; `load_depth_levels` for its 33 standard levels and layer boundaries; `load_areas` for the WOA23 grid-cell areas (volume weights for WOA23 = area × layer thickness from `load_depth_levels`); `load_basin_mask` for `basinmask_01`.
+   - Note [cmip6-bgc-units-per-volume]: convert CMIP6 `no3`/`po4` from mol m-3 to µmol kg-1 as mol m-3 × 1e6/1025 with `transform_unit`, recording `attrs['density_assumption'] = 1025 kg/m3`; WOA23 nitrate and phosphate are already µmol kg-1 and need no conversion.
+
+3. **Form the 1971–2000 annual means of the models.** `temporal_aggregate` with `freq='mean'` on each model's `no3` and `po4` (and on GFDL-ESM4's monthly `volcello`).
+   - Note [monthly-means-are-time-averages]: use `temporal_aggregate(freq='mean')`'s day weights rather than `mean(dim='time')`, and average `no3` and `po4` first, forming N:P afterwards, so the diagnostic is of the mean state and like-for-like with the WOA23 climatology; state that ratio-first would instead give the mean monthly N:P.
+
+4. **Restrict to the 200–1000 m layer.** Keep only levels whose layer lies in 200–1000 m for each of the four sources (all levels fully or partly within the layer; the interface levels 200 m and 1000 m are excluded as levels, the layer between them is kept). Carry each cell's volume from `volcello` (models) or area × layer thickness (WOA23).
+   - Note [cmip6-static-grid-fields]: use the published `volcello`/`areacello`, with layer thickness `volcello`/`areacello` rather than `lev_bnds` differences because partial bottom cells matter; GFDL-ESM4 `volcello` is monthly and is annual-averaged in step 3; report `attrs['volume_source']`/`attrs['area_source']` wherever they feed an integral.
+
+5. **Compute the cell-by-cell N:P ratio for all four sources.** `compute_ratio` of nitrate over phosphate at every cell of the 200–1000 m layer, giving one ratio field per source.
+
+6. **Headline stoichiometry, two ways, per source.** With `compute_basic_stat` over the 200–1000 m layer: (i) the volume-weighted mean of the cell-by-cell N:P ratio (headline, 2 dp) and (ii) the ratio of the volume-weighted mean nitrate to the volume-weighted mean phosphate (2 dp).
+   - Note [omip-weighted-means-and-integrals]: use Σ field·`volcello` / Σ `volcello` over valid ocean cells with NaN-aware weights (plain `mean()` is wrong); the headline is the volume-weighted mean of the cell-by-cell ratio, and the ratio-of-means is the ratio of the volume-weighted mean `no3` to the mean `po4` — label which is which; the regression in step 7 is equal-cell weighted; volume shares must be shares of volume with missing cells out of the denominator.
+
+7. **Ordinary least squares NO3 = a·PO4 + b, one fit per source.** `fit_multivariate_relation` predicting `no3` from `po4` over all valid 200–1000 m cells in µmol kg-1, each cell weighted equally, reporting slope a (2 dp), intercept b (2 dp) and R² (3 dp), plus the number of cells used.
+
+8. **Volume shares of N:P.** `compute_exceedance_fraction` by volume on each source's N:P field: the percentage of water volume with N:P strictly between 14 and 18 (1 dp), recorded together with the m3 behind the percentage and the valid-volume denominator.
+
+9. **Basin breakdown of the headline mean N:P.** `select_basin` with the WOA23 `basinmask_01` on each source's N:P field, once per basin, then `compute_basic_stat` volume-weighted mean of the cell-by-cell ratio for Pacific, Atlantic and Indian Oceans (2 dp); repeat `compute_exceedance_fraction` by volume for N:P below 12 globally, in the Pacific and in the Indian Ocean (1 dp, with m3).
+   - Note [basin-and-region-definitions]: use `load_basin_mask`/`select_basin` rather than any CMOR Ofx `basin` field, with `include_marginal_seas=True` folding marginal seas into their parent ocean and `depth_dependent=False` (surface labels applied through the water column); treat Southern and Arctic as basins of their own and exclude them from the Pacific/Atlantic/Indian breakdown (they remain in the global numbers).
+
+10. **Quantify the model–observation agreement.** Put each source's 200–1000 m N:P column field (volume-weighted over levels) on the WOA23 1° grid with `regrid_horizontal`, then build one shared sample and score each model against WOA23 with `compute_difference_metrics` (bias, RMSE, largest departure and its location) in N:P units.
+    - Note [common-comparison-mask]: build one mask with `build_comparison_mask` (`ocean_only=True`, WOA23 as reference) for the 200–1000 m layer rather than the surface, apply `.where(mask)` to all four fields before any model–observation metric, report the mask cell count, and take the compared means from `compute_difference_metrics` on that shared sample.
+
+11. **Figures.** Figure 1: 4-panel scatter of nitrate (y) vs phosphate (x) in µmol kg-1 over 200–1000 m for WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, identical axis ranges/ticks, each with its own fitted line from step 7, the Redfield 16:1 line through the origin, and a/b/R² annotated. Figure 2: 2×2 maps of the 200–1000 m mean N:P minus 16 for the four sources on a common longitude–latitude frame with one shared diverging scale centred on zero.
+    - Note [cmip6-grid-labels]: GFDL-ESM4 is `gr` (regridded 1°) while CESM2 and MPI-ESM1-2-LR are `gn`, with ~2.5× different resolution, so narrow features are not comparable; the regular longitude–latitude fields used in Figure 2 are for display only — all means, masks and volume shares in steps 6–10 are computed on each model's archive/native grid with its own `areacello`/`volcello`.
+
+Other notes:
+- The question prescribes a constant ρ = 1025 kg/m3 for the regression concentrations; state that in-situ density below the surface would change the µmol kg-1 concentrations (and hence a and b), while the ratio-based quantities are unaffected because the same ρ cancels.
+- State that the headline mean N:P is the mean of cell-by-cell ratios and that ratio-of-means is reported separately, since the two differ because N:P is nonlinear.
+- State whether each source's mean N:P sits at, above or below Redfield 16:1, and whether each model reproduces the observed low-N:P volume fraction (<12) and its Pacific/Indian distribution, including the comparison-mask cell counts behind those statements.
+- State that the Pacific/Atlantic/Indian means exclude the Southern and Arctic basins, which are retained in the global numbers.
+
+The code that actually ran and produced the results below:
+<executed_code>
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+TIME_WIN   = ['1971-01', '2000-12']
+DEPTH_WIN  = [200.0, 1000.0]
+MODELS     = ['CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']
+SOURCES    = ['WOA23'] + MODELS
+
+
+def _num(x):
+    """Materialise a scalar out of a (possibly lazy) DataArray / numpy value."""
+    if isinstance(x, xr.DataArray):
+        x = x.compute()
+        v = np.asarray(x.values, dtype=float).ravel()
+        return float(v[0]) if v.size == 1 else v
+    return float(x)
+
+
+def sub_layer(da, dmin=DEPTH_WIN[0], dmax=DEPTH_WIN[1]):
+    """Keep levels whose centre lies strictly inside the 200-1000 m layer."""
+    d = np.asarray(da['depth'].values, dtype=float)
+    idx = np.nonzero((d > dmin) & (d < dmax))[0]
+    if idx.size == 0:
+        raise ValueError(f"no depth levels strictly inside {dmin}-{dmax} m")
+    return da.isel(depth=idx)
+
+
+# --------------------------------------------------------------------------
+# 1. CMIP6 nitrate / phosphate, 1971-2000, converted to umol kg-1
+# --------------------------------------------------------------------------
+def prep_cmip(model):
+    raw_no3 = load_regular_data(dataset='cmip6_historical', variable='no3', model=model,
+                                time_range=TIME_WIN, depth_range=DEPTH_WIN)
+    raw_po4 = load_regular_data(dataset='cmip6_historical', variable='po4', model=model,
+                                time_range=TIME_WIN, depth_range=DEPTH_WIN)
+
+    no3 = transform_unit(raw_no3, from_unit='mol m-3', to_unit='umol kg-1', density=1.025)
+    po4 = transform_unit(raw_po4, from_unit='mol m-3', to_unit='umol kg-1', density=1.025)
+
+    prov_no3 = dict(no3.attrs)
+    prov_po4 = dict(po4.attrs)
+
+    # day-weighted 1971-2000 annual mean (NOT mean(dim='time'))
+    no3a = temporal_aggregate(no3, freq='mean').compute().assign_attrs(**prov_no3)
+    po4a = temporal_aggregate(po4, freq='mean').compute().assign_attrs(**prov_po4)
+
+    no3a = sub_layer(no3a)
+    po4a = sub_layer(po4a)
+    no3a = no3a.assign_attrs(units='umol kg-1')
+    po4a = po4a.assign_attrs(units='umol kg-1')
+    return no3a, po4a
+
+
+fields = {}
+for m in MODELS:
+    fields[m] = prep_cmip(m)
+
+# --------------------------------------------------------------------------
+# 2. WOA23 observed climatology (already umol kg-1)
+# --------------------------------------------------------------------------
+woa_no3 = load_climatology_data(dataset='woa23', variable='nitrate',
+                                time_slice='annual', depth_range=DEPTH_WIN)
+woa_po4 = load_climatology_data(dataset='woa23', variable='phosphate',
+                                time_slice='annual', depth_range=DEPTH_WIN)
+woa_no3 = sub_layer(woa_no3).assign_attrs(units='umol kg-1')
+woa_po4 = sub_layer(woa_po4).assign_attrs(units='umol kg-1')
+fields['WOA23'] = (woa_no3, woa_po4)
+
+# provenance of the volume weights actually used downstream
+vol_source = {}
+for m in MODELS:
+    v = load_volumes_for_cmip6(dataset='cmip6_historical', model=m, depth_range=DEPTH_WIN)
+    vol_source[m] = v.attrs.get('volume_source', 'unknown')
+vol_source['WOA23'] = 'area x layer thickness (WOA23 1 deg grid)'
+
+
+# --------------------------------------------------------------------------
+# 3. cell-by-cell N:P field for every source
+# --------------------------------------------------------------------------
+def np_ratio_field(no3, po4):
+    r = compute_ratio(no3, po4)
+    attrs = dict(no3.attrs)
+    attrs['units'] = '1'
+    attrs['long_name'] = 'Nitrate to phosphate ratio'
+    return r.assign_attrs(**attrs)
+
+
+np_fields = {s: np_ratio_field(*fields[s]) for s in SOURCES}
+
+
+# --------------------------------------------------------------------------
+# 4. OLS  NO3 = a*PO4 + b  (equal weight per cell) via fit_multivariate_relation
+# --------------------------------------------------------------------------
+def _flatten(da):
+    return da.stack(cell=list(da.dims))
+
+
+def _extract_line(res, xv, yv):
+    """Return (slope, intercept) from the tool's coefficients, order-robust."""
+    co = res.get('coefficients')
+    arr = None
+    if co is not None:
+        if isinstance(co, dict):
+            vals = [co[k] for k in co if k != 'intercept'] + ([co['intercept']] if 'intercept' in co else [])
+            arr = np.asarray(vals, dtype=float).ravel()
+        else:
+            arr = np.asarray(co, dtype=float).ravel()
+    sl_ref, ic_ref = np.polyfit(xv, yv, 1)
+    if arr is not None and arr.size == 2:
+        if abs(arr[0] - sl_ref) <= abs(arr[1] - sl_ref):
+            return float(arr[0]), float(arr[1])
+        return float(arr[1]), float(arr[0])
+    return float(sl_ref), float(ic_ref)
+
+
+fits = {}
+for s in SOURCES:
+    no3, po4 = fields[s]
+    xda = _flatten(po4)
+    yda = _flatten(no3)
+    xv = np.asarray(xda.values, dtype=float)
+    yv = np.asarray(yda.values, dtype=float)
+    good = np.isfinite(xv) & np.isfinite(yv)
+    xv, yv = xv[good], yv[good]
+
+    xs = xr.DataArray(xv, dims='cell', coords={'cell': np.arange(xv.size)})
+    ys = xr.DataArray(yv, dims='cell', coords={'cell': np.arange(yv.size)})
+    res = fit_multivariate_relation(target=ys, predictors=[xs], method='linear',
+                                    validation='random', test_size=0.2)
+
+    a, b = _extract_line(res, xv, yv)
+    r2 = float(res['metrics']['r2'])
+    fits[s] = dict(a=a, b=b, r2=r2, n=int(xv.size),
+                   r2_numpy=float(np.corrcoef(xv, yv)[0, 1] ** 2))
+
+
+# --------------------------------------------------------------------------
+# 5. headline stoichiometry, basin split, volume shares
+# --------------------------------------------------------------------------
+BASINS = ['Pacific', 'Atlantic', 'Indian']
+results = {}
+
+for s in SOURCES:
+    no3, po4 = fields[s]
+    r = np_fields[s]
+    dims = list(r.dims)
+
+    # (i) mean of the cell-by-cell ratio  -- headline
+    mean_ratio = _num(compute_basic_stat(r, op='volume_weighted_mean', dim=dims))
+
+    # (ii) ratio of the volume-weighted means
+    m_no3 = _num(compute_basic_stat(no3, op='volume_weighted_mean', dim=list(no3.dims)))
+    m_po4 = _num(compute_basic_stat(po4, op='volume_weighted_mean', dim=list(po4.dims)))
+    ratio_of_means = m_no3 / m_po4
+
+    # share of water volume with 14 < N:P < 18
+    band = compute_exceedance_fraction(r, threshold=2.0, comparison='abs_less',
+                                       reference=16.0, weighting='volume')
+    pct_14_18 = _num(band['fraction_percent'])
+    band_m3 = _num(band['exceeding_amount'])
+    total_m3 = _num(band['total_amount'])
+
+    # basin means of the headline (Southern / Arctic kept out of these three)
+    basin_means = {}
+    for b in BASINS:
+        rb = select_basin(r, basin=b, include_marginal_seas=True, depth_dependent=False)
+        basin_means[b] = _num(compute_basic_stat(rb, op='volume_weighted_mean', dim=list(rb.dims)))
+
+    # volume fraction with N:P < 12
+    low_g = compute_exceedance_fraction(r, threshold=12.0, comparison='less',
+                                        reference=0.0, weighting='volume')
+    low_p = compute_exceedance_fraction(select_basin(r, basin='Pacific', include_marginal_seas=True,
+                                                     depth_dependent=False),
+                                        threshold=12.0, comparison='less',
+                                        reference=0.0, weighting='volume')
+    low_i = compute_exceedance_fraction(select_basin(r, basin='Indian', include_marginal_seas=True,
+                                                     depth_dependent=False),
+                                        threshold=12.0, comparison='less',
+                                        reference=0.0, weighting='volume')
+
+    results[s] = dict(
+        mean_ratio=mean_ratio,
+        ratio_of_means=ratio_of_means,
+        mean_no3=m_no3, mean_po4=m_po4,
+        pct_14_18=pct_14_18, band_m3=band_m3, total_m3=total_m3,
+        basins=basin_means,
+        pct_lt12_global=_num(low_g['fraction_percent']),
+        m3_lt12_global=_num(low_g['exceeding_amount']),
+        vol_global_m3=_num(low_g['total_amount']),
+        pct_lt12_pacific=_num(low_p['fraction_percent']),
+        m3_lt12_pacific=_num(low_p['exceeding_amount']),
+        vol_pacific_m3=_num(low_p['total_amount']),
+        pct_lt12_indian=_num(low_i['fraction_percent']),
+        m3_lt12_indian=_num(low_i['exceeding_amount']),
+        vol_indian_m3=_num(low_i['total_amount']),
+        a=fits[s]['a'], b=fits[s]['b'], r2=fits[s]['r2'], n_cells=fits[s]['n'],
+    )
+
+
+# --------------------------------------------------------------------------
+# 6. 200-1000 m column N:P map, put on the WOA23 1 deg grid for comparison
+# --------------------------------------------------------------------------
+maps_native = {}
+maps_reg = {}
+for s in SOURCES:
+    r = np_fields[s]
+    maps_native[s] = compute_basic_stat(r, op='volume_weighted_mean', dim=['depth']).compute()
+    if s == 'WOA23':
+        maps_reg[s] = maps_native[s].compute()
+    else:
+        maps_reg[s] = regrid_horizontal(maps_native[s], target='woa23',
+                                        method='conservative').compute()
+
+cmp_mask = build_comparison_mask([maps_reg[s] for s in SOURCES], ocean_only=True)
+n_mask_cells = int(np.asarray(cmp_mask.values).sum())
+n_mask_total = int(np.asarray(cmp_mask.values).size)
+
+diff_metrics = {}
+for m in MODELS:
+    diff_metrics[m] = compute_difference_metrics(maps_reg[m].where(cmp_mask),
+                                                 maps_reg['WOA23'].where(cmp_mask))
+
+for m in MODELS:
+    dm = diff_metrics[m]
+    results[m]['bias_vs_woa'] = _num(dm['bias'])
+    results[m]['rmse_vs_woa'] = _num(dm['rmse'])
+    results[m]['crmse_vs_woa'] = _num(dm['centered_rmse'])
+    results[m]['max_abs_err_vs_woa'] = _num(dm['max_abs_error'])
+    results[m]['max_abs_err_at'] = dm['max_abs_error_at']
+    results[m]['mean_data_masked'] = _num(dm['mean_data'])
+    results[m]['mean_woa_masked'] = _num(dm['mean_reference'])
+    results[m]['n_valid_masked'] = int(_num(dm['n_valid']))
+
+
+# --------------------------------------------------------------------------
+# 7. summary table
+# --------------------------------------------------------------------------
+rows = []
+for s in SOURCES:
+    R = results[s]
+    rows.append({
+        'source': s,
+        'mean_NP(mean of ratios)': round(R['mean_ratio'], 2),
+        'ratio_of_means': round(R['ratio_of_means'], 2),
+        'a (slope)': round(R['a'], 2),
+        'b (intercept)': round(R['b'], 2),
+        'R2': round(R['r2'], 3),
+        'n_cells': R['n_cells'],
+        '%vol 14<NP<18': round(R['pct_14_18'], 1),
+        'Pacific': round(R['basins']['Pacific'], 2),
+        'Atlantic': round(R['basins']['Atlantic'], 2),
+        'Indian': round(R['basins']['Indian'], 2),
+        '%vol NP<12 global': round(R['pct_lt12_global'], 1),
+        '%vol NP<12 Pacific': round(R['pct_lt12_pacific'], 1),
+        '%vol NP<12 Indian': round(R['pct_lt12_indian'], 1),
+    })
+summary = pd.DataFrame(rows).set_index('source')
+print("200-1000 m nitrate:phosphate stoichiometry")
+print(summary.to_string())
+print()
+for s in SOURCES:
+    R = results[s]
+    print(f"{s}: volume of layer = {R['total_m3']:.3e} m3 ; "
+          f"14<NP<18 volume = {R['band_m3']:.3e} m3 ; "
+          f"NP<12 global = {R['m3_lt12_global']:.3e} m3 ; "
+          f"Pacific = {R['m3_lt12_pacific']:.3e} m3 of {R['vol_pacific_m3']:.3e} m3 ; "
+          f"Indian = {R['m3_lt12_indian']:.3e} m3 of {R['vol_indian_m3']:.3e} m3")
+    print(f"    mean NO3 = {R['mean_no3']:.3f}, mean PO4 = {R['mean_po4']:.3f} umol kg-1 ; "
+          f"volume-source = {vol_source[s]}")
+print()
+print(f"comparison mask: {n_mask_cells} ocean cells retained of {n_mask_total}")
+for m in MODELS:
+    R = results[m]
+    print(f"{m} vs WOA23: bias = {R['bias_vs_woa']:+.3f}, RMSE = {R['rmse_vs_woa']:.3f}, "
+          f"centred RMSE = {R['crmse_vs_woa']:.3f}, max |err| = {R['max_abs_err_vs_woa']:.2f} "
+          f"at {R['max_abs_err_at']}, n = {R['n_valid_masked']}")
+
+# scatter samples for the figure (subsampled for drawing only)
+rng = np.random.default_rng(0)
+scatter_data = {}
+for s in SOURCES:
+    no3, po4 = fields[s]
+    x = np.asarray(po4.values, dtype=float).ravel()
+    y = np.asarray(no3.values, dtype=float).ravel()
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if x.size > 20000:
+        sel = rng.choice(x.size, 20000, replace=False)
+        x, y = x[sel], y[sel]
+    scatter_data[s] = (x, y)
+
+print("\ndone")
+
+# --- visualization ---
+import numpy as np
+import matplotlib.pyplot as plt
+
+SOURCES_ORDER = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']
+COLORS = {'WOA23': 'k', 'CESM2': 'tab:blue', 'GFDL-ESM4': 'tab:green', 'MPI-ESM1-2-LR': 'tab:red'}
+
+# ------------------------------------------------------------------
+# Figure 1: NO3 vs PO4 scatter, 200-1000 m, one panel per source
+# ------------------------------------------------------------------
+fig1, axes1 = plt.subplots(2, 2, figsize=(11, 9.5), constrained_layout=True)
+
+xall = np.concatenate([scatter_data[s][0] for s in SOURCES_ORDER])
+yall = np.concatenate([scatter_data[s][1] for s in SOURCES_ORDER])
+xmin, xmax = 0.0, float(np.nanpercentile(xall, 99.7))
+ymin, ymax = 0.0, float(np.nanpercentile(yall, 99.7))
+xticks = np.linspace(0, np.ceil(xmax), 6)
+yticks = np.linspace(0, np.ceil(ymax), 6)
+
+xline = np.linspace(0.0, np.ceil(xmax), 100)
+
+for ax, s in zip(axes1.ravel(), SOURCES_ORDER):
+    xs, ys = scatter_data[s]
+    ax.scatter(xs, ys, s=2, alpha=0.18, color=COLORS[s], edgecolors='none',
+               label='cells (200-1000 m)')
+    R = results[s]
+    ax.plot(xline, R['a'] * xline + R['b'], color='tab:orange', lw=2,
+            label=f"fit: NO3 = {R['a']:.2f}*PO4 + {R['b']:.2f}")
+    ax.plot(xline, 16.0 * xline, color='m', lw=1.4, ls='--', label='Redfield 16:1')
+    ax.set_xlim(0, np.ceil(xmax))
+    ax.set_ylim(0, np.ceil(ymax))
+    ax.set_xticks(xticks)
+    ax.set_yticks(yticks)
+    ax.set_xlabel('Phosphate (umol kg$^{-1}$)')
+    ax.set_ylabel('Nitrate (umol kg$^{-1}$)')
+    ax.set_title(f"{s}\na = {R['a']:.2f}, b = {R['b']:.2f}, R$^2$ = {R['r2']:.3f}")
+    ax.legend(loc='upper left', fontsize=8, framealpha=0.85)
+    ax.grid(alpha=0.25)
+
+fig1.suptitle('Nitrate vs phosphate, 200-1000 m (each source, equal-cell-weight OLS)', fontsize=13)
+
+# ------------------------------------------------------------------
+# Figure 2: 200-1000 m mean N:P minus 16, common lon-lat frame
+# ------------------------------------------------------------------
+fig2, axes2 = plt.subplots(2, 2, figsize=(13, 7.5), constrained_layout=True)
+
+diff_maps = {s: (maps_reg[s] - 16.0) for s in SOURCES_ORDER}
+pooled = np.concatenate([np.asarray(diff_maps[s].values, dtype=float).ravel()
+                         for s in SOURCES_ORDER])
+vmax = float(np.nanpercentile(np.abs(pooled), 98))
+if not np.isfinite(vmax) or vmax == 0:
+    vmax = 1.0
+
+pcm = None
+for ax, s in zip(axes2.ravel(), SOURCES_ORDER):
+    f = diff_maps[s]
+    lon = np.asarray(f['lon'].values)
+    lat = np.asarray(f['lat'].values)
+    pcm = ax.pcolormesh(lon, lat, np.asarray(f.values), cmap='RdBu_r',
+                        vmin=-vmax, vmax=vmax, shading='auto')
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-80, 85)
+    ax.set_xticks([-180, -120, -60, 0, 60, 120, 180])
+    ax.set_yticks([-80, -40, 0, 40, 80])
+    ax.set_title(f"{s}", fontsize=11)
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+
+cb = fig2.colorbar(pcm, ax=axes2, orientation='vertical', extend='both', shrink=0.9)
+cb.set_label('N:P - 16')
+fig2.suptitle(f'Mean N:P minus 16 over 200-1000 m (shared scale, clipped at '
+              f'{vmax:.1f}; models regridded to the 1$^\\circ$ grid for display only)',
+              fontsize=12)
+
+print("figures built")
+</executed_code>
+
+Here are the results of code execution:
+
+Status Summary:
+- Computation: Success
+- Visualization: Generated
+
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "TIME_WIN": [
+        "1971-01",
+        "2000-12"
+      ],
+      "DEPTH_WIN": [
+        200.0,
+        1000.0
+      ],
+      "MODELS": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "SOURCES": [
+        "WOA23",
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "fields": {
+        "CESM2": [
+          {
+            "type": "DataArray",
+            "dims": {
+              "depth": 20,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "umol kg-1",
+            "long_name": "Dissolved Nitrate Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2457600,
+            "n_valid": 1558515,
+            "min": -1.2429112272107439,
+            "max": 40.657987156349776,
+            "mean": 19.2548949367223,
+            "std": 7.077679276041299
+          },
+          {
+            "type": "DataArray",
+            "dims": {
+              "depth": 20,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "umol kg-1",
+            "long_name": "Total Dissolved Inorganic Phosphorus Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2457600,
+            "n_valid": 1558515,
+            "min": 0.12754869829029797,
+            "max": 7.386716366293223,
+            "mean": 1.719147221288973,
+            "std": 0.7059949970221956
+          }
+        ],
+        "GFDL-ESM4": [
+          {
+            "type": "DataArray",
+            "dims": {
+              "depth": 8,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "umol kg-1",
+            "long_name": "Dissolved Nitrate Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 518400,
+            "n_valid": 315011,
+            "min": 0.25638289908261874,
+            "max": 45.897650203617744,
+            "mean": 23.073233365978147,
+            "std": 8.912631786652508
+          },
+          {
+            "type": "DataArray",
+            "dims": {
+              "depth": 8,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "umol kg-1",
+            "long_name": "Total Dissolved Inorganic Phosphorus Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 518400,
+            "n_valid": 315011,
+            "min": 0.10832037833761679,
+            "max": 4.299630111885942,
+            "mean": 1.669058516956483,
+            "std": 0.7140985599038961
+          }
+        ],
+        "MPI-ESM1-2-LR": [
+          {
+            "type": "DataArray",
+            "dims": {
+              "depth": 11,
+              "j": 220,
+              "i": 254
+            },
+            "units": "umol kg-1",
+            "long_name": "Dissolved Nitrate Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 614680,
+            "n_valid": 330410,
+            "min": 0.7086485538058503,
+            "max": 48.9497202312583,
+            "mean": 17.673122380226186,
+            "std": 6.9092958529898105
+          },
+          {
+            "type": "DataArray",
+            "dims": {
+              "depth": 11,
+              "j": 220,
+              "i": 254
+            },
+            "units": "umol kg-1",
+            "long_name": "Total Dissolved Inorganic Phosphorus Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 614680,
+            "n_valid": 330410,
+            "min": 0.09417574453353066,
+            "max": 5.232363428071285,
+            "mean": 1.3998098906746281,
+            "std": 0.6620695845078602
+          }
+        ],
+        "WOA23": [
+          {
+            "type": "DataArray",
+            "dims": {
+              "depth": 21,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "umol kg-1",
+            "long_name": "Objectively analyzed mean fields for moles_of_nitrate_per_unit_mass_in_sea_water at standard depth levels.",
+            "source_dataset": "woa23",
+            "size": 1360800,
+            "n_valid": 784057,
+            "min": 0.0,
+            "max": 49.30696105957031,
+            "mean": 24.869802474975586,
+            "std": 10.232882499694824
+          },
+          {
+            "type": "DataArray",
+            "dims": {
+              "depth": 21,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "umol kg-1",
+            "long_name": "Objectively analyzed mean fields for moles_of_phosphate_per_unit_mass_in_sea_water at standard depth levels.",
+            "source_dataset": "woa23",
+            "size": 1360800,
+            "n_valid": 784057,
+            "min": 0.027720004320144653,
+            "max": 9.790349960327148,
+            "mean": 1.7750780582427979,
+            "std": 0.751785159111023
+          }
+        ]
+      },
+      "woa_no3": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 21,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "umol kg-1",
+        "long_name": "Objectively analyzed mean fields for moles_of_nitrate_per_unit_mass_in_sea_water at standard depth levels.",
+        "source_dataset": "woa23",
+        "size": 1360800,
+        "n_valid": 784057,
+        "min": 0.0,
+        "max": 49.30696105957031,
+        "mean": 24.869802474975586,
+        "std": 10.232882499694824
+      },
+      "woa_po4": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 21,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "umol kg-1",
+        "long_name": "Objectively analyzed mean fields for moles_of_phosphate_per_unit_mass_in_sea_water at standard depth levels.",
+        "source_dataset": "woa23",
+        "size": 1360800,
+        "n_valid": 784057,
+        "min": 0.027720004320144653,
+        "max": 9.790349960327148,
+        "mean": 1.7750780582427979,
+        "std": 0.751785159111023
+      },
+      "vol_source": {
+        "CESM2": "volcello published by cmip6_historical",
+        "GFDL-ESM4": "volcello published by cmip6_historical",
+        "MPI-ESM1-2-LR": "volcello published by cmip6_historical",
+        "WOA23": "area x layer thickness (WOA23 1 deg grid)"
+      },
+      "np_fields": {
+        "WOA23": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 21,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "woa23",
+          "size": 1360800,
+          "n_valid": 784057,
+          "min": 0.0,
+          "max": 138.867431640625,
+          "mean": 14.172592163085938,
+          "std": 1.9178621768951416
+        },
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 20,
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "cmip6_historical",
+          "size": 2457600,
+          "n_valid": 1558515,
+          "min": -0.37621481142704777,
+          "max": 32.61127958416687,
+          "mean": 12.048960207990236,
+          "std": 3.1140537021722654
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 8,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "cmip6_historical",
+          "size": 518400,
+          "n_valid": 315011,
+          "min": 0.07223735245246425,
+          "max": 16.914352000405863,
+          "mean": 14.164135900158088,
+          "std": 1.5512172343345105
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 11,
+            "j": 220,
+            "i": 254
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "cmip6_historical",
+          "size": 614680,
+          "n_valid": 330410,
+          "min": 1.0104710717071648,
+          "max": 29.803192163749625,
+          "mean": 12.974137504845922,
+          "std": 1.5767239681780572
+        }
+      },
+      "fits": {
+        "WOA23": {
+          "a": 12.959784980279071,
+          "b": 1.8651704642955664,
+          "r2": 0.9065404291753683,
+          "n": 784057,
+          "r2_numpy": 0.9065404291753681
+        },
+        "CESM2": {
+          "a": 4.893215334885374,
+          "b": 10.842737390585519,
+          "r2": 0.23823751237734303,
+          "n": 1558515,
+          "r2_numpy": 0.23823751237734286
+        },
+        "GFDL-ESM4": {
+          "a": 11.290156711917307,
+          "b": 4.2293011481791645,
+          "r2": 0.8182845014537156,
+          "n": 315011,
+          "r2_numpy": 0.8182845014537141
+        },
+        "MPI-ESM1-2-LR": {
+          "a": 8.593049365347108,
+          "b": 5.644486887557969,
+          "r2": 0.6780072040159917,
+          "n": 330410,
+          "r2_numpy": 0.6780072040159921
+        }
+      },
+      "BASINS": [
+        "Pacific",
+        "Atlantic",
+        "Indian"
+      ],
+      "results": {
+        "WOA23": {
+          "mean_ratio": 14.17728332715514,
+          "ratio_of_means": 14.007659793848134,
+          "mean_no3": 27.494439151067063,
+          "mean_po4": 1.9628145997050868,
+          "pct_14_18": 55.225596220706905,
+          "band_m3": 1.3687527192675643e+17,
+          "total_m3": 2.478475223331946e+17,
+          "basins": {
+            "Pacific": 13.608267408916694,
+            "Atlantic": 15.589312305372857,
+            "Indian": 13.749757034943313
+          },
+          "pct_lt12_global": 5.682333571614599,
+          "m3_lt12_global": 1.4083522967954108e+16,
+          "vol_global_m3": 2.478475223331946e+17,
+          "pct_lt12_pacific": 7.28717163201639,
+          "m3_lt12_pacific": 8204201201489804.0,
+          "vol_pacific_m3": 1.1258416318128723e+17,
+          "pct_lt12_indian": 9.958333013272995,
+          "m3_lt12_indian": 4314659418689123.0,
+          "vol_indian_m3": 4.3327125262213224e+16,
+          "a": 12.959784980279071,
+          "b": 1.8651704642955664,
+          "r2": 0.9065404291753683,
+          "n_cells": 784057
+        },
+        "CESM2": {
+          "mean_ratio": 11.830482560650232,
+          "ratio_of_means": 10.927294858825897,
+          "mean_no3": 21.309043248909408,
+          "mean_po4": 1.9500748835104644,
+          "pct_14_18": 17.163525412504953,
+          "band_m3": 4.748561352219853e+16,
+          "total_m3": 2.7666585028971725e+17,
+          "basins": {
+            "Pacific": 10.578631631290953,
+            "Atlantic": 13.546512040914422,
+            "Indian": 11.181847067562554
+          },
+          "pct_lt12_global": 36.72567181983481,
+          "m3_lt12_global": 1.0160739221495706e+17,
+          "vol_global_m3": 2.7666585028971725e+17,
+          "pct_lt12_pacific": 59.35749953030386,
+          "m3_lt12_pacific": 7.384733724227994e+16,
+          "vol_pacific_m3": 1.244111322522583e+17,
+          "pct_lt12_indian": 35.83043333814737,
+          "m3_lt12_indian": 1.7240049346654208e+16,
+          "vol_indian_m3": 4.81156596236288e+16,
+          "a": 4.893215334885374,
+          "b": 10.842737390585519,
+          "r2": 0.23823751237734303,
+          "n_cells": 1558515,
+          "bias_vs_woa": -2.3227933133949534,
+          "rmse_vs_woa": 3.5994935256420195,
+          "crmse_vs_woa": 2.749724506998203,
+          "max_abs_err_vs_woa": 24.21190736506146,
+          "max_abs_err_at": {
+            "lat": 23.5,
+            "lon": -79.5
+          },
+          "mean_data_masked": 11.856663378556416,
+          "mean_woa_masked": 14.179456691951367,
+          "n_valid_masked": 38084
+        },
+        "GFDL-ESM4": {
+          "mean_ratio": 14.171496420827092,
+          "ratio_of_means": 13.694851122175695,
+          "mean_no3": 24.377003477218402,
+          "mean_po4": 1.7800123024152772,
+          "pct_14_18": 75.345870384017,
+          "band_m3": 1.7900546222588045e+17,
+          "total_m3": 2.3757833218136474e+17,
+          "basins": {
+            "Pacific": 13.455786340548734,
+            "Atlantic": 15.060694721918432,
+            "Indian": 14.760292463360704
+          },
+          "pct_lt12_global": 7.027652822088077,
+          "m3_lt12_global": 1.6696180366213468e+16,
+          "vol_global_m3": 2.3757833218136474e+17,
+          "pct_lt12_pacific": 14.531380344663344,
+          "m3_lt12_pacific": 1.5601696359269312e+16,
+          "vol_pacific_m3": 1.0736554951573504e+17,
+          "pct_lt12_indian": 0.3099634698700255,
+          "m3_lt12_indian": 127564865089536.0,
+          "vol_indian_m3": 4.11548061270016e+16,
+          "a": 11.290156711917307,
+          "b": 4.2293011481791645,
+          "r2": 0.8182845014537156,
+          "n_cells": 315011,
+          "bias_vs_woa": -0.012005932771991322,
+          "rmse_vs_woa": 1.6603422228488816,
+          "crmse_vs_woa": 1.660298814838172,
+          "max_abs_err_vs_woa": 26.260786249776466,
+          "max_abs_err_at": {
+            "lat": 31.5,
+            "lon": 17.5
+          },
+          "mean_data_masked": 14.167450759179378,
+          "mean_woa_masked": 14.179456691951367,
+          "n_valid_masked": 38084
+        },
+        "MPI-ESM1-2-LR": {
+          "mean_ratio": 12.284580583447095,
+          "ratio_of_means": 11.771490696882312,
+          "mean_no3": 20.37652860903865,
+          "mean_po4": 1.7310066442507057,
+          "pct_14_18": 0.5461184280304227,
+          "band_m3": 1487375544812544.0,
+          "total_m3": 2.7235402954204774e+17,
+          "basins": {
+            "Pacific": 11.285435518990234,
+            "Atlantic": 13.148035379573106,
+            "Indian": 12.602320305323563
+          },
+          "pct_lt12_global": 22.519123821348604,
+          "m3_lt12_global": 6.133174114500608e+16,
+          "vol_global_m3": 2.7235402954204774e+17,
+          "pct_lt12_pacific": 40.016647394226354,
+          "m3_lt12_pacific": 4.883684626717082e+16,
+          "vol_pacific_m3": 1.2204132391714816e+17,
+          "pct_lt12_indian": 14.985226654136358,
+          "m3_lt12_indian": 7030725430247424.0,
+          "vol_indian_m3": 4.691771164039578e+16,
+          "a": 8.593049365347108,
+          "b": 5.644486887557969,
+          "r2": 0.6780072040159917,
+          "n_cells": 330410,
+          "bias_vs_woa": -1.8737492850338033,
+          "rmse_vs_woa": 2.726125150632754,
+          "crmse_vs_woa": 1.980106551109754,
+          "max_abs_err_vs_woa": 29.32789090240501,
+          "max_abs_err_at": {
+            "lat": 31.5,
+            "lon": 17.5
+          },
+          "mean_data_masked": 12.305707406917566,
+          "mean_woa_masked": 14.179456691951367,
+          "n_valid_masked": 38084
+        }
+      },
+      "maps_native": {
+        "WOA23": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 38519,
+          "min": 0.0006856875032618907,
+          "max": 50.34051864624024,
+          "mean": 14.23013904485709,
+          "std": 1.5701372175432768
+        },
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "cmip6_historical",
+          "size": 122880,
+          "n_valid": 80296,
+          "min": 0.00430498925492799,
+          "max": 25.458857605818075,
+          "mean": 11.8284585181465,
+          "std": 3.23682440159079
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "cmip6_historical",
+          "size": 64800,
+          "n_valid": 40866,
+          "min": 2.2866053955764087,
+          "max": 16.67689329650734,
+          "mean": 14.094959578963923,
+          "std": 1.4290563813179153
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "j": 220,
+            "i": 254
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "cmip6_historical",
+          "size": 55880,
+          "n_valid": 32619,
+          "min": 2.0192496566556293,
+          "max": 26.99758937191961,
+          "mean": 13.050670339698723,
+          "std": 1.4518638317323254
+        }
+      },
+      "maps_reg": {
+        "WOA23": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 38519,
+          "min": 0.0006856875032618907,
+          "max": 50.34051864624024,
+          "mean": 14.23013904485709,
+          "std": 1.5701372175432768
+        },
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 39475,
+          "min": 0.01069842100004848,
+          "max": 24.336460586251075,
+          "mean": 12.270801645329222,
+          "std": 2.8687937284471703
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 40866,
+          "min": 2.2866053955764087,
+          "max": 16.67689329650734,
+          "mean": 14.094959578963923,
+          "std": 1.4290563813179153
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Nitrate to phosphate ratio",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 39586,
+          "min": 2.0192867409961663,
+          "max": 26.04190096779793,
+          "mean": 12.639010105924687,
+          "std": 1.6894976195855174
+        }
+      },
+      "cmp_mask": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "long_name": "cells covered by every field in the comparison",
+        "source_dataset": "woa23",
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "n_mask_cells": 38084,
+      "n_mask_total": 64800,
+      "diff_metrics": {
+        "CESM2": {
+          "bias": -2.3227933133949534,
+          "mae": 2.3955243098824957,
+          "rmse": 3.5994935256420195,
+          "centered_rmse": 2.749724506998203,
+          "max_abs_error": 24.21190736506146,
+          "max_abs_error_at": {
+            "lat": 23.5,
+            "lon": -79.5
+          },
+          "std_data": 3.161083020222551,
+          "std_reference": 1.5067919157383893,
+          "std_ratio": 2.0978895540951266,
+          "mean_data": 11.856663378556416,
+          "mean_reference": 14.179456691951367,
+          "n_valid": 38084,
+          "weighting": "area: WOA23 lat_bnds/lon_bnds (woa23_decav71A0_t00_01.nc)",
+          "difference": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "1",
+            "long_name": "Nitrate to phosphate ratio",
+            "source_dataset": "woa23",
+            "size": 64800,
+            "n_valid": 38084,
+            "min": -24.21190736506146,
+            "max": 5.331208198510802,
+            "mean": -1.9582100253587045,
+            "std": 2.53780985217305
+          }
+        },
+        "GFDL-ESM4": {
+          "bias": -0.012005932771991322,
+          "mae": 1.0237687180615813,
+          "rmse": 1.6603422228488816,
+          "centered_rmse": 1.660298814838172,
+          "max_abs_error": 26.260786249776466,
+          "max_abs_error_at": {
+            "lat": 31.5,
+            "lon": 17.5
+          },
+          "std_data": 1.5369467158129309,
+          "std_reference": 1.5067919157383893,
+          "std_ratio": 1.020012584192665,
+          "mean_data": 14.167450759179378,
+          "mean_reference": 14.179456691951367,
+          "n_valid": 38084,
+          "weighting": "area: WOA23 lat_bnds/lon_bnds (woa23_decav71A0_t00_01.nc)",
+          "difference": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "1",
+            "long_name": "Nitrate to phosphate ratio",
+            "source_dataset": "woa23",
+            "size": 64800,
+            "n_valid": 38084,
+            "min": -26.260786249776466,
+            "max": 8.919058229490982,
+            "mean": -0.09408846544463942,
+            "std": 1.6111216205740118
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "bias": -1.8737492850338033,
+          "mae": 1.9459773316620605,
+          "rmse": 2.726125150632754,
+          "centered_rmse": 1.980106551109754,
+          "max_abs_error": 29.32789090240501,
+          "max_abs_error_at": {
+            "lat": 31.5,
+            "lon": 17.5
+          },
+          "std_data": 1.8478477810799325,
+          "std_reference": 1.5067919157383893,
+          "std_ratio": 1.2263456962963675,
+          "mean_data": 12.305707406917566,
+          "mean_reference": 14.179456691951367,
+          "n_valid": 38084,
+          "weighting": "area: WOA23 lat_bnds/lon_bnds (woa23_decav71A0_t00_01.nc)",
+          "difference": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "1",
+            "long_name": "Nitrate to phosphate ratio",
+            "source_dataset": "woa23",
+            "size": 64800,
+            "n_valid": 38084,
+            "min": -29.32789090240501,
+            "max": 18.92578389374169,
+            "mean": -1.606307684991491,
+            "std": 1.912376814637411
+          }
+        }
+      },
+      "rows": [
+        {
+          "source": "WOA23",
+          "mean_NP(mean of ratios)": 14.18,
+          "ratio_of_means": 14.01,
+          "a (slope)": 12.96,
+          "b (intercept)": 1.87,
+          "R2": 0.907,
+          "n_cells": 784057,
+          "%vol 14<NP<18": 55.2,
+          "Pacific": 13.61,
+          "Atlantic": 15.59,
+          "Indian": 13.75,
+          "%vol NP<12 global": 5.7,
+          "%vol NP<12 Pacific": 7.3,
+          "%vol NP<12 Indian": 10.0
+        },
+        {
+          "source": "CESM2",
+          "mean_NP(mean of ratios)": 11.83,
+          "ratio_of_means": 10.93,
+          "a (slope)": 4.89,
+          "b (intercept)": 10.84,
+          "R2": 0.238,
+          "n_cells": 1558515,
+          "%vol 14<NP<18": 17.2,
+          "Pacific": 10.58,
+          "Atlantic": 13.55,
+          "Indian": 11.18,
+          "%vol NP<12 global": 36.7,
+          "%vol NP<12 Pacific": 59.4,
+          "%vol NP<12 Indian": 35.8
+        },
+        {
+          "source": "GFDL-ESM4",
+          "mean_NP(mean of ratios)": 14.17,
+          "ratio_of_means": 13.69,
+          "a (slope)": 11.29,
+          "b (intercept)": 4.23,
+          "R2": 0.818,
+          "n_cells": 315011,
+          "%vol 14<NP<18": 75.3,
+          "Pacific": 13.46,
+          "Atlantic": 15.06,
+          "Indian": 14.76,
+          "%vol NP<12 global": 7.0,
+          "%vol NP<12 Pacific": 14.5,
+          "%vol NP<12 Indian": 0.3
+        },
+        {
+          "source": "MPI-ESM1-2-LR",
+          "mean_NP(mean of ratios)": 12.28,
+          "ratio_of_means": 11.77,
+          "a (slope)": 8.59,
+          "b (intercept)": 5.64,
+          "R2": 0.678,
+          "n_cells": 330410,
+          "%vol 14<NP<18": 0.5,
+          "Pacific": 11.29,
+          "Atlantic": 13.15,
+          "Indian": 12.6,
+          "%vol NP<12 global": 22.5,
+          "%vol NP<12 Pacific": 40.0,
+          "%vol NP<12 Indian": 15.0
+        }
+      ],
+      "summary": "               mean_NP(mean of ratios)  ...  %vol NP<12 Indian\nsource                                  ...                   \nWOA23                            14.18  ...               10.0\nCESM2                            11.83  ...               35.8\nGFDL-ESM4                        14.17  ...                0.3\nMPI-ESM1-2-LR                    12.28  ...               15.0\n\n[4 rows x 13 columns]",
+      "rng": "Generator(PCG64)",
+      "scatter_data": {
+        "WOA23": [
+          {
+            "type": "ndarray",
+            "shape": [
+              20000
+            ],
+            "size": 20000,
+            "n_valid": 20000,
+            "min": 0.07002926617860794,
+            "max": 9.0454740524292,
+            "mean": 1.7748183535791933,
+            "std": 0.7501426293124918
+          },
+          {
+            "type": "ndarray",
+            "shape": [
+              20000
+            ],
+            "size": 20000,
+            "n_valid": 20000,
+            "min": 0.0,
+            "max": 45.88815689086914,
+            "mean": 24.89997715170448,
+            "std": 10.233287443913794
+          }
+        ],
+        "CESM2": [
+          {
+            "type": "ndarray",
+            "shape": [
+              20000
+            ],
+            "size": 20000,
+            "n_valid": 20000,
+            "min": 0.15251328100760778,
+            "max": 7.208632389268919,
+            "mean": 1.7187296161428338,
+            "std": 0.7074250363921916
+          },
+          {
+            "type": "ndarray",
+            "shape": [
+              20000
+            ],
+            "size": 20000,
+            "n_valid": 20000,
+            "min": -1.201092594079333,
+            "max": 40.601610920875586,
+            "mean": 19.268995462188638,
+            "std": 7.070576258700193
+          }
+        ],
+        "GFDL-ESM4": [
+          {
+            "type": "ndarray",
+            "shape": [
+              20000
+            ],
+            "size": 20000,
+            "n_valid": 20000,
+            "min": 0.15934366161556549,
+            "max": 4.050270107238805,
+            "mean": 1.6685743163001803,
+            "std": 0.714351050383889
+          },
+          {
+            "type": "ndarray",
+            "shape": [
+              20000
+            ],
+            "size": 20000,
+            "n_valid": 20000,
+            "min": 1.5653863606550922,
+            "max": 45.680224889119465,
+            "mean": 23.049462382951432,
+            "std": 8.907570916005568
+          }
+        ],
+        "MPI-ESM1-2-LR": [
+          {
+            "type": "ndarray",
+            "shape": [
+              20000
+            ],
+            "size": 20000,
+            "n_valid": 20000,
+            "min": 0.1153255515004525,
+            "max": 5.1723919087114245,
+            "mean": 1.3961988279618112,
+            "std": 0.6600430678825725
+          },
+          {
+            "type": "ndarray",
+            "shape": [
+              20000
+            ],
+            "size": 20000,
+            "n_valid": 20000,
+            "min": 0.8993688384752614,
+            "max": 47.39379863700721,
+            "mean": 17.656722149713627,
+            "std": 6.917227437965546
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_full_20261020/T7_deepseek-flash_20261027_203314/turn01/figures/visualization_T7_deepseek-flash_20261027_203314_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_full_20261020/T7_deepseek-flash_20261027_203314/turn01/figures/visualization_T7_deepseek-flash_20261027_203314_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Please provide a clear scientific summary inside <solution></solution> tags.
+
+Describe the methodology strictly from the <executed_code> above, never by inferring it from variable
+names: the baseline period, the source of any climatology, the weighting, the units, the region and
+time range, the range of lags — all of it must match the tools and arguments the code actually
+called. Do not report a step the code did not take. Where a variable name in the observation is
+ambiguous, the code decides what it means.
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
+4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, tool choice, computation and visualization attempts
+3. Suggestions for how to reformulate the query
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+**Direct answer.** Over 200–1000 m, all four sources have mean N:P below Redfield 16:1. The WOA23 observed headline N:P (volume-weighted mean of cell-by-cell N:P) is **14.18**; the models give **14.17** (GFDL-ESM4), **12.28** (MPI-ESM1-2-LR) and **11.83** (CESM2). GFDL-ESM4 reproduces the observed global mean and global low-N:P fraction best (bias −0.01; N:P<12 fraction 7.0% vs observed 5.7%), but **no model reproduces the observed low-N:P volume and its basin distribution**. CESM2 and MPI-ESM1-2-LR strongly overproduce low-N:P water, while GFDL-ESM4 nearly removes the Indian Ocean low-N:P signal.
+
+**Methodology actually used.** CMIP6 historical `no3` and `po4` for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR were loaded monthly for **1971-01 to 2000-12** with `load_regular_data` and depth range 200–1000 m. They were converted with `transform_unit` from mol m−3 to µmol kg−1 using the constant-density conversion argument `density=1.025`; WOA23 nitrate/phosphate were already µmol kg−1 and were not converted. Annual means were formed with `temporal_aggregate(freq='mean')` on `no3` and `po4`, and N:P was computed afterwards with `compute_ratio`, not from monthly ratios. Levels whose depth coordinate lies strictly inside 200–1000 m were retained with `sub_layer`; the 200 m and 1000 m interfaces themselves were excluded. This left 21 WOA23 levels, 20 CESM2 levels, 8 GFDL-ESM4 levels and 11 MPI-ESM1-2-LR levels. The WOA23 input was the annual objectively analyzed climatology on the 1° grid. Volume-weighted diagnostics used `compute_basic_stat(op='volume_weighted_mean')` and `compute_exceedance_fraction(weighting='volume')`; recorded volume sources were published `volcello` for each CMIP6 model and WOA23 area × layer thickness. The OLS fit used `fit_multivariate_relation(method='linear')` over all valid cells with equal cell weight, in µmol kg−1. Basin means used `select_basin(..., include_marginal_seas=True, depth_dependent=False)` for Pacific, Atlantic and Indian; Southern and Arctic basins were excluded from these three basin means but remain in the global numbers. The headline mean is the **volume-weighted mean of the cell-by-cell N:P ratio**; the ratio of the volume-weighted mean nitrate to the volume-weighted mean phosphate is reported separately because N:P is nonlinear.
+
+### Key stoichiometry results
+
+| Source | Headline mean N:P: mean of cell-by-cell N:P | Ratio of VW mean NO3 to VW mean PO4 | OLS slope a | OLS intercept b (µmol kg−1) | R² | N cells | % volume 14<N:P<18 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| WOA23 | **14.18** | 14.01 | 12.96 | 1.87 | 0.907 | 784,057 | 55.2 |
+| CESM2 | **11.83** | 10.93 | 4.89 | 10.84 | 0.238 | 1,558,515 | 17.2 |
+| GFDL-ESM4 | **14.17** | 13.69 | 11.29 | 4.23 | 0.818 | 315,011 | 75.3 |
+| MPI-ESM1-2-LR | **12.28** | 11.77 | 8.59 | 5.64 | 0.678 | 330,410 | 0.5 |
+
+All sources sit **below Redfield 16:1** in the 200–1000 m mean. The WOA23 observed mean is 14.18; GFDL-ESM4 is almost identical at 14.17, while CESM2 and MPI-ESM1-2-LR are substantially lower. The fitted slopes are also below 16 in every source, with positive intercepts; CESM2 has the weakest NO3–PO4 relationship (R² = 0.238), while WOA23 has the strongest (R² = 0.907).
+
+### Basin means and low-N:P volume fractions
+
+| Source | Pacific mean N:P | Atlantic mean N:P | Indian mean N:P | % volume N:P<12 global | % volume N:P<12 Pacific | % volume N:P<12 Indian |
+|---|---:|---:|---:|---:|---:|---:|
+| WOA23 | 13.61 | 15.59 | 13.75 | 5.7 | 7.3 | 10.0 |
+| CESM2 | 10.58 | 13.55 | 11.18 | 36.7 | 59.4 | 35.8 |
+| GFDL-ESM4 | 13.46 | 15.06 | 14.76 | 7.0 | 14.5 | 0.3 |
+| MPI-ESM1-2-LR | 11.29 | 13.15 | 12.60 | 22.5 | 40.0 | 15.0 |
+
+The observed low-N:P signal is modest globally (5.7%) and is larger in the Indian Ocean (10.0%) than in the Pacific (7.3%). CESM2 and MPI-ESM1-2-LR greatly overproduce N:P<12 water globally and especially in the Pacific. GFDL-ESM4 roughly matches the global low-N:P fraction (7.0%) and the global mean, but has too much low-N:P water in the Pacific (14.5%) and almost none in the Indian Ocean (0.3%). Thus the models do not reproduce the observed basin distribution of the low-N:P denitrification signal. The mean N:P ordering with Atlantic highest and Pacific/Indian lower is broadly present, but the N:P<12 volume distribution is wrong.
+
+Volumes behind the shares: layer volume is 2.478×10^17 m³ (WOA23), 2.767×10^17 m³ (CESM2), 2.376×10^17 m³ (GFDL-ESM4) and 2.724×10^17 m³ (MPI-ESM1-2-LR). Global N:P<12 volume is 1.408×10^16, 1.016×10^17, 1.670×10^16 and 6.133×10^16 m³ respectively. Pacific N:P<12 volume is 8.204×10^15, 7.385×10^16, 1.560×10^16 and 4.884×10^16 m³; Indian N:P<12 volume is 4.315×10^15, 1.724×10^16, 1.276×10^14 and 7.031×10^15 m³.
+
+### Model–observation agreement
+
+Each model’s 200–1000 m column N:P was conservatively regridded to the WOA23 1° grid for comparison and display; the metrics use a shared comparison mask built with `build_comparison_mask(ocean_only=True)`. The mask retained **38,084 of 64,800** cells. The WOA23 mean on that shared sample is 14.179.
+
+| Model | Bias (model − WOA23) | RMSE | Centred RMSE | Max absolute error and location | Compared mean N:P | n valid |
+|---|---:|---:|---:|---|---:|---:|
+| CESM2 | −2.32 | 3.60 | 2.75 | 24.21 at 23.5°N, 79.5°W | 11.86 | 38,084 |
+| GFDL-ESM4 | −0.01 | 1.66 | 1.66 | 26.26 at 31.5°N, 17.5°E | 14.17 | 38,084 |
+| MPI-ESM1-2-LR | −1.87 | 2.73 | 1.98 | 29.33 at 31.5°N, 17.5°E | 12.31 | 38,084 |
+
+GFDL-ESM4 has by far the smallest global bias and a mean N:P almost identical to WOA23, but it still has large local errors and the wrong spatial low-N:P distribution. CESM2 is strongly biased low and has the largest RMSE. MPI-ESM1-2-LR is also biased low and overproduces low-N:P volume.
+
+### Figures
+
+- **Figure 1** is a four-panel scatter of nitrate (y) versus phosphate (x) in µmol kg−1 over 200–1000 m, ordered WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, with identical axis ranges and ticks. Each panel shows its own OLS fit, the Redfield 16:1 line through the origin, and annotations of slope a, intercept b and R². For drawing only, the scatter uses up to 20,000 randomly selected valid cells per source; the fitted statistics use all valid cells.
+- **Figure 2** is a 2×2 map of the 200–1000 m mean N:P minus 16 for the four sources on a common longitude–latitude frame, using one shared diverging colour scale centred on zero. The model fields were put on the WOA23 1° grid for display only; all means, volume shares, basin statistics and comparison masks were computed on each model’s archive/native grid with its own area/volume information.
+
+### Important insights and caveats
+
+The observed low-N:P signal is small in total volume but basin-dependent. None of the three CMIP6 models reproduces both the magnitude and the Pacific/Indian distribution of N:P<12 water: CESM2 and MPI-ESM1-2-LR generate far too much low-N:P water, whereas GFDL-ESM4 matches the global mean and global low-N:P fraction but has an almost absent Indian Ocean low-N:P signal. CESM2 also contains slightly negative nitrate (minimum about −1.24 µmol kg−1) and negative N:P in some cells, which weakens its fit and inflates low-N:P fractions. The CMIP6 concentrations were placed on a constant-density basis for the regression; using in-situ density below the surface would change the µmol kg−1 concentrations and therefore the fitted a and b, while ratio-based quantities would be unchanged because the same density factor cancels.
+</solution>

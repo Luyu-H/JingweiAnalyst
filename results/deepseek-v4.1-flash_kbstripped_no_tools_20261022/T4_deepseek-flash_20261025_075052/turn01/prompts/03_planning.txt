@@ -1,0 +1,177 @@
+# exchange 3: planning
+# elapsed: 33.6 s
+
+===== SYSTEM =====
+You are an oceanographic data analysis assistant with conversation history support.
+
+
+
+Available tools: none. There are no project functions in this setting; the analysis code opens
+the datasets' raw files itself with numpy, pandas and xarray.
+
+Available datasets:
+{
+  "woa23": {
+    "description": "[climatology] World Ocean Atlas 2023 (NOAA/NCEI) 1.00 degree objectively analysed climatology. Temperature and salinity come on two climate normals, 1971-2000 and 1991-2020; oxygen, apparent oxygen utilization and percent oxygen saturation each provide both a 1971-2000 normal (the default) and a 1965-2022 all-period (all) composite; nutrients provide only the 1965-2022 all-period composite. Variables: apparent_oxygen_utilization, nitrate, oxygen, percent_oxygen_saturation, phosphate, salinity, silicate, temperature."
+  },
+  "glodap": {
+    "description": "[climatology] GLODAPv2 global ocean carbon chemistry mapped climatology (DIVA objective analysis), built from 1972-2013 input data. No time dimension, 33 standard depth levels. Variables: Cant, NO3, OmegaA, OmegaC, PI_TCO2, PO4, TAlk, TCO2, oxygen, pHts25p0, pHtsinsitutp, salinity, silicate, temperature. Climatology period 1972-2013."
+  },
+  "seanoe_mld": {
+    "description": "[climatology] Global ocean mixed layer depth (MLD) monthly climatology from the LOPS laboratory. The criterion is a potential density increase of 0.03 kg/m3 relative to the reference depth. Based on a month-by-month objective analysis of 1970-2021 Argo and WOD profiles. Variables: mask, mld_dr003, n_obs. Climatology period 1970-2021."
+  },
+  "ersst": {
+    "description": "[timeseries] NOAA Extended Reconstructed SST v5 (in situ observations only), monthly mean, 1854 to present. Surface only, no vertical dimension. Variables: sst."
+  },
+  "cpc_indices": {
+    "description": "[index] NOAA monthly climate indices. The four Nino products are CPC ENSO monitoring indices, giving regional mean SST and its anomaly in degC. The PDO product is a NOAA NCEI pattern index and is dimensionless; it is kept here so the monthly indices live together, despite the dataset id naming CPC. Products: ersst5_81-10, ersst5_91-20, oisst, oni, pdo."
+  },
+  "cmip6_historical": {
+    "description": "[timeseries] CMIP6 historical (all-forcing historical simulation) ocean component, Omon monthly frequency plus Ofx fixed fields. Three models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 1850-01 to 2014-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  },
+  "cmip6_ssp245": {
+    "description": "[timeseries] CMIP6 ScenarioMIP ssp245 (SSP2-4.5, concentration-driven). Grid and coordinate definitions are the same as historical; they differ in time range, variant label and variable coverage. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 2015-01 to 2100-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  }
+}
+
+Domain knowledge retrieved for this question (grouped by [fragment-id] (severity)):
+<domain_knowledge>
+[cmip6-mlotst-definition] (must)
+- Apply the `mlotst` criterion exactly: displaced-parcel δB > ΔB_crit = 0.0003 m s-2 (≈ Δρ_crit = 0.03 kg m-3), crossing depth linearly interpolated between the bracketing levels, referenced to the model's shallowest level; pass that as `ref_depth` to `compute_mixed_layer_depth` because `mlotst` is referenced to the ocean surface, not 10 m.
+- State the three residual causes — reference level, displaced-parcel-at-local-pressure vs σ0 density form, and instantaneous-MLD averaging vs MLD of monthly means (offline MLD expected shallower) — and do not report them as model error; drop columns where the threshold is never reached (GFDL/MPI fill ~full column depth, CESM2 often 0 m) and report the excluded area; note GFDL-ESM4's native 75 hybrid layers were remapped to 35 z levels.
+
+[monthly-means-are-time-averages] (must)
+- Compute the MLD of each monthly profile and then average the monthly MLDs; never average `thetao`/`so` first — state that the diagnostic-first order was used, since f(monthly mean) ≠ mean of f.
+- Each March/September climatology is the plain mean of that month's values across the 30 years (no day weights); day weighting via `temporal_aggregate` applies only to means spanning different calendar months.
+
+[common-comparison-mask] (must)
+- A bias, RMSE or pattern correlation between two fields exists only where both have data, and several models' cell-by-cell scores can be ranked only on the cells all of them cover; for a cell-by-cell comparison of one field put the fields on one grid, build one mask over all of them and apply it to every field (a pattern that an analysis produced on each source's own domain, such as a variability mode, is correlated with the reference over the cells the two share), and keep WOA23's land-sea mask out of comparisons WOA23 is not part of (GLODAP, for instance).
+
+[cmip6-thetao-potential-temperature] (should)
+- `thetao` is potential temperature (no `bigthetao` exists locally), so density/MLD must go through the potential-temperature route read by `temperature_kind()` in `src/tools/scientific_calculator.py`; the in-situ route biases density increasingly with depth.
+
+[cmip6-so-practical-salinity] (should)
+- `so` is practical salinity with units "0.001" and stored values ~35 — no ×0.001 or ×1000; before TEOS-10 (gsw) density calls convert S_P to S_A with the location-dependent function, otherwise the MLD bias varies by region.
+
+[cmip6-static-grid-fields] (should)
+- Take cell thickness as `volcello` / `areacello` (`cell_thickness_like` in `src/tools/data_loader.py`), not `lev_bnds` differences, which fail at partial top/bottom cells (GFDL-ESM4 differs >1 % in 14 % of cells; GFDL `volcello` is monthly).
+- Total ocean area differs between models by about a per cent; state the model's own `areacello` total each percentage is taken over rather than rescaling one model to another.
+
+[cmip6-grid-labels] (should)
+- GFDL-ESM4 is `gr`: its values and mask are already remapped to 1° (conserve_order1), so its comparison is on the archive grid, not the native one.
+- CESM2 (100 km) vs MPI (250 km) resolution differs ~2.5×; features narrower than the coarse grid are not comparable in amplitude, so say so where disagreement concentrates.
+
+[missing-values-and-land-cells] (should)
+- Build each field's valid mask from the field itself (masks differ between variables of one model), reduce NaN-aware with weights masked to the same cells, and keep land missing so it stays out of area fractions; a value near 1e20 in output is an unmasked fill value, not a result.
+</domain_knowledge>
+
+Data selection rules:
+1. <selected_data> must contain dataset IDs exactly as listed above (e.g. woa23, cmip6_historical).
+   Never put a file path there, and never invent a name. One dataset ID holds many variables, and
+   CMIP6 also holds several models; those are chosen in the next step, not here.
+2. Long-term trends, interannual variability and scenario projections need a timeseries dataset
+   (cmip6_historical, cmip6_ssp245, ersst). Mean state, seasonal cycle and vertical structure need a
+   climatology (woa23, glodap, seanoe_mld). A question about the ENSO monitoring index itself needs
+   cpc_indices.
+3. Select several datasets, comma-separated, when the question compares a model against observations
+   or needs variables that live in different products.
+4. Reading data: there are no loading functions. The code step opens the raw files of the datasets
+   you select and is shown where they live and how they are laid out; plan the reading as part of
+   the steps.
+5. Regional and global means are area- or volume-weighted, never plain averages over lat/lon: plan
+   where the weights come from (for CMIP6, the model's own areacello / volcello fixed fields).
+
+How to write the plan:
+1. Write the plan as numbered steps, each naming the datasets, variables and models it needs.
+   End it with an "Other notes:" section, one line each, holding only the caveats the answer must
+   state.
+2. Add no computational constraint of your own. Every definition, weighting, mask, threshold,
+   interpolation, filter or correction a step applies must come from the question or from what is
+   given above (the dataset descriptions, and any domain knowledge); do not devise one that
+   none of them states (an extra mask, a partial-layer weighting, a screening threshold).
+3. There are no project tools to call: plan every step as an operation the code performs on the raw
+   data with the standard libraries (numpy, pandas, xarray).
+4. Do not round intermediate values: later steps use the unrounded results of earlier ones, and a
+   value is rounded only where it is reported, to the precision the question asks for.
+5. The steps, any notes under them and Other notes all go inside the <plan> tags; nothing outside them
+   is passed on to the later steps.
+
+How to use the domain knowledge:
+1. Priority: definitions and procedures the user states explicitly in the question come first, the
+   dataset descriptions second, the knowledge fragments last. Use the fragments to settle
+   choices the question leaves open and to find the caveats that must be stated. When a fragment
+   conflicts with what the question prescribes, follow the question and record the difference under
+   Other notes so the answer can explain it.
+2. Under the step where a piece of knowledge FIRST matters, add one line "- Note [fragment-id]: ..."
+   carrying what to do (the formula, threshold, unit conversion or check). Each
+   fragment gets exactly ONE such note line in the whole plan, under a step or under Other notes, not
+   both. A later step that also depends on it names "[fragment-id]" inline in its own text, with no
+   further note line and no restatement - the next stage reads the whole plan. Do not copy the
+   knowledge text into the plan.
+3. Other notes also hold the differences between the question's definition and the protocol; a line
+   that comes from a fragment takes the form "- [fragment-id] ...".
+4. Cite every fragment of severity must at least once, in a step or under Other notes. Fragments of
+   severity should or info that end up unused may be left out.
+5. The notes may name functions of this project in backticks (`compute_basic_stat`,
+   `load_regular_data`, ...). None of them exists in this setting: read such a name as the operation
+   it stands for, and plan that operation on the raw data.
+
+Analyze the user's question and select appropriate data. Follow this format strictly:
+<plan>numbered steps: the datasets, variables and models each step needs, with the knowledge notes under each step, then Other notes</plan>
+<selected_data>comma-separated list of dataset IDs you will use</selected_data>
+
+IMPORTANT: Your response MUST contain all required XML tags, and tags must be properly closed.
+
+
+===== USER =====
+User question: Check whether a mixed layer depth (MLD) computed from each CMIP6 model's own temperature and salinity reproduces the mlotst field that the same model publishes. This is an internal consistency test: both quantities come from the same simulation, so any disagreement is a property of the diagnostic, not of the model's physics.
+
+Data to use:
+- CMIP6 historical `thetao`, `so` and `mlotst` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12.
+- Each model's own published cell areas (areacello).
+
+Expected numerical results, comparing the 1971-2000 March and September climatologies of the operator MLD with those of the published mlotst, for each of the six model-and-month combinations. The operator MLD is the mixed layer depth computed offline from the model's own thetao and so with the density criterion that defines mlotst, the crossing depth interpolated between the bracketing levels. For each model and calendar month, both climatologies cover only the cells where both fields are defined in all 30 instances of that month (the 30 Marches, or the 30 Septembers):
+- The mean difference, operator MLD minus mlotst, in metres to 1 decimal place.
+- The root-mean-square difference, in metres to 1 decimal place.
+- The spatial Pearson correlation between the two fields, to 3 decimal places.
+- The percentage of the area where both fields are defined on which the absolute difference exceeds 20 m, to 1 decimal place, and the area where both fields are defined as a percentage of the model's total ocean area, to 1 decimal place.
+- The ranking of the three models from most to least internally consistent, with the criterion used, the regions where the disagreement concentrates, and why the operator and mlotst are not expected to agree exactly.
+
+Expected visualizations:
+- Figure 1, a 3-by-2 panel of global maps of operator MLD minus mlotst, rows CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, columns March and September, all six panels drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only) with one shared diverging colour scale centred on zero.
+- Figure 2, a 3-by-2 panel of scatter plots in the same layout, operator MLD on the x axis against mlotst on the y axis, one point per ocean cell, with logarithmic axes of identical range and ticks in every panel, a dashed y = x reference line, and each panel annotated with its bias, root-mean-square difference and correlation.
+
+Now output your reasoning and selections.
+
+===== RESPONSE =====
+<plan>
+1. **Load the CMIP6 historical fields.** From `cmip6_historical`, open the monthly `thetao`, `so` and `mlotst` files for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, and each model's fixed `areacello`, reading the raw NetCDF with xarray. Restrict the monthly fields to 1971-01 … 2000-12 and split them into the 30 March and 30 September records per model. Keep every model on its own native grid and coordinate set (no common grid is imposed at this stage); report a variable a model does not publish as missing.
+   - Note [cmip6-grid-labels]: GFDL-ESM4 is `gr`, so its values and mask are already remapped to 1° and its comparison is on that archive grid, not the native one; CESM2 (~100 km) and MPI (~250 km) differ in resolution by ~2.5×, so features narrower than the coarse grid are not comparable in amplitude and will be flagged where the disagreement concentrates.
+
+2. **Compute the operator MLD from each monthly `thetao`/`so` profile.** For every cell and every one of the 30 monthly records of each month, build the vertical density profile from potential temperature (`thetao`) and practical salinity (`so`) converted to Absolute Salinity with the location-dependent gsw conversion, evaluate density with the potential-temperature route at the local pressure of each level, and find the shallowest level where the displaced-parcel buoyancy difference relative to the reference level exceeds the mlotst threshold. Linearly interpolate the crossing depth between the bracketing levels. Pass the model's shallowest level depth as the reference depth, since `mlotst` is referenced to the ocean surface, not 10 m. Where the threshold is never reached in the column (GFDL-ESM4 and MPI fill roughly the full column depth, CESM2 is often 0 m), drop the cell and record the excluded area.
+   - Note [cmip6-mlotst-definition]: apply the criterion exactly as displaced-parcel δB > ΔB_crit = 0.0003 m s-2 (≈ Δρ_crit = 0.03 kg m-3) with linear interpolation between bracketing levels and `ref_depth` = the model's shallowest level; drop columns where the threshold is never reached and report the excluded area; state the three residual causes (reference level, displaced-parcel-at-local-pressure vs σ0 density form, and instantaneous-MLD averaging vs MLD of monthly means, with the offline MLD expected to be shallower) and do not report them as model error; note that GFDL-ESM4's native 75 hybrid layers were remapped to 35 z levels.
+   - Note [cmip6-thetao-potential-temperature]: `thetao` is potential temperature and no `bigthetao` exists, so density must be taken through the potential-temperature route; the in-situ route biases density increasingly with depth.
+   - Note [cmip6-so-practical-salinity]: `so` is practical salinity with units "0.001" and stored values ~35 — no ×0.001 or ×1000; convert S_P to S_A with the location-dependent gsw function before any TEOS-10 density call, otherwise the MLD bias varies by region.
+
+3. **Form the March and September climatologies and the common mask.** For each model and each calendar month, compute the plain mean of the 30 monthly operator MLDs and the plain mean of the 30 monthly `mlotst` values (diagnostic first, average second). Build one mask per model and month from the cells where both the operator MLD and `mlotst` are defined in all 30 instances of that month, and apply it to both climatologies before any statistic.
+   - Note [monthly-means-are-time-averages]: compute the MLD of each monthly profile first and then average the monthly MLDs; never average `thetao`/`so` first, and state that the diagnostic-first order was used because f(monthly mean) ≠ mean of f; each March/September climatology is the plain mean of that month's values across the 30 years, with no day weights.
+   - Note [common-comparison-mask]: build one mask over the two fields and apply it to every field before scoring, and keep WOA23's land-sea mask out of this comparison (WOA23 is not part of it).
+   - Note [missing-values-and-land-cells]: derive each field's valid mask from the field itself, reduce NaN-aware with the weights masked to the same cells, and keep land missing so it stays out of the area fractions; a value near 1e20 in the output is an unmasked fill value, not a result.
+
+4. **Score the two fields on the common mask with the model's own cell areas.** Using `areacello` on the mask from step 3, compute for each of the six model-and-month cases: the area-weighted mean of (operator MLD − `mlotst`), the area-weighted RMS difference, the area-weighted spatial Pearson correlation of the two fields, the percentage of the common-mask area where |difference| > 20 m, and the common-mask area as a percentage of the model's total ocean area. Also report, per model, the area excluded in step 2 as a percentage of the same total ocean area.
+   - Note [cmip6-static-grid-fields]: take cell areas from `areacello` (and any cell thickness from `volcello`/`areacello`, never from `lev_bnds` differences, since partial top and bottom cells fail and GFDL `volcello` is monthly); the total each percentage is taken over is each model's own `areacello` ocean total, since model totals differ by about a per cent and no model is rescaled to another.
+
+5. **Rank the models and locate the disagreement.** Order CESM2, GFDL-ESM4 and MPI-ESM1-2-LR from most to least internally consistent using the area-weighted RMS difference, averaged over the March and September cases, as the primary criterion, with the mean difference, correlation and the >20 m area fraction as supporting evidence; state the criterion explicitly. Then summarise where the disagreement concentrates by tabulating the |difference| > 20 m cells by latitude band and basin, and by describing the patterns in Figure 1. The ranking compares scores computed on each model's own grid and its own `areacello` total, so it is not a cell-by-cell cross-model comparison.
+
+6. **Figure 1 — maps of operator MLD minus mlotst.** A 3-by-2 panel, rows CESM2, GFDL-ESM4, MPI-ESM1-2-LR and columns March and September, on a common longitude-latitude frame (curvilinear model fields interpolated to a regular lon-lat grid for display only, coastlines drawn), one shared diverging colour scale centred on zero with symmetric limits taken from the largest |difference| across all six panels, land left white.
+
+7. **Figure 2 — scatter plots.** A 3-by-2 panel in the same layout, operator MLD on x against `mlotst` on y, one point per common-mask ocean cell, logarithmic axes with identical range and identical ticks in all six panels, a dashed y = x line, and each panel annotated with its area-weighted bias, RMS difference and correlation from step 4. Cells with non-positive MLD cannot be placed on logarithmic axes and are omitted from the panel only, with their count stated; they remain in all statistics of step 4.
+
+Other notes:
+- The comparison is an internal-consistency test: both quantities come from the same simulation, so any disagreement is a property of the diagnostic, not of the model's physics.
+- Ranking criterion: lowest area-weighted RMS difference, averaged over the two months, is most internally consistent; bias, correlation and the >20 m area fraction are reported alongside it.
+- The six percentages in step 4 are each taken over that model's own `areacello` ocean total, not a rescaled common area.
+- Resolution asymmetry between CESM2 and MPI-ESM1-2-LR must be stated wherever the disagreement concentrates in narrow features.
+</plan>
+
+<selected_data>cmip6_historical</selected_data>

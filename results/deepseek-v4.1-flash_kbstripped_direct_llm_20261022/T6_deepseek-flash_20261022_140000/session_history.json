@@ -1,0 +1,1405 @@
+{
+  "session_id": "T6_deepseek-flash_20261022_140000",
+  "total_turns": 1,
+  "max_turns": 10,
+  "history": [
+    {
+      "session_id": "T6_deepseek-flash_20261022_140000",
+      "user_query": "Assess the nitracline depth simulated by three CMIP6 models against the WOA23 observed nitrate climatology, globally and by ocean basin.\n\nData to use:\n- CMIP6 historical `no3` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12, each on its own native grid with its own areacello.\n- WOA23 nitrate, the all-time-periods annual climatology, objectively analysed, on the 1-degree grid.\n- The WOA23 land-sea mask (landsea_01, ocean is value > 1) and basin mask (basinmask_01).\n\nThe nitracline is the depth of the maximum vertical gradient of nitrate concentration, searched over the levels within the top 1000 m only (the gradient at the deepest of these still uses the level just below 1000 m, so load the profile below 1000 m).\n\nExpected numerical results:\n- The global mean nitracline depth of each model (1971-2000 climatology) and of WOA23, in metres to the nearest whole metre, and each model's difference from WOA23.\n- The mean nitracline depth in the Pacific, Atlantic and Indian Oceans (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded) for each of the four sources, in metres to the nearest whole metre, and each model's difference from WOA23 in each basin.\n- For each model, the spatial Pearson correlation with WOA23 to 3 decimal places and the RMSE in metres to 1 decimal place, on the WOA23 1-degree grid.\n- Which model reproduces the observed nitracline best, and whether each model reproduces the observed ordering of nitracline depth across the three basins.\n\nExpected visualizations:\n- Figure 1, a 2-by-2 panel of global maps of nitracline depth for the three models and WOA23, all four on one shared sequential colour scale on which deeper is visually heavier.\n- Figure 2, a 4-panel longitude-depth section of nitrate concentration through the equatorial Pacific averaged over 2S-2N, in the order WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, covering 120E to 80W and the top 1000 m with depth increasing downward, all four panels on one shared colour scale in the same concentration unit, and each panel's own nitracline depth overlaid as a line.",
+      "language": "en",
+      "turn_number": 1,
+      "bundle_path": "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T6_deepseek-flash_20261022_140000/turn01",
+      "selected_tools": [],
+      "knowledge": null,
+      "generated_code": "<compute>\nimport os\nimport glob\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\n\n# ---------------------------------------------------------------------------\n# Paths / constants\n# ---------------------------------------------------------------------------\nWOA_CLIM_ROOT = \"/data1/lorraine-20419/ocean_data/WOA23/climatology\"\nWOA_MASK_ROOT = \"/data1/lorraine-20419/ocean_data/WOA23/masks\"\nCMIP_HIST_ROOT = \"/data1/lorraine-20419/benchmark_cmip6/historical\"\nRHO_REF = 1025.0\n\nMODEL_META = {\n    \"CESM2\": {\n        \"y_dim\": \"nlat\", \"x_dim\": \"nlon\",\n        \"lat_coord\": \"lat\", \"lon_coord\": \"lon\",\n        \"depth_coord\": \"lev\", \"depth_scale\": 0.01,\n    },\n    \"GFDL-ESM4\": {\n        \"y_dim\": \"lat\", \"x_dim\": \"lon\",\n        \"lat_coord\": \"lat\", \"lon_coord\": \"lon\",\n        \"depth_coord\": \"lev\", \"depth_scale\": 1.0,\n    },\n    \"MPI-ESM1-2-LR\": {\n        \"y_dim\": \"j\", \"x_dim\": \"i\",\n        \"lat_coord\": \"latitude\", \"lon_coord\": \"longitude\",\n        \"depth_coord\": \"lev\", \"depth_scale\": 1.0,\n    },\n}\nMODEL_NAMES = [\"CESM2\", \"GFDL-ESM4\", \"MPI-ESM1-2-LR\"]\nBASIN_IDS = {\"Pacific\": 2, \"Atlantic\": 1, \"Indian\": 3}\n\n# ---------------------------------------------------------------------------\n# Helpers\n# ---------------------------------------------------------------------------\ndef find_var(ds, candidates):\n    for c in candidates:\n        if c in ds.data_vars:\n            return c\n    for v in ds.data_vars:\n        for c in candidates:\n            if c.lower() in v.lower():\n                return v\n    raise KeyError(f\"None of {candidates} found in {list(ds.data_vars)}\")\n\n\ndef nitracline_depth(conc, depth, max_depth=1000.0, absolute=False):\n    \"\"\"\n    Depth of maximum vertical nitrate gradient, searching only intervals whose\n    upper level is <= max_depth.  The gradient at the deepest searched level\n    uses the level immediately below it.\n\n    conc : array with vertical axis first, shape (nlev, ...)\n    depth: 1-D vertical coordinate, positive down\n    \"\"\"\n    conc = np.asarray(conc, dtype=float)\n    depth = np.asarray(depth, dtype=float)\n\n    # ensure increasing depth\n    if depth.size > 1 and depth[0] > depth[-1]:\n        depth = depth[::-1]\n        conc = conc[::-1, ...]\n\n    idx = np.where(depth[:-1] <= max_depth)[0]\n    out_shape = conc.shape[1:]\n    if idx.size == 0:\n        return np.full(out_shape, np.nan)\n\n    dz = depth[idx + 1] - depth[idx]\n    dz_shape = (len(idx),) + (1,) * (conc.ndim - 1)\n    grad = (conc[idx + 1] - conc[idx]) / dz.reshape(dz_shape)\n\n    if absolute:\n        grad = np.abs(grad)\n\n    grad_filled = np.where(np.isfinite(grad), grad, -np.inf)\n    imax = np.argmax(grad_filled, axis=0)\n    maxg = np.take_along_axis(grad_filled, imax[None, ...], axis=0)[0]\n    bad = ~np.isfinite(maxg)\n\n    depth_upper = depth[idx]\n    out = np.full(out_shape, np.nan)\n    out[~bad] = depth_upper[imax[~bad]]\n    return out\n\n\ndef latlon_to_xyz(lat, lon):\n    lat = np.deg2rad(np.asarray(lat, dtype=float).ravel())\n    lon = np.deg2rad(np.mod(np.asarray(lon, dtype=float).ravel(), 360.0))\n    return np.column_stack((\n        np.cos(lat) * np.cos(lon),\n        np.cos(lat) * np.sin(lon),\n        np.sin(lat),\n    ))\n\n\ndef nearest_indices(src_lat, src_lon, tgt_lat, tgt_lon):\n    src_xyz = latlon_to_xyz(src_lat, src_lon)\n    tgt_xyz = latlon_to_xyz(tgt_lat, tgt_lon)\n    try:\n        from scipy.spatial import cKDTree\n        tree = cKDTree(src_xyz)\n        _, ind = tree.query(tgt_xyz)\n        return ind\n    except Exception:\n        # Fallback brute-force nearest neighbour, chunked in target space.\n        ind = np.empty(tgt_xyz.shape[0], dtype=int)\n        chunk = 100\n        for start in range(0, tgt_xyz.shape[0], chunk):\n            stop = min(start + chunk, tgt_xyz.shape[0])\n            d2 = ((tgt_xyz[start:stop, None, :] - src_xyz[None, :, :]) ** 2).sum(axis=-1)\n            ind[start:stop] = np.argmin(d2, axis=1)\n        return ind\n\n\ndef read_landsea(path, lat_axis, lon_axis):\n    \"\"\"Read WOA landsea_01.msk; ocean where Bottom_Standard_Level > 1.\"\"\"\n    nlat, nlon = len(lat_axis), len(lon_axis)\n    ocean = np.zeros((nlat, nlon), dtype=bool)\n    dlat = lat_axis[1] - lat_axis[0]\n    dlon = lon_axis[1] - lon_axis[0]\n\n    with open(path, \"r\") as f:\n        for line in f:\n            s = line.strip()\n            if not s or s.startswith(\"#\"):\n                continue\n            parts = s.split()\n            if len(parts) < 3:\n                continue\n            try:\n                lat = float(parts[0])\n                lon = float(parts[1])\n                bottom = float(parts[2])\n            except ValueError:\n                continue\n            i = int(round((lat - lat_axis[0]) / dlat))\n            j = int(round((lon - lon_axis[0]) / dlon))\n            if 0 <= i < nlat and 0 <= j < nlon:\n                ocean[i, j] = bottom > 1.0\n    return ocean\n\n\ndef read_basin_mask(path, lat_axis, lon_axis, nlev):\n    \"\"\"\n    Read basinmask_01.msk.  The file is a sparse table over ocean points.\n    It may contain either one basin number per point or one basin number per\n    standard depth level per point.  The latter is returned as a 3-D array.\n    \"\"\"\n    rows = []\n    max_rest = 0\n    with open(path, \"r\") as f:\n        for line in f:\n            s = line.strip()\n            if not s or s.startswith(\"#\"):\n                continue\n            parts = s.split()\n            if len(parts) < 3:\n                continue\n            try:\n                lat = float(parts[0])\n                lon = float(parts[1])\n            except ValueError:\n                continue\n            rest = []\n            for p in parts[2:]:\n                try:\n                    rest.append(float(p))\n                except ValueError:\n                    rest.append(np.nan)\n            rows.append((lat, lon, rest))\n            max_rest = max(max_rest, len(rest))\n\n    nlat, nlon = len(lat_axis), len(lon_axis)\n    dlat = lat_axis[1] - lat_axis[0]\n    dlon = lon_axis[1] - lon_axis[0]\n\n    if max_rest <= 1:\n        basin2d = np.full((nlat, nlon), np.nan)\n        for lat, lon, rest in rows:\n            i = int(round((lat - lat_axis[0]) / dlat))\n            j = int(round((lon - lon_axis[0]) / dlon))\n            if 0 <= i < nlat and 0 <= j < nlon and len(rest) > 0:\n                basin2d[i, j] = rest[0]\n        return basin2d, None\n\n    basin3d = np.full((nlev, nlat, nlon), np.nan)\n    for lat, lon, rest in rows:\n        i = int(round((lat - lat_axis[0]) / dlat))\n        j = int(round((lon - lon_axis[0]) / dlon))\n        if 0 <= i < nlat and 0 <= j < nlon:\n            m = min(nlev, len(rest))\n            vals = np.asarray(rest[:m], dtype=float)\n            vals[vals <= 0] = np.nan\n            basin3d[:m, i, j] = vals\n    return None, basin3d\n\n\ndef fold_basin(b):\n    \"\"\"Fold WOA13 marginal-sea basin numbers into their parent ocean.\"\"\"\n    out = np.array(b, dtype=float, copy=True)\n    # WOA13 marginal seas: Mediterranean, Black Sea, Baltic, Hudson Bay -> Atlantic\n    out[np.isin(out, [6, 7, 8, 11])] = 1.0\n    # Red Sea and Persian Gulf -> Indian\n    out[np.isin(out, [9, 10])] = 3.0\n    return out\n\n\ndef load_woa_nitrate():\n    path = os.path.join(\n        WOA_CLIM_ROOT, \"nitrate\", \"all_time_periods\", \"woa23_all_n00_01.nc\"\n    )\n    ds = xr.open_dataset(path, decode_times=False)\n    var = find_var(ds, [\"n_an\", \"n\", \"nitrate\", \"no3\"])\n    da = ds[var]\n\n    # annual climatology: remove singleton time axis\n    for d in list(da.dims):\n        if d.lower() in (\"time\", \"month\") and da.sizes[d] == 1:\n            da = da.isel({d: 0}, drop=True)\n\n    depth_name = None\n    for c in [\"depth\", \"lev\", \"st_level\"]:\n        if c in ds.coords or c in ds.dims:\n            depth_name = c\n            break\n    if depth_name is None:\n        depth_name = da.dims[0]\n\n    lat_name = \"lat\" if (\"lat\" in ds.coords or \"lat\" in ds.dims) else \"latitude\"\n    lon_name = \"lon\" if (\"lon\" in ds.coords or \"lon\" in ds.dims) else \"longitude\"\n\n    da = da.transpose(depth_name, lat_name, lon_name)\n    depth = ds[depth_name].values.astype(float)\n    lat = ds[lat_name].values.astype(float)\n    lon = ds[lon_name].values.astype(float)\n    N = da.values.astype(float)\n\n    order = np.argsort(depth)\n    depth = depth[order]\n    N = N[order, ...]\n\n    if lat.size > 1 and lat[0] > lat[-1]:\n        lat = lat[::-1]\n        N = N[:, ::-1, :]\n    if lon.size > 1 and lon[0] > lon[-1]:\n        lon = lon[::-1]\n        N = N[:, :, ::-1]\n\n    return N, depth, lat, lon\n\n\ndef load_cmip_no3(model, meta):\n    files = sorted(glob.glob(os.path.join(CMIP_HIST_ROOT, model, \"no3\", \"*.nc\")))\n    if not files:\n        raise FileNotFoundError(f\"No no3 files for {model}\")\n\n    ds = xr.open_mfdataset(\n        files,\n        combine=\"by_coords\",\n        use_cftime=True,\n        chunks={\"time\": 60},\n    )\n    var = find_var(ds, [\"no3\"])\n    da_all = ds[var]\n\n    t = ds.indexes[\"time\"]\n    if hasattr(t[0], \"year\"):\n        years = np.array([x.year for x in t])\n    else:\n        years = np.asarray(pd.to_datetime(t).year)\n    sel = (years >= 1971) & (years <= 2000)\n    if sel.sum() == 0:\n        raise ValueError(f\"No 1971-2000 data for {model}\")\n\n    da = da_all.isel(time=np.where(sel)[0]).mean(\"time\")\n\n    zname = meta[\"depth_coord\"]\n    z = ds[zname].values.astype(float) * float(meta[\"depth_scale\"])\n\n    lat = ds[meta[\"lat_coord\"]]\n    lon = ds[meta[\"lon_coord\"]]\n    if lat.ndim == 1 and lon.ndim == 1:\n        lon2d, lat2d = np.meshgrid(lon.values, lat.values)\n    else:\n        lat2d = lat.values\n        lon2d = lon.values\n\n    da = da.transpose(zname, meta[\"y_dim\"], meta[\"x_dim\"])\n    N = da.compute().values.astype(float)\n    units = da_all.attrs.get(\"units\", \"\")\n\n    order = np.argsort(z)\n    z = z[order]\n    N = N[order, ...]\n\n    return N, z, lat2d, lon2d, units\n\n\ndef load_areacello(model, meta):\n    files = sorted(glob.glob(os.path.join(CMIP_HIST_ROOT, model, \"areacello\", \"*.nc\")))\n    if not files:\n        raise FileNotFoundError(f\"No areacello file for {model}\")\n    ds = xr.open_dataset(files[0])\n    var = find_var(ds, [\"areacello\"])\n    da = ds[var]\n    if \"time\" in da.dims and da.sizes[\"time\"] == 1:\n        da = da.isel(time=0, drop=True)\n\n    try:\n        da = da.transpose(meta[\"y_dim\"], meta[\"x_dim\"])\n    except Exception:\n        dims = [d for d in da.dims if d not in (\"time\", \"lev\", \"depth\")]\n        if len(dims) >= 2:\n            da = da.transpose(dims[-2], dims[-1])\n    return da.values.astype(float)\n\n\ndef make_lon_depth_section(N, depth, lat2d, lon2d, lon_edges, lat_min=-2.0, lat_max=2.0):\n    \"\"\"\n    Average a 3-D field (depth, y, x) over a latitude band and bin by longitude.\n    Longitudes are treated modulo 360 so 120E-80W crosses the dateline.\n    \"\"\"\n    N = np.asarray(N, dtype=float)\n    nlev = N.shape[0]\n    centers = 0.5 * (lon_edges[:-1] + lon_edges[1:])\n    sec = np.full((nlev, centers.size), np.nan)\n\n    lat_band = (lat2d >= lat_min) & (lat2d <= lat_max)\n    lon360 = np.mod(lon2d, 360.0)\n\n    Nflat = N.reshape(nlev, -1)\n    latflat = lat_band.ravel()\n    lonflat = lon360.ravel()\n\n    for j in range(centers.size):\n        m = latflat & (lonflat >= lon_edges[j]) & (lonflat < lon_edges[j + 1])\n        if not np.any(m):\n            continue\n        vals = Nflat[:, m]\n        cnt = np.sum(np.isfinite(vals), axis=1)\n        sums = np.nansum(vals, axis=1)\n        with np.errstate(invalid=\"ignore\", divide=\"ignore\"):\n            sec[:, j] = np.where(cnt > 0, sums / cnt, np.nan)\n\n    return centers, sec\n\n\n# ---------------------------------------------------------------------------\n# WOA23 observed nitrate, nitracline, masks\n# ---------------------------------------------------------------------------\nN_woa, depth_woa, lat_woa, lon_woa = load_woa_nitrate()\nlat2d_woa, lon2d_woa = np.meshgrid(lat_woa, lon_woa, indexing=\"ij\")\n\nnt_woa = nitracline_depth(N_woa, depth_woa, max_depth=1000.0)\n\nlandsea_path = os.path.join(WOA_MASK_ROOT, \"landsea_01.msk\")\nbasin_path = os.path.join(WOA_MASK_ROOT, \"basinmask_01.msk\")\n\nocean_woa = read_landsea(landsea_path, lat_woa, lon_woa)\nbasin2d_woa, basin3d_woa = read_basin_mask(\n    basin_path, lat_woa, lon_woa, nlev=depth_woa.size\n)\n\nif basin3d_woa is not None:\n    valid3 = np.isfinite(basin3d_woa) & (basin3d_woa > 0)\n    has = valid3.any(axis=0)\n    first_idx = np.argmax(valid3, axis=0)\n    basin2d_woa = np.full(valid3.shape[1:], np.nan)\n    basin2d_woa[has] = np.take_along_axis(\n        basin3d_woa, first_idx[None, :, :], axis=0\n    )[0][has]\n\nbasin2d_woa = fold_basin(basin2d_woa)\nbasin2d_woa[~ocean_woa] = np.nan\n\nweights_woa = np.cos(np.deg2rad(lat2d_woa))\nvalid_woa = ocean_woa & np.isfinite(nt_woa)\n\n# WOA global and basin means\nglobal_raw = {}\nbasin_raw = {\"WOA23\": {}}\n\nm = valid_woa\nglobal_raw[\"WOA23\"] = (\n    np.nansum(nt_woa[m] * weights_woa[m]) / np.nansum(weights_woa[m])\n)\n\nfor bname, bid in BASIN_IDS.items():\n    m = valid_woa & (basin2d_woa == bid)\n    basin_raw[\"WOA23\"][bname] = (\n        np.nansum(nt_woa[m] * weights_woa[m]) / np.nansum(weights_woa[m])\n    )\n\n# ---------------------------------------------------------------------------\n# WOA section for Figure 2\n# ---------------------------------------------------------------------------\nlon_edges = np.arange(120.0, 281.0, 1.0)\n\nlon_centers_sec, sec_woa = make_lon_depth_section(\n    N_woa, depth_woa, lat2d_woa, lon2d_woa, lon_edges\n)\nnt_line_woa = nitracline_depth(sec_woa, depth_woa, max_depth=1000.0)\nmask_depth_woa = depth_woa <= 1000.0\n\nsections = {\n    \"WOA23\": {\n        \"lon\": lon_centers_sec,\n        \"depth_plot\": depth_woa[mask_depth_woa],\n        \"conc_plot\": sec_woa[mask_depth_woa, :],\n        \"nt_line\": nt_line_woa,\n    }\n}\n\n# Precompute WOA ocean-basin lookup for mapping model native grids to basins\nwoa_basin_ocean = (\n    ocean_woa\n    & np.isfinite(basin2d_woa)\n    & (basin2d_woa > 0)\n)\nsrc_lat_b = lat2d_woa[woa_basin_ocean]\nsrc_lon_b = lon2d_woa[woa_basin_ocean]\nsrc_basin_b = basin2d_woa[woa_basin_ocean]\n\n# ---------------------------------------------------------------------------\n# Models\n# ---------------------------------------------------------------------------\nnt_native = {}\nnt_regrid = {}\ncorr_raw = {}\nrmse_raw = {}\n\nfor model in MODEL_NAMES:\n    meta = MODEL_META[model]\n    N_model, depth_model, lat2d_model, lon2d_model, units_model = load_cmip_no3(\n        model, meta\n    )\n    area_model = load_areacello(model, meta)\n\n    if area_model.shape != N_model.shape[1:]:\n        if area_model.T.shape == N_model.shape[1:]:\n            area_model = area_model.T\n        else:\n            area_model = np.squeeze(area_model)\n            if area_model.shape != N_model.shape[1:]:\n                raise ValueError(\n                    f\"areacello shape {area_model.shape} does not match \"\n                    f\"{model} no3 spatial shape {N_model.shape[1:]}\"\n                )\n\n    nt_model = nitracline_depth(N_model, depth_model, max_depth=1000.0)\n    nt_native[model] = nt_model\n\n    valid_model = (\n        np.isfinite(nt_model)\n        & np.isfinite(area_model)\n        & (area_model > 0)\n    )\n\n    # Native-grid global mean weighted by the model's own areacello\n    global_raw[model] = (\n        np.nansum(nt_model[valid_model] * area_model[valid_model])\n        / np.nansum(area_model[valid_model])\n    )\n\n    # Map model native points to WOA basins by nearest WOA ocean point\n    valid_b = np.isfinite(nt_model)\n    inds_b = nearest_indices(\n        src_lat_b,\n        src_lon_b,\n        lat2d_model[valid_b],\n        lon2d_model[valid_b],\n    )\n    basin_model = np.full(nt_model.shape, np.nan)\n    basin_model[valid_b] = src_basin_b[inds_b]\n\n    basin_raw[model] = {}\n    for bname, bid in BASIN_IDS.items():\n        m = valid_model & (basin_model == bid)\n        basin_raw[model][bname] = (\n            np.nansum(nt_model[m] * area_model[m]) / np.nansum(area_model[m])\n        )\n\n    # Regrid native nitracline to the WOA 1-degree grid by nearest valid model\n    # point (used for maps, spatial correlation and RMSE).\n    valid_r = valid_model\n    inds_r = nearest_indices(\n        lat2d_model[valid_r],\n        lon2d_model[valid_r],\n        lat2d_woa.ravel(),\n        lon2d_woa.ravel(),\n    )\n    arr = nt_model[valid_r][inds_r].reshape(lat2d_woa.shape)\n    arr[~ocean_woa] = np.nan\n    nt_regrid[model] = arr\n\n    m = ocean_woa & np.isfinite(nt_woa) & np.isfinite(arr)\n    x = arr[m]\n    y = nt_woa[m]\n    corr_raw[model] = float(np.corrcoef(x, y)[0, 1])\n    rmse_raw[model] = float(np.sqrt(np.mean((x - y) ** 2)))\n\n    # Section: convert CMIP6 mol m-3 to approximate micromol kg-1 using a\n    # constant reference density.  The nitracline depth itself is invariant\n    # to this constant multiplicative factor.\n    units_norm = str(units_model).lower().replace(\" \", \"\")\n    if \"mol\" in units_norm and (\"m-3\" in units_norm or \"m^-3\" in units_norm):\n        conv = 1000.0 / RHO_REF\n    else:\n        conv = 1.0\n    N_model_plot = N_model * conv\n\n    lon_centers_m, sec_m = make_lon_depth_section(\n        N_model_plot, depth_model, lat2d_model, lon2d_model, lon_edges\n    )\n    nt_line_m = nitracline_depth(sec_m, depth_model, max_depth=1000.0)\n    mask_depth_m = depth_model <= 1000.0\n\n    sections[model] = {\n        \"lon\": lon_centers_m,\n        \"depth_plot\": depth_model[mask_depth_m],\n        \"conc_plot\": sec_m[mask_depth_m, :],\n        \"nt_line\": nt_line_m,\n    }\n\n# ---------------------------------------------------------------------------\n# Rounded result variables for the answer\n# ---------------------------------------------------------------------------\nglobal_mean_nitracline_raw = global_raw.copy()\nglobal_mean_nitracline = {\n    k: int(round(v)) for k, v in global_mean_nitracline_raw.items()\n}\nglobal_diff_from_woa = {\n    k: int(round(global_mean_nitracline_raw[k] - global_mean_nitracline_raw[\"WOA23\"]))\n    for k in MODEL_NAMES\n}\n\nbasin_mean_nitracline_raw = {\n    source: {bname: basin_raw[source][bname] for bname in BASIN_IDS}\n    for source in [\"WOA23\", *MODEL_NAMES]\n}\nbasin_mean_nitracline = {\n    source: {\n        bname: int(round(basin_mean_nitracline_raw[source][bname]))\n        for bname in BASIN_IDS\n    }\n    for source in [\"WOA23\", *MODEL_NAMES]\n}\nbasin_diff_from_woa = {\n    model: {\n        bname: int(\n            round(\n                basin_mean_nitracline_raw[model][bname]\n                - basin_mean_nitracline_raw[\"WOA23\"][bname]\n            )\n        )\n        for bname in BASIN_IDS\n    }\n    for model in MODEL_NAMES\n}\n\nspatial_corr = {m: round(corr_raw[m], 3) for m in MODEL_NAMES}\nspatial_rmse = {m: round(rmse_raw[m], 1) for m in MODEL_NAMES}\n\nbest_model = min(MODEL_NAMES, key=lambda m: rmse_raw[m])\nbest_model_by_corr = max(MODEL_NAMES, key=lambda m: corr_raw[m])\n\n\ndef ordered_basins(d):\n    return [b for b, _ in sorted(d.items(), key=lambda kv: kv[1], reverse=True)]\n\n\nbasin_order_woa = ordered_basins(basin_mean_nitracline_raw[\"WOA23\"])\nbasin_order_models = {\n    m: ordered_basins(basin_mean_nitracline_raw[m]) for m in MODEL_NAMES\n}\nbasin_order_matches_woa = {\n    m: (basin_order_models[m] == basin_order_woa) for m in MODEL_NAMES\n}\n</compute>\n\n<visualize>\nimport matplotlib.pyplot as plt\nfrom matplotlib.ticker import FuncFormatter\n\n# ---------------------------------------------------------------------------\n# Figure 1: global nitracline-depth maps, shared sequential colour scale\n# ---------------------------------------------------------------------------\nmap_order = [\"CESM2\", \"GFDL-ESM4\", \"MPI-ESM1-2-LR\", \"WOA23\"]\nmap_data = {\n    \"CESM2\": nt_regrid[\"CESM2\"],\n    \"GFDL-ESM4\": nt_regrid[\"GFDL-ESM4\"],\n    \"MPI-ESM1-2-LR\": nt_regrid[\"MPI-ESM1-2-LR\"],\n    \"WOA23\": nt_woa,\n}\n\nfig1, axes1 = plt.subplots(\n    2, 2, figsize=(12, 8), sharex=True, sharey=True, constrained_layout=True\n)\nvmin1, vmax1 = 0.0, 1000.0\nmesh1 = None\n\nfor ax, name in zip(axes1.ravel(), map_order):\n    data = np.ma.masked_invalid(map_data[name])\n    mesh1 = ax.pcolormesh(\n        lon_woa,\n        lat_woa,\n        data,\n        shading=\"auto\",\n        cmap=\"viridis_r\",\n        vmin=vmin1,\n        vmax=vmax1,\n    )\n    ax.set_title(name)\n    ax.set_xlim(-180, 180)\n    ax.set_ylim(-90, 90)\n    ax.set_xlabel(\"Longitude\")\n    ax.set_ylabel(\"Latitude\")\n\ncbar1 = fig1.colorbar(\n    mesh1, ax=axes1.ravel().tolist(), orientation=\"vertical\", shrink=0.85\n)\ncbar1.set_label(\"Nitracline depth (m)\")\n\n# ---------------------------------------------------------------------------\n# Figure 2: equatorial Pacific longitude-depth nitrate sections\n# ---------------------------------------------------------------------------\nsection_order = [\"WOA23\", \"CESM2\", \"GFDL-ESM4\", \"MPI-ESM1-2-LR\"]\n\nall_section_vals = np.concatenate(\n    [sections[name][\"conc_plot\"].ravel() for name in section_order]\n)\nvmax2 = np.nanpercentile(all_section_vals, 99)\nvmin2 = 0.0\n\nfig2, axes2 = plt.subplots(\n    4, 1, figsize=(12, 11), sharex=True, sharey=True, constrained_layout=True\n)\nmesh2 = None\n\nfor ax, name in zip(axes2, section_order):\n    s = sections[name]\n    mesh2 = ax.pcolormesh(\n        s[\"lon\"],\n        s[\"depth_plot\"],\n        s[\"conc_plot\"],\n        shading=\"auto\",\n        cmap=\"viridis\",\n        vmin=vmin2,\n        vmax=vmax2,\n    )\n    ax.plot(s[\"lon\"], s[\"nt_line\"], color=\"k\", linewidth=1.6)\n    ax.set_ylim(1000, 0)\n    ax.set_title(name)\n    ax.set_ylabel(\"Depth (m)\")\n\naxes2[-1].set_xlabel(\"Longitude\")\n\nxticks = [120, 150, 180, 210, 240, 270]\naxes2[-1].set_xticks(xticks)\n\n\ndef lon_label(x, pos=None):\n    x = x % 360\n    if abs(x - 180) < 1e-6:\n        return \"180\"\n    if x > 180:\n        return f\"{360 - x:.0f}W\"\n    return f\"{x:.0f}E\"\n\n\naxes2[-1].xaxis.set_major_formatter(FuncFormatter(lon_label))\n\ncbar2 = fig2.colorbar(\n    mesh2, ax=axes2.tolist(), orientation=\"vertical\", shrink=0.85\n)\ncbar2.set_label(r\"Nitrate ($\\mu$mol kg$^{-1}$)\")\n</visualize>",
+      "compute_iterations": [
+        {
+          "iteration": 1,
+          "code": "import os\nimport glob\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\n\n# ---------------------------------------------------------------------------\n# Paths / constants\n# ---------------------------------------------------------------------------\nWOA_CLIM_ROOT = \"/data1/lorraine-20419/ocean_data/WOA23/climatology\"\nWOA_MASK_ROOT = \"/data1/lorraine-20419/ocean_data/WOA23/masks\"\nCMIP_HIST_ROOT = \"/data1/lorraine-20419/benchmark_cmip6/historical\"\nRHO_REF = 1025.0\n\nMODEL_META = {\n    \"CESM2\": {\n        \"y_dim\": \"nlat\", \"x_dim\": \"nlon\",\n        \"lat_coord\": \"lat\", \"lon_coord\": \"lon\",\n        \"depth_coord\": \"lev\", \"depth_scale\": 0.01,\n    },\n    \"GFDL-ESM4\": {\n        \"y_dim\": \"lat\", \"x_dim\": \"lon\",\n        \"lat_coord\": \"lat\", \"lon_coord\": \"lon\",\n        \"depth_coord\": \"lev\", \"depth_scale\": 1.0,\n    },\n    \"MPI-ESM1-2-LR\": {\n        \"y_dim\": \"j\", \"x_dim\": \"i\",\n        \"lat_coord\": \"latitude\", \"lon_coord\": \"longitude\",\n        \"depth_coord\": \"lev\", \"depth_scale\": 1.0,\n    },\n}\nMODEL_NAMES = [\"CESM2\", \"GFDL-ESM4\", \"MPI-ESM1-2-LR\"]\nBASIN_IDS = {\"Pacific\": 2, \"Atlantic\": 1, \"Indian\": 3}\n\n# ---------------------------------------------------------------------------\n# Helpers\n# ---------------------------------------------------------------------------\ndef find_var(ds, candidates):\n    for c in candidates:\n        if c in ds.data_vars:\n            return c\n    for v in ds.data_vars:\n        for c in candidates:\n            if c.lower() in v.lower():\n                return v\n    raise KeyError(f\"None of {candidates} found in {list(ds.data_vars)}\")\n\n\ndef nitracline_depth(conc, depth, max_depth=1000.0, absolute=False):\n    \"\"\"\n    Depth of maximum vertical nitrate gradient, searching only intervals whose\n    upper level is <= max_depth.  The gradient at the deepest searched level\n    uses the level immediately below it.\n\n    conc : array with vertical axis first, shape (nlev, ...)\n    depth: 1-D vertical coordinate, positive down\n    \"\"\"\n    conc = np.asarray(conc, dtype=float)\n    depth = np.asarray(depth, dtype=float)\n\n    # ensure increasing depth\n    if depth.size > 1 and depth[0] > depth[-1]:\n        depth = depth[::-1]\n        conc = conc[::-1, ...]\n\n    idx = np.where(depth[:-1] <= max_depth)[0]\n    out_shape = conc.shape[1:]\n    if idx.size == 0:\n        return np.full(out_shape, np.nan)\n\n    dz = depth[idx + 1] - depth[idx]\n    dz_shape = (len(idx),) + (1,) * (conc.ndim - 1)\n    grad = (conc[idx + 1] - conc[idx]) / dz.reshape(dz_shape)\n\n    if absolute:\n        grad = np.abs(grad)\n\n    grad_filled = np.where(np.isfinite(grad), grad, -np.inf)\n    imax = np.argmax(grad_filled, axis=0)\n    maxg = np.take_along_axis(grad_filled, imax[None, ...], axis=0)[0]\n    bad = ~np.isfinite(maxg)\n\n    depth_upper = depth[idx]\n    out = np.full(out_shape, np.nan)\n    out[~bad] = depth_upper[imax[~bad]]\n    return out\n\n\ndef latlon_to_xyz(lat, lon):\n    lat = np.deg2rad(np.asarray(lat, dtype=float).ravel())\n    lon = np.deg2rad(np.mod(np.asarray(lon, dtype=float).ravel(), 360.0))\n    return np.column_stack((\n        np.cos(lat) * np.cos(lon),\n        np.cos(lat) * np.sin(lon),\n        np.sin(lat),\n    ))\n\n\ndef nearest_indices(src_lat, src_lon, tgt_lat, tgt_lon):\n    src_xyz = latlon_to_xyz(src_lat, src_lon)\n    tgt_xyz = latlon_to_xyz(tgt_lat, tgt_lon)\n    try:\n        from scipy.spatial import cKDTree\n        tree = cKDTree(src_xyz)\n        _, ind = tree.query(tgt_xyz)\n        return ind\n    except Exception:\n        # Fallback brute-force nearest neighbour, chunked in target space.\n        ind = np.empty(tgt_xyz.shape[0], dtype=int)\n        chunk = 100\n        for start in range(0, tgt_xyz.shape[0], chunk):\n            stop = min(start + chunk, tgt_xyz.shape[0])\n            d2 = ((tgt_xyz[start:stop, None, :] - src_xyz[None, :, :]) ** 2).sum(axis=-1)\n            ind[start:stop] = np.argmin(d2, axis=1)\n        return ind\n\n\ndef read_landsea(path, lat_axis, lon_axis):\n    \"\"\"Read WOA landsea_01.msk; ocean where Bottom_Standard_Level > 1.\"\"\"\n    nlat, nlon = len(lat_axis), len(lon_axis)\n    ocean = np.zeros((nlat, nlon), dtype=bool)\n    dlat = lat_axis[1] - lat_axis[0]\n    dlon = lon_axis[1] - lon_axis[0]\n\n    with open(path, \"r\") as f:\n        for line in f:\n            s = line.strip()\n            if not s or s.startswith(\"#\"):\n                continue\n            parts = s.split()\n            if len(parts) < 3:\n                continue\n            try:\n                lat = float(parts[0])\n                lon = float(parts[1])\n                bottom = float(parts[2])\n            except ValueError:\n                continue\n            i = int(round((lat - lat_axis[0]) / dlat))\n            j = int(round((lon - lon_axis[0]) / dlon))\n            if 0 <= i < nlat and 0 <= j < nlon:\n                ocean[i, j] = bottom > 1.0\n    return ocean\n\n\ndef read_basin_mask(path, lat_axis, lon_axis, nlev):\n    \"\"\"\n    Read basinmask_01.msk.  The file is a sparse table over ocean points.\n    It may contain either one basin number per point or one basin number per\n    standard depth level per point.  The latter is returned as a 3-D array.\n    \"\"\"\n    rows = []\n    max_rest = 0\n    with open(path, \"r\") as f:\n        for line in f:\n            s = line.strip()\n            if not s or s.startswith(\"#\"):\n                continue\n            parts = s.split()\n            if len(parts) < 3:\n                continue\n            try:\n                lat = float(parts[0])\n                lon = float(parts[1])\n            except ValueError:\n                continue\n            rest = []\n            for p in parts[2:]:\n                try:\n                    rest.append(float(p))\n                except ValueError:\n                    rest.append(np.nan)\n            rows.append((lat, lon, rest))\n            max_rest = max(max_rest, len(rest))\n\n    nlat, nlon = len(lat_axis), len(lon_axis)\n    dlat = lat_axis[1] - lat_axis[0]\n    dlon = lon_axis[1] - lon_axis[0]\n\n    if max_rest <= 1:\n        basin2d = np.full((nlat, nlon), np.nan)\n        for lat, lon, rest in rows:\n            i = int(round((lat - lat_axis[0]) / dlat))\n            j = int(round((lon - lon_axis[0]) / dlon))\n            if 0 <= i < nlat and 0 <= j < nlon and len(rest) > 0:\n                basin2d[i, j] = rest[0]\n        return basin2d, None\n\n    basin3d = np.full((nlev, nlat, nlon), np.nan)\n    for lat, lon, rest in rows:\n        i = int(round((lat - lat_axis[0]) / dlat))\n        j = int(round((lon - lon_axis[0]) / dlon))\n        if 0 <= i < nlat and 0 <= j < nlon:\n            m = min(nlev, len(rest))\n            vals = np.asarray(rest[:m], dtype=float)\n            vals[vals <= 0] = np.nan\n            basin3d[:m, i, j] = vals\n    return None, basin3d\n\n\ndef fold_basin(b):\n    \"\"\"Fold WOA13 marginal-sea basin numbers into their parent ocean.\"\"\"\n    out = np.array(b, dtype=float, copy=True)\n    # WOA13 marginal seas: Mediterranean, Black Sea, Baltic, Hudson Bay -> Atlantic\n    out[np.isin(out, [6, 7, 8, 11])] = 1.0\n    # Red Sea and Persian Gulf -> Indian\n    out[np.isin(out, [9, 10])] = 3.0\n    return out\n\n\ndef load_woa_nitrate():\n    path = os.path.join(\n        WOA_CLIM_ROOT, \"nitrate\", \"all_time_periods\", \"woa23_all_n00_01.nc\"\n    )\n    ds = xr.open_dataset(path, decode_times=False)\n    var = find_var(ds, [\"n_an\", \"n\", \"nitrate\", \"no3\"])\n    da = ds[var]\n\n    # annual climatology: remove singleton time axis\n    for d in list(da.dims):\n        if d.lower() in (\"time\", \"month\") and da.sizes[d] == 1:\n            da = da.isel({d: 0}, drop=True)\n\n    depth_name = None\n    for c in [\"depth\", \"lev\", \"st_level\"]:\n        if c in ds.coords or c in ds.dims:\n            depth_name = c\n            break\n    if depth_name is None:\n        depth_name = da.dims[0]\n\n    lat_name = \"lat\" if (\"lat\" in ds.coords or \"lat\" in ds.dims) else \"latitude\"\n    lon_name = \"lon\" if (\"lon\" in ds.coords or \"lon\" in ds.dims) else \"longitude\"\n\n    da = da.transpose(depth_name, lat_name, lon_name)\n    depth = ds[depth_name].values.astype(float)\n    lat = ds[lat_name].values.astype(float)\n    lon = ds[lon_name].values.astype(float)\n    N = da.values.astype(float)\n\n    order = np.argsort(depth)\n    depth = depth[order]\n    N = N[order, ...]\n\n    if lat.size > 1 and lat[0] > lat[-1]:\n        lat = lat[::-1]\n        N = N[:, ::-1, :]\n    if lon.size > 1 and lon[0] > lon[-1]:\n        lon = lon[::-1]\n        N = N[:, :, ::-1]\n\n    return N, depth, lat, lon\n\n\ndef load_cmip_no3(model, meta):\n    files = sorted(glob.glob(os.path.join(CMIP_HIST_ROOT, model, \"no3\", \"*.nc\")))\n    if not files:\n        raise FileNotFoundError(f\"No no3 files for {model}\")\n\n    ds = xr.open_mfdataset(\n        files,\n        combine=\"by_coords\",\n        use_cftime=True,\n        chunks={\"time\": 60},\n    )\n    var = find_var(ds, [\"no3\"])\n    da_all = ds[var]\n\n    t = ds.indexes[\"time\"]\n    if hasattr(t[0], \"year\"):\n        years = np.array([x.year for x in t])\n    else:\n        years = np.asarray(pd.to_datetime(t).year)\n    sel = (years >= 1971) & (years <= 2000)\n    if sel.sum() == 0:\n        raise ValueError(f\"No 1971-2000 data for {model}\")\n\n    da = da_all.isel(time=np.where(sel)[0]).mean(\"time\")\n\n    zname = meta[\"depth_coord\"]\n    z = ds[zname].values.astype(float) * float(meta[\"depth_scale\"])\n\n    lat = ds[meta[\"lat_coord\"]]\n    lon = ds[meta[\"lon_coord\"]]\n    if lat.ndim == 1 and lon.ndim == 1:\n        lon2d, lat2d = np.meshgrid(lon.values, lat.values)\n    else:\n        lat2d = lat.values\n        lon2d = lon.values\n\n    da = da.transpose(zname, meta[\"y_dim\"], meta[\"x_dim\"])\n    N = da.compute().values.astype(float)\n    units = da_all.attrs.get(\"units\", \"\")\n\n    order = np.argsort(z)\n    z = z[order]\n    N = N[order, ...]\n\n    return N, z, lat2d, lon2d, units\n\n\ndef load_areacello(model, meta):\n    files = sorted(glob.glob(os.path.join(CMIP_HIST_ROOT, model, \"areacello\", \"*.nc\")))\n    if not files:\n        raise FileNotFoundError(f\"No areacello file for {model}\")\n    ds = xr.open_dataset(files[0])\n    var = find_var(ds, [\"areacello\"])\n    da = ds[var]\n    if \"time\" in da.dims and da.sizes[\"time\"] == 1:\n        da = da.isel(time=0, drop=True)\n\n    try:\n        da = da.transpose(meta[\"y_dim\"], meta[\"x_dim\"])\n    except Exception:\n        dims = [d for d in da.dims if d not in (\"time\", \"lev\", \"depth\")]\n        if len(dims) >= 2:\n            da = da.transpose(dims[-2], dims[-1])\n    return da.values.astype(float)\n\n\ndef make_lon_depth_section(N, depth, lat2d, lon2d, lon_edges, lat_min=-2.0, lat_max=2.0):\n    \"\"\"\n    Average a 3-D field (depth, y, x) over a latitude band and bin by longitude.\n    Longitudes are treated modulo 360 so 120E-80W crosses the dateline.\n    \"\"\"\n    N = np.asarray(N, dtype=float)\n    nlev = N.shape[0]\n    centers = 0.5 * (lon_edges[:-1] + lon_edges[1:])\n    sec = np.full((nlev, centers.size), np.nan)\n\n    lat_band = (lat2d >= lat_min) & (lat2d <= lat_max)\n    lon360 = np.mod(lon2d, 360.0)\n\n    Nflat = N.reshape(nlev, -1)\n    latflat = lat_band.ravel()\n    lonflat = lon360.ravel()\n\n    for j in range(centers.size):\n        m = latflat & (lonflat >= lon_edges[j]) & (lonflat < lon_edges[j + 1])\n        if not np.any(m):\n            continue\n        vals = Nflat[:, m]\n        cnt = np.sum(np.isfinite(vals), axis=1)\n        sums = np.nansum(vals, axis=1)\n        with np.errstate(invalid=\"ignore\", divide=\"ignore\"):\n            sec[:, j] = np.where(cnt > 0, sums / cnt, np.nan)\n\n    return centers, sec\n\n\n# ---------------------------------------------------------------------------\n# WOA23 observed nitrate, nitracline, masks\n# ---------------------------------------------------------------------------\nN_woa, depth_woa, lat_woa, lon_woa = load_woa_nitrate()\nlat2d_woa, lon2d_woa = np.meshgrid(lat_woa, lon_woa, indexing=\"ij\")\n\nnt_woa = nitracline_depth(N_woa, depth_woa, max_depth=1000.0)\n\nlandsea_path = os.path.join(WOA_MASK_ROOT, \"landsea_01.msk\")\nbasin_path = os.path.join(WOA_MASK_ROOT, \"basinmask_01.msk\")\n\nocean_woa = read_landsea(landsea_path, lat_woa, lon_woa)\nbasin2d_woa, basin3d_woa = read_basin_mask(\n    basin_path, lat_woa, lon_woa, nlev=depth_woa.size\n)\n\nif basin3d_woa is not None:\n    valid3 = np.isfinite(basin3d_woa) & (basin3d_woa > 0)\n    has = valid3.any(axis=0)\n    first_idx = np.argmax(valid3, axis=0)\n    basin2d_woa = np.full(valid3.shape[1:], np.nan)\n    basin2d_woa[has] = np.take_along_axis(\n        basin3d_woa, first_idx[None, :, :], axis=0\n    )[0][has]\n\nbasin2d_woa = fold_basin(basin2d_woa)\nbasin2d_woa[~ocean_woa] = np.nan\n\nweights_woa = np.cos(np.deg2rad(lat2d_woa))\nvalid_woa = ocean_woa & np.isfinite(nt_woa)\n\n# WOA global and basin means\nglobal_raw = {}\nbasin_raw = {\"WOA23\": {}}\n\nm = valid_woa\nglobal_raw[\"WOA23\"] = (\n    np.nansum(nt_woa[m] * weights_woa[m]) / np.nansum(weights_woa[m])\n)\n\nfor bname, bid in BASIN_IDS.items():\n    m = valid_woa & (basin2d_woa == bid)\n    basin_raw[\"WOA23\"][bname] = (\n        np.nansum(nt_woa[m] * weights_woa[m]) / np.nansum(weights_woa[m])\n    )\n\n# ---------------------------------------------------------------------------\n# WOA section for Figure 2\n# ---------------------------------------------------------------------------\nlon_edges = np.arange(120.0, 281.0, 1.0)\n\nlon_centers_sec, sec_woa = make_lon_depth_section(\n    N_woa, depth_woa, lat2d_woa, lon2d_woa, lon_edges\n)\nnt_line_woa = nitracline_depth(sec_woa, depth_woa, max_depth=1000.0)\nmask_depth_woa = depth_woa <= 1000.0\n\nsections = {\n    \"WOA23\": {\n        \"lon\": lon_centers_sec,\n        \"depth_plot\": depth_woa[mask_depth_woa],\n        \"conc_plot\": sec_woa[mask_depth_woa, :],\n        \"nt_line\": nt_line_woa,\n    }\n}\n\n# Precompute WOA ocean-basin lookup for mapping model native grids to basins\nwoa_basin_ocean = (\n    ocean_woa\n    & np.isfinite(basin2d_woa)\n    & (basin2d_woa > 0)\n)\nsrc_lat_b = lat2d_woa[woa_basin_ocean]\nsrc_lon_b = lon2d_woa[woa_basin_ocean]\nsrc_basin_b = basin2d_woa[woa_basin_ocean]\n\n# ---------------------------------------------------------------------------\n# Models\n# ---------------------------------------------------------------------------\nnt_native = {}\nnt_regrid = {}\ncorr_raw = {}\nrmse_raw = {}\n\nfor model in MODEL_NAMES:\n    meta = MODEL_META[model]\n    N_model, depth_model, lat2d_model, lon2d_model, units_model = load_cmip_no3(\n        model, meta\n    )\n    area_model = load_areacello(model, meta)\n\n    if area_model.shape != N_model.shape[1:]:\n        if area_model.T.shape == N_model.shape[1:]:\n            area_model = area_model.T\n        else:\n            area_model = np.squeeze(area_model)\n            if area_model.shape != N_model.shape[1:]:\n                raise ValueError(\n                    f\"areacello shape {area_model.shape} does not match \"\n                    f\"{model} no3 spatial shape {N_model.shape[1:]}\"\n                )\n\n    nt_model = nitracline_depth(N_model, depth_model, max_depth=1000.0)\n    nt_native[model] = nt_model\n\n    valid_model = (\n        np.isfinite(nt_model)\n        & np.isfinite(area_model)\n        & (area_model > 0)\n    )\n\n    # Native-grid global mean weighted by the model's own areacello\n    global_raw[model] = (\n        np.nansum(nt_model[valid_model] * area_model[valid_model])\n        / np.nansum(area_model[valid_model])\n    )\n\n    # Map model native points to WOA basins by nearest WOA ocean point\n    valid_b = np.isfinite(nt_model)\n    inds_b = nearest_indices(\n        src_lat_b,\n        src_lon_b,\n        lat2d_model[valid_b],\n        lon2d_model[valid_b],\n    )\n    basin_model = np.full(nt_model.shape, np.nan)\n    basin_model[valid_b] = src_basin_b[inds_b]\n\n    basin_raw[model] = {}\n    for bname, bid in BASIN_IDS.items():\n        m = valid_model & (basin_model == bid)\n        basin_raw[model][bname] = (\n            np.nansum(nt_model[m] * area_model[m]) / np.nansum(area_model[m])\n        )\n\n    # Regrid native nitracline to the WOA 1-degree grid by nearest valid model\n    # point (used for maps, spatial correlation and RMSE).\n    valid_r = valid_model\n    inds_r = nearest_indices(\n        lat2d_model[valid_r],\n        lon2d_model[valid_r],\n        lat2d_woa.ravel(),\n        lon2d_woa.ravel(),\n    )\n    arr = nt_model[valid_r][inds_r].reshape(lat2d_woa.shape)\n    arr[~ocean_woa] = np.nan\n    nt_regrid[model] = arr\n\n    m = ocean_woa & np.isfinite(nt_woa) & np.isfinite(arr)\n    x = arr[m]\n    y = nt_woa[m]\n    corr_raw[model] = float(np.corrcoef(x, y)[0, 1])\n    rmse_raw[model] = float(np.sqrt(np.mean((x - y) ** 2)))\n\n    # Section: convert CMIP6 mol m-3 to approximate micromol kg-1 using a\n    # constant reference density.  The nitracline depth itself is invariant\n    # to this constant multiplicative factor.\n    units_norm = str(units_model).lower().replace(\" \", \"\")\n    if \"mol\" in units_norm and (\"m-3\" in units_norm or \"m^-3\" in units_norm):\n        conv = 1000.0 / RHO_REF\n    else:\n        conv = 1.0\n    N_model_plot = N_model * conv\n\n    lon_centers_m, sec_m = make_lon_depth_section(\n        N_model_plot, depth_model, lat2d_model, lon2d_model, lon_edges\n    )\n    nt_line_m = nitracline_depth(sec_m, depth_model, max_depth=1000.0)\n    mask_depth_m = depth_model <= 1000.0\n\n    sections[model] = {\n        \"lon\": lon_centers_m,\n        \"depth_plot\": depth_model[mask_depth_m],\n        \"conc_plot\": sec_m[mask_depth_m, :],\n        \"nt_line\": nt_line_m,\n    }\n\n# ---------------------------------------------------------------------------\n# Rounded result variables for the answer\n# ---------------------------------------------------------------------------\nglobal_mean_nitracline_raw = global_raw.copy()\nglobal_mean_nitracline = {\n    k: int(round(v)) for k, v in global_mean_nitracline_raw.items()\n}\nglobal_diff_from_woa = {\n    k: int(round(global_mean_nitracline_raw[k] - global_mean_nitracline_raw[\"WOA23\"]))\n    for k in MODEL_NAMES\n}\n\nbasin_mean_nitracline_raw = {\n    source: {bname: basin_raw[source][bname] for bname in BASIN_IDS}\n    for source in [\"WOA23\", *MODEL_NAMES]\n}\nbasin_mean_nitracline = {\n    source: {\n        bname: int(round(basin_mean_nitracline_raw[source][bname]))\n        for bname in BASIN_IDS\n    }\n    for source in [\"WOA23\", *MODEL_NAMES]\n}\nbasin_diff_from_woa = {\n    model: {\n        bname: int(\n            round(\n                basin_mean_nitracline_raw[model][bname]\n                - basin_mean_nitracline_raw[\"WOA23\"][bname]\n            )\n        )\n        for bname in BASIN_IDS\n    }\n    for model in MODEL_NAMES\n}\n\nspatial_corr = {m: round(corr_raw[m], 3) for m in MODEL_NAMES}\nspatial_rmse = {m: round(rmse_raw[m], 1) for m in MODEL_NAMES}\n\nbest_model = min(MODEL_NAMES, key=lambda m: rmse_raw[m])\nbest_model_by_corr = max(MODEL_NAMES, key=lambda m: corr_raw[m])\n\n\ndef ordered_basins(d):\n    return [b for b, _ in sorted(d.items(), key=lambda kv: kv[1], reverse=True)]\n\n\nbasin_order_woa = ordered_basins(basin_mean_nitracline_raw[\"WOA23\"])\nbasin_order_models = {\n    m: ordered_basins(basin_mean_nitracline_raw[m]) for m in MODEL_NAMES\n}\nbasin_order_matches_woa = {\n    m: (basin_order_models[m] == basin_order_woa) for m in MODEL_NAMES\n}",
+          "success": false,
+          "error": "index 0 is out of bounds for axis 0 with size 0",
+          "error_type": "IndexError",
+          "traceback": "Traceback (most recent call last):\n  File \"/home/lorraine/projects/2025-jingwei_QA_GMD/src/models/agent_with_tools.py\", line 717, in _safe_execute_tool\n    exec(code, sandbox_globals)\n  File \"<string>\", line 477, in <module>\nIndexError: index 0 is out of bounds for axis 0 with size 0\n"
+        },
+        {
+          "iteration": 2,
+          "code": "import os\nimport glob\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\n\n# ---------------------------------------------------------------------------\n# Paths / constants\n# ---------------------------------------------------------------------------\nWOA_CLIM_ROOT = \"/data1/lorraine-20419/ocean_data/WOA23/climatology\"\nWOA_MASK_ROOT = \"/data1/lorraine-20419/ocean_data/WOA23/masks\"\nCMIP_HIST_ROOT = \"/data1/lorraine-20419/benchmark_cmip6/historical\"\nRHO_REF = 1025.0\n\nMODEL_META = {\n    \"CESM2\": {\n        \"y_dim\": \"nlat\", \"x_dim\": \"nlon\",\n        \"lat_coord\": \"lat\", \"lon_coord\": \"lon\",\n        \"depth_coord\": \"lev\", \"depth_scale\": 0.01,\n    },\n    \"GFDL-ESM4\": {\n        \"y_dim\": \"lat\", \"x_dim\": \"lon\",\n        \"lat_coord\": \"lat\", \"lon_coord\": \"lon\",\n        \"depth_coord\": \"lev\", \"depth_scale\": 1.0,\n    },\n    \"MPI-ESM1-2-LR\": {\n        \"y_dim\": \"j\", \"x_dim\": \"i\",\n        \"lat_coord\": \"latitude\", \"lon_coord\": \"longitude\",\n        \"depth_coord\": \"lev\", \"depth_scale\": 1.0,\n    },\n}\nMODEL_NAMES = [\"CESM2\", \"GFDL-ESM4\", \"MPI-ESM1-2-LR\"]\nBASIN_IDS = {\"Pacific\": 2, \"Atlantic\": 1, \"Indian\": 3}\n\n# ---------------------------------------------------------------------------\n# Helpers\n# ---------------------------------------------------------------------------\ndef find_var(ds, candidates):\n    for c in candidates:\n        if c in ds.data_vars:\n            return c\n    for v in ds.data_vars:\n        for c in candidates:\n            if c.lower() in v.lower():\n                return v\n    raise KeyError(f\"None of {candidates} found in {list(ds.data_vars)}\")\n\n\ndef nitracline_depth(conc, depth, max_depth=1000.0, absolute=False):\n    \"\"\"\n    Depth of maximum vertical nitrate gradient, searching only intervals whose\n    upper level is <= max_depth.  The gradient at the deepest searched level\n    uses the level immediately below it.\n\n    conc : array with vertical axis first, shape (nlev, ...)\n    depth: 1-D vertical coordinate, positive down\n    \"\"\"\n    conc = np.asarray(conc, dtype=float)\n    depth = np.asarray(depth, dtype=float)\n\n    # ensure increasing depth\n    if depth.size > 1 and depth[0] > depth[-1]:\n        depth = depth[::-1]\n        conc = conc[::-1, ...]\n\n    idx = np.where(depth[:-1] <= max_depth)[0]\n    out_shape = conc.shape[1:]\n    if idx.size == 0:\n        return np.full(out_shape, np.nan)\n\n    dz = depth[idx + 1] - depth[idx]\n    dz_shape = (len(idx),) + (1,) * (conc.ndim - 1)\n    grad = (conc[idx + 1] - conc[idx]) / dz.reshape(dz_shape)\n\n    if absolute:\n        grad = np.abs(grad)\n\n    grad_filled = np.where(np.isfinite(grad), grad, -np.inf)\n    imax = np.argmax(grad_filled, axis=0)\n    maxg = np.take_along_axis(grad_filled, imax[None, ...], axis=0)[0]\n    bad = ~np.isfinite(maxg)\n\n    depth_upper = depth[idx]\n    out = np.full(out_shape, np.nan)\n    out[~bad] = depth_upper[imax[~bad]]\n    return out\n\n\ndef latlon_to_xyz(lat, lon):\n    lat = np.deg2rad(np.asarray(lat, dtype=float).ravel())\n    lon = np.deg2rad(np.mod(np.asarray(lon, dtype=float).ravel(), 360.0))\n    return np.column_stack((\n        np.cos(lat) * np.cos(lon),\n        np.cos(lat) * np.sin(lon),\n        np.sin(lat),\n    ))\n\n\ndef nearest_indices(src_lat, src_lon, tgt_lat, tgt_lon):\n    src_xyz = latlon_to_xyz(src_lat, src_lon)\n    tgt_xyz = latlon_to_xyz(tgt_lat, tgt_lon)\n\n    if src_xyz.shape[0] == 0:\n        raise ValueError(\"No source points for nearest-neighbor mapping\")\n    if tgt_xyz.shape[0] == 0:\n        return np.empty(0, dtype=int)\n\n    try:\n        from scipy.spatial import cKDTree\n        tree = cKDTree(src_xyz)\n        _, ind = tree.query(tgt_xyz)\n        return ind\n    except Exception:\n        # Fallback brute-force nearest neighbour, chunked in target space.\n        ind = np.empty(tgt_xyz.shape[0], dtype=int)\n        chunk = 100\n        for start in range(0, tgt_xyz.shape[0], chunk):\n            stop = min(start + chunk, tgt_xyz.shape[0])\n            d2 = ((tgt_xyz[start:stop, None, :] - src_xyz[None, :, :]) ** 2).sum(axis=-1)\n            ind[start:stop] = np.argmin(d2, axis=1)\n        return ind\n\n\ndef read_landsea(path, lat_axis, lon_axis):\n    \"\"\"Read WOA landsea_01.msk; ocean where Bottom_Standard_Level > 1.\"\"\"\n    nlat, nlon = len(lat_axis), len(lon_axis)\n    ocean = np.zeros((nlat, nlon), dtype=bool)\n    if nlat < 2 or nlon < 2:\n        return ocean\n\n    dlat = lat_axis[1] - lat_axis[0]\n    dlon = lon_axis[1] - lon_axis[0]\n\n    with open(path, \"r\") as f:\n        for line in f:\n            s = line.strip()\n            if not s or s.startswith(\"#\"):\n                continue\n            parts = s.replace(\",\", \" \").split()\n            if len(parts) < 3:\n                continue\n            try:\n                lat = float(parts[0])\n                lon = float(parts[1])\n                bottom = float(parts[2])\n            except ValueError:\n                continue\n            i = int(round((lat - lat_axis[0]) / dlat))\n            j = int(round((lon - lon_axis[0]) / dlon))\n            if 0 <= i < nlat and 0 <= j < nlon:\n                ocean[i, j] = bottom > 1.0\n    return ocean\n\n\ndef read_basin_mask(path, lat_axis, lon_axis, nlev=None):\n    \"\"\"\n    Read basinmask_01.msk.  The file may contain either one basin number per\n    ocean point, or a sequence of basin numbers on standard levels.  This\n    routine extracts the shallowest valid basin code at each point and returns\n    a 2-D array.\n    \"\"\"\n    nlat, nlon = len(lat_axis), len(lon_axis)\n    basin2d = np.full((nlat, nlon), np.nan)\n    if nlat < 2 or nlon < 2:\n        return basin2d, None\n\n    dlat = lat_axis[1] - lat_axis[0]\n    dlon = lon_axis[1] - lon_axis[0]\n\n    with open(path, \"r\") as f:\n        for line in f:\n            s = line.strip()\n            if not s or s.startswith(\"#\"):\n                continue\n            parts = s.replace(\",\", \" \").split()\n            if len(parts) < 3:\n                continue\n            try:\n                lat = float(parts[0])\n                lon = float(parts[1])\n            except ValueError:\n                continue\n\n            vals = []\n            for p in parts[2:]:\n                try:\n                    v = float(p)\n                except ValueError:\n                    continue\n                if np.isfinite(v):\n                    vals.append(v)\n            if not vals:\n                continue\n\n            # Drop a possible leading level count / bottom index.\n            start = 0\n            if len(vals) > 1 and vals[0] >= 1 and abs(vals[0] - (len(vals) - 1)) < 1e-6:\n                start = 1\n\n            code = None\n            for v in vals[start:]:\n                if 1 <= v <= 11:\n                    code = v\n                    break\n            if code is None:\n                for v in vals[start:]:\n                    if v > 0:\n                        code = v\n                        break\n            if code is None:\n                continue\n\n            i = int(round((lat - lat_axis[0]) / dlat))\n            j = int(round((lon - lon_axis[0]) / dlon))\n            if 0 <= i < nlat and 0 <= j < nlon:\n                basin2d[i, j] = code\n\n    return basin2d, None\n\n\ndef fold_basin(b):\n    \"\"\"Fold WOA13 marginal-sea basin numbers into their parent ocean.\"\"\"\n    out = np.array(b, dtype=float, copy=True)\n    # WOA13 marginal seas: Mediterranean, Black Sea, Baltic, Hudson Bay -> Atlantic\n    out[np.isin(out, [6, 7, 8, 11])] = 1.0\n    # Red Sea and Persian Gulf -> Indian\n    out[np.isin(out, [9, 10])] = 3.0\n    return out\n\n\ndef load_woa_nitrate():\n    path = os.path.join(\n        WOA_CLIM_ROOT, \"nitrate\", \"all_time_periods\", \"woa23_all_n00_01.nc\"\n    )\n    ds = xr.open_dataset(path, decode_times=False)\n    var = find_var(ds, [\"n_an\", \"n\", \"nitrate\", \"no3\"])\n    da = ds[var]\n\n    # annual climatology: remove singleton time axis\n    for d in list(da.dims):\n        if d.lower() in (\"time\", \"month\") and da.sizes[d] == 1:\n            da = da.isel({d: 0}, drop=True)\n\n    depth_name = None\n    for c in [\"depth\", \"lev\", \"st_level\"]:\n        if c in ds.coords or c in ds.dims:\n            depth_name = c\n            break\n    if depth_name is None:\n        depth_name = da.dims[0]\n\n    lat_name = \"lat\" if (\"lat\" in ds.coords or \"lat\" in ds.dims) else \"latitude\"\n    lon_name = \"lon\" if (\"lon\" in ds.coords or \"lon\" in ds.dims) else \"longitude\"\n\n    da = da.transpose(depth_name, lat_name, lon_name)\n    depth = ds[depth_name].values.astype(float)\n    lat = ds[lat_name].values.astype(float)\n    lon = ds[lon_name].values.astype(float)\n    N = da.values.astype(float)\n\n    order = np.argsort(depth)\n    depth = depth[order]\n    N = N[order, ...]\n\n    if lat.size > 1 and lat[0] > lat[-1]:\n        lat = lat[::-1]\n        N = N[:, ::-1, :]\n    if lon.size > 1 and lon[0] > lon[-1]:\n        lon = lon[::-1]\n        N = N[:, :, ::-1]\n\n    return N, depth, lat, lon\n\n\ndef load_cmip_no3(model, meta):\n    files = sorted(glob.glob(os.path.join(CMIP_HIST_ROOT, model, \"no3\", \"*.nc\")))\n    if not files:\n        raise FileNotFoundError(f\"No no3 files for {model}\")\n\n    ds = xr.open_mfdataset(\n        files,\n        combine=\"by_coords\",\n        use_cftime=True,\n        chunks={\"time\": 60},\n    )\n    var = find_var(ds, [\"no3\"])\n    da_all = ds[var]\n\n    t = ds.indexes[\"time\"]\n    if hasattr(t[0], \"year\"):\n        years = np.array([x.year for x in t])\n    else:\n        years = np.asarray(pd.to_datetime(t).year)\n    sel = (years >= 1971) & (years <= 2000)\n    if sel.sum() == 0:\n        raise ValueError(f\"No 1971-2000 data for {model}\")\n\n    da = da_all.isel(time=np.where(sel)[0]).mean(\"time\")\n\n    zname = meta[\"depth_coord\"]\n    z = ds[zname].values.astype(float) * float(meta[\"depth_scale\"])\n\n    lat = ds[meta[\"lat_coord\"]]\n    lon = ds[meta[\"lon_coord\"]]\n    if lat.ndim == 1 and lon.ndim == 1:\n        lon2d, lat2d = np.meshgrid(lon.values, lat.values)\n    else:\n        lat2d = lat.values\n        lon2d = lon.values\n\n    da = da.transpose(zname, meta[\"y_dim\"], meta[\"x_dim\"])\n    N = da.compute().values.astype(float)\n    units = da_all.attrs.get(\"units\", \"\")\n\n    order = np.argsort(z)\n    z = z[order]\n    N = N[order, ...]\n\n    return N, z, lat2d, lon2d, units\n\n\ndef load_areacello(model, meta):\n    files = sorted(glob.glob(os.path.join(CMIP_HIST_ROOT, model, \"areacello\", \"*.nc\")))\n    if not files:\n        raise FileNotFoundError(f\"No areacello file for {model}\")\n    ds = xr.open_dataset(files[0])\n    var = find_var(ds, [\"areacello\"])\n    da = ds[var]\n    if \"time\" in da.dims and da.sizes[\"time\"] == 1:\n        da = da.isel(time=0, drop=True)\n\n    try:\n        da = da.transpose(meta[\"y_dim\"], meta[\"x_dim\"])\n    except Exception:\n        dims = [d for d in da.dims if d not in (\"time\", \"lev\", \"depth\")]\n        if len(dims) >= 2:\n            da = da.transpose(dims[-2], dims[-1])\n    return da.values.astype(float)\n\n\ndef make_lon_depth_section(N, depth, lat2d, lon2d, lon_edges, lat_min=-2.0, lat_max=2.0):\n    \"\"\"\n    Average a 3-D field (depth, y, x) over a latitude band and bin by longitude.\n    Longitudes are treated modulo 360 so 120E-80W crosses the dateline.\n    \"\"\"\n    N = np.asarray(N, dtype=float)\n    nlev = N.shape[0]\n    centers = 0.5 * (lon_edges[:-1] + lon_edges[1:])\n    sec = np.full((nlev, centers.size), np.nan)\n\n    lat_band = (lat2d >= lat_min) & (lat2d <= lat_max)\n    lon360 = np.mod(lon2d, 360.0)\n\n    Nflat = N.reshape(nlev, -1)\n    latflat = lat_band.ravel()\n    lonflat = lon360.ravel()\n\n    for j in range(centers.size):\n        m = latflat & (lonflat >= lon_edges[j]) & (lonflat < lon_edges[j + 1])\n        if not np.any(m):\n            continue\n        vals = Nflat[:, m]\n        cnt = np.sum(np.isfinite(vals), axis=1)\n        sums = np.nansum(vals, axis=1)\n        with np.errstate(invalid=\"ignore\", divide=\"ignore\"):\n            sec[:, j] = np.where(cnt > 0, sums / cnt, np.nan)\n\n    return centers, sec\n\n\n# ---------------------------------------------------------------------------\n# WOA23 observed nitrate, nitracline, masks\n# ---------------------------------------------------------------------------\nN_woa, depth_woa, lat_woa, lon_woa = load_woa_nitrate()\nlat2d_woa, lon2d_woa = np.meshgrid(lat_woa, lon_woa, indexing=\"ij\")\n\nnt_woa = nitracline_depth(N_woa, depth_woa, max_depth=1000.0)\n\nlandsea_path = os.path.join(WOA_MASK_ROOT, \"landsea_01.msk\")\nbasin_path = os.path.join(WOA_MASK_ROOT, \"basinmask_01.msk\")\n\nocean_woa = read_landsea(landsea_path, lat_woa, lon_woa)\nocean_from_data = np.isfinite(N_woa).any(axis=0)\n\nif ocean_woa.sum() == 0:\n    ocean_woa = ocean_from_data\nelse:\n    ocean_woa = ocean_woa & ocean_from_data\n    if ocean_woa.sum() < 0.5 * ocean_from_data.sum():\n        ocean_woa = ocean_from_data\n\nbasin2d_woa, basin3d_woa = read_basin_mask(\n    basin_path, lat_woa, lon_woa, nlev=depth_woa.size\n)\n\nif basin3d_woa is not None:\n    valid3 = np.isfinite(basin3d_woa) & (basin3d_woa > 0)\n    has = valid3.any(axis=0)\n    first_idx = np.argmax(valid3, axis=0)\n    basin2d_woa = np.full(valid3.shape[1:], np.nan)\n    basin2d_woa[has] = np.take_along_axis(\n        basin3d_woa, first_idx[None, :, :], axis=0\n    )[0][has]\n\nbasin2d_woa = fold_basin(basin2d_woa)\nbasin2d_woa[~ocean_woa] = np.nan\n\nweights_woa = np.cos(np.deg2rad(lat2d_woa))\nvalid_woa = ocean_woa & np.isfinite(nt_woa)\n\n# WOA global and basin means\nglobal_raw = {}\nbasin_raw = {\"WOA23\": {}}\n\nm = valid_woa\nglobal_raw[\"WOA23\"] = (\n    np.nansum(nt_woa[m] * weights_woa[m]) / np.nansum(weights_woa[m])\n)\n\nfor bname, bid in BASIN_IDS.items():\n    m = valid_woa & (basin2d_woa == bid)\n    denom = np.nansum(weights_woa[m])\n    if denom > 0:\n        basin_raw[\"WOA23\"][bname] = (\n            np.nansum(nt_woa[m] * weights_woa[m]) / denom\n        )\n    else:\n        basin_raw[\"WOA23\"][bname] = np.nan\n\n# ---------------------------------------------------------------------------\n# WOA section for Figure 2\n# ---------------------------------------------------------------------------\nlon_edges = np.arange(120.0, 281.0, 1.0)\n\nlon_centers_sec, sec_woa = make_lon_depth_section(\n    N_woa, depth_woa, lat2d_woa, lon2d_woa, lon_edges\n)\nnt_line_woa = nitracline_depth(sec_woa, depth_woa, max_depth=1000.0)\nmask_depth_woa = depth_woa <= 1000.0\n\nsections = {\n    \"WOA23\": {\n        \"lon\": lon_centers_sec,\n        \"depth_plot\": depth_woa[mask_depth_woa],\n        \"conc_plot\": sec_woa[mask_depth_woa, :],\n        \"nt_line\": nt_line_woa,\n    }\n}\n\n# Precompute WOA ocean-basin lookup for mapping model native grids to basins\nwoa_basin_ocean = (\n    ocean_woa\n    & np.isfinite(basin2d_woa)\n    & (basin2d_woa > 0)\n)\nif not np.any(woa_basin_ocean):\n    woa_basin_ocean = np.isfinite(basin2d_woa) & (basin2d_woa > 0)\nif not np.any(woa_basin_ocean):\n    raise RuntimeError(\"No WOA ocean basin points available for model-basin mapping\")\n\nsrc_lat_b = lat2d_woa[woa_basin_ocean]\nsrc_lon_b = lon2d_woa[woa_basin_ocean]\nsrc_basin_b = basin2d_woa[woa_basin_ocean]\n\n# ---------------------------------------------------------------------------\n# Models\n# ---------------------------------------------------------------------------\nnt_native = {}\nnt_regrid = {}\ncorr_raw = {}\nrmse_raw = {}\n\nfor model in MODEL_NAMES:\n    meta = MODEL_META[model]\n    N_model, depth_model, lat2d_model, lon2d_model, units_model = load_cmip_no3(\n        model, meta\n    )\n    area_model = load_areacello(model, meta)\n\n    if area_model.shape != N_model.shape[1:]:\n        if area_model.T.shape == N_model.shape[1:]:\n            area_model = area_model.T\n        else:\n            area_model = np.squeeze(area_model)\n            if area_model.shape != N_model.shape[1:]:\n                raise ValueError(\n                    f\"areacello shape {area_model.shape} does not match \"\n                    f\"{model} no3 spatial shape {N_model.shape[1:]}\"\n                )\n\n    nt_model = nitracline_depth(N_model, depth_model, max_depth=1000.0)\n    nt_native[model] = nt_model\n\n    valid_model = (\n        np.isfinite(nt_model)\n        & np.isfinite(area_model)\n        & (area_model > 0)\n    )\n\n    # Native-grid global mean weighted by the model's own areacello\n    denom = np.nansum(area_model[valid_model])\n    if denom > 0:\n        global_raw[model] = (\n            np.nansum(nt_model[valid_model] * area_model[valid_model])\n            / denom\n        )\n    else:\n        global_raw[model] = np.nan\n\n    # Map model native points to WOA basins by nearest WOA ocean point\n    valid_b = np.isfinite(nt_model)\n    basin_model = np.full(nt_model.shape, np.nan)\n    if np.any(valid_b):\n        inds_b = nearest_indices(\n            src_lat_b,\n            src_lon_b,\n            lat2d_model[valid_b],\n            lon2d_model[valid_b],\n        )\n        basin_model[valid_b] = src_basin_b[inds_b]\n\n    basin_raw[model] = {}\n    for bname, bid in BASIN_IDS.items():\n        m = valid_model & (basin_model == bid)\n        denom = np.nansum(area_model[m])\n        if denom > 0:\n            basin_raw[model][bname] = (\n                np.nansum(nt_model[m] * area_model[m]) / denom\n            )\n        else:\n            basin_raw[model][bname] = np.nan\n\n    # Regrid native nitracline to the WOA 1-degree grid by nearest valid model\n    # point (used for maps, spatial correlation and RMSE).\n    valid_r = valid_model\n    if np.any(valid_r):\n        inds_r = nearest_indices(\n            lat2d_model[valid_r],\n            lon2d_model[valid_r],\n            lat2d_woa.ravel(),\n            lon2d_woa.ravel(),\n        )\n        arr = nt_model[valid_r][inds_r].reshape(lat2d_woa.shape)\n    else:\n        arr = np.full(lat2d_woa.shape, np.nan)\n    arr[~ocean_woa] = np.nan\n    nt_regrid[model] = arr\n\n    m = ocean_woa & np.isfinite(nt_woa) & np.isfinite(arr)\n    x = arr[m]\n    y = nt_woa[m]\n    if x.size > 1:\n        corr_raw[model] = float(np.corrcoef(x, y)[0, 1])\n        rmse_raw[model] = float(np.sqrt(np.mean((x - y) ** 2)))\n    else:\n        corr_raw[model] = np.nan\n        rmse_raw[model] = np.nan\n\n    # Section: convert CMIP6 mol m-3 to approximate micromol kg-1 using a\n    # constant reference density.  The nitracline depth itself is invariant\n    # to this constant multiplicative factor.\n    units_norm = str(units_model).lower().replace(\" \", \"\")\n    if \"mol\" in units_norm and (\"m-3\" in units_norm or \"m^-3\" in units_norm):\n        conv = 1.0e6 / RHO_REF\n    else:\n        conv = 1.0\n    N_model_plot = N_model * conv\n\n    lon_centers_m, sec_m = make_lon_depth_section(\n        N_model_plot, depth_model, lat2d_model, lon2d_model, lon_edges\n    )\n    nt_line_m = nitracline_depth(sec_m, depth_model, max_depth=1000.0)\n    mask_depth_m = depth_model <= 1000.0\n\n    sections[model] = {\n        \"lon\": lon_centers_m,\n        \"depth_plot\": depth_model[mask_depth_m],\n        \"conc_plot\": sec_m[mask_depth_m, :],\n        \"nt_line\": nt_line_m,\n    }\n\n# ---------------------------------------------------------------------------\n# Rounded result variables for the answer\n# ---------------------------------------------------------------------------\nglobal_mean_nitracline_raw = global_raw.copy()\nglobal_mean_nitracline = {\n    k: int(round(v)) for k, v in global_mean_nitracline_raw.items()\n}\nglobal_diff_from_woa = {\n    k: int(round(global_mean_nitracline_raw[k] - global_mean_nitracline_raw[\"WOA23\"]))\n    for k in MODEL_NAMES\n}\n\nbasin_mean_nitracline_raw = {\n    source: {bname: basin_raw[source][bname] for bname in BASIN_IDS}\n    for source in [\"WOA23\", *MODEL_NAMES]\n}\nbasin_mean_nitracline = {\n    source: {\n        bname: int(round(basin_mean_nitracline_raw[source][bname]))\n        for bname in BASIN_IDS\n    }\n    for source in [\"WOA23\", *MODEL_NAMES]\n}\nbasin_diff_from_woa = {\n    model: {\n        bname: int(\n            round(\n                basin_mean_nitracline_raw[model][bname]\n                - basin_mean_nitracline_raw[\"WOA23\"][bname]\n            )\n        )\n        for bname in BASIN_IDS\n    }\n    for model in MODEL_NAMES\n}\n\nspatial_corr = {m: round(corr_raw[m], 3) for m in MODEL_NAMES}\nspatial_rmse = {m: round(rmse_raw[m], 1) for m in MODEL_NAMES}\n\nbest_model = min(MODEL_NAMES, key=lambda m: rmse_raw[m])\nbest_model_by_corr = max(MODEL_NAMES, key=lambda m: corr_raw[m])\n\n\ndef ordered_basins(d):\n    return [b for b, _ in sorted(d.items(), key=lambda kv: kv[1], reverse=True)]\n\n\nbasin_order_woa = ordered_basins(basin_mean_nitracline_raw[\"WOA23\"])\nbasin_order_models = {\n    m: ordered_basins(basin_mean_nitracline_raw[m]) for m in MODEL_NAMES\n}\nbasin_order_matches_woa = {\n    m: (basin_order_models[m] == basin_order_woa) for m in MODEL_NAMES\n}",
+          "success": true,
+          "materialized_results": {
+            "materialized": 0
+          },
+          "output": {
+            "WOA_CLIM_ROOT": "/data1/lorraine-20419/ocean_data/WOA23/climatology",
+            "WOA_MASK_ROOT": "/data1/lorraine-20419/ocean_data/WOA23/masks",
+            "CMIP_HIST_ROOT": "/data1/lorraine-20419/benchmark_cmip6/historical",
+            "RHO_REF": 1025.0,
+            "MODEL_META": {
+              "CESM2": {
+                "y_dim": "nlat",
+                "x_dim": "nlon",
+                "lat_coord": "lat",
+                "lon_coord": "lon",
+                "depth_coord": "lev",
+                "depth_scale": 0.01
+              },
+              "GFDL-ESM4": {
+                "y_dim": "lat",
+                "x_dim": "lon",
+                "lat_coord": "lat",
+                "lon_coord": "lon",
+                "depth_coord": "lev",
+                "depth_scale": 1.0
+              },
+              "MPI-ESM1-2-LR": {
+                "y_dim": "j",
+                "x_dim": "i",
+                "lat_coord": "latitude",
+                "lon_coord": "longitude",
+                "depth_coord": "lev",
+                "depth_scale": 1.0
+              }
+            },
+            "MODEL_NAMES": [
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR"
+            ],
+            "BASIN_IDS": {
+              "Pacific": 2,
+              "Atlantic": 1,
+              "Indian": 3
+            },
+            "N_woa": {
+              "type": "ndarray",
+              "shape": [
+                102,
+                180,
+                360
+              ],
+              "size": 6609600,
+              "n_valid": 3305010,
+              "min": 0.0,
+              "max": 49.30696105957031,
+              "mean": 22.99764005786831,
+              "std": 13.058622407504448
+            },
+            "depth_woa": {
+              "type": "ndarray",
+              "shape": [
+                102
+              ],
+              "size": 102,
+              "n_valid": 102,
+              "min": 0.0,
+              "max": 5500.0,
+              "mean": 1738.235294117647,
+              "std": 1683.6734242538364
+            },
+            "lat_woa": {
+              "type": "ndarray",
+              "shape": [
+                180
+              ],
+              "size": 180,
+              "n_valid": 180,
+              "min": -89.5,
+              "max": 89.5,
+              "mean": 0.0,
+              "std": 51.96072234550504
+            },
+            "lon_woa": {
+              "type": "ndarray",
+              "shape": [
+                360
+              ],
+              "size": 360,
+              "n_valid": 360,
+              "min": -179.5,
+              "max": 179.5,
+              "mean": 0.0,
+              "std": 103.92264751567228
+            },
+            "lat2d_woa": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 64800,
+              "min": -89.5,
+              "max": 89.5,
+              "mean": 0.0,
+              "std": 51.96072234550504
+            },
+            "lon2d_woa": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 64800,
+              "min": -179.5,
+              "max": 179.5,
+              "mean": 0.0,
+              "std": 103.92264751567228
+            },
+            "nt_woa": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 41071,
+              "min": 0.0,
+              "max": 1000.0,
+              "mean": 131.46258917484357,
+              "std": 156.48574775215147
+            },
+            "landsea_path": "/data1/lorraine-20419/ocean_data/WOA23/masks/landsea_01.msk",
+            "basin_path": "/data1/lorraine-20419/ocean_data/WOA23/masks/basinmask_01.msk",
+            "ocean_woa": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            },
+            "ocean_from_data": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            },
+            "basin2d_woa": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 41088,
+              "min": 1.0,
+              "max": 56.0,
+              "mean": 2.286993769470405,
+              "std": 3.823302801438523
+            },
+            "basin3d_woa": null,
+            "weights_woa": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 64800,
+              "min": 0.008726535498373897,
+              "max": 0.9999619230641713,
+              "mean": 0.6366278526673906,
+              "std": 0.3077417378389015
+            },
+            "valid_woa": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            },
+            "global_raw": {
+              "WOA23": 156.32411142970884,
+              "CESM2": 139.99772372466143,
+              "GFDL-ESM4": 116.7726314244507,
+              "MPI-ESM1-2-LR": 124.40544046815543
+            },
+            "basin_raw": {
+              "WOA23": {
+                "Pacific": 196.4851795988354,
+                "Atlantic": 141.11357504956325,
+                "Indian": 112.3312840263746
+              },
+              "CESM2": {
+                "Pacific": 153.4165940410697,
+                "Atlantic": 95.60961541651656,
+                "Indian": 160.87915101339232
+              },
+              "GFDL-ESM4": {
+                "Pacific": 138.14063776452235,
+                "Atlantic": 71.76659371066073,
+                "Indian": 127.04593441772425
+              },
+              "MPI-ESM1-2-LR": {
+                "Pacific": 172.81226289144695,
+                "Atlantic": 90.48282518413079,
+                "Indian": 82.87633525416673
+              }
+            },
+            "m": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            },
+            "lon_edges": {
+              "type": "ndarray",
+              "shape": [
+                161
+              ],
+              "size": 161,
+              "n_valid": 161,
+              "min": 120.0,
+              "max": 280.0,
+              "mean": 200.0,
+              "std": 46.475800154489
+            },
+            "lon_centers_sec": {
+              "type": "ndarray",
+              "shape": [
+                160
+              ],
+              "size": 160,
+              "n_valid": 160,
+              "min": 120.5,
+              "max": 279.5,
+              "mean": 200.0,
+              "std": 46.18711941656461
+            },
+            "sec_woa": {
+              "type": "ndarray",
+              "shape": [
+                102,
+                160
+              ],
+              "size": 16320,
+              "n_valid": 14245,
+              "min": 0.03489695908501744,
+              "max": 43.08572006225586,
+              "mean": 28.006411169415355,
+              "std": 13.921342880937853
+            },
+            "nt_line_woa": {
+              "type": "ndarray",
+              "shape": [
+                160
+              ],
+              "size": 160,
+              "n_valid": 160,
+              "min": 30.0,
+              "max": 275.0,
+              "mean": 116.09375,
+              "std": 68.92403398624822
+            },
+            "mask_depth_woa": {
+              "type": "ndarray",
+              "shape": [
+                102
+              ],
+              "size": 102,
+              "values": [
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "False",
+                "False",
+                "False"
+              ]
+            },
+            "sections": {
+              "WOA23": {
+                "lon": {
+                  "type": "ndarray",
+                  "shape": [
+                    160
+                  ],
+                  "size": 160,
+                  "n_valid": 160,
+                  "min": 120.5,
+                  "max": 279.5,
+                  "mean": 200.0,
+                  "std": 46.18711941656461
+                },
+                "depth_plot": {
+                  "type": "ndarray",
+                  "shape": [
+                    47
+                  ],
+                  "size": 47,
+                  "n_valid": 47,
+                  "min": 0.0,
+                  "max": 1000.0,
+                  "mean": 293.6170212765957,
+                  "std": 291.9973442892559,
+                  "values": [
+                    0.0,
+                    5.0,
+                    10.0,
+                    15.0,
+                    20.0,
+                    25.0,
+                    30.0,
+                    35.0,
+                    40.0,
+                    45.0,
+                    50.0,
+                    55.0,
+                    60.0,
+                    65.0,
+                    70.0,
+                    75.0,
+                    80.0,
+                    85.0,
+                    90.0,
+                    95.0,
+                    100.0,
+                    125.0,
+                    150.0,
+                    175.0,
+                    200.0,
+                    225.0,
+                    250.0,
+                    275.0,
+                    300.0,
+                    325.0,
+                    350.0,
+                    375.0,
+                    400.0,
+                    425.0,
+                    450.0,
+                    475.0,
+                    500.0,
+                    550.0,
+                    600.0,
+                    650.0,
+                    700.0,
+                    750.0,
+                    800.0,
+                    850.0,
+                    900.0,
+                    950.0,
+                    1000.0
+                  ]
+                },
+                "conc_plot": {
+                  "type": "ndarray",
+                  "shape": [
+                    47,
+                    160
+                  ],
+                  "size": 7520,
+                  "n_valid": 7502,
+                  "min": 0.03489695908501744,
+                  "max": 43.08572006225586,
+                  "mean": 19.339400173464835,
+                  "std": 14.347044544192377
+                },
+                "nt_line": {
+                  "type": "ndarray",
+                  "shape": [
+                    160
+                  ],
+                  "size": 160,
+                  "n_valid": 160,
+                  "min": 30.0,
+                  "max": 275.0,
+                  "mean": 116.09375,
+                  "std": 68.92403398624822
+                }
+              },
+              "CESM2": {
+                "lon": {
+                  "type": "ndarray",
+                  "shape": [
+                    160
+                  ],
+                  "size": 160,
+                  "n_valid": 160,
+                  "min": 120.5,
+                  "max": 279.5,
+                  "mean": 200.0,
+                  "std": 46.18711941656461
+                },
+                "depth_plot": {
+                  "type": "ndarray",
+                  "shape": [
+                    40
+                  ],
+                  "size": 40,
+                  "n_valid": 40,
+                  "min": 5.0,
+                  "max": 984.705859375,
+                  "mean": 281.95008105468753,
+                  "std": 245.0217430829415,
+                  "values": [
+                    5.0,
+                    15.0,
+                    25.0,
+                    35.0,
+                    45.0,
+                    55.0,
+                    65.0,
+                    75.0,
+                    85.0,
+                    95.0,
+                    105.0,
+                    115.0,
+                    125.0,
+                    135.0,
+                    145.0,
+                    155.0,
+                    165.098398,
+                    175.479043,
+                    186.29127,
+                    197.660273,
+                    209.711387,
+                    222.578281,
+                    236.408828,
+                    251.370156,
+                    267.654199,
+                    285.483652,
+                    305.119219,
+                    326.867988,
+                    351.093477,
+                    378.227617,
+                    408.784648,
+                    443.377695,
+                    482.736719,
+                    527.728008,
+                    579.372891,
+                    638.862617,
+                    707.563281,
+                    787.0025,
+                    878.825234,
+                    984.705859
+                  ]
+                },
+                "conc_plot": {
+                  "type": "ndarray",
+                  "shape": [
+                    40,
+                    160
+                  ],
+                  "size": 6400,
+                  "n_valid": 5679,
+                  "min": -0.47340977944554835,
+                  "max": 34.02259265711914,
+                  "mean": 14.275513127655687,
+                  "std": 9.209913869766845
+                },
+                "nt_line": {
+                  "type": "ndarray",
+                  "shape": [
+                    160
+                  ],
+                  "size": 160,
+                  "n_valid": 142,
+                  "min": 25.0,
+                  "max": 186.29126953125,
+                  "mean": 115.67433703785211,
+                  "std": 52.34267662496382
+                }
+              },
+              "GFDL-ESM4": {
+                "lon": {
+                  "type": "ndarray",
+                  "shape": [
+                    160
+                  ],
+                  "size": 160,
+                  "n_valid": 160,
+                  "min": 120.5,
+                  "max": 279.5,
+                  "mean": 200.0,
+                  "std": 46.18711941656461
+                },
+                "depth_plot": {
+                  "type": "ndarray",
+                  "shape": [
+                    19
+                  ],
+                  "size": 19,
+                  "n_valid": 19,
+                  "min": 2.5,
+                  "max": 1000.0,
+                  "mean": 328.1578947368421,
+                  "std": 318.21416996103255,
+                  "values": [
+                    2.5,
+                    10.0,
+                    20.0,
+                    32.5,
+                    51.25,
+                    75.0,
+                    100.0,
+                    125.0,
+                    156.25,
+                    200.0,
+                    250.0,
+                    312.5,
+                    400.0,
+                    500.0,
+                    600.0,
+                    700.0,
+                    800.0,
+                    900.0,
+                    1000.0
+                  ]
+                },
+                "conc_plot": {
+                  "type": "ndarray",
+                  "shape": [
+                    19,
+                    160
+                  ],
+                  "size": 3040,
+                  "n_valid": 3040,
+                  "min": 0.01769337536754348,
+                  "max": 36.04988135942599,
+                  "mean": 18.680820421495778,
+                  "std": 11.602864706865146
+                },
+                "nt_line": {
+                  "type": "ndarray",
+                  "shape": [
+                    160
+                  ],
+                  "size": 160,
+                  "n_valid": 160,
+                  "min": 10.0,
+                  "max": 200.0,
+                  "mean": 102.3828125,
+                  "std": 60.10046876035863
+                }
+              },
+              "MPI-ESM1-2-LR": {
+                "lon": {
+                  "type": "ndarray",
+                  "shape": [
+                    160
+                  ],
+                  "size": 160,
+                  "n_valid": 160,
+                  "min": 120.5,
+                  "max": 279.5,
+                  "mean": 200.0,
+                  "std": 46.18711941656461
+                },
+                "depth_plot": {
+                  "type": "ndarray",
+                  "shape": [
+                    23
+                  ],
+                  "size": 23,
+                  "n_valid": 23,
+                  "min": 6.0,
+                  "max": 960.0,
+                  "mean": 291.60869565217394,
+                  "std": 280.8109357975862,
+                  "values": [
+                    6.0,
+                    17.0,
+                    27.0,
+                    37.0,
+                    47.0,
+                    57.0,
+                    68.5,
+                    82.5,
+                    100.0,
+                    122.5,
+                    150.0,
+                    182.5,
+                    220.0,
+                    262.5,
+                    310.0,
+                    362.5,
+                    420.0,
+                    485.0,
+                    560.0,
+                    645.0,
+                    740.0,
+                    845.0,
+                    960.0
+                  ]
+                },
+                "conc_plot": {
+                  "type": "ndarray",
+                  "shape": [
+                    23,
+                    160
+                  ],
+                  "size": 3680,
+                  "n_valid": 3105,
+                  "min": 0.01758162575353664,
+                  "max": 36.115337435792135,
+                  "mean": 13.399319574959184,
+                  "std": 9.42426367496635
+                },
+                "nt_line": {
+                  "type": "ndarray",
+                  "shape": [
+                    160
+                  ],
+                  "size": 160,
+                  "n_valid": 135,
+                  "min": 6.0,
+                  "max": 485.0,
+                  "mean": 38.1037037037037,
+                  "std": 47.82963966754321
+                }
+              }
+            },
+            "woa_basin_ocean": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            },
+            "src_lat_b": {
+              "type": "ndarray",
+              "shape": [
+                41088
+              ],
+              "size": 41088,
+              "n_valid": 41088,
+              "min": -77.5,
+              "max": 89.5,
+              "mean": -0.5027258566978193,
+              "std": 47.91127484598185
+            },
+            "src_lon_b": {
+              "type": "ndarray",
+              "shape": [
+                41088
+              ],
+              "size": 41088,
+              "n_valid": 41088,
+              "min": -179.5,
+              "max": 179.5,
+              "mean": -9.336618964174455,
+              "std": 109.99417556433586
+            },
+            "src_basin_b": {
+              "type": "ndarray",
+              "shape": [
+                41088
+              ],
+              "size": 41088,
+              "n_valid": 41088,
+              "min": 1.0,
+              "max": 56.0,
+              "mean": 2.286993769470405,
+              "std": 3.823302801438523
+            },
+            "nt_native": {
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  384,
+                  320
+                ],
+                "size": 122880,
+                "n_valid": 86096,
+                "min": 5.0,
+                "max": 707.56328125,
+                "mean": 131.98228222597268,
+                "std": 93.55443394271515
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 44564,
+                "min": 2.5,
+                "max": 900.0,
+                "mean": 98.28488241630015,
+                "std": 112.78400314073144
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  220,
+                  256
+                ],
+                "size": 56320,
+                "n_valid": 36791,
+                "min": 6.0,
+                "max": 960.0,
+                "mean": 71.36720937185724,
+                "std": 109.17428959692694
+              }
+            },
+            "nt_regrid": {
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41088,
+                "min": 5.0,
+                "max": 707.56328125,
+                "mean": 133.27939608707607,
+                "std": 93.01393864258368
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41088,
+                "min": 2.5,
+                "max": 900.0,
+                "mean": 103.1882179711838,
+                "std": 114.50054129790665
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41088,
+                "min": 6.0,
+                "max": 960.0,
+                "mean": 100.57601976246106,
+                "std": 138.0608358654983
+              }
+            },
+            "corr_raw": {
+              "CESM2": 0.35615312513306924,
+              "GFDL-ESM4": 0.45665382846085156,
+              "MPI-ESM1-2-LR": 0.5812083858761473
+            },
+            "rmse_raw": {
+              "CESM2": 150.91659492529067,
+              "GFDL-ESM4": 148.44195762603616,
+              "MPI-ESM1-2-LR": 139.24492998281315
+            },
+            "global_mean_nitracline_raw": {
+              "WOA23": 156.32411142970884,
+              "CESM2": 139.99772372466143,
+              "GFDL-ESM4": 116.7726314244507,
+              "MPI-ESM1-2-LR": 124.40544046815543
+            },
+            "global_mean_nitracline": {
+              "WOA23": 156,
+              "CESM2": 140,
+              "GFDL-ESM4": 117,
+              "MPI-ESM1-2-LR": 124
+            },
+            "global_diff_from_woa": {
+              "CESM2": -16,
+              "GFDL-ESM4": -40,
+              "MPI-ESM1-2-LR": -32
+            },
+            "basin_mean_nitracline_raw": {
+              "WOA23": {
+                "Pacific": 196.4851795988354,
+                "Atlantic": 141.11357504956325,
+                "Indian": 112.3312840263746
+              },
+              "CESM2": {
+                "Pacific": 153.4165940410697,
+                "Atlantic": 95.60961541651656,
+                "Indian": 160.87915101339232
+              },
+              "GFDL-ESM4": {
+                "Pacific": 138.14063776452235,
+                "Atlantic": 71.76659371066073,
+                "Indian": 127.04593441772425
+              },
+              "MPI-ESM1-2-LR": {
+                "Pacific": 172.81226289144695,
+                "Atlantic": 90.48282518413079,
+                "Indian": 82.87633525416673
+              }
+            },
+            "basin_mean_nitracline": {
+              "WOA23": {
+                "Pacific": 196,
+                "Atlantic": 141,
+                "Indian": 112
+              },
+              "CESM2": {
+                "Pacific": 153,
+                "Atlantic": 96,
+                "Indian": 161
+              },
+              "GFDL-ESM4": {
+                "Pacific": 138,
+                "Atlantic": 72,
+                "Indian": 127
+              },
+              "MPI-ESM1-2-LR": {
+                "Pacific": 173,
+                "Atlantic": 90,
+                "Indian": 83
+              }
+            },
+            "basin_diff_from_woa": {
+              "CESM2": {
+                "Pacific": -43,
+                "Atlantic": -46,
+                "Indian": 49
+              },
+              "GFDL-ESM4": {
+                "Pacific": -58,
+                "Atlantic": -69,
+                "Indian": 15
+              },
+              "MPI-ESM1-2-LR": {
+                "Pacific": -24,
+                "Atlantic": -51,
+                "Indian": -29
+              }
+            },
+            "spatial_corr": {
+              "CESM2": 0.356,
+              "GFDL-ESM4": 0.457,
+              "MPI-ESM1-2-LR": 0.581
+            },
+            "spatial_rmse": {
+              "CESM2": 150.9,
+              "GFDL-ESM4": 148.4,
+              "MPI-ESM1-2-LR": 139.2
+            },
+            "best_model": "MPI-ESM1-2-LR",
+            "best_model_by_corr": "MPI-ESM1-2-LR",
+            "basin_order_woa": [
+              "Pacific",
+              "Atlantic",
+              "Indian"
+            ],
+            "basin_order_models": {
+              "CESM2": [
+                "Indian",
+                "Pacific",
+                "Atlantic"
+              ],
+              "GFDL-ESM4": [
+                "Pacific",
+                "Indian",
+                "Atlantic"
+              ],
+              "MPI-ESM1-2-LR": [
+                "Pacific",
+                "Atlantic",
+                "Indian"
+              ]
+            },
+            "basin_order_matches_woa": {
+              "CESM2": false,
+              "GFDL-ESM4": false,
+              "MPI-ESM1-2-LR": true
+            }
+          },
+          "omitted_loop_variables": [
+            "N_model",
+            "N_model_plot",
+            "area_model",
+            "arr",
+            "basin_model",
+            "bid",
+            "bname",
+            "conv",
+            "denom",
+            "depth_model",
+            "inds_b",
+            "inds_r",
+            "lat2d_model",
+            "lon2d_model",
+            "lon_centers_m",
+            "mask_depth_m",
+            "meta",
+            "model",
+            "nt_line_m",
+            "nt_model",
+            "sec_m",
+            "units_model",
+            "units_norm",
+            "valid_b",
+            "valid_model",
+            "valid_r",
+            "x",
+            "y"
+          ]
+        }
+      ],
+      "visualization_iterations": [
+        {
+          "iteration": 1,
+          "code": "import matplotlib.pyplot as plt\nfrom matplotlib.ticker import FuncFormatter\n\n# ---------------------------------------------------------------------------\n# Figure 1: global nitracline-depth maps, shared sequential colour scale\n# ---------------------------------------------------------------------------\nmap_order = [\"CESM2\", \"GFDL-ESM4\", \"MPI-ESM1-2-LR\", \"WOA23\"]\nmap_data = {\n    \"CESM2\": nt_regrid[\"CESM2\"],\n    \"GFDL-ESM4\": nt_regrid[\"GFDL-ESM4\"],\n    \"MPI-ESM1-2-LR\": nt_regrid[\"MPI-ESM1-2-LR\"],\n    \"WOA23\": nt_woa,\n}\n\nfig1, axes1 = plt.subplots(\n    2, 2, figsize=(12, 8), sharex=True, sharey=True, constrained_layout=True\n)\nvmin1, vmax1 = 0.0, 1000.0\nmesh1 = None\n\nfor ax, name in zip(axes1.ravel(), map_order):\n    data = np.ma.masked_invalid(map_data[name])\n    mesh1 = ax.pcolormesh(\n        lon_woa,\n        lat_woa,\n        data,\n        shading=\"auto\",\n        cmap=\"viridis_r\",\n        vmin=vmin1,\n        vmax=vmax1,\n    )\n    ax.set_title(name)\n    ax.set_xlim(-180, 180)\n    ax.set_ylim(-90, 90)\n    ax.set_xlabel(\"Longitude\")\n    ax.set_ylabel(\"Latitude\")\n\ncbar1 = fig1.colorbar(\n    mesh1, ax=axes1.ravel().tolist(), orientation=\"vertical\", shrink=0.85\n)\ncbar1.set_label(\"Nitracline depth (m)\")\n\n# ---------------------------------------------------------------------------\n# Figure 2: equatorial Pacific longitude-depth nitrate sections\n# ---------------------------------------------------------------------------\nsection_order = [\"WOA23\", \"CESM2\", \"GFDL-ESM4\", \"MPI-ESM1-2-LR\"]\n\nall_section_vals = np.concatenate(\n    [sections[name][\"conc_plot\"].ravel() for name in section_order]\n)\nvmax2 = np.nanpercentile(all_section_vals, 99)\nvmin2 = 0.0\n\nfig2, axes2 = plt.subplots(\n    4, 1, figsize=(12, 11), sharex=True, sharey=True, constrained_layout=True\n)\nmesh2 = None\n\nfor ax, name in zip(axes2, section_order):\n    s = sections[name]\n    mesh2 = ax.pcolormesh(\n        s[\"lon\"],\n        s[\"depth_plot\"],\n        s[\"conc_plot\"],\n        shading=\"auto\",\n        cmap=\"viridis\",\n        vmin=vmin2,\n        vmax=vmax2,\n    )\n    ax.plot(s[\"lon\"], s[\"nt_line\"], color=\"k\", linewidth=1.6)\n    ax.set_ylim(1000, 0)\n    ax.set_title(name)\n    ax.set_ylabel(\"Depth (m)\")\n\naxes2[-1].set_xlabel(\"Longitude\")\n\nxticks = [120, 150, 180, 210, 240, 270]\naxes2[-1].set_xticks(xticks)\n\n\ndef lon_label(x, pos=None):\n    x = x % 360\n    if abs(x - 180) < 1e-6:\n        return \"180\"\n    if x > 180:\n        return f\"{360 - x:.0f}W\"\n    return f\"{x:.0f}E\"\n\n\naxes2[-1].xaxis.set_major_formatter(FuncFormatter(lon_label))\n\ncbar2 = fig2.colorbar(\n    mesh2, ax=axes2.tolist(), orientation=\"vertical\", shrink=0.85\n)\ncbar2.set_label(r\"Nitrate ($\\mu$mol kg$^{-1}$)\")",
+          "success": true,
+          "output": {
+            "map_order": [
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR",
+              "WOA23"
+            ],
+            "map_data": {
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41088,
+                "min": 5.0,
+                "max": 707.56328125,
+                "mean": 133.27939608707607,
+                "std": 93.01393864258368
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41088,
+                "min": 2.5,
+                "max": 900.0,
+                "mean": 103.1882179711838,
+                "std": 114.50054129790665
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41088,
+                "min": 6.0,
+                "max": 960.0,
+                "mean": 100.57601976246106,
+                "std": 138.0608358654983
+              },
+              "WOA23": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41071,
+                "min": 0.0,
+                "max": 1000.0,
+                "mean": 131.46258917484357,
+                "std": 156.48574775215147
+              }
+            },
+            "fig1": "Figure(1200x800)",
+            "axes1": {
+              "type": "ndarray",
+              "shape": [
+                2,
+                2
+              ],
+              "size": 4,
+              "values": [
+                "Axes(0.125,0.53;0.281818x0.35)",
+                "Axes(0.463182,0.53;0.281818x0.35)",
+                "Axes(0.125,0.11;0.281818x0.35)",
+                "Axes(0.463182,0.11;0.281818x0.35)"
+              ]
+            },
+            "vmin1": 0.0,
+            "vmax1": 1000.0,
+            "mesh1": "<matplotlib.collections.QuadMesh object at 0x79a6a535d790>",
+            "cbar1": "<matplotlib.colorbar.Colorbar object at 0x79a6a08b2ed0>",
+            "section_order": [
+              "WOA23",
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR"
+            ],
+            "all_section_vals": {
+              "type": "ndarray",
+              "shape": [
+                20640
+              ],
+              "size": 20640,
+              "n_valid": 19326,
+              "min": -0.47340977944554835,
+              "max": 43.08572006225586,
+              "mean": 16.793407870996855,
+              "std": 12.127024062792746
+            },
+            "vmax2": 39.93681359291077,
+            "vmin2": 0.0,
+            "fig2": "Figure(1200x1100)",
+            "axes2": {
+              "type": "ndarray",
+              "shape": [
+                4
+              ],
+              "size": 4,
+              "values": [
+                "Axes(0.125,0.712609;0.62x0.167391)",
+                "Axes(0.125,0.511739;0.62x0.167391)",
+                "Axes(0.125,0.31087;0.62x0.167391)",
+                "Axes(0.125,0.11;0.62x0.167391)"
+              ]
+            },
+            "mesh2": "<matplotlib.collections.QuadMesh object at 0x79a6a08a9a10>",
+            "xticks": [
+              120,
+              150,
+              180,
+              210,
+              240,
+              270
+            ],
+            "cbar2": "<matplotlib.colorbar.Colorbar object at 0x79a6a092aed0>"
+          },
+          "omitted_loop_variables": [
+            "ax",
+            "data",
+            "name",
+            "s"
+          ]
+        }
+      ],
+      "visualization_paths": [
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T6_deepseek-flash_20261022_140000/turn01/figures/visualization_T6_deepseek-flash_20261022_140000_turn1_1.png",
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T6_deepseek-flash_20261022_140000/turn01/figures/visualization_T6_deepseek-flash_20261022_140000_turn1_2.png"
+      ],
+      "selected_data": {
+        "name": [
+          "woa23",
+          "cmip6_historical"
+        ],
+        "path": [
+          "/data1/lorraine-20419/ocean_data/WOA23/climatology",
+          "/data1/lorraine-20419/benchmark_cmip6/historical"
+        ],
+        "how": "inferred from the root directories the executed code names"
+      },
+      "observation": "[\n  {\n    \"type\": \"computation\",\n    \"status\": \"success\",\n    \"results\": {\n      \"WOA_CLIM_ROOT\": \"/data1/lorraine-20419/ocean_data/WOA23/climatology\",\n      \"WOA_MASK_ROOT\": \"/data1/lorraine-20419/ocean_data/WOA23/masks\",\n      \"CMIP_HIST_ROOT\": \"/data1/lorraine-20419/benchmark_cmip6/historical\",\n      \"RHO_REF\": 1025.0,\n      \"MODEL_META\": {\n        \"CESM2\": {\n          \"y_dim\": \"nlat\",\n          \"x_dim\": \"nlon\",\n          \"lat_coord\": \"lat\",\n          \"lon_coord\": \"lon\",\n          \"depth_coord\": \"lev\",\n          \"depth_scale\": 0.01\n        },\n        \"GFDL-ESM4\": {\n          \"y_dim\": \"lat\",\n          \"x_dim\": \"lon\",\n          \"lat_coord\": \"lat\",\n          \"lon_coord\": \"lon\",\n          \"depth_coord\": \"lev\",\n          \"depth_scale\": 1.0\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"y_dim\": \"j\",\n          \"x_dim\": \"i\",\n          \"lat_coord\": \"latitude\",\n          \"lon_coord\": \"longitude\",\n          \"depth_coord\": \"lev\",\n          \"depth_scale\": 1.0\n        }\n      },\n      \"MODEL_NAMES\": [\n        \"CESM2\",\n        \"GFDL-ESM4\",\n        \"MPI-ESM1-2-LR\"\n      ],\n      \"BASIN_IDS\": {\n        \"Pacific\": 2,\n        \"Atlantic\": 1,\n        \"Indian\": 3\n      },\n      \"N_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          102,\n          180,\n          360\n        ],\n        \"size\": 6609600,\n        \"n_valid\": 3305010,\n        \"min\": 0.0,\n        \"max\": 49.30696105957031,\n        \"mean\": 22.99764005786831,\n        \"std\": 13.058622407504448\n      },\n      \"depth_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          102\n        ],\n        \"size\": 102,\n        \"n_valid\": 102,\n        \"min\": 0.0,\n        \"max\": 5500.0,\n        \"mean\": 1738.235294117647,\n        \"std\": 1683.6734242538364\n      },\n      \"lat_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180\n        ],\n        \"size\": 180,\n        \"n_valid\": 180,\n        \"min\": -89.5,\n        \"max\": 89.5,\n        \"mean\": 0.0,\n        \"std\": 51.96072234550504\n      },\n      \"lon_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          360\n        ],\n        \"size\": 360,\n        \"n_valid\": 360,\n        \"min\": -179.5,\n        \"max\": 179.5,\n        \"mean\": 0.0,\n        \"std\": 103.92264751567228\n      },\n      \"lat2d_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 64800,\n        \"min\": -89.5,\n        \"max\": 89.5,\n        \"mean\": 0.0,\n        \"std\": 51.96072234550504\n      },\n      \"lon2d_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 64800,\n        \"min\": -179.5,\n        \"max\": 179.5,\n        \"mean\": 0.0,\n        \"std\": 103.92264751567228\n      },\n      \"nt_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 41071,\n        \"min\": 0.0,\n        \"max\": 1000.0,\n        \"mean\": 131.46258917484357,\n        \"std\": 156.48574775215147\n      },\n      \"landsea_path\": \"/data1/lorraine-20419/ocean_data/WOA23/masks/landsea_01.msk\",\n      \"basin_path\": \"/data1/lorraine-20419/ocean_data/WOA23/masks/basinmask_01.msk\",\n      \"ocean_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"values\": [\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\"\n        ]\n      },\n      \"ocean_from_data\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"values\": [\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\"\n        ]\n      },\n      \"basin2d_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 41088,\n        \"min\": 1.0,\n        \"max\": 56.0,\n        \"mean\": 2.286993769470405,\n        \"std\": 3.823302801438523\n      },\n      \"basin3d_woa\": null,\n      \"weights_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 64800,\n        \"min\": 0.008726535498373897,\n        \"max\": 0.9999619230641713,\n        \"mean\": 0.6366278526673906,\n        \"std\": 0.3077417378389015\n      },\n      \"valid_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"values\": [\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\"\n        ]\n      },\n      \"global_raw\": {\n        \"WOA23\": 156.32411142970884,\n        \"CESM2\": 139.99772372466143,\n        \"GFDL-ESM4\": 116.7726314244507,\n        \"MPI-ESM1-2-LR\": 124.40544046815543\n      },\n      \"basin_raw\": {\n        \"WOA23\": {\n          \"Pacific\": 196.4851795988354,\n          \"Atlantic\": 141.11357504956325,\n          \"Indian\": 112.3312840263746\n        },\n        \"CESM2\": {\n          \"Pacific\": 153.4165940410697,\n          \"Atlantic\": 95.60961541651656,\n          \"Indian\": 160.87915101339232\n        },\n        \"GFDL-ESM4\": {\n          \"Pacific\": 138.14063776452235,\n          \"Atlantic\": 71.76659371066073,\n          \"Indian\": 127.04593441772425\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"Pacific\": 172.81226289144695,\n          \"Atlantic\": 90.48282518413079,\n          \"Indian\": 82.87633525416673\n        }\n      },\n      \"m\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"values\": [\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\"\n        ]\n      },\n      \"lon_edges\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          161\n        ],\n        \"size\": 161,\n        \"n_valid\": 161,\n        \"min\": 120.0,\n        \"max\": 280.0,\n        \"mean\": 200.0,\n        \"std\": 46.475800154489\n      },\n      \"lon_centers_sec\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          160\n        ],\n        \"size\": 160,\n        \"n_valid\": 160,\n        \"min\": 120.5,\n        \"max\": 279.5,\n        \"mean\": 200.0,\n        \"std\": 46.18711941656461\n      },\n      \"sec_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          102,\n          160\n        ],\n        \"size\": 16320,\n        \"n_valid\": 14245,\n        \"min\": 0.03489695908501744,\n        \"max\": 43.08572006225586,\n        \"mean\": 28.006411169415355,\n        \"std\": 13.921342880937853\n      },\n      \"nt_line_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          160\n        ],\n        \"size\": 160,\n        \"n_valid\": 160,\n        \"min\": 30.0,\n        \"max\": 275.0,\n        \"mean\": 116.09375,\n        \"std\": 68.92403398624822\n      },\n      \"mask_depth_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          102\n        ],\n        \"size\": 102,\n        \"values\": [\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"False\",\n          \"False\",\n          \"False\"\n        ]\n      },\n      \"sections\": {\n        \"WOA23\": {\n          \"lon\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              160\n            ],\n            \"size\": 160,\n            \"n_valid\": 160,\n            \"min\": 120.5,\n            \"max\": 279.5,\n            \"mean\": 200.0,\n            \"std\": 46.18711941656461\n          },\n          \"depth_plot\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              47\n            ],\n            \"size\": 47,\n            \"n_valid\": 47,\n            \"min\": 0.0,\n            \"max\": 1000.0,\n            \"mean\": 293.6170212765957,\n            \"std\": 291.9973442892559,\n            \"values\": [\n              0.0,\n              5.0,\n              10.0,\n              15.0,\n              20.0,\n              25.0,\n              30.0,\n              35.0,\n              40.0,\n              45.0,\n              50.0,\n              55.0,\n              60.0,\n              65.0,\n              70.0,\n              75.0,\n              80.0,\n              85.0,\n              90.0,\n              95.0,\n              100.0,\n              125.0,\n              150.0,\n              175.0,\n              200.0,\n              225.0,\n              250.0,\n              275.0,\n              300.0,\n              325.0,\n              350.0,\n              375.0,\n              400.0,\n              425.0,\n              450.0,\n              475.0,\n              500.0,\n              550.0,\n              600.0,\n              650.0,\n              700.0,\n              750.0,\n              800.0,\n              850.0,\n              900.0,\n              950.0,\n              1000.0\n            ]\n          },\n          \"conc_plot\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              47,\n              160\n            ],\n            \"size\": 7520,\n            \"n_valid\": 7502,\n            \"min\": 0.03489695908501744,\n            \"max\": 43.08572006225586,\n            \"mean\": 19.339400173464835,\n            \"std\": 14.347044544192377\n          },\n          \"nt_line\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              160\n            ],\n            \"size\": 160,\n            \"n_valid\": 160,\n            \"min\": 30.0,\n            \"max\": 275.0,\n            \"mean\": 116.09375,\n            \"std\": 68.92403398624822\n          }\n        },\n        \"CESM2\": {\n          \"lon\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              160\n            ],\n            \"size\": 160,\n            \"n_valid\": 160,\n            \"min\": 120.5,\n            \"max\": 279.5,\n            \"mean\": 200.0,\n            \"std\": 46.18711941656461\n          },\n          \"depth_plot\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              40\n            ],\n            \"size\": 40,\n            \"n_valid\": 40,\n            \"min\": 5.0,\n            \"max\": 984.705859375,\n            \"mean\": 281.95008105468753,\n            \"std\": 245.0217430829415,\n            \"values\": [\n              5.0,\n              15.0,\n              25.0,\n              35.0,\n              45.0,\n              55.0,\n              65.0,\n              75.0,\n              85.0,\n              95.0,\n              105.0,\n              115.0,\n              125.0,\n              135.0,\n              145.0,\n              155.0,\n              165.098398,\n              175.479043,\n              186.29127,\n              197.660273,\n              209.711387,\n              222.578281,\n              236.408828,\n              251.370156,\n              267.654199,\n              285.483652,\n              305.119219,\n              326.867988,\n              351.093477,\n              378.227617,\n              408.784648,\n              443.377695,\n              482.736719,\n              527.728008,\n              579.372891,\n              638.862617,\n              707.563281,\n              787.0025,\n              878.825234,\n              984.705859\n            ]\n          },\n          \"conc_plot\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              40,\n              160\n            ],\n            \"size\": 6400,\n            \"n_valid\": 5679,\n            \"min\": -0.47340977944554835,\n            \"max\": 34.02259265711914,\n            \"mean\": 14.275513127655687,\n            \"std\": 9.209913869766845\n          },\n          \"nt_line\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              160\n            ],\n            \"size\": 160,\n            \"n_valid\": 142,\n            \"min\": 25.0,\n            \"max\": 186.29126953125,\n            \"mean\": 115.67433703785211,\n            \"std\": 52.34267662496382\n          }\n        },\n        \"GFDL-ESM4\": {\n          \"lon\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              160\n            ],\n            \"size\": 160,\n            \"n_valid\": 160,\n            \"min\": 120.5,\n            \"max\": 279.5,\n            \"mean\": 200.0,\n            \"std\": 46.18711941656461\n          },\n          \"depth_plot\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              19\n            ],\n            \"size\": 19,\n            \"n_valid\": 19,\n            \"min\": 2.5,\n            \"max\": 1000.0,\n            \"mean\": 328.1578947368421,\n            \"std\": 318.21416996103255,\n            \"values\": [\n              2.5,\n              10.0,\n              20.0,\n              32.5,\n              51.25,\n              75.0,\n              100.0,\n              125.0,\n              156.25,\n              200.0,\n              250.0,\n              312.5,\n              400.0,\n              500.0,\n              600.0,\n              700.0,\n              800.0,\n              900.0,\n              1000.0\n            ]\n          },\n          \"conc_plot\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              19,\n              160\n            ],\n            \"size\": 3040,\n            \"n_valid\": 3040,\n            \"min\": 0.01769337536754348,\n            \"max\": 36.04988135942599,\n            \"mean\": 18.680820421495778,\n            \"std\": 11.602864706865146\n          },\n          \"nt_line\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              160\n            ],\n            \"size\": 160,\n            \"n_valid\": 160,\n            \"min\": 10.0,\n            \"max\": 200.0,\n            \"mean\": 102.3828125,\n            \"std\": 60.10046876035863\n          }\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"lon\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              160\n            ],\n            \"size\": 160,\n            \"n_valid\": 160,\n            \"min\": 120.5,\n            \"max\": 279.5,\n            \"mean\": 200.0,\n            \"std\": 46.18711941656461\n          },\n          \"depth_plot\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              23\n            ],\n            \"size\": 23,\n            \"n_valid\": 23,\n            \"min\": 6.0,\n            \"max\": 960.0,\n            \"mean\": 291.60869565217394,\n            \"std\": 280.8109357975862,\n            \"values\": [\n              6.0,\n              17.0,\n              27.0,\n              37.0,\n              47.0,\n              57.0,\n              68.5,\n              82.5,\n              100.0,\n              122.5,\n              150.0,\n              182.5,\n              220.0,\n              262.5,\n              310.0,\n              362.5,\n              420.0,\n              485.0,\n              560.0,\n              645.0,\n              740.0,\n              845.0,\n              960.0\n            ]\n          },\n          \"conc_plot\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              23,\n              160\n            ],\n            \"size\": 3680,\n            \"n_valid\": 3105,\n            \"min\": 0.01758162575353664,\n            \"max\": 36.115337435792135,\n            \"mean\": 13.399319574959184,\n            \"std\": 9.42426367496635\n          },\n          \"nt_line\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              160\n            ],\n            \"size\": 160,\n            \"n_valid\": 135,\n            \"min\": 6.0,\n            \"max\": 485.0,\n            \"mean\": 38.1037037037037,\n            \"std\": 47.82963966754321\n          }\n        }\n      },\n      \"woa_basin_ocean\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"values\": [\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\"\n        ]\n      },\n      \"src_lat_b\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          41088\n        ],\n        \"size\": 41088,\n        \"n_valid\": 41088,\n        \"min\": -77.5,\n        \"max\": 89.5,\n        \"mean\": -0.5027258566978193,\n        \"std\": 47.91127484598185\n      },\n      \"src_lon_b\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          41088\n        ],\n        \"size\": 41088,\n        \"n_valid\": 41088,\n        \"min\": -179.5,\n        \"max\": 179.5,\n        \"mean\": -9.336618964174455,\n        \"std\": 109.99417556433586\n      },\n      \"src_basin_b\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          41088\n        ],\n        \"size\": 41088,\n        \"n_valid\": 41088,\n        \"min\": 1.0,\n        \"max\": 56.0,\n        \"mean\": 2.286993769470405,\n        \"std\": 3.823302801438523\n      },\n      \"nt_native\": {\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            384,\n            320\n          ],\n          \"size\": 122880,\n          \"n_valid\": 86096,\n          \"min\": 5.0,\n          \"max\": 707.56328125,\n          \"mean\": 131.98228222597268,\n          \"std\": 93.55443394271515\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 44564,\n          \"min\": 2.5,\n          \"max\": 900.0,\n          \"mean\": 98.28488241630015,\n          \"std\": 112.78400314073144\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            220,\n            256\n          ],\n          \"size\": 56320,\n          \"n_valid\": 36791,\n          \"min\": 6.0,\n          \"max\": 960.0,\n          \"mean\": 71.36720937185724,\n          \"std\": 109.17428959692694\n        }\n      },\n      \"nt_regrid\": {\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 41088,\n          \"min\": 5.0,\n          \"max\": 707.56328125,\n          \"mean\": 133.27939608707607,\n          \"std\": 93.01393864258368\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 41088,\n          \"min\": 2.5,\n          \"max\": 900.0,\n          \"mean\": 103.1882179711838,\n          \"std\": 114.50054129790665\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 41088,\n          \"min\": 6.0,\n          \"max\": 960.0,\n          \"mean\": 100.57601976246106,\n          \"std\": 138.0608358654983\n        }\n      },\n      \"corr_raw\": {\n        \"CESM2\": 0.35615312513306924,\n        \"GFDL-ESM4\": 0.45665382846085156,\n        \"MPI-ESM1-2-LR\": 0.5812083858761473\n      },\n      \"rmse_raw\": {\n        \"CESM2\": 150.91659492529067,\n        \"GFDL-ESM4\": 148.44195762603616,\n        \"MPI-ESM1-2-LR\": 139.24492998281315\n      },\n      \"global_mean_nitracline_raw\": {\n        \"WOA23\": 156.32411142970884,\n        \"CESM2\": 139.99772372466143,\n        \"GFDL-ESM4\": 116.7726314244507,\n        \"MPI-ESM1-2-LR\": 124.40544046815543\n      },\n      \"global_mean_nitracline\": {\n        \"WOA23\": 156,\n        \"CESM2\": 140,\n        \"GFDL-ESM4\": 117,\n        \"MPI-ESM1-2-LR\": 124\n      },\n      \"global_diff_from_woa\": {\n        \"CESM2\": -16,\n        \"GFDL-ESM4\": -40,\n        \"MPI-ESM1-2-LR\": -32\n      },\n      \"basin_mean_nitracline_raw\": {\n        \"WOA23\": {\n          \"Pacific\": 196.4851795988354,\n          \"Atlantic\": 141.11357504956325,\n          \"Indian\": 112.3312840263746\n        },\n        \"CESM2\": {\n          \"Pacific\": 153.4165940410697,\n          \"Atlantic\": 95.60961541651656,\n          \"Indian\": 160.87915101339232\n        },\n        \"GFDL-ESM4\": {\n          \"Pacific\": 138.14063776452235,\n          \"Atlantic\": 71.76659371066073,\n          \"Indian\": 127.04593441772425\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"Pacific\": 172.81226289144695,\n          \"Atlantic\": 90.48282518413079,\n          \"Indian\": 82.87633525416673\n        }\n      },\n      \"basin_mean_nitracline\": {\n        \"WOA23\": {\n          \"Pacific\": 196,\n          \"Atlantic\": 141,\n          \"Indian\": 112\n        },\n        \"CESM2\": {\n          \"Pacific\": 153,\n          \"Atlantic\": 96,\n          \"Indian\": 161\n        },\n        \"GFDL-ESM4\": {\n          \"Pacific\": 138,\n          \"Atlantic\": 72,\n          \"Indian\": 127\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"Pacific\": 173,\n          \"Atlantic\": 90,\n          \"Indian\": 83\n        }\n      },\n      \"basin_diff_from_woa\": {\n        \"CESM2\": {\n          \"Pacific\": -43,\n          \"Atlantic\": -46,\n          \"Indian\": 49\n        },\n        \"GFDL-ESM4\": {\n          \"Pacific\": -58,\n          \"Atlantic\": -69,\n          \"Indian\": 15\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"Pacific\": -24,\n          \"Atlantic\": -51,\n          \"Indian\": -29\n        }\n      },\n      \"spatial_corr\": {\n        \"CESM2\": 0.356,\n        \"GFDL-ESM4\": 0.457,\n        \"MPI-ESM1-2-LR\": 0.581\n      },\n      \"spatial_rmse\": {\n        \"CESM2\": 150.9,\n        \"GFDL-ESM4\": 148.4,\n        \"MPI-ESM1-2-LR\": 139.2\n      },\n      \"best_model\": \"MPI-ESM1-2-LR\",\n      \"best_model_by_corr\": \"MPI-ESM1-2-LR\",\n      \"basin_order_woa\": [\n        \"Pacific\",\n        \"Atlantic\",\n        \"Indian\"\n      ],\n      \"basin_order_models\": {\n        \"CESM2\": [\n          \"Indian\",\n          \"Pacific\",\n          \"Atlantic\"\n        ],\n        \"GFDL-ESM4\": [\n          \"Pacific\",\n          \"Indian\",\n          \"Atlantic\"\n        ],\n        \"MPI-ESM1-2-LR\": [\n          \"Pacific\",\n          \"Atlantic\",\n          \"Indian\"\n        ]\n      },\n      \"basin_order_matches_woa\": {\n        \"CESM2\": false,\n        \"GFDL-ESM4\": false,\n        \"MPI-ESM1-2-LR\": true\n      }\n    }\n  },\n  {\n    \"type\": \"visualization\",\n    \"status\": \"success\",\n    \"paths\": [\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T6_deepseek-flash_20261022_140000/turn01/figures/visualization_T6_deepseek-flash_20261022_140000_turn1_1.png\",\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T6_deepseek-flash_20261022_140000/turn01/figures/visualization_T6_deepseek-flash_20261022_140000_turn1_2.png\"\n    ]\n  }\n]",
+      "solution": "<solution>\nThe nitracline was defined as the depth of the maximum vertical nitrate gradient within the top 1000 m, using the level just below 1000 m for the deepest gradient. CMIP6 values are 1971–2000 climatologies from each model’s native grid; global model means use each model’s own `areacello`, and WOA23 global means use cosine-latitude weighting. Basin means use the WOA23 basin mask with marginal seas folded into their parent oceans; Southern and Arctic Oceans are excluded.\n\nNegative differences below mean the simulated nitracline is shallower than WOA23; positive means deeper.\n\n### Global mean nitracline depth\n\n| Source | Global mean depth (m) | Difference from WOA23 (m) |\n|---|---:|---:|\n| WOA23 | 156 | — |\n| CESM2 | 140 | -16 |\n| GFDL-ESM4 | 117 | -40 |\n| MPI-ESM1-2-LR | 124 | -32 |\n\nAll three models place the global-mean nitracline too shallow relative to WOA23. CESM2 is closest in the global mean, although MPI-ESM1-2-LR has the best spatial statistics.\n\n### Basin-mean nitracline depth\n\n| Source | Pacific (m) | Atlantic (m) | Indian (m) |\n|---|---:|---:|---:|\n| WOA23 | 196 | 141 | 112 |\n| CESM2 | 153 | 96 | 161 |\n| GFDL-ESM4 | 138 | 72 | 127 |\n| MPI-ESM1-2-LR | 173 | 90 | 83 |\n\nDifferences from WOA23:\n\n| Model | Pacific difference (m) | Atlantic difference (m) | Indian difference (m) |\n|---|---:|---:|---:|\n| CESM2 | -43 | -46 | +49 |\n| GFDL-ESM4 | -58 | -69 | +15 |\n| MPI-ESM1-2-LR | -24 | -51 | -29 |\n\nThe models are generally too shallow in the Pacific and Atlantic. The Indian Ocean bias differs strongly among models: CESM2 and GFDL-ESM4 place the Indian nitracline too deep, whereas MPI-ESM1-2-LR places it too shallow.\n\n### Spatial comparison with WOA23 on the 1° grid\n\n| Model | Pearson correlation | RMSE (m) |\n|---|---:|---:|\n| CESM2 | 0.356 | 150.9 |\n| GFDL-ESM4 | 0.457 | 148.4 |\n| MPI-ESM1-2-LR | 0.581 | 139.2 |\n\n### Best model and basin ordering\n\nMPI-ESM1-2-LR reproduces the observed nitracline best overall: it has the highest spatial correlation with WOA23 (0.581) and the lowest RMSE (139.2 m). However, its absolute nitracline depths are still too shallow in all three basins.\n\nThe observed WOA23 basin ordering is:\n\n**Pacific > Atlantic > Indian**\n\nOnly **MPI-ESM1-2-LR** reproduces this ordering exactly.  \nCESM2 gives **Indian > Pacific > Atlantic**, so it does not match.  \nGFDL-ESM4 gives **Pacific > Indian > Atlantic**, so it also does not match.\n\nThe generated figures are consistent with these diagnostics: Figure 1 shows the global nitracline-depth maps on a common 0–1000 m scale with deeper values visually heavier, and Figure 2 shows equatorial Pacific nitrate sections averaged over 2°S–2°N from 120°E to 80°W, with the nitracline depth overlaid in each panel.\n</solution>",
+      "timestamp": "2026-10-22T14:24:22.509054"
+    }
+  ]
+}

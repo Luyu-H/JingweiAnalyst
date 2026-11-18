@@ -1,0 +1,2008 @@
+# exchange 6: solution
+# elapsed: 29.0 s
+
+===== SYSTEM =====
+
+The user's question:
+Check whether a mixed layer depth (MLD) computed from each CMIP6 model's own temperature and salinity reproduces the mlotst field that the same model publishes. This is an internal consistency test: both quantities come from the same simulation, so any disagreement is a property of the diagnostic, not of the model's physics.
+
+Data to use:
+- CMIP6 historical `thetao`, `so` and `mlotst` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12.
+- Each model's own published cell areas (areacello).
+
+Expected numerical results, comparing the 1971-2000 March and September climatologies of the operator MLD with those of the published mlotst, for each of the six model-and-month combinations. The operator MLD is the mixed layer depth computed offline from the model's own thetao and so with the density criterion that defines mlotst, the crossing depth interpolated between the bracketing levels. For each model and calendar month, both climatologies cover only the cells where both fields are defined in all 30 instances of that month (the 30 Marches, or the 30 Septembers):
+- The mean difference, operator MLD minus mlotst, in metres to 1 decimal place.
+- The root-mean-square difference, in metres to 1 decimal place.
+- The spatial Pearson correlation between the two fields, to 3 decimal places.
+- The percentage of the area where both fields are defined on which the absolute difference exceeds 20 m, to 1 decimal place, and the area where both fields are defined as a percentage of the model's total ocean area, to 1 decimal place.
+- The ranking of the three models from most to least internally consistent, with the criterion used, the regions where the disagreement concentrates, and why the operator and mlotst are not expected to agree exactly.
+
+Expected visualizations:
+- Figure 1, a 3-by-2 panel of global maps of operator MLD minus mlotst, rows CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, columns March and September, all six panels drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only) with one shared diverging colour scale centred on zero.
+- Figure 2, a 3-by-2 panel of scatter plots in the same layout, operator MLD on the x axis against mlotst on the y axis, one point per ocean cell, with logarithmic axes of identical range and ticks in every panel, a dashed y = x reference line, and each panel annotated with its bias, root-mean-square difference and correlation.
+
+The analysis plan:
+1. Load CMIP6 historical monthly `thetao`, `so` and `mlotst` for models CESM2, GFDL-ESM4 and MPI-ESM1-2-LR over 1971-01 to 2000-12, and load each model’s `areacello` and vertical level metadata. Tools: `load_regular_data`, `load_volumes_for_cmip6`, `load_depth_levels`.
+- Note [missing-values-and-land-cells]: treat exposed fill values as missing immediately and build validity from each loaded field itself, not from an external mask.
+
+2. From each model’s monthly `thetao` and `so`, compute monthly offline operator MLD on the native model grid using the same density-threshold definition as `mlotst`, with threshold-crossing depth linearly interpolated between bracketing levels. Use the model’s shallowest level as `ref_depth`, and exclude cells/months where the threshold is never reached from later operator-versus-`mlotst` comparison. Tools: `compute_potential_density_anomaly`, `compute_mixed_layer_depth`.
+- Note [cmip6-mlotst-definition]: compute the offline operator monthly first, then compare only its March/September climatologies against published `mlotst` climatologies, interpreting residuals as diagnostic differences rather than model error.
+- Note [cmip6-thetao-potential-temperature]: use `thetao` as potential temperature in the density/MLD calculation.
+
+3. For each model, isolate March and September monthly fields for both operator MLD and published `mlotst`, then enforce the strict shared comparison mask separately for March and September: keep only cells where both fields are defined in all 30 March instances, or all 30 September instances, before any climatology is formed. Then compute the 1971-2000 March and September climatologies as plain means across the 30 monthly values. Tools: `temporal_aggregate`.
+- Note [monthly-means-are-time-averages]: compute MLD from each monthly `thetao`/`so` field first and average the 30 same-calendar-month MLDs; do not compute MLD from a month-mean profile.
+- Note [common-comparison-mask]: build and apply the all-30-month shared valid-data mask before climatologies and all subsequent metrics.
+
+4. On each model’s native archived grid, compute operator-minus-`mlotst` difference maps for March and September climatologies, then calculate area-weighted mean difference and area-weighted RMSD over the shared mask using each model’s `areacello`. Also compute total valid comparison area and express it as a percentage of total ocean area from `areacello`. Tools: `compute_difference_metrics`, `compute_basic_stat`.
+- Note [omip-native-grid-vs-regridded]: keep all summary metrics on the native model grid; any horizontal regridding is only for the display maps.
+- Note [omip-weighted-means-and-integrals]: use `areacello` weights on the shared valid cells for map means, RMSD, exceedance area, and valid-area percentage.
+
+5. Compute the area-weighted percentage of the shared comparison area where `|operator MLD - mlotst| > 20 m` for each model and month, using the same native-grid shared mask and `areacello` weights. Tool: `compute_exceedance_fraction`.
+
+6. Compute the spatial Pearson correlation between the March climatology pair and the September climatology pair for each model on the shared native-grid mask. Tool: `analyze_correlation`.
+
+7. Identify where disagreement concentrates by locating the largest positive/negative departures and summarizing the geographical patterns in the native-grid difference fields; use these diagnostics together with the bias, RMSD, correlation, and exceedance-area results to rank the three models from most to least internally consistent, stating the ranking criterion explicitly. Tools: `locate_extreme`, `compute_difference_metrics`.
+
+8. Regrid each March and September climatological difference map from each model’s native grid to a regular longitude-latitude grid for Figure 1 display only, then plot the 3-by-2 panel with one shared diverging colour scale centred on zero. Tool: `regrid_horizontal`.
+
+9. Prepare Figure 2 scatter-plot inputs from the native-grid March and September climatology pairs on the shared mask, one point per ocean cell, and annotate each panel with the already computed bias, RMSD and correlation; use identical logarithmic axes, identical limits/ticks, and a dashed `y=x` line across all six panels. Tools: `analyze_correlation`, `compute_difference_metrics`.
+
+Other notes:
+- [cmip6-mlotst-definition] Published `mlotst` and the offline operator are not expected to match exactly because `mlotst` is based on the model top level, a displaced-parcel density test at local pressure, and a monthly mean of instantaneous MLDs, whereas the offline operator uses monthly `thetao`/`so`; the offline result is therefore expected to be systematically shallower in many places.
+
+The code that actually ran and produced the results below:
+<executed_code>
+# Computation code only
+
+dataset = selected_data
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+time_range = ["1971-01", "2000-12"]
+target_months = [3, 9]
+month_names = {3: "March", 9: "September"}
+
+results = {}
+diff_maps_native = {}
+pair_fields_native = {}
+scatter_inputs = {}
+extremes = {}
+display_maps = []
+
+for model in models:
+    # Load monthly model data on native grid
+    thetao = load_regular_data(
+        dataset=dataset,
+        variable="thetao",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+    so = load_regular_data(
+        dataset=dataset,
+        variable="so",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+    mlotst = load_regular_data(
+        dataset=dataset,
+        variable="mlotst",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+
+    # Ensure temperature metadata reflects potential temperature for TEOS-10 route
+    thetao = thetao.assign_attrs(**{**thetao.attrs, "temperature_type": "potential"})
+
+    # Load grid metadata requested in the plan
+    volumes = load_volumes_for_cmip6(
+        dataset=dataset,
+        model=model,
+        depth_range=[float(thetao.depth.min()), float(thetao.depth.max())],
+        variable="thetao",
+    )
+    levels, bounds = load_depth_levels(
+        dataset=dataset,
+        model=model,
+        variable="thetao",
+    )
+
+    # Use shallowest model level as reference depth
+    ref_depth = float(np.asarray(levels)[0])
+
+    # Offline mixed layer depth from monthly thetao and so on native grid
+    mld_offline = compute_mixed_layer_depth(
+        temp_data=thetao,
+        sal_data=so,
+        ref_depth=ref_depth,
+        method="density",
+        density_threshold=0.03,
+        temperature_type="potential",
+    ).assign_attrs(units="m", long_name=f"{model} offline mixed layer depth")
+
+    results[model] = {}
+    diff_maps_native[model] = {}
+    pair_fields_native[model] = {}
+    scatter_inputs[model] = {}
+    extremes[model] = {}
+
+    # Total ocean area from published mlotst mask on native grid
+    mlotst_any = mlotst.isel(time=0)
+    total_ocean_area = compute_basic_stat(
+        mlotst_any.where(np.isfinite(mlotst_any)),
+        op="area_weighted_mean",
+        dim=["lat", "lon"],
+    )
+    area_field = xr.ones_like(mlotst_any).where(np.isfinite(mlotst_any))
+    total_ocean_area_amount = compute_exceedance_fraction(
+        area_field,
+        threshold=0.5,
+        comparison="greater",
+        dim=["lat", "lon"],
+        weighting="area",
+        reference=0.0,
+    )["total_amount"]
+    if hasattr(total_ocean_area_amount, "compute"):
+        total_ocean_area_amount = total_ocean_area_amount.compute()
+    total_ocean_area_amount = float(total_ocean_area_amount)
+
+    for month in target_months:
+        month_label = month_names[month]
+
+        # Extract all instances of the target month
+        off_m = mld_offline.where(mld_offline["time"].dt.month == month, drop=True)
+        pub_m = mlotst.where(mlotst["time"].dt.month == month, drop=True)
+
+        # Strict shared mask: keep only cells valid in both fields for all 30 same-calendar months
+        shared_all30 = (off_m.notnull() & pub_m.notnull()).all(dim="time")
+
+        off_m_shared = off_m.where(shared_all30)
+        pub_m_shared = pub_m.where(shared_all30)
+
+        # 1971-2000 climatologies as plain mean over the 30 monthly values
+        off_clim = compute_basic_stat(off_m_shared, op="mean", dim="time").assign_attrs(units="m")
+        pub_clim = compute_basic_stat(pub_m_shared, op="mean", dim="time").assign_attrs(units="m")
+
+        # Native-grid difference map for all reported metrics
+        diff = (off_clim - pub_clim).assign_attrs(
+            units="m",
+            long_name=f"{model} {month_label} offline MLD minus mlotst",
+        )
+
+        # Metrics on native grid, area weighted
+        metrics = compute_difference_metrics(
+            data=off_clim,
+            reference=pub_clim,
+            dim=["lat", "lon"],
+            weighting="area",
+        )
+
+        bias = metrics["bias"]
+        if hasattr(bias, "compute"):
+            bias = bias.compute()
+        bias = float(bias)
+
+        rmsd = metrics["rmse"]
+        if hasattr(rmsd, "compute"):
+            rmsd = rmsd.compute()
+        rmsd = float(rmsd)
+
+        corr = analyze_correlation(
+            var1=off_clim,
+            var2=pub_clim,
+            dim=["lat", "lon"],
+            method="pearson",
+            weighting="area",
+        )
+        spatial_corr = corr["correlation"]
+        if hasattr(spatial_corr, "compute"):
+            spatial_corr = spatial_corr.compute()
+        spatial_corr = float(spatial_corr)
+
+        exc = compute_exceedance_fraction(
+            data=diff,
+            threshold=20.0,
+            comparison="abs_greater",
+            dim=["lat", "lon"],
+            weighting="area",
+            reference=0.0,
+        )
+        frac_gt20 = exc["fraction_percent"]
+        if hasattr(frac_gt20, "compute"):
+            frac_gt20 = frac_gt20.compute()
+        frac_gt20 = float(frac_gt20)
+
+        valid_area_amount = exc["total_amount"]
+        if hasattr(valid_area_amount, "compute"):
+            valid_area_amount = valid_area_amount.compute()
+        valid_area_amount = float(valid_area_amount)
+        valid_area_pct = 100.0 * valid_area_amount / total_ocean_area_amount
+
+        # Regional concentration of disagreement
+        pos_ext = locate_extreme(diff, op="max")
+        neg_ext = locate_extreme(diff, op="min")
+        abs_ext = locate_extreme(diff, op="abs_max")
+
+        # Materialize all quantities that will be reported or plotted
+        off_clim_c = off_clim.compute() if hasattr(off_clim, "compute") else off_clim
+        pub_clim_c = pub_clim.compute() if hasattr(pub_clim, "compute") else pub_clim
+        diff_c = diff.compute() if hasattr(diff, "compute") else diff
+        mask_c = shared_all30.compute() if hasattr(shared_all30, "compute") else shared_all30
+
+        results[model][month] = {
+            "month_name": month_label,
+            "bias_m": round(bias, 1),
+            "rmsd_m": round(rmsd, 1),
+            "corr": round(spatial_corr, 3),
+            "area_absdiff_gt20_percent": round(frac_gt20, 1),
+            "valid_area_percent_of_ocean": round(valid_area_pct, 1),
+        }
+
+        diff_maps_native[model][month] = diff_c
+        pair_fields_native[model][month] = {
+            "offline_mld": off_clim_c,
+            "mlotst": pub_clim_c,
+            "shared_mask": mask_c,
+        }
+        scatter_inputs[model][month] = {
+            "x_offline": off_clim_c.values.ravel(),
+            "y_mlotst": pub_clim_c.values.ravel(),
+        }
+        extremes[model][month] = {
+            "max_positive": pos_ext,
+            "max_negative": neg_ext,
+            "max_abs": abs_ext,
+        }
+
+        # Regrid for display only
+        diff_display = regrid_horizontal(diff_c, target="woa23", method="bilinear")
+        diff_maps_native[model][f"{month}_display"] = diff_display.compute() if hasattr(diff_display, "compute") else diff_display
+        display_maps.append(diff_maps_native[model][f"{month}_display"].values.ravel())
+
+# Ranking criterion: lowest mean of normalized RMSD rank, |bias| rank, highest correlation rank,
+# and lowest exceedance-area rank across March and September.
+ranking_scores = []
+for model in models:
+    rmsd_mean = np.mean([results[model][m]["rmsd_m"] for m in target_months])
+    abias_mean = np.mean([abs(results[model][m]["bias_m"]) for m in target_months])
+    corr_mean = np.mean([results[model][m]["corr"] for m in target_months])
+    exc_mean = np.mean([results[model][m]["area_absdiff_gt20_percent"] for m in target_months])
+    ranking_scores.append(
+        {
+            "model": model,
+            "rmsd_mean": rmsd_mean,
+            "abias_mean": abias_mean,
+            "corr_mean": corr_mean,
+            "exc_mean": exc_mean,
+        }
+    )
+
+rank_df = pd.DataFrame(ranking_scores).set_index("model")
+rank_df["r_rmsd"] = rank_df["rmsd_mean"].rank(ascending=True, method="min")
+rank_df["r_abias"] = rank_df["abias_mean"].rank(ascending=True, method="min")
+rank_df["r_corr"] = rank_df["corr_mean"].rank(ascending=False, method="min")
+rank_df["r_exc"] = rank_df["exc_mean"].rank(ascending=True, method="min")
+rank_df["consistency_score"] = rank_df[["r_rmsd", "r_abias", "r_corr", "r_exc"]].mean(axis=1)
+ranking = rank_df.sort_values(["consistency_score", "r_rmsd", "r_corr"]).index.tolist()
+
+# Compact summary table
+summary_rows = []
+for model in models:
+    for month in target_months:
+        rr = results[model][month]
+        summary_rows.append(
+            {
+                "model": model,
+                "month": rr["month_name"],
+                "mean_diff_m": rr["bias_m"],
+                "rmsd_m": rr["rmsd_m"],
+                "spatial_r": rr["corr"],
+                "area_|diff|>20m_%": rr["area_absdiff_gt20_percent"],
+                "valid_area_%_of_ocean": rr["valid_area_percent_of_ocean"],
+            }
+        )
+summary_table = pd.DataFrame(summary_rows)
+
+ranking_criterion = (
+    "Models ranked by the mean of four native-grid March/September ranks: lower RMSD, "
+    "lower absolute bias, higher spatial Pearson correlation, and lower area fraction with "
+    "|offline MLD - mlotst| > 20 m."
+)
+
+diagnostic_note = (
+    "Offline MLD and published mlotst are not expected to agree exactly because published mlotst "
+    "is based on the model top level and a displaced-parcel density test at local pressure, and "
+    "is typically archived as a monthly mean of instantaneous MLDs, whereas the offline operator "
+    "is computed from monthly mean thetao/so profiles using a sigma-threshold crossing depth "
+    "interpolated between vertical levels. This commonly makes the offline estimate systematically "
+    "shallower and can amplify disagreement in deep winter mixed-layer regions and frontal zones."
+)
+
+# --- visualization ---
+# Visualization code only
+
+# Figure 1: 3x2 maps of offline MLD minus mlotst on a common display grid
+fig1, axes1 = plt.subplots(3, 2, figsize=(14, 11), constrained_layout=True)
+
+pooled = np.concatenate([x[np.isfinite(x)] for x in display_maps if np.isfinite(x).any()])
+vmax = float(np.nanpercentile(np.abs(pooled), 98))
+vmin = -vmax
+
+for i, model in enumerate(models):
+    for j, month in enumerate(target_months):
+        ax = axes1[i, j]
+        da = diff_maps_native[model][f"{month}_display"]
+        lon = da["lon"].values
+        lat = da["lat"].values
+        im = ax.pcolormesh(lon, lat, da.values, cmap="RdBu_r", vmin=vmin, vmax=vmax, shading="auto")
+        ax.set_title(f"{model} - {month_names[month]}")
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_xlim(lon.min(), lon.max())
+        ax.set_ylim(lat.min(), lat.max())
+
+cbar1 = fig1.colorbar(im, ax=axes1, orientation="vertical", shrink=0.9, extend="both")
+cbar1.set_label("Offline MLD - mlotst (m)")
+fig1.suptitle("Figure 1. CMIP6 internal MLD consistency: native-grid differences regridded for display only\nShared color scale clipped at pooled 98th percentile", y=1.02)
+
+# Figure 2: 3x2 scatter plots with identical logarithmic axes
+fig2, axes2 = plt.subplots(3, 2, figsize=(12, 12), constrained_layout=True)
+
+all_xy = []
+for model in models:
+    for month in target_months:
+        x = scatter_inputs[model][month]["x_offline"]
+        y = scatter_inputs[model][month]["y_mlotst"]
+        valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+        all_xy.append(np.concatenate([x[valid], y[valid]]))
+all_xy = np.concatenate(all_xy)
+xy_min = float(np.nanpercentile(all_xy, 1))
+xy_max = float(np.nanpercentile(all_xy, 99.5))
+
+ticks = np.array([1, 3, 10, 30, 100, 300, 1000], dtype=float)
+ticks = ticks[(ticks >= xy_min) & (ticks <= xy_max)]
+
+for i, model in enumerate(models):
+    for j, month in enumerate(target_months):
+        ax = axes2[i, j]
+        x = scatter_inputs[model][month]["x_offline"]
+        y = scatter_inputs[model][month]["y_mlotst"]
+        valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+
+        ax.scatter(x[valid], y[valid], s=3, alpha=0.25, linewidths=0)
+        ax.plot([xy_min, xy_max], [xy_min, xy_max], "--", color="k", lw=1)
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlim(xy_min, xy_max)
+        ax.set_ylim(xy_min, xy_max)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        ax.set_xticklabels([f"{t:g}" for t in ticks])
+        ax.set_yticklabels([f"{t:g}" for t in ticks])
+
+        rr = results[model][month]
+        ax.set_title(f"{model} - {month_names[month]}")
+        ax.set_xlabel("Offline MLD (m)")
+        ax.set_ylabel("mlotst (m)")
+        ax.text(
+            0.03,
+            0.97,
+            f"Bias = {rr['bias_m']:.1f} m\nRMSD = {rr['rmsd_m']:.1f} m\nr = {rr['corr']:.3f}",
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+        )
+
+fig2.suptitle("Figure 2. Offline MLD versus published mlotst\nOne point per shared valid ocean cell; identical log axes in all panels", y=1.02)
+</executed_code>
+
+Here are the results of code execution:
+
+Status Summary:
+- Computation: Success
+- Visualization: Generated
+
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "dataset": "cmip6_historical",
+      "models": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "time_range": [
+        "1971-01",
+        "2000-12"
+      ],
+      "target_months": [
+        3,
+        9
+      ],
+      "month_names": {
+        "3": "March",
+        "9": "September"
+      },
+      "results": {
+        "CESM2": {
+          "3": {
+            "month_name": "March",
+            "bias_m": -4.5,
+            "rmsd_m": 7.5,
+            "corr": 0.998,
+            "area_absdiff_gt20_percent": 2.7,
+            "valid_area_percent_of_ocean": 96.4
+          },
+          "9": {
+            "month_name": "September",
+            "bias_m": -2.6,
+            "rmsd_m": 5.1,
+            "corr": 0.998,
+            "area_absdiff_gt20_percent": 0.2,
+            "valid_area_percent_of_ocean": 97.9
+          }
+        },
+        "GFDL-ESM4": {
+          "3": {
+            "month_name": "March",
+            "bias_m": -9.6,
+            "rmsd_m": 21.4,
+            "corr": 0.945,
+            "area_absdiff_gt20_percent": 6.3,
+            "valid_area_percent_of_ocean": 97.2
+          },
+          "9": {
+            "month_name": "September",
+            "bias_m": -8.0,
+            "rmsd_m": 14.3,
+            "corr": 0.987,
+            "area_absdiff_gt20_percent": 7.5,
+            "valid_area_percent_of_ocean": 98.5
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "3": {
+            "month_name": "March",
+            "bias_m": -2.5,
+            "rmsd_m": 6.8,
+            "corr": 0.995,
+            "area_absdiff_gt20_percent": 1.5,
+            "valid_area_percent_of_ocean": 96.8
+          },
+          "9": {
+            "month_name": "September",
+            "bias_m": -2.4,
+            "rmsd_m": 14.3,
+            "corr": 0.983,
+            "area_absdiff_gt20_percent": 3.5,
+            "valid_area_percent_of_ocean": 97.6
+          }
+        }
+      },
+      "diff_maps_native": {
+        "CESM2": {
+          "3": {
+            "type": "DataArray",
+            "dims": {
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "m",
+            "long_name": "CESM2 March offline MLD minus mlotst",
+            "source_dataset": "cmip6_historical",
+            "size": 122880,
+            "n_valid": 82360,
+            "min": -372.87395530643624,
+            "max": 166.23389642294183,
+            "mean": -4.083143887626508,
+            "std": 6.374185336106573
+          },
+          "3_display": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "m",
+            "long_name": "CESM2 March offline MLD minus mlotst",
+            "source_dataset": "woa23",
+            "size": 64800,
+            "n_valid": 40526,
+            "min": -235.72523755483562,
+            "max": 166.23389642294183,
+            "mean": -3.960586964219549,
+            "std": 5.766142464259189
+          },
+          "9": {
+            "type": "DataArray",
+            "dims": {
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "m",
+            "long_name": "CESM2 September offline MLD minus mlotst",
+            "source_dataset": "cmip6_historical",
+            "size": 122880,
+            "n_valid": 84146,
+            "min": -51.23250975091403,
+            "max": 20.116798654679883,
+            "mean": -2.4392951539897156,
+            "std": 4.067819537178374
+          },
+          "9_display": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "m",
+            "long_name": "CESM2 September offline MLD minus mlotst",
+            "source_dataset": "woa23",
+            "size": 64800,
+            "n_valid": 41544,
+            "min": -51.23250975091403,
+            "max": 17.370707978895524,
+            "mean": -2.3316738082601636,
+            "std": 4.040975113594259
+          }
+        },
+        "GFDL-ESM4": {
+          "3": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "m",
+            "long_name": "GFDL-ESM4 March offline MLD minus mlotst",
+            "source_dataset": "cmip6_historical",
+            "size": 64800,
+            "n_valid": 42122,
+            "min": -626.5736121588398,
+            "max": 814.1713717477398,
+            "mean": -9.52210535703019,
+            "std": 21.038809894368
+          },
+          "3_display": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "m",
+            "long_name": "GFDL-ESM4 March offline MLD minus mlotst",
+            "source_dataset": "woa23",
+            "size": 64800,
+            "n_valid": 42122,
+            "min": -626.5736121588398,
+            "max": 814.1713717477398,
+            "mean": -9.52210535703019,
+            "std": 21.038809894368
+          },
+          "9": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "m",
+            "long_name": "GFDL-ESM4 September offline MLD minus mlotst",
+            "source_dataset": "cmip6_historical",
+            "size": 64800,
+            "n_valid": 43259,
+            "min": -196.9634355494175,
+            "max": 432.45824192663997,
+            "mean": -7.564249606241882,
+            "std": 12.896806428673937
+          },
+          "9_display": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "m",
+            "long_name": "GFDL-ESM4 September offline MLD minus mlotst",
+            "source_dataset": "woa23",
+            "size": 64800,
+            "n_valid": 43259,
+            "min": -196.9634355494175,
+            "max": 432.45824192663997,
+            "mean": -7.564249606241882,
+            "std": 12.896806428673937
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "3": {
+            "type": "DataArray",
+            "dims": {
+              "j": 220,
+              "i": 254
+            },
+            "units": "m",
+            "long_name": "MPI-ESM1-2-LR March offline MLD minus mlotst",
+            "source_dataset": "cmip6_historical",
+            "size": 55880,
+            "n_valid": 32978,
+            "min": -433.6901049918704,
+            "max": 173.45800382084246,
+            "mean": -2.1535290391346833,
+            "std": 13.504611050683707
+          },
+          "3_display": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "m",
+            "long_name": "MPI-ESM1-2-LR March offline MLD minus mlotst",
+            "source_dataset": "woa23",
+            "size": 64800,
+            "n_valid": 40692,
+            "min": -176.78447116301388,
+            "max": 140.5900932590592,
+            "mean": -2.2327961362152693,
+            "std": 6.468886506370758
+          },
+          "9": {
+            "type": "DataArray",
+            "dims": {
+              "j": 220,
+              "i": 254
+            },
+            "units": "m",
+            "long_name": "MPI-ESM1-2-LR September offline MLD minus mlotst",
+            "source_dataset": "cmip6_historical",
+            "size": 55880,
+            "n_valid": 34894,
+            "min": -697.8057214650286,
+            "max": 75.79620688515342,
+            "mean": -4.672967247127025,
+            "std": 19.976582199484195
+          },
+          "9_display": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "m",
+            "long_name": "MPI-ESM1-2-LR September offline MLD minus mlotst",
+            "source_dataset": "woa23",
+            "size": 64800,
+            "n_valid": 41312,
+            "min": -432.25351263590073,
+            "max": 67.99311891240525,
+            "mean": -3.4653915321046376,
+            "std": 17.092755486036847
+          }
+        }
+      },
+      "pair_fields_native": {
+        "CESM2": {
+          "3": {
+            "offline_mld": {
+              "type": "DataArray",
+              "dims": {
+                "nlat": 384,
+                "nlon": 320
+              },
+              "units": "m",
+              "long_name": "CESM2 offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 122880,
+              "n_valid": 82360,
+              "min": 5.162514227826433,
+              "max": 1890.4282364294368,
+              "mean": 61.898141367394786,
+              "std": 114.95509207806866
+            },
+            "mlotst": {
+              "type": "DataArray",
+              "dims": {
+                "nlat": 384,
+                "nlon": 320
+              },
+              "units": "m",
+              "long_name": "Ocean Mixed Layer Thickness Defined by Sigma T",
+              "source_dataset": "cmip6_historical",
+              "size": 122880,
+              "n_valid": 82360,
+              "min": 5.172881126403809,
+              "max": 1903.814208984375,
+              "mean": 65.98128509521484,
+              "std": 115.75826263427734
+            },
+            "shared_mask": {
+              "type": "DataArray",
+              "dims": {
+                "nlat": 384,
+                "nlon": 320
+              },
+              "units": "m",
+              "long_name": "CESM2 offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 122880,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            }
+          },
+          "9": {
+            "offline_mld": {
+              "type": "DataArray",
+              "dims": {
+                "nlat": 384,
+                "nlon": 320
+              },
+              "units": "m",
+              "long_name": "CESM2 offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 122880,
+              "n_valid": 84146,
+              "min": 5.176631991358443,
+              "max": 416.6764108138985,
+              "mean": 68.48866239676931,
+              "std": 62.546721383731565
+            },
+            "mlotst": {
+              "type": "DataArray",
+              "dims": {
+                "nlat": 384,
+                "nlon": 320
+              },
+              "units": "m",
+              "long_name": "Ocean Mixed Layer Thickness Defined by Sigma T",
+              "source_dataset": "cmip6_historical",
+              "size": 122880,
+              "n_valid": 84146,
+              "min": 5.216787338256836,
+              "max": 403.7369689941406,
+              "mean": 70.9279556274414,
+              "std": 60.955711364746094
+            },
+            "shared_mask": {
+              "type": "DataArray",
+              "dims": {
+                "nlat": 384,
+                "nlon": 320
+              },
+              "units": "m",
+              "long_name": "CESM2 offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 122880,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            }
+          }
+        },
+        "GFDL-ESM4": {
+          "3": {
+            "offline_mld": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 180,
+                "lon": 360
+              },
+              "units": "m",
+              "long_name": "GFDL-ESM4 offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 64800,
+              "n_valid": 42122,
+              "min": 2.517043538304436,
+              "max": 1567.2566386719648,
+              "mean": 37.64773136041817,
+              "std": 60.69294727201302
+            },
+            "mlotst": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 180,
+                "lon": 360
+              },
+              "units": "m",
+              "long_name": "Ocean Mixed Layer Thickness Defined by Sigma T",
+              "source_dataset": "cmip6_historical",
+              "size": 64800,
+              "n_valid": 42122,
+              "min": 0.9927991032600403,
+              "max": 1563.1015625,
+              "mean": 47.169837951660156,
+              "std": 62.2643928527832
+            },
+            "shared_mask": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 180,
+                "lon": 360
+              },
+              "units": "m",
+              "long_name": "GFDL-ESM4 offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 64800,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            }
+          },
+          "9": {
+            "offline_mld": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 180,
+                "lon": 360
+              },
+              "units": "m",
+              "long_name": "GFDL-ESM4 offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 64800,
+              "n_valid": 43259,
+              "min": 2.5153469751859054,
+              "max": 664.2550095574974,
+              "mean": 49.8701624657035,
+              "std": 74.36766192885949
+            },
+            "mlotst": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 180,
+                "lon": 360
+              },
+              "units": "m",
+              "long_name": "Ocean Mixed Layer Thickness Defined by Sigma T",
+              "source_dataset": "cmip6_historical",
+              "size": 64800,
+              "n_valid": 43259,
+              "min": 0.9601655602455139,
+              "max": 746.5198974609375,
+              "mean": 57.43441390991211,
+              "std": 71.21014404296875
+            },
+            "shared_mask": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 180,
+                "lon": 360
+              },
+              "units": "m",
+              "long_name": "GFDL-ESM4 offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 64800,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            }
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "3": {
+            "offline_mld": {
+              "type": "DataArray",
+              "dims": {
+                "j": 220,
+                "i": 254
+              },
+              "units": "m",
+              "long_name": "MPI-ESM1-2-LR offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 55880,
+              "n_valid": 32978,
+              "min": 6.070026343543002,
+              "max": 1216.9636721756674,
+              "mean": 70.27146033077437,
+              "std": 115.53830070989012
+            },
+            "mlotst": {
+              "type": "DataArray",
+              "dims": {
+                "j": 220,
+                "i": 254
+              },
+              "units": "m",
+              "long_name": "Ocean Mixed Layer Thickness Defined by Sigma T",
+              "source_dataset": "cmip6_historical",
+              "size": 55880,
+              "n_valid": 32978,
+              "min": 6.0703630447387695,
+              "max": 1168.7266845703125,
+              "mean": 72.42499542236328,
+              "std": 109.95013427734375
+            },
+            "shared_mask": {
+              "type": "DataArray",
+              "dims": {
+                "j": 220,
+                "i": 254
+              },
+              "units": "m",
+              "long_name": "MPI-ESM1-2-LR offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 55880,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            }
+          },
+          "9": {
+            "offline_mld": {
+              "type": "DataArray",
+              "dims": {
+                "j": 220,
+                "i": 254
+              },
+              "units": "m",
+              "long_name": "MPI-ESM1-2-LR offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 55880,
+              "n_valid": 34894,
+              "min": 6.053519093924253,
+              "max": 768.8999213935597,
+              "mean": 65.57186605773357,
+              "std": 75.80836358833483
+            },
+            "mlotst": {
+              "type": "DataArray",
+              "dims": {
+                "j": 220,
+                "i": 254
+              },
+              "units": "m",
+              "long_name": "Ocean Mixed Layer Thickness Defined by Sigma T",
+              "source_dataset": "cmip6_historical",
+              "size": 55880,
+              "n_valid": 34894,
+              "min": 6.063059329986572,
+              "max": 991.2354736328125,
+              "mean": 70.24483489990234,
+              "std": 80.76732635498047
+            },
+            "shared_mask": {
+              "type": "DataArray",
+              "dims": {
+                "j": 220,
+                "i": 254
+              },
+              "units": "m",
+              "long_name": "MPI-ESM1-2-LR offline mixed layer depth",
+              "source_dataset": "cmip6_historical",
+              "size": 55880,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            }
+          }
+        }
+      },
+      "scatter_inputs": {
+        "CESM2": {
+          "3": {
+            "x_offline": {
+              "type": "ndarray",
+              "shape": [
+                122880
+              ],
+              "size": 122880,
+              "n_valid": 82360,
+              "min": 5.162514227826433,
+              "max": 1890.4282364294368,
+              "mean": 61.898141367394786,
+              "std": 114.95509207806866
+            },
+            "y_mlotst": {
+              "type": "ndarray",
+              "shape": [
+                122880
+              ],
+              "size": 122880,
+              "n_valid": 82360,
+              "min": 5.172881126403809,
+              "max": 1903.814208984375,
+              "mean": 65.98128509521484,
+              "std": 115.75826263427734
+            }
+          },
+          "9": {
+            "x_offline": {
+              "type": "ndarray",
+              "shape": [
+                122880
+              ],
+              "size": 122880,
+              "n_valid": 84146,
+              "min": 5.176631991358443,
+              "max": 416.6764108138985,
+              "mean": 68.48866239676931,
+              "std": 62.546721383731565
+            },
+            "y_mlotst": {
+              "type": "ndarray",
+              "shape": [
+                122880
+              ],
+              "size": 122880,
+              "n_valid": 84146,
+              "min": 5.216787338256836,
+              "max": 403.7369689941406,
+              "mean": 70.9279556274414,
+              "std": 60.955711364746094
+            }
+          }
+        },
+        "GFDL-ESM4": {
+          "3": {
+            "x_offline": {
+              "type": "ndarray",
+              "shape": [
+                64800
+              ],
+              "size": 64800,
+              "n_valid": 42122,
+              "min": 2.517043538304436,
+              "max": 1567.2566386719648,
+              "mean": 37.64773136041817,
+              "std": 60.69294727201302
+            },
+            "y_mlotst": {
+              "type": "ndarray",
+              "shape": [
+                64800
+              ],
+              "size": 64800,
+              "n_valid": 42122,
+              "min": 0.9927991032600403,
+              "max": 1563.1015625,
+              "mean": 47.169837951660156,
+              "std": 62.2643928527832
+            }
+          },
+          "9": {
+            "x_offline": {
+              "type": "ndarray",
+              "shape": [
+                64800
+              ],
+              "size": 64800,
+              "n_valid": 43259,
+              "min": 2.5153469751859054,
+              "max": 664.2550095574974,
+              "mean": 49.8701624657035,
+              "std": 74.36766192885949
+            },
+            "y_mlotst": {
+              "type": "ndarray",
+              "shape": [
+                64800
+              ],
+              "size": 64800,
+              "n_valid": 43259,
+              "min": 0.9601655602455139,
+              "max": 746.5198974609375,
+              "mean": 57.43441390991211,
+              "std": 71.21014404296875
+            }
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "3": {
+            "x_offline": {
+              "type": "ndarray",
+              "shape": [
+                55880
+              ],
+              "size": 55880,
+              "n_valid": 32978,
+              "min": 6.070026343543002,
+              "max": 1216.9636721756674,
+              "mean": 70.27146033077437,
+              "std": 115.53830070989012
+            },
+            "y_mlotst": {
+              "type": "ndarray",
+              "shape": [
+                55880
+              ],
+              "size": 55880,
+              "n_valid": 32978,
+              "min": 6.0703630447387695,
+              "max": 1168.7266845703125,
+              "mean": 72.42499542236328,
+              "std": 109.95013427734375
+            }
+          },
+          "9": {
+            "x_offline": {
+              "type": "ndarray",
+              "shape": [
+                55880
+              ],
+              "size": 55880,
+              "n_valid": 34894,
+              "min": 6.053519093924253,
+              "max": 768.8999213935597,
+              "mean": 65.57186605773357,
+              "std": 75.80836358833483
+            },
+            "y_mlotst": {
+              "type": "ndarray",
+              "shape": [
+                55880
+              ],
+              "size": 55880,
+              "n_valid": 34894,
+              "min": 6.063059329986572,
+              "max": 991.2354736328125,
+              "mean": 70.24483489990234,
+              "std": 80.76732635498047
+            }
+          }
+        }
+      },
+      "extremes": {
+        "CESM2": {
+          "3": {
+            "max_positive": {
+              "value": 166.23389642294183,
+              "coordinates": {
+                "lat": 73.35158729717122,
+                "lon": 6.861674656270708,
+                "nlat": 368.0,
+                "nlon": 67.0
+              },
+              "indices": {
+                "nlat": 367,
+                "nlon": 66
+              },
+              "ties": 1,
+              "n_valid": 82360,
+              "description": "max = 166.234 m at lat 73.3516, lon 6.86167"
+            },
+            "max_negative": {
+              "value": -372.87395530643624,
+              "coordinates": {
+                "lat": 59.71015313359534,
+                "lon": -58.58602289971043,
+                "nlat": 351.0,
+                "nlon": 301.0
+              },
+              "indices": {
+                "nlat": 350,
+                "nlon": 300
+              },
+              "ties": 1,
+              "n_valid": 82360,
+              "description": "min = -372.874 m at lat 59.7102, lon -58.586"
+            },
+            "max_abs": {
+              "value": -372.87395530643624,
+              "coordinates": {
+                "lat": 59.71015313359534,
+                "lon": -58.58602289971043,
+                "nlat": 351.0,
+                "nlon": 301.0
+              },
+              "indices": {
+                "nlat": 350,
+                "nlon": 300
+              },
+              "ties": 1,
+              "n_valid": 82360,
+              "description": "largest departure from zero = -372.874 m at lat 59.7102, lon -58.586"
+            }
+          },
+          "9": {
+            "max_positive": {
+              "value": 20.116798654679883,
+              "coordinates": {
+                "lat": -34.87938919658492,
+                "lon": 119.18750331669429,
+                "nlat": 84.0,
+                "nlon": 142.0
+              },
+              "indices": {
+                "nlat": 83,
+                "nlon": 141
+              },
+              "ties": 1,
+              "n_valid": 84146,
+              "description": "max = 20.1168 m at lat -34.8794, lon 119.188"
+            },
+            "max_negative": {
+              "value": -51.23250975091403,
+              "coordinates": {
+                "lat": -75.48100513760106,
+                "lon": -56.31249154912547,
+                "nlat": 8.0,
+                "nlon": 306.0
+              },
+              "indices": {
+                "nlat": 7,
+                "nlon": 305
+              },
+              "ties": 1,
+              "n_valid": 84146,
+              "description": "min = -51.2325 m at lat -75.481, lon -56.3125"
+            },
+            "max_abs": {
+              "value": -51.23250975091403,
+              "coordinates": {
+                "lat": -75.48100513760106,
+                "lon": -56.31249154912547,
+                "nlat": 8.0,
+                "nlon": 306.0
+              },
+              "indices": {
+                "nlat": 7,
+                "nlon": 305
+              },
+              "ties": 1,
+              "n_valid": 84146,
+              "description": "largest departure from zero = -51.2325 m at lat -75.481, lon -56.3125"
+            }
+          }
+        },
+        "GFDL-ESM4": {
+          "3": {
+            "max_positive": {
+              "value": 814.1713717477398,
+              "coordinates": {
+                "lat": 54.5,
+                "lon": -10.5
+              },
+              "indices": {
+                "lat": 144,
+                "lon": 169
+              },
+              "ties": 1,
+              "n_valid": 42122,
+              "description": "max = 814.171 m at lat 54.5, lon -10.5"
+            },
+            "max_negative": {
+              "value": -626.5736121588398,
+              "coordinates": {
+                "lat": 56.5,
+                "lon": -54.5
+              },
+              "indices": {
+                "lat": 146,
+                "lon": 125
+              },
+              "ties": 1,
+              "n_valid": 42122,
+              "description": "min = -626.574 m at lat 56.5, lon -54.5"
+            },
+            "max_abs": {
+              "value": 814.1713717477398,
+              "coordinates": {
+                "lat": 54.5,
+                "lon": -10.5
+              },
+              "indices": {
+                "lat": 144,
+                "lon": 169
+              },
+              "ties": 1,
+              "n_valid": 42122,
+              "description": "largest departure from zero = 814.171 m at lat 54.5, lon -10.5"
+            }
+          },
+          "9": {
+            "max_positive": {
+              "value": 432.45824192663997,
+              "coordinates": {
+                "lat": -37.5,
+                "lon": 139.5
+              },
+              "indices": {
+                "lat": 52,
+                "lon": 319
+              },
+              "ties": 1,
+              "n_valid": 43259,
+              "description": "max = 432.458 m at lat -37.5, lon 139.5"
+            },
+            "max_negative": {
+              "value": -196.9634355494175,
+              "coordinates": {
+                "lat": -71.5,
+                "lon": -166.5
+              },
+              "indices": {
+                "lat": 18,
+                "lon": 13
+              },
+              "ties": 1,
+              "n_valid": 43259,
+              "description": "min = -196.963 m at lat -71.5, lon -166.5"
+            },
+            "max_abs": {
+              "value": 432.45824192663997,
+              "coordinates": {
+                "lat": -37.5,
+                "lon": 139.5
+              },
+              "indices": {
+                "lat": 52,
+                "lon": 319
+              },
+              "ties": 1,
+              "n_valid": 43259,
+              "description": "largest departure from zero = 432.458 m at lat -37.5, lon 139.5"
+            }
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "3": {
+            "max_positive": {
+              "value": 173.45800382084246,
+              "coordinates": {
+                "j": 46.0,
+                "i": 187.0,
+                "latitude": 70.0968790743852,
+                "longitude": 5.740871327591378
+              },
+              "indices": {
+                "j": 46,
+                "i": 186
+              },
+              "ties": 1,
+              "n_valid": 32978,
+              "description": "max = 173.458 m at latitude 70.0969, longitude 5.74087"
+            },
+            "max_negative": {
+              "value": -433.6901049918704,
+              "coordinates": {
+                "j": 57.0,
+                "i": 96.0,
+                "latitude": 53.95812561288555,
+                "longitude": -51.7878125135465
+              },
+              "indices": {
+                "j": 57,
+                "i": 95
+              },
+              "ties": 1,
+              "n_valid": 32978,
+              "description": "min = -433.69 m at latitude 53.9581, longitude -51.7878"
+            },
+            "max_abs": {
+              "value": -433.6901049918704,
+              "coordinates": {
+                "j": 57.0,
+                "i": 96.0,
+                "latitude": 53.95812561288555,
+                "longitude": -51.7878125135465
+              },
+              "indices": {
+                "j": 57,
+                "i": 95
+              },
+              "ties": 1,
+              "n_valid": 32978,
+              "description": "largest departure from zero = -433.69 m at latitude 53.9581, longitude -51.7878"
+            }
+          },
+          "9": {
+            "max_positive": {
+              "value": 75.79620688515342,
+              "coordinates": {
+                "j": 156.0,
+                "i": 117.0,
+                "latitude": -39.965817154670354,
+                "longitude": -28.191414553930883
+              },
+              "indices": {
+                "j": 156,
+                "i": 116
+              },
+              "ties": 1,
+              "n_valid": 34894,
+              "description": "max = 75.7962 m at latitude -39.9658, longitude -28.1914"
+            },
+            "max_negative": {
+              "value": -697.8057214650286,
+              "coordinates": {
+                "j": 192.0,
+                "i": 45.0,
+                "latitude": -72.18304424314971,
+                "longitude": -139.0802324083832
+              },
+              "indices": {
+                "j": 192,
+                "i": 44
+              },
+              "ties": 1,
+              "n_valid": 34894,
+              "description": "min = -697.806 m at latitude -72.183, longitude -139.08"
+            },
+            "max_abs": {
+              "value": -697.8057214650286,
+              "coordinates": {
+                "j": 192.0,
+                "i": 45.0,
+                "latitude": -72.18304424314971,
+                "longitude": -139.0802324083832
+              },
+              "indices": {
+                "j": 192,
+                "i": 44
+              },
+              "ties": 1,
+              "n_valid": 34894,
+              "description": "largest departure from zero = -697.806 m at latitude -72.183, longitude -139.08"
+            }
+          }
+        }
+      },
+      "display_maps": [
+        {
+          "type": "ndarray",
+          "shape": [
+            64800
+          ],
+          "size": 64800,
+          "n_valid": 40526,
+          "min": -235.72523755483562,
+          "max": 166.23389642294183,
+          "mean": -3.960586964219549,
+          "std": 5.766142464259189
+        },
+        {
+          "type": "ndarray",
+          "shape": [
+            64800
+          ],
+          "size": 64800,
+          "n_valid": 41544,
+          "min": -51.23250975091403,
+          "max": 17.370707978895524,
+          "mean": -2.3316738082601636,
+          "std": 4.040975113594259
+        },
+        {
+          "type": "ndarray",
+          "shape": [
+            64800
+          ],
+          "size": 64800,
+          "n_valid": 42122,
+          "min": -626.5736121588398,
+          "max": 814.1713717477398,
+          "mean": -9.52210535703019,
+          "std": 21.038809894368
+        },
+        {
+          "type": "ndarray",
+          "shape": [
+            64800
+          ],
+          "size": 64800,
+          "n_valid": 43259,
+          "min": -196.9634355494175,
+          "max": 432.45824192663997,
+          "mean": -7.564249606241882,
+          "std": 12.896806428673937
+        },
+        {
+          "type": "ndarray",
+          "shape": [
+            64800
+          ],
+          "size": 64800,
+          "n_valid": 40692,
+          "min": -176.78447116301388,
+          "max": 140.5900932590592,
+          "mean": -2.2327961362152693,
+          "std": 6.468886506370758
+        },
+        {
+          "type": "ndarray",
+          "shape": [
+            64800
+          ],
+          "size": 64800,
+          "n_valid": 41312,
+          "min": -432.25351263590073,
+          "max": 67.99311891240525,
+          "mean": -3.4653915321046376,
+          "std": 17.092755486036847
+        }
+      ],
+      "ranking_scores": [
+        {
+          "model": "CESM2",
+          "rmsd_mean": 6.3,
+          "abias_mean": 3.55,
+          "corr_mean": 0.998,
+          "exc_mean": 1.4500000000000002
+        },
+        {
+          "model": "GFDL-ESM4",
+          "rmsd_mean": 17.85,
+          "abias_mean": 8.8,
+          "corr_mean": 0.966,
+          "exc_mean": 6.9
+        },
+        {
+          "model": "MPI-ESM1-2-LR",
+          "rmsd_mean": 10.55,
+          "abias_mean": 2.45,
+          "corr_mean": 0.989,
+          "exc_mean": 2.5
+        }
+      ],
+      "rank_df": "               rmsd_mean  abias_mean  ...  r_exc  consistency_score\nmodel                                 ...                          \nCESM2               6.30        3.55  ...    1.0               1.25\nGFDL-ESM4          17.85        8.80  ...    3.0               3.00\nMPI-ESM1-2-LR      10.55        2.45  ...    2.0               1.75\n\n[3 rows x 9 columns]",
+      "ranking": [
+        "CESM2",
+        "MPI-ESM1-2-LR",
+        "GFDL-ESM4"
+      ],
+      "summary_rows": [
+        {
+          "model": "CESM2",
+          "month": "March",
+          "mean_diff_m": -4.5,
+          "rmsd_m": 7.5,
+          "spatial_r": 0.998,
+          "area_|diff|>20m_%": 2.7,
+          "valid_area_%_of_ocean": 96.4
+        },
+        {
+          "model": "CESM2",
+          "month": "September",
+          "mean_diff_m": -2.6,
+          "rmsd_m": 5.1,
+          "spatial_r": 0.998,
+          "area_|diff|>20m_%": 0.2,
+          "valid_area_%_of_ocean": 97.9
+        },
+        {
+          "model": "GFDL-ESM4",
+          "month": "March",
+          "mean_diff_m": -9.6,
+          "rmsd_m": 21.4,
+          "spatial_r": 0.945,
+          "area_|diff|>20m_%": 6.3,
+          "valid_area_%_of_ocean": 97.2
+        },
+        {
+          "model": "GFDL-ESM4",
+          "month": "September",
+          "mean_diff_m": -8.0,
+          "rmsd_m": 14.3,
+          "spatial_r": 0.987,
+          "area_|diff|>20m_%": 7.5,
+          "valid_area_%_of_ocean": 98.5
+        },
+        {
+          "model": "MPI-ESM1-2-LR",
+          "month": "March",
+          "mean_diff_m": -2.5,
+          "rmsd_m": 6.8,
+          "spatial_r": 0.995,
+          "area_|diff|>20m_%": 1.5,
+          "valid_area_%_of_ocean": 96.8
+        },
+        {
+          "model": "MPI-ESM1-2-LR",
+          "month": "September",
+          "mean_diff_m": -2.4,
+          "rmsd_m": 14.3,
+          "spatial_r": 0.983,
+          "area_|diff|>20m_%": 3.5,
+          "valid_area_%_of_ocean": 97.6
+        }
+      ],
+      "summary_table": "           model      month  ...  area_|diff|>20m_%  valid_area_%_of_ocean\n0          CESM2      March  ...                2.7                   96.4\n1          CESM2  September  ...                0.2                   97.9\n2      GFDL-ESM4      March  ...                6.3                   97.2\n3      GFDL-ESM4  September  ...                7.5                   98.5\n4  MPI-ESM1-2-LR      March  ...                1.5                   96.8\n5  MPI-ESM1-2-LR  September  ...                3.5                   97.6\n\n[6 rows x 7 columns]",
+      "ranking_criterion": "Models ranked by the mean of four native-grid March/September ranks: lower RMSD, lower absolute bias, higher spatial Pearson correlation, and lower area fraction with |offline MLD - mlotst| > 20 m.",
+      "diagnostic_note": "Offline MLD and published mlotst are not expected to agree exactly because published mlotst is based on the model top level and a displaced-parcel density test at local pressure, and is typically archived as a monthly mean of instantaneous MLDs, whereas the offline operator is computed from monthly mean thetao/so profiles using a sigma-threshold crossing depth interpolated between vertical levels. This commonly makes the offline estimate systematically shallower and can amplify disagreement in deep winter mixed-layer regions and frontal zones."
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/gpt-5.4_kbstripped_full_20261024/T4_gpt-5.4_20261024_210205/turn01/figures/visualization_T4_gpt-5.4_20261024_210205_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/gpt-5.4_kbstripped_full_20261024/T4_gpt-5.4_20261024_210205/turn01/figures/visualization_T4_gpt-5.4_20261024_210205_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Please provide a clear scientific summary inside <solution></solution> tags.
+
+Describe the methodology strictly from the <executed_code> above, never by inferring it from variable
+names: the baseline period, the source of any climatology, the weighting, the units, the region and
+time range, the range of lags — all of it must match the tools and arguments the code actually
+called. Do not report a step the code did not take. Where a variable name in the observation is
+ambiguous, the code decides what it means.
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
+4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, tool choice, computation and visualization attempts
+3. Suggestions for how to reformulate the query
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+Yes. Across all three CMIP6 historical simulations, the mixed-layer depth computed offline from each model’s own monthly `thetao` and `so` reproduces the corresponding published `mlotst` climatologies quite well overall, but not exactly. In every model-month case the offline operator is biased shallow relative to `mlotst` (negative operator-minus-`mlotst` mean difference), with the smallest discrepancies in CESM2 and the largest in GFDL-ESM4.
+
+Method used, exactly as in the executed code:
+- Data: CMIP6 historical monthly `thetao`, `so`, and `mlotst` for CESM2, GFDL-ESM4, and MPI-ESM1-2-LR over 1971-01 to 2000-12.
+- Offline MLD: computed from the monthly `thetao` and `so` fields using `compute_mixed_layer_depth` with `method="density"`, `density_threshold=0.03`, `temperature_type="potential"`, and `ref_depth` set to the shallowest loaded model level.
+- Month selection: March and September only.
+- Comparison mask: for each model and month separately, only cells where both offline MLD and published `mlotst` were non-null in all 30 instances of that month were retained.
+- Climatologies: plain mean over the 30 retained monthly values for that calendar month.
+- Metrics: bias and RMSD from `compute_difference_metrics(..., weighting="area", dim=["lat","lon"])`; spatial Pearson correlation from `analyze_correlation(..., weighting="area", dim=["lat","lon"])`; area fraction with `|difference| > 20 m` from `compute_exceedance_fraction(..., weighting="area")`.
+- Reported differences are offline MLD minus published `mlotst`, in metres.
+- Display maps were regridded horizontally to a regular WOA23 longitude-latitude grid for plotting only; all metrics were computed on the native archived grids.
+
+Numerical results for the 1971-2000 March and September climatologies:
+
+| Model | Month | Mean difference (m) | RMSD (m) | Spatial r | Area with \|diff\|>20 m (%) | Shared valid area (% of ocean) |
+|---|---:|---:|---:|---:|---:|---:|
+| CESM2 | March | -4.5 | 7.5 | 0.998 | 2.7 | 96.4 |
+| CESM2 | September | -2.6 | 5.1 | 0.998 | 0.2 | 97.9 |
+| GFDL-ESM4 | March | -9.6 | 21.4 | 0.945 | 6.3 | 97.2 |
+| GFDL-ESM4 | September | -8.0 | 14.3 | 0.987 | 7.5 | 98.5 |
+| MPI-ESM1-2-LR | March | -2.5 | 6.8 | 0.995 | 1.5 | 96.8 |
+| MPI-ESM1-2-LR | September | -2.4 | 14.3 | 0.983 | 3.5 | 97.6 |
+
+Interpretation:
+- Internal consistency is generally high: all six correlations are at least 0.945, and four are 0.983 or higher.
+- The offline operator is systematically shallower than published `mlotst` in every case, with mean differences from -2.4 to -9.6 m.
+- CESM2 is the closest match overall, with very small RMSD (5.1-7.5 m), near-perfect correlations (0.998 in both months), and very limited area exceeding 20 m difference.
+- MPI-ESM1-2-LR is also quite consistent in March, but September shows a much larger RMSD despite still high correlation.
+- GFDL-ESM4 shows the largest mismatch in both months, especially March, with the weakest correlation and the largest exceedance fractions.
+
+Ranking of models from most to least internally consistent:
+1. CESM2
+2. MPI-ESM1-2-LR
+3. GFDL-ESM4
+
+Criterion used for ranking:
+- The code ranked models by the mean of four March/September native-grid rank scores:
+  - lower RMSD,
+  - lower absolute bias,
+  - higher spatial Pearson correlation,
+  - lower area fraction with `|offline MLD - mlotst| > 20 m`.
+
+Mean ranking components:
+- CESM2: mean RMSD 6.3 m, mean absolute bias 3.55 m, mean correlation 0.998, mean exceedance area 1.45%.
+- MPI-ESM1-2-LR: mean RMSD 10.55 m, mean absolute bias 2.45 m, mean correlation 0.989, mean exceedance area 2.5%.
+- GFDL-ESM4: mean RMSD 17.85 m, mean absolute bias 8.8 m, mean correlation 0.966, mean exceedance area 6.9%.
+
+Where the disagreement concentrates:
+The largest departures identified by the code occur mainly in high-latitude and deep winter mixed-layer regions:
+- CESM2:
+  - March largest negative departure near 59.7°N, 58.6°W
+  - March largest positive departure near 73.4°N, 6.9°E
+  - September largest negative departure near 75.5°S, 56.3°W
+- GFDL-ESM4:
+  - March extremes near 54.5°N, 10.5°W and 56.5°N, 54.5°W
+  - September extremes near 37.5°S, 139.5°E and 71.5°S, 166.5°W
+- MPI-ESM1-2-LR:
+  - March extremes near 70.1°N, 5.7°E and 54.0°N, 51.8°W
+  - September strongest negative departure near 72.2°S, 139.1°W
+
+These locations are consistent with disagreement being concentrated in deep mixed-layer regions and frontal/high-latitude settings rather than being uniformly spread.
+
+Why exact agreement is not expected:
+The executed workflow itself notes that the offline and published diagnostics differ by construction. The code’s diagnostic note states that published `mlotst` is based on the model top level and a displaced-parcel density test at local pressure, and is typically archived as a monthly mean of instantaneous MLDs. By contrast, the offline operator here was computed from monthly mean `thetao`/`so` using a density-threshold crossing depth interpolated between levels. That difference in diagnostic formulation and temporal averaging commonly makes the offline result systematically shallower and enhances disagreement in deep winter mixed-layer regions and frontal zones.
+
+Visualizations generated:
+- Figure 1: a 3×2 panel of maps of offline MLD minus `mlotst`, arranged by model (rows: CESM2, GFDL-ESM4, MPI-ESM1-2-LR) and month (columns: March, September). For display only, each native-grid difference field was bilinearly regridded to a regular WOA23 longitude-latitude grid. All panels use one shared diverging colour scale centred on zero, clipped using the pooled 98th percentile of absolute differences.
+- Figure 2: a 3×2 panel of scatter plots in the same layout, with one point per shared valid ocean cell. The x-axis is offline MLD and the y-axis is published `mlotst`. All panels use identical logarithmic axes and the same tick set, plus a dashed `y=x` line. Each panel is annotated with its bias, RMSD, and correlation.
+
+Overall scientific takeaway:
+This internal consistency test indicates that the published `mlotst` fields are broadly reproducible from each model’s own temperature and salinity using an offline density-threshold operator, especially for CESM2 and, to a lesser extent, MPI-ESM1-2-LR. The remaining discrepancies are diagnostic rather than dynamical: they reflect differences between how the archived `mlotst` was originally computed and how the offline operator was reconstructed from monthly mean `thetao` and `so`.
+</solution>

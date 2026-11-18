@@ -1,0 +1,651 @@
+# exchange 3: solution
+# elapsed: 36.8 s
+
+===== SYSTEM =====
+
+The user's question:
+Evaluate the 1971-2000 sea surface temperature (SST) climatology of three CMIP6 historical simulations against the World Ocean Atlas 2023 (WOA23) observational climatology, and describe the spatial structure of the bias.
+
+Data to use:
+- CMIP6 historical variable `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, from 1971-01 to 2000-12, each on its own native grid with its own published cell areas (areacello).
+- WOA23 temperature, the 1971-2000 climate normal, annual time slice, objectively analysed field, at 0 m depth, on the 1-degree grid.
+- The WOA23 1-degree land-sea mask (landsea_01), in which a cell is ocean when its value is greater than 1.
+
+Expected numerical results:
+- For each model, the global mean of its 1971-2000 SST climatology over its own native ocean grid, in degrees Celsius to 2 decimal places.
+- The global mean of the WOA23 0 m annual field over the whole 1-degree grid, in degrees Celsius to 2 decimal places.
+- On the WOA23 1-degree grid, over the cells on which the models are compared with WOA23: the mean SST of each model and of WOA23, in degrees Celsius to 2 decimal places.
+- On the same cells, for each model: the mean bias delta_SST (model minus WOA23) in degrees Celsius to 2 decimal places, the RMSE against WOA23 in degrees Celsius to 3 decimal places, and the spatial Pearson correlation with WOA23 to 3 decimal places.
+- The ranking of the three models from smallest to largest absolute delta_SST.
+
+Expected visualizations:
+- Figure 1, a 2-by-2 panel of global maps: the bias fields (model minus WOA23) of CESM2, GFDL-ESM4 and MPI-ESM1-2-LR on the cells of that comparison with one shared diverging colour scale centred on zero, and the WOA23 0 m reference SST on the same cells with a sequential colour scale. Label every panel and give each colour scale a unit label in degrees Celsius.
+- Figure 2, a bar chart of the four global mean SST values of the first two items above, each over its own native ocean grid (CESM2, GFDL-ESM4, MPI-ESM1-2-LR and WOA23), each bar annotated with its value, with the y axis labelled in degrees Celsius.
+
+The analysis plan:
+1. Load CMIP6 historical `tos` for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly 1971-01 to 2000-12, on each model’s native grid using `load_regular_data`; convert from K to degrees Celsius with `transform_unit`. Load each model’s native `areacello` cell areas with `load_areas`. For each model, form the 1971-2000 SST climatology with `temporal_aggregate` using the day-weighted long-term mean.
+2. For each model, compute the native-ocean global mean of its 1971-2000 SST climatology with `compute_basic_stat`, using `areacello` as spatial weights and restricting to its native valid ocean cells.
+3. Load WOA23 `temperature`, 1971-2000 climate normal, annual time slice, 0 m depth, with `load_climatology_data`; load the WOA23 1-degree cell areas with `load_areas`. Compute the WOA23 global mean over the whole 1-degree grid with `compute_basic_stat`, area-weighted by the WOA23 1-degree cell areas.
+4. Load the WOA23 1-degree `landsea_01` mask with `load_landsea_mask`; treat cells with value greater than 1 as ocean, as specified.
+5. Regrid each model’s 1971-2000 SST climatology horizontally to the WOA23 1-degree grid with `regrid_horizontal`. Use `build_comparison_mask` on the regridded CESM2, GFDL-ESM4 and MPI-ESM1-2-LR SST fields together with WOA23 SST, restricted to WOA ocean cells (`landsea_01 > 1`) and cells valid for all fields.
+6. On the common comparison mask, compute the area-weighted mean SST of each regridded model and of WOA23 with `compute_basic_stat`, using WOA23 1-degree cell areas as weights. For each model, use `compute_difference_metrics` with model as the first field and WOA23 as the reference to obtain mean bias `delta_SST` (model minus WOA23) and RMSE. Use `analyze_correlation` to obtain the spatial Pearson correlation between each model SST and WOA23 over the same cells.
+7. Form each model-minus-WOA23 bias field on the common comparison cells for mapping. Rank CESM2, GFDL-ESM4 and MPI-ESM1-2-LR from smallest to largest absolute mean `delta_SST`. Use the bias maps to describe broad spatial structure, such as coherent regional warm or cold bias patterns.
+8. Produce Figure 1 as a 2-by-2 panel: the CESM2, GFDL-ESM4 and MPI-ESM1-2-LR bias fields on the comparison cells, all using one shared diverging colour scale centred on zero, plus WOA23 0 m SST on the same cells using a sequential colour scale; label every panel and colourbar in degrees Celsius.
+9. Produce Figure 2 as a bar chart of the four global mean SST values from steps 2 and 3, each over its own native grid, annotated with its value and with the y axis labelled in degrees Celsius.
+
+Other notes:
+- CMIP6 `tos` is converted from K to degrees Celsius before all climatology, bias and mean calculations; WOA23 temperature is already in degrees Celsius.
+- Native-grid model global means use each model’s own `areacello` and native ocean cells; the WOA23 global mean uses WOA23 1-degree areas over the whole grid, not the land-sea comparison mask.
+- The model-WOA23 comparison is performed on the WOA23 1-degree grid after horizontal regridding, using only WOA ocean cells (`landsea_01 > 1`) that are valid for all three models and WOA23.
+- Bias is defined as model minus WOA23; the model ranking uses absolute mean bias.
+- RMSE and spatial Pearson correlation are computed over the same common comparison cells as the comparison means and biases.
+- Figure 1 uses a shared diverging scale centred at zero for the three model biases and a separate sequential scale for the WOA23 reference field; all colour scales are labelled in degrees Celsius.
+
+The code that actually ran and produced the results below:
+<executed_code>
+# ---------------------------------------------------------------
+# 1. CMIP6 historical SST: native-grid 1971-2000 climatology
+# ---------------------------------------------------------------
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+time_range = ["1971-01", "2000-12"]
+
+model_clim = {}
+native_mean = {}
+
+for m in models:
+    tos = load_regular_data(dataset="cmip6_historical", variable="tos",
+                            model=m, time_range=time_range)
+    tos = transform_unit(tos, from_unit=tos.attrs.get("units", "K"), to_unit="degC")
+    clim = temporal_aggregate(tos, freq="mean")          # day-weighted long-term mean
+    model_clim[m] = clim
+    # native-ocean global mean, weighted by the model's own areacello
+    native_mean[m] = float(
+        compute_basic_stat(clim, op="area_weighted_mean", dim=["lat", "lon"]).compute()
+    )
+
+# ---------------------------------------------------------------
+# 2. WOA23 0 m annual SST climatology, 1971-2000 normal
+# ---------------------------------------------------------------
+woa = load_climatology_data(dataset="woa23", variable="temperature",
+                            period="1971-2000", time_slice="annual",
+                            depth_range=[0, 10])
+woa_sst = woa.isel(depth=0, drop=True) if "depth" in woa.dims else woa
+woa_sst = woa_sst.assign_attrs(units="degC")
+
+woa_native_mean = float(
+    compute_basic_stat(woa_sst, op="area_weighted_mean", dim=["lat", "lon"]).compute()
+)
+
+# WOA23 1-degree land-sea mask: ocean is (value > 1)
+lsm = load_landsea_mask()
+ocean = lsm > 1
+
+# ---------------------------------------------------------------
+# 3. Regrid each model climatology conservatively to the WOA23 grid
+# ---------------------------------------------------------------
+regridded = {}
+for m in models:
+    regridded[m] = regrid_horizontal(model_clim[m], target="woa23", method="conservative")
+
+# ---------------------------------------------------------------
+# 4. Common comparison mask (WOA ocean cells valid for every field)
+# ---------------------------------------------------------------
+mask = build_comparison_mask([regridded[m] for m in models] + [woa_sst],
+                             ocean_only=True, extra_mask=ocean)
+
+# ---------------------------------------------------------------
+# 5. Comparison statistics on the common cells
+# ---------------------------------------------------------------
+comp_mean = {}
+delta = {}
+rmse = {}
+corr = {}
+bias_field = {}
+woa_comp_mean = None
+
+for m in models:
+    f = regridded[m].where(mask)
+    w = woa_sst.where(mask)
+
+    dm = compute_difference_metrics(data=f, reference=w, dim=["lat", "lon"])
+    comp_mean[m] = float(dm["mean_data"])
+    delta[m] = float(dm["bias"])
+    rmse[m] = float(dm["rmse"])
+    bias_field[m] = dm["difference"].assign_attrs(
+        units="degC", long_name=f"{m} SST bias (model - WOA23)"
+    )
+    if woa_comp_mean is None:
+        woa_comp_mean = float(dm["mean_reference"])
+
+    c = analyze_correlation(var1=f, var2=w, dim=["lat", "lon"],
+                            method="pearson", weighting="area")
+    corr[m] = float(c["correlation"])
+
+# ---------------------------------------------------------------
+# 6. Ranking by absolute mean bias
+# ---------------------------------------------------------------
+ranking = sorted(models, key=lambda mm: abs(delta[mm]))
+
+print("Native-grid global mean SST (degC):")
+for m in models:
+    print(f"  {m:15s} {native_mean[m]:.2f}")
+print(f"  {'WOA23 (full grid)':15s} {woa_native_mean:.2f}")
+
+print("\nOn the common WOA23 comparison cells:")
+print(f"  WOA23 mean SST: {woa_comp_mean:.2f} degC")
+for m in models:
+    print(f"  {m:15s} mean={comp_mean[m]:.2f}  delta_SST={delta[m]:+.2f}  "
+          f"RMSE={rmse[m]:.3f}  r={corr[m]:.3f}")
+
+print("\nRanking (smallest -> largest |delta_SST|):")
+for i, m in enumerate(ranking, 1):
+    print(f"  {i}. {m}  (|delta| = {abs(delta[m]):.2f} degC)")
+
+summary = pd.DataFrame({
+    "native_global_mean_degC": [native_mean[m] for m in models] + [woa_native_mean],
+    "comparison_mean_degC":    [comp_mean[m] for m in models] + [woa_comp_mean],
+    "delta_SST_degC":          [delta[m] for m in models] + [np.nan],
+    "RMSE_degC":               [rmse[m] for m in models] + [np.nan],
+    "spatial_r":               [corr[m] for m in models] + [np.nan],
+}, index=models + ["WOA23"])
+
+# --- visualization ---
+# ---------------------------------------------------------------
+# Figure 1: 2x2 bias maps (shared diverging scale) + WOA23 reference
+# ---------------------------------------------------------------
+lon = woa_sst["lon"].values
+lat = woa_sst["lat"].values
+
+pooled = np.concatenate([bias_field[m].values.ravel() for m in models])
+vmax = float(np.nanpercentile(np.abs(pooled), 98))
+
+ref_vals = woa_sst.where(mask).values
+rvmin = float(np.nanpercentile(ref_vals, 1))
+rvmax = float(np.nanpercentile(ref_vals, 99))
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 8.0), constrained_layout=True)
+axes = axes.ravel()
+
+for i, m in enumerate(models):
+    ax = axes[i]
+    pcm = ax.pcolormesh(lon, lat, bias_field[m].values, cmap="RdBu_r",
+                       vmin=-vmax, vmax=vmax, shading="auto")
+    ax.set_title(f"{m} − WOA23")
+    cb = fig.colorbar(pcm, ax=ax, extend="both")
+    cb.set_label("SST bias (°C)")
+
+ax = axes[3]
+pcm = ax.pcolormesh(lon, lat, ref_vals, cmap="viridis",
+                   vmin=rvmin, vmax=rvmax, shading="auto")
+ax.set_title("WOA23 SST (0 m, 1971–2000)")
+cb = fig.colorbar(pcm, ax=ax)
+cb.set_label("SST (°C)")
+
+for ax in axes:
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_xlim(float(np.nanmin(lon)), float(np.nanmax(lon)))
+    ax.set_ylim(float(np.nanmin(lat)), float(np.nanmax(lat)))
+
+fig.suptitle("SST bias vs WOA23 on the common comparison cells "
+             f"(diverging scale shared across models, clipped at 98th pct = ±{vmax:.1f} °C)",
+             fontsize=11)
+
+# ---------------------------------------------------------------
+# Figure 2: global mean SST of each model (native grid) and WOA23
+# ---------------------------------------------------------------
+labels = models + ["WOA23"]
+values = [native_mean[m] for m in models] + [woa_native_mean]
+colors = ["#1f77b4", "#2ca02c", "#9467bd", "#d62728"]
+
+fig2, ax2 = plt.subplots(figsize=(7.5, 5.2), constrained_layout=True)
+bars = ax2.bar(labels, values, color=colors)
+for b, v in zip(bars, values):
+    ax2.annotate(f"{v:.2f}",
+                 xy=(b.get_x() + b.get_width() / 2.0, v),
+                 xytext=(0, 3), textcoords="offset points",
+                 ha="center", va="bottom", fontsize=10)
+
+pad = 0.6
+ax2.set_ylim(min(values) - pad, max(values) + pad)
+ax2.set_ylabel("Global mean SST (°C)")
+ax2.set_title("1971–2000 mean SST over each model's native ocean grid")
+ax2.grid(axis="y", alpha=0.3)
+</executed_code>
+
+Here are the results of code execution:
+
+Status Summary:
+- Computation: Success
+- Visualization: Generated
+
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "models": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "time_range": [
+        "1971-01",
+        "2000-12"
+      ],
+      "model_clim": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "cmip6_historical",
+          "size": 122880,
+          "n_valid": 86096,
+          "min": -1.8941294181888655,
+          "max": 31.213487881860456,
+          "mean": 17.229741504054964,
+          "std": 11.411205189955092
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "cmip6_historical",
+          "size": 64800,
+          "n_valid": 44564,
+          "min": -1.9662576276774302,
+          "max": 30.703347584870116,
+          "mean": 13.517202237592397,
+          "std": 11.277409664949442
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "j": 220,
+            "i": 254
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "cmip6_historical",
+          "size": 55880,
+          "n_valid": 36791,
+          "min": -1.8999340074256859,
+          "max": 30.8174464824013,
+          "mean": 9.783093592122832,
+          "std": 10.082874612858356
+        }
+      },
+      "native_mean": {
+        "CESM2": 18.519858364923476,
+        "GFDL-ESM4": 18.128874834449835,
+        "MPI-ESM1-2-LR": 17.582050150881958
+      },
+      "woa": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 3,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "degrees_celsius",
+        "long_name": "Objectively analyzed mean fields for sea_water_temperature at standard depth levels.",
+        "source_dataset": "woa23",
+        "size": 194400,
+        "n_valid": 123212,
+        "min": -1.839609980583191,
+        "max": 30.500808715820312,
+        "mean": 13.788484573364258,
+        "std": 11.289341926574707
+      },
+      "woa_sst": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "degC",
+        "long_name": "Objectively analyzed mean fields for sea_water_temperature at standard depth levels.",
+        "source_dataset": "woa23",
+        "size": 64800,
+        "n_valid": 41088,
+        "min": -1.814810037612915,
+        "max": 30.500808715820312,
+        "mean": 13.847308158874512,
+        "std": 11.28067684173584
+      },
+      "woa_native_mean": 18.19282961186937,
+      "lsm": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "long_name": "WOA23 bottom standard level",
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 1.0,
+        "max": 138.0,
+        "mean": 52.128179012345676,
+        "std": 43.05470955174635
+      },
+      "ocean": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "long_name": "WOA23 bottom standard level",
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "regridded": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 42576,
+          "min": -1.88265930549586,
+          "max": 31.13529971642854,
+          "mean": 13.98003583446302,
+          "std": 11.625953694671919
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 44564,
+          "min": -1.9662576276774302,
+          "max": 30.703347584870116,
+          "mean": 13.517202237592397,
+          "std": 11.277409664949442
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 42720,
+          "min": -1.8999303423301184,
+          "max": 30.8174464824013,
+          "mean": 13.249807692661435,
+          "std": 10.996747230973234
+        }
+      },
+      "mask": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "long_name": "cells covered by every field in the comparison",
+        "source_dataset": "woa23",
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "comp_mean": {
+        "CESM2": 18.48451490630703,
+        "GFDL-ESM4": 18.117958123143126,
+        "MPI-ESM1-2-LR": 17.573469017408332
+      },
+      "delta": {
+        "CESM2": 0.2802338863204253,
+        "GFDL-ESM4": -0.08632289684348228,
+        "MPI-ESM1-2-LR": -0.6308120025782749
+      },
+      "rmse": {
+        "CESM2": 1.0616562973819714,
+        "GFDL-ESM4": 0.8324818359093958,
+        "MPI-ESM1-2-LR": 1.3390155824619232
+      },
+      "corr": {
+        "CESM2": 0.9950348612161424,
+        "GFDL-ESM4": 0.996511535333739,
+        "MPI-ESM1-2-LR": 0.9930282846579704
+      },
+      "bias_field": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "CESM2 SST bias (model - WOA23)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 40830,
+          "min": -4.8021104699708275,
+          "max": 8.838888401363667,
+          "mean": 0.15238845911378907,
+          "std": 1.0308341173622875
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "GFDL-ESM4 SST bias (model - WOA23)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 40830,
+          "min": -4.489401657360709,
+          "max": 7.377024266249421,
+          "mean": -0.07716654673656587,
+          "std": 0.8167261750167126
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "MPI-ESM1-2-LR SST bias (model - WOA23)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 40830,
+          "min": -7.33476798008599,
+          "max": 7.614731593229077,
+          "mean": -0.5049523217589597,
+          "std": 1.1990249569940394
+        }
+      },
+      "woa_comp_mean": 18.204281019986606,
+      "ranking": [
+        "GFDL-ESM4",
+        "CESM2",
+        "MPI-ESM1-2-LR"
+      ],
+      "summary": "               native_global_mean_degC  ...  spatial_r\nCESM2                        18.519858  ...   0.995035\nGFDL-ESM4                    18.128875  ...   0.996512\nMPI-ESM1-2-LR                17.582050  ...   0.993028\nWOA23                        18.192830  ...        NaN\n\n[4 rows x 5 columns]"
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_no_knowledge_20261020/T3_deepseek-flash_20261025_085155/turn01/figures/visualization_T3_deepseek-flash_20261025_085155_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_no_knowledge_20261020/T3_deepseek-flash_20261025_085155/turn01/figures/visualization_T3_deepseek-flash_20261025_085155_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Please provide a clear scientific summary inside <solution></solution> tags.
+
+Describe the methodology strictly from the <executed_code> above, never by inferring it from variable
+names: the baseline period, the source of any climatology, the weighting, the units, the region and
+time range, the range of lags — all of it must match the tools and arguments the code actually
+called. Do not report a step the code did not take. Where a variable name in the observation is
+ambiguous, the code decides what it means.
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
+4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, tool choice, computation and visualization attempts
+3. Suggestions for how to reformulate the query
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+The three CMIP6 historical simulations reproduce the WOA23 1971–2000 SST climatology well in spatial pattern, with small global-mean offsets but non-uniform regional biases. Using the executed workflow, `tos` was loaded for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR over 1971-01 to 2000-12, converted from K to °C, and temporally aggregated with `temporal_aggregate(freq="mean")` to form the 1971–2000 climatology. WOA23 temperature was loaded as the 1971–2000 annual climatology, depth range `[0,10]`, then the first depth level was selected; it was treated as °C. The WOA23 land–sea mask was loaded with `load_landsea_mask` and ocean cells were defined by `landsea_01 > 1`. Model climatologies were conservatively regridded to the WOA23 1° grid with `regrid_horizontal(target="woa23", method="conservative")`. A common comparison mask was built with `build_comparison_mask(..., ocean_only=True, extra_mask=ocean)`, restricted to cells valid for all three regridded models and WOA23; 40,830 common cells were used. Means, biases and RMSE were computed with `compute_difference_metrics`, and spatial Pearson correlations with `analyze_correlation(..., method="pearson", weighting="area")`. Global/native means were computed with `compute_basic_stat(..., op="area_weighted_mean", dim=["lat","lon"])`. The executed code does not show an explicit `load_areas`/`areacello` argument; the weighted values reported below are those returned by those `compute_basic_stat` calls.
+
+Key results:
+
+| Field | Native/global mean SST (°C) | Common-cell mean SST (°C) | ΔSST model − WOA23 (°C) | RMSE (°C) | Spatial Pearson r |
+|---|---:|---:|---:|---:|---:|
+| CESM2 | 18.52 | 18.48 | +0.28 | 1.062 | 0.995 |
+| GFDL-ESM4 | 18.13 | 18.12 | −0.09 | 0.832 | 0.997 |
+| MPI-ESM1-2-LR | 17.58 | 17.57 | −0.63 | 1.339 | 0.993 |
+| WOA23 | 18.19 | 18.20 | — | — | — |
+
+The WOA23 global mean over its valid 1° SST field, without applying the multi-model comparison mask, is 18.19°C. On the common comparison cells the WOA23 mean is 18.20°C.
+
+Ranking from smallest to largest absolute mean bias:
+1. GFDL-ESM4: |ΔSST| = 0.09°C  
+2. CESM2: |ΔSST| = 0.28°C  
+3. MPI-ESM1-2-LR: |ΔSST| = 0.63°C  
+
+GFDL-ESM4 has the smallest global-mean bias and the lowest RMSE. CESM2 has a moderate warm mean bias, while MPI-ESM1-2-LR has the largest cold mean bias and largest RMSE. All models nevertheless capture the large-scale SST pattern very strongly, with correlations of 0.993–0.997. The bias fields are not uniform: the unweighted spread of the model-minus-WOA23 fields is about 1.03°C standard deviation for CESM2 (range roughly −4.80 to +8.84°C), 0.82°C for GFDL-ESM4 (−4.49 to +7.38°C), and 1.20°C for MPI-ESM1-2-LR (−7.33 to +7.61°C). Thus regional warm and cold biases are larger than the global-mean offsets and partly compensate in the global mean; the spatial maps are important for interpreting model performance beyond the global scalar metrics.
+
+Figure 1 is a 2×2 panel of global maps on the common WOA23 comparison cells: the first three panels show the CESM2, GFDL-ESM4 and MPI-ESM1-2-LR bias fields (model minus WOA23) with a shared diverging color scale centered at zero, clipped at the 98th percentile of pooled absolute bias, enabling direct comparison of sign and magnitude. The fourth panel shows the WOA23 0 m reference SST on the same cells with a separate sequential color scale, clipped at the 1st–99th percentiles. All panels and colorbars are labelled, with SST/bias units in °C. The figure is designed to reveal the regional spatial structure and sign of the biases against the observed SST pattern.
+
+Figure 2 is a bar chart of the four global-mean SST values over their own native/valid grids: CESM2 18.52°C, GFDL-ESM4 18.13°C, MPI-ESM1-2-LR 17.58°C and WOA23 18.19°C. Each bar is annotated with its value, and the y axis is labelled in °C. The chart summarizes the overall global-mean SST offsets before focusing on the common-cell comparison statistics and maps.
+</solution>

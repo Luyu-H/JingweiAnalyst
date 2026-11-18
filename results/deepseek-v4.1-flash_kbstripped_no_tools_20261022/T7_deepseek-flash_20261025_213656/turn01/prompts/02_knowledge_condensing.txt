@@ -1,0 +1,514 @@
+# exchange 2: knowledge_condensing
+# elapsed: 18.9 s
+
+===== SYSTEM =====
+You condense knowledge fragments into short notes for the planning step of a data analysis. The
+planner sees only your notes, not the fragments.
+
+Fragments selected for this question (each headed by its [fragment-id]):
+<fragments>
+### [cmip6-bgc-units-per-volume] CMIP6 biogeochemical tracers are per unit volume (mol m-3, kg m-3)
+(type: concept; severity: must)
+#### Key points
+- In the OMIP tracer equation "conservation of volume is assumed … and
+  standard units of mol m−3 are used for all tracers". [OMIP-BGC §2.4]
+- The CMOR comments define "mole concentration" as "number of moles per unit
+  volume, also called 'molarity'". [CMOR Omon, o2/no3/po4/si]
+- Units as archived [CMOR Omon; OMIP-BGC Tables 6, 10, 12]:
+
+  | variable | CMOR units | common reporting unit | factor (volume basis) |
+  |---|---|---|---|
+  | o2, o2sat, no3, po4, si, dissic, dissoc, talk, phycos | mol m-3 | mmol m-3 = µmol L-1 | × 1e3 |
+  | dfe | mol m-3 | nmol L-1 (nM) | × 1e6 |
+  | chl | kg m-3 | mg m-3 (≈ µg L-1) | × 1e6 |
+  | ph | 1 | – | – |
+
+  The factors in the last column are unit arithmetic. They change the prefix
+  but keep the volume basis.
+#### Implications for this project
+- Numbers in mmol m-3 are **still per volume**. WOA23 and GLODAP report
+  µmol kg-1 (per mass). Changing the prefix does not make the two comparable.
+  Only a density conversion does: µmol kg-1 = mmol m-3 × 1000 / ρ, where ρ is in
+  kg m-3. `configs/datasets.yaml` (`cross_dataset_notes.units`) records this
+  and notes that no loader converts automatically.
+- The density error only cancels in quantities that are invariant under scaling:
+  ratios of two tracers converted with the same ρ, or depths of extrema and
+  gradients. Absolute concentrations, inventories against observations and
+  thresholds on a mass basis all need the conversion. The scale-invariant
+  quantities need no conversion at all and are best taken from the native
+  field: a constant ρ cancels exactly, while the in-situ density, which grows
+  with depth, rescales each level by a different factor and so itself shifts
+  a depth located from the shape of a profile (a nutricline, the depth of a
+  maximum gradient) by a little.
+- Inventories (mol) are volume integrals of the per-volume field: Σ c · volcello.
+  No density is needed for these on the model side.
+- Two concentrations on different bases cannot be compared, differenced or
+  evaluated against each other until one has been converted. The conversion
+  needs a density, and the one that mass-per-volume arithmetic needs is the
+  in-situ density, `compute_potential_density_anomaly` with `ref_pressure=None`
+  (a sigma at a fixed reference pressure is not). `transform_unit` defaults to a
+  constant density, the mean surface value, which errs by about a per cent in
+  the deep ocean and in fresh polar water, enough to rival the differences a
+  model-observation comparison sets out to measure. Pass the in-situ density
+  field for anything below the surface that needs converting (not for the
+  scale-invariant quantities above), and state which density was used (the
+  result's `attrs['density_assumption']`).
+- For inventories prefer the volume basis: a model's native mol m-3 field
+  integrates exactly with `convert_concentration_to_content`, with no density
+  in the arithmetic. Handing it a µmol kg-1 field without an explicit density
+  applies the tool's constant default instead, which undoes any in-situ density
+  used to make that field and biases the inventory by about one per cent.
+#### Common mistakes
+- Multiplying mol m-3 by 1000 and labelling the result "µmol/kg".
+- Applying a µmol kg-1 threshold (for example a hypoxia threshold defined in
+  µmol kg-1) to a mol m-3 field without conversion: every cell then falls below
+  it, and the whole ocean is marked as depleted.
+- Reading chlorophyll in kg m-3 as mg m-3. The two differ by a factor of 1e6.
+
+### [common-comparison-mask] One comparison sample: a shared mask for model–observation and multi-model metrics
+(type: method; severity: must)
+#### Key points
+- Regridding model output to a spherical grid "generally involves a land–sea
+  mask distinct from the model native mask". [OMIP-phys A3] After remapping,
+  each source covers its own set of cells, and coastal cells differ most.
+- The GLODAPv2 mapped climatology is a global 1° × 1° product on 33 standard
+  depth surfaces, mapped from the GLODAPv2 bottle data. [Lauvset et al. 2016]
+  It shares the horizontal geometry of the WOA 1° grid, but not WOA's data
+  coverage or its land-sea mask.
+#### Checked in the local files
+- GLODAPv2.2016b surface `TCO2` has 41320 valid cells on its 1° grid, and
+  WOA23 `landsea_01` calls 1459 of them land: 442 north of 60°N, 179 south of
+  60°S, the rest coastal cells at all latitudes. `build_comparison_mask` on the
+  GLODAP field keeps 39861 cells with `ocean_only=True` and all 41320 with
+  `ocean_only=False` (checked 2026-10-20).
+#### Implications for this project
+- A model is comparable with an observation, or with another model, only where
+  both have data, and several models can be ranked against each other on a
+  cell-by-cell score (a bias, an RMSE or the pattern correlation of one field)
+  only where all of them do. Left to itself each pair covers a different set of
+  cells, so such a score from one pair describes a different piece of ocean
+  from the next, and a ranking between them means nothing. Put the fields on
+  one grid, build one mask over all of them with `build_comparison_mask`, and
+  apply it with `.where(mask)` to every field before any metric is taken.
+- Where the shared mask does not apply: a pattern that is itself the result of
+  an analysis on each source's own domain, such as the regression pattern of a
+  variability mode (see `eof-modes-and-pdo-index`). Each mode was computed on
+  its own source's cells, so masking the patterns afterwards to the other
+  sources' coverage does not make them comparable. Correlate each with the
+  reference pattern over the cells the two share (`analyze_correlation` leaves
+  out the cells either one lacks), and compare the models on those
+  correlations. Nor does a mask built on one level carry to another: coverage
+  shrinks with depth, so a statistic at several depths takes its cells from the
+  fields at each depth, not from the surface mask.
+- The numbers of one cell-by-cell comparison come from one sample. Report the
+  means that `compute_difference_metrics` returns over the shared sample
+  (`mean_data`, `mean_reference`) together with the bias, not means computed
+  separately over different cells. A global or regional mean of each source
+  over its own ocean, with its own weights, is a different quantity (see
+  `omip-native-grid-vs-regridded`): when the difference of such means is asked
+  for, take each mean on its own grid and say that the difference is not the
+  bias on the shared mask.
+- `ocean_only=True`, the default of `build_comparison_mask`, is right only when
+  WOA23 is part of the comparison. The check is made on the grid, so a
+  GLODAP-against-models comparison on the shared 1° geometry silently inherits
+  WOA23's coastline and drops cells where GLODAP has data and WOA23 says land.
+  Those are among the hardest cells for a model to match, so dropping them
+  flatters every model. Pass `ocean_only=False` when the reference is not WOA23.
+- Report the cell counts the mask records alongside the metrics. A mask much
+  smaller than the individual fields means the products disagree about where
+  the ocean is, not that the models are poor.
+#### Common mistakes
+- Scoring each model on its own pairwise mask in a cell-by-cell comparison of
+  one field, and then ranking the models on those scores.
+- Applying the WOA23 land-sea mask to a comparison against GLODAP.
+
+### [basin-and-region-definitions] Ocean basin partitions in CMIP6/OMIP and CF standard region names
+(type: method; severity: should)
+#### Key points
+- OMIP recommends a tracer region mask with CF standard region names and
+  `flag_values = 1..10` [OMIP-phys G6]:
+
+  | flag | region | flag | region |
+  |---|---|---|---|
+  | 1 | southern_ocean | 6 | mediterranean_sea |
+  | 2 | atlantic_ocean | 7 | black_sea |
+  | 3 | pacific_ocean | 8 | hudson_bay |
+  | 4 | arctic_ocean | 9 | baltic_sea |
+  | 5 | indian_ocean | 10 | red_sea |
+
+  Some enclosed seas "may be missing from the model". [OMIP-phys G6]
+- The CMOR Ofx `basin` variable (standard_name `region`) carries this mask on
+  the model grid. It is requested on both the native and the spherical grid.
+  [CMOR Ofx; OMIP-phys Table G1]
+- For **overturning and meridional transports** the partition is different:
+  `atlantic_arctic_ocean`, `indian_pacific_ocean`, `global_ocean`.
+  [CMOR coordinate `basin`; OMIP-phys I6]
+- The CMOR `oline` axis lists the standard passages (e.g. drake_passage,
+  indonesian_throughflow, bering_strait, fram_strait, denmark_strait,
+  florida_bahamas_strait, pacific_equatorial_undercurrent). [CMOR coordinate]
+- CF: regions with complex boundaries are identified by a label variable with
+  standard_name `region`, using the standardised region names. [CF 6.1.1]
+#### Implications for this project
+- The Ofx `basin` field is not in the local archive. Basin statistics here use
+  the WOA23 basin mask carried onto each grid (`select_basin`,
+  `load_basin_mask`). That mask follows a WOA labelling, not the OMIP 10-region
+  one. Report which mask was used, whether the Southern Ocean is a separate
+  basin or split among the three oceans, and whether marginal seas are
+  folded into their parent ocean. Each of these choices changes basin means.
+- In the WOA23 mask each marginal sea carries its own code, so an ocean taken
+  as its main code alone silently excludes a large part of what the name
+  usually means. `select_basin` folds the marginal seas into the ocean they
+  open onto by default (`include_marginal_seas=True`); either choice is
+  defensible as long as it is stated.
+- A marginal sea's label stops at its sill, and below that depth the water
+  belongs to the open ocean, so the mask labels each standard level
+  separately. The surface labels applied through the whole water column
+  (`depth_dependent=False`) are what a named ocean usually means; each level's
+  own labels (`depth_dependent=True`) are what a water-mass analysis wants.
+- Model domains differ: the CESM2 paper notes that the Caspian Sea is treated
+  as a lake in the land model and "is no longer included in the ocean model"
+  (see `model-cesm2-configuration`). Marginal seas present in an observational
+  mask may therefore have no model counterpart.
+#### Common mistakes
+- Reporting "Indian Ocean" overturning. OMIP says the Indian and Pacific
+  basins cannot be separated for overturning.
+- Comparing basin means computed with different basin masks for model and
+  observations.
+
+### [cmip6-static-grid-fields] Meaning of the CMIP6 ocean grid fields areacello, volcello, deptho, sftof (and the absent thkcello/masscello)
+(type: concept; severity: should)
+#### Key points
+- **areacello**: "Horizontal area of ocean grid cells" (m2, cell_methods
+  `area: sum`). This is the area of a **tracer** cell, and it "should be zero or
+  missing over land". All CMIP6 ocean models have fixed horizontal grids, so
+  the area is static. [CMOR Ofx; OMIP-phys B, G7]
+- **volcello**: "Ocean Grid-Cell Volume" (m3, `area: sum`). This is an
+  extensive field. It exists as a fixed field (Ofx) and as a time-varying one
+  (Omon). [CMOR Ofx, Omon]
+- **deptho**: "sea floor depth for present day relative to z=0 geoid.
+  Reported as missing for land grid cells." It is the bottom "from the
+  perspective of the model tracer fields". [CMOR Ofx; OMIP-phys G5]
+- **sftof**: "Percentage of horizontal area occupied by ocean" (%). [CMOR Ofx]
+- **thkcello** (cell thickness, m) and **masscello** (mass per area, kg m-2)
+  are part of the request. For models with static cells,
+  masscello = rhozero × thkcello, where rhozero is the model's Boussinesq
+  reference density. That density is not the same in all models: OMIP
+  suggests 1035 kg m-3, and early GFDL models used 1000 kg m-3. Where cell
+  thickness varies in time, both are monthly fields. [CMOR Ofx/Omon; OMIP-phys
+  B1–B2, G3]
+- For full cells, thickness can be taken as the difference of the layer
+  depth bounds. That fails at partial top and bottom cells. [OMIP-phys B1.1]
+#### Implications for this project
+- None of the three models' local archive has `thkcello`, `masscello` or `rhozero`.
+  The layer thickness that respects partial bottom cells is
+  **volcello / areacello**. The `lev_bnds` difference is right only for full
+  cells. Checked on the local historical files (January 2000, cells where
+  `thetao` is valid):
+  - **GFDL-ESM4**: area × layer-bound thickness gives 1.53e18 m3 against
+    1.33e18 m3 from `volcello`, and 14 % of cells differ by more than 1 %.
+    Its remapped z levels carry values in bottom cells that are only partly
+    water.
+  - **MPI-ESM1-2-LR**: partial bottom steps differ by up to ±50 % in 3.3 % of
+    cells.
+  - **CESM2**: the two agree within 0.6 %.
+  `cell_thickness_like` in `src/tools/data_loader.py` returns volcello /
+  areacello for CMIP6 fields. `identify_oxygen_minimum_zone` and the depth
+  averages use it.
+- `deptho` is model bathymetry, not true bathymetry. Deciding "is this level
+  above the model sea floor" should use `deptho` or the fill pattern of the
+  field itself, not an external topography.
+- GFDL-ESM4's `volcello` varies in time because its native vertical coordinate
+  moves (see `cmip6-grid-labels` and `configs/datasets.yaml`). The loaders
+  already handle the time axis.
+- On a curvilinear grid the model's own `areacello` is the only correct area
+  weight, and the published `volcello` alone accounts for the partial cells at
+  the sea floor. `load_areas` and `load_volumes_for_cmip6` use them where the
+  model publishes them and record the origin in `attrs['area_source']` and
+  `attrs['volume_source']`, which is worth reporting when they feed an
+  integral.
+- Total ocean area differs between models by a per cent or so, because a
+  coarser grid resolves the coastline differently. That is a property of the
+  model, not an error to correct: state the area each integral was taken over
+  rather than rescaling one model to match another.
+
+### [omip-weighted-means-and-integrals] How OMIP defines global and regional means and integrals of ocean fields
+(type: method; severity: should)
+#### Key points
+- Spatial integrals "are computed using all grid points within the region or
+  line. There is no sub-sampling." [OMIP-phys A2, C1]
+- Global mean of a 3-D tracer T [OMIP-phys H12.1]:
+  - Boussinesq model, **volume-weighted**: ⟨T⟩ = Σ T dA dz / Σ dA dz (Eq. H29)
+  - non-Boussinesq model, **mass-weighted**: ⟨T⟩ = Σ ρ T dA dz / Σ ρ dA dz
+    (Eq. H28)
+  The same forms hold for salinity (Eqs. H35–H36).
+- Global mean SST and SSS are **area-weighted over the top level**:
+  tosga = Σ θ(k=1) dA / Σ dA (Eq. H34, likewise sosga, Eq. H37).
+  [OMIP-phys H13, H18]
+- Because the terms of these averages vary in time, OMIP computes the official
+  global means online each time step (products of time-dependent terms).
+  [OMIP-phys H12.1, H17]
+- MPIOM (MPI-ESM1.2) is hydrostatic and Boussinesq. [MPI §4]
+#### Implications for this project
+- Offline, with monthly fields: a global mean of `thetao` is
+  Σ thetao · volcello / Σ volcello over valid ocean cells. A surface mean is
+  Σ tos · areacello / Σ areacello. Unweighted `mean()` over (y, x) on a
+  curvilinear grid is wrong. On a regular grid, unweighted means over latitude
+  are also wrong.
+- The weight must be restricted to the **same cells** as the valid data
+  (NaN-aware weights). Otherwise the denominator counts land or missing cells.
+- Volume weighting and mass weighting differ only through density variations.
+  In-situ density varies by no more than about 2 % around 1035 kg m-3 over
+  most of the ocean (OMIP-phys G3). For a Boussinesq model the volume-weighted
+  form is the protocol form. The papers read here confirm the Boussinesq formulation only
+  for MPIOM. For the other two models, state the assumption.
+- A mean over a region follows the same rule, with the region mask applied on
+  the model's own grid.
+- Use a weighted mean for any physical average. A plain mean is right only
+  when every element represents the same amount of ocean, which is rarely
+  true: cells shrink towards the poles, and layer thicknesses vary by more than
+  an order of magnitude with depth. With the tools: `compute_basic_stat` with
+  `op='area_weighted_mean'` for a horizontal mean, and
+  `op='volume_weighted_mean'` for any mean whose dimensions include depth (the
+  mean temperature or concentration of a depth range). Its plain `op='mean'`
+  weights every element equally.
+- The same holds for every statistic taken over a map, not only for means: an
+  unweighted RMSE, bias or pattern correlation counts a polar cell as heavily
+  as a tropical one many times its size. `compute_difference_metrics` weights
+  by area by default; `analyze_correlation` needs `weighting='area'` for a
+  pattern correlation between two maps.
+- A share of the ocean beyond a threshold is a share of its area (or volume),
+  not of its cells, and missing cells must stay out of the denominator.
+  `compute_exceedance_fraction` does both and returns the amount behind the
+  percentage (m2 or m3), which belongs next to the percentage when the question
+  is how much ocean.
+- The mean of a ratio is not the ratio of the means. Averaging a cell-by-cell
+  ratio such as N:P weights every cell's composition by its volume alone; the
+  ratio of the two volume-weighted means weights each cell by its content and
+  is pulled towards the richest water. Both are defensible, so state which one
+  is reported. `compute_ratio` gives the cell-by-cell ratio; the ratio of means
+  is the weighted mean of each field, divided.
+#### Common mistakes
+- Averaging a depth profile level by level with equal weight. Level thickness
+  varies from 10 m to 250 m or more.
+- Dividing an area-weighted sum by the total area of the region including
+  land.
+
+### [bgc-model-structure-comparison] Side-by-side structure of the three ocean biogeochemistry models (MARBL, COBALTv2, HAMOCC6)
+(type: dataset; severity: info)
+#### Key points
+| aspect | CESM2 (MARBL) | GFDL-ESM4 (COBALTv2) | MPI-ESM1-2-LR (HAMOCC6) |
+|---|---|---|---|
+| nutrients / limitation | N, P, Si, Fe co-limitation | C, alkalinity, O2, N, P, Fe, Si cycles (33 tracers) | limitation scheme not detailed in paper; nitrate, phosphate, iron and silicate appear (Fe limitation of cyanobacteria, weathering inputs) |
+| phytoplankton | diatoms, diazotrophs, pico/nano (explicit); calcifiers (implicit) | small, large (diatom, non-diatom), diazotrophs | bulk phytoplankton + prognostic cyanobacteria |
+| zooplankton | 1 group | 3 groups (+ bacteria) | – (not detailed in paper) |
+| stoichiometry | **variable C:P** | **fixed N:P per plankton type** | **prescribed Redfield** in organic matter |
+| DOM | semilabile and refractory pools | 3 labilities (incl. semilabile) | one combined pool |
+| N2 fixation | diazotroph group | diazotroph group | prognostic cyanobacteria, ~40°S–40°N, ~82 Tg N yr-1 |
+| O2 and remineralisation | – (not detailed in paper) | – (not detailed in paper) | Monod O2 limitation (10 µmol L-1), anaerobic on NO3, N2O, SO4 |
+| sinking particles | implicit, mineral ballasting | temperature-dependent remineralisation of sinking organic matter | settling 3.5 → 80 m d-1 with depth |
+| carbonate chemistry | fully prognostic | mocsy 2.0 | total pH scale, Dickson constants, P+Si alkalinity |
+| iron | dust + black carbon deposition, ligand tracer | interactive dust/iron, iceberg iron | dust climatology (Mahowald et al. 2005) |
+
+[CESM2 §2.2; GFDL §2.6–2.7; MPI §5]
+#### Implications for this project
+- Cross-model spread in nutrient ratios, chlorophyll or DOC reflects model
+  **structure** as well as circulation. For example, a fixed-Redfield model
+  can only produce N:P departures through N-cycle and transport processes.
+  Mention this when interpreting spread.
+- "Not detailed in paper" means the description paper does not state it. It
+  does not mean the feature is absent. Do not infer absence.
+
+### [omip-native-grid-vs-regridded] When to work on the native grid and when regridding is acceptable
+(type: method; severity: should)
+#### Key points
+- Two aims conflict: spherical-grid output is easy to map and difference,
+  while native-grid output preserves conservation for budgets. "regridding …
+  generally involves a land–sea mask distinct from the model native mask. When
+  changing the land–sea mask it is difficult to ensure conservation even when
+  using 'conservative' regridding methods." [OMIP-phys A3]
+- The loss of conservation "may be of minor consequence for many metric-based
+  analysis purposes. However, it sacrifices the needs of budget analyses."
+  Regridding "merely for visualization purposes and/or to produce difference
+  maps" can ignore non-conservation. [OMIP-phys A3, A3.2]
+- Structured-grid models archive on their native grid. The standard spherical
+  targets are the 1° or ¼° grids of the World Ocean Atlas. [OMIP-phys A3.3]
+- In the vertical, models on z, z\*, p or p\* need no regridding. Coarsening to
+  the 33 WOA standard levels is allowed, but "care should be given to models
+  that do not share the same 5500 m depth as the World Ocean Atlas".
+  [OMIP-phys A4, C2]
+- For transports across sections (overturning, passages, heat transport) on
+  non-spherical grids, compute along a native-grid "zig-zag" path that
+  approximates the section rather than regridding fluxes. [OMIP-phys C4]
+#### Implications for this project
+- A good pattern for model-versus-observation work: compute every **number**
+  (global and basin means, inventories, integrals) on each source's native grid
+  with its own weights. Regrid to the WOA 1° grid only for **maps, pattern
+  correlation and RMSE on a common mask**. Say which numbers come from which
+  grid. The exception is an analysis whose result depends on the grid and is
+  compared between sources, such as an EOF mode with its explained variance
+  and its regression pattern (see `eof-modes-and-pdo-index`): put every
+  source, the observations included, on one common grid before the analysis,
+  and take its numbers there.
+- After regridding a field for a cell-by-cell comparison, build one shared
+  valid-data mask for all sources before computing pattern statistics. Coastal
+  cells otherwise differ between the sources (see `common-comparison-mask`,
+  which also says when a pair's own shared cells are the sample instead, as
+  for the patterns of a variability mode).
+- Regrid only for the cell-by-cell comparison. An average, a trend or an
+  integral belongs on the field's own grid with its own cell areas, because
+  regridding replaces those with the target's.
+- Method in `regrid_horizontal`: 'conservative' is the right choice going to a
+  coarser grid and before any area-weighted step; 'bilinear' is the fallback
+  when a model's corner mesh is unusable; 'nearest_s2d' is for masks and other
+  categorical fields. A regridded RMSE or pattern correlation depends on the
+  method, so state the method whenever one is quoted.
+- Vertical interpolation onto another level set changes layer-integrated
+  quantities. Integrate thickness-weighted quantities (inventories, OMZ
+  thickness) on the original levels.
+- Values at fixed depths (a bias "at 100, 500 and 1000 m") need each product
+  interpolated to those depths (`regrid_vertical`), not the nearest level
+  selected: vertical grids differ between products and rarely line up, so each
+  product would answer at a different depth, and the products differ most
+  where the gradients are steepest. This interpolation is for comparison, not
+  for budgets.
+- Diagnostics located at a vertical extremum, such as a nutricline (the depth of
+  the maximum vertical gradient), are quantised by the vertical grid. Where the
+  profile is smooth, in the subtropical gyres especially, the maximum can jump
+  between levels, so read such a map together with the gradient itself.
+#### Common mistakes
+- Computing a global inventory after regridding to 1° and comparing it with
+  the native-grid value as if they should agree.
+- Regridding velocity components as scalars (see
+  `velocity-components-are-grid-relative`).
+
+### [monthly-means-are-time-averages] CMIP6 monthly fields are time averages of every model time step, so nonlinear diagnostics from them are not the model's own
+(type: pitfall; severity: must)
+#### Key points
+- Each requested period (day, month, year) "is sampled as a time average. Time
+  averages include all model time steps over the given period; there is no
+  sub-sampling. Products of time-dependent fields are time-averaged as a
+  product". [OMIP-phys A1]
+- `mlotstmax`/`mlotstmin` are the extremes over snapshots within the month.
+  Adjacent points "need not have extrema registered at the same time step".
+  [OMIP-phys A1, H24.1]
+- Squared fields (e.g. `tossq`, `mlotstsq`) are accumulated online so that
+  variance can be computed. Squaring a monthly mean does not give them.
+  [OMIP-phys Table H1 caption, H25]
+- MLD is recommended online "in order to avoid aliasing". [OMIP-phys H24.2]
+- For extensive quantities, "experience at GFDL with Boussinesq z* models
+  suggests that errors are minor when working offline using time averaged
+  thickness and time averaged tracer concentration". Errors are "generally
+  unacceptable" for isopycnal models. [OMIP-phys F3]
+#### Implications for this project
+- f(monthly mean) ≠ monthly mean of f for any nonlinear f. Examples are density
+  from T and S, MLD by a threshold crossing, depth of a maximum gradient, a
+  threshold exceedance (hypoxia) or a ratio of two tracers. The order of
+  operations therefore changes the answer and must be chosen on purpose:
+  - **diagnostic first, then average** reproduces the mean of the diagnostic
+    and matches how archived online diagnostics are defined;
+  - **average first, then diagnostic** gives the diagnostic of the mean state.
+    This is the like-for-like choice when the reference exists only as a
+    climatology.
+  State which order was used and why.
+- Monthly variance within a month cannot be recovered from monthly means. Only
+  interannual or inter-month variance can.
+- Averaging monthly fields over a period needs day weights in the model's own
+  calendar. `temporal_aggregate` does this, and equal weights do not: calendar
+  months are 28 to 31 days long, so an equal-weight average of monthly means is
+  not a time average. `compute_basic_stat(op='mean', dim='time')` gives every
+  month the same weight. `temporal_aggregate` is the only tool that weights by
+  month length and so the only correct way to average monthly data over a
+  period that spans different calendar months; its `freq='mean'` gives the
+  mean state of a period, the field a bias or an RMSE is measured on. Day
+  weights do not enter a monthly climatology, each calendar month averaged
+  across the years of a baseline (what an anomaly or a climate index is taken
+  against): that is the plain mean of that month's values over the years, as
+  climate normals are defined, and `compute_anomaly_vs_own_climatology` and the
+  index tools build it so.
+#### Common mistakes
+- Calling an MLD from climatological T/S profiles "the model's climatological
+  MLD". It is a different quantity from the time mean of the monthly MLDs.
+- Reporting a variance of monthly means as if it were sub-monthly variability.
+</fragments>
+
+Rules:
+1. For each fragment keep only what changes how THIS question is computed or how its result must be
+   stated. Write at most 2 notes per fragment, one line each, the most important first.
+2. Each note is actionable: the formula, threshold, unit conversion, weighting, tool argument or check
+   to apply, or the caveat the answer must state. Leave out background, the source's reasoning, and
+   points about variables, models or steps this question does not involve.
+3. Invent nothing; the notes must follow the fragment text. Every note must be backed by what the
+   fragment says: add no number, tool argument, rule or exception the fragment does not contain, and
+   never state the opposite of what it says. Copy numbers, formulas, variable names and tool names
+   exactly as the fragment writes them, and put variable and tool names in backticks. You may refer
+   to quantities the question itself defines (its thresholds, periods, regions).
+4. Only where the question's text actually states a definition or procedure that differs from the
+   fragment, write a note saying so, quoting the question's words: the question's version is
+   followed and the difference is stated in the answer. Where the question is silent, follow the
+   fragment, and never claim the question prescribes something it does not say.
+5. If, having read it, a fragment does not apply to this question, write
+   "[fragment-id] not applicable: <reason>" and no notes for it.
+6. Keep the whole answer under about 3600 characters.
+
+Follow this format strictly:
+<knowledge_notes>
+[fragment-id]
+- note
+- note
+[fragment-id] not applicable: reason
+</knowledge_notes>
+
+
+===== USER =====
+User question: Assess the nitrate-to-phosphate stoichiometry of intermediate water, 200 to 1000 m, in three CMIP6 models against the WOA23 observed climatology, and test whether the models reproduce the low-N:P signal left by denitrification.
+
+Data to use:
+- CMIP6 historical `no3` and `po4` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12, with each model's own volcello.
+- WOA23 nitrate and phosphate, the annual objectively analysed climatology.
+- The WOA23 basin mask (basinmask_01).
+
+Expected numerical results, for the 200-1000 m layer of each of the four sources (the three models' 1971-2000 climatologies and WOA23):
+- The mean N:P, to 2 decimal places, reported two ways and clearly labelled: the mean of the cell-by-cell N:P ratio (the headline value), and the ratio of the mean nitrate to the mean phosphate.
+- The ordinary least-squares regression NO3 = a * PO4 + b over all valid cells, each cell weighted equally, with model concentrations expressed in micromoles per kilogram at a constant density of 1025 kg/m3: the slope a to 2 decimal places, the intercept b in micromoles per kilogram to 2 decimal places, and the R-squared to 3 decimal places.
+- The percentage of water volume with N:P strictly between 14 and 18, to 1 decimal place.
+- For each of the four sources, the headline mean N:P in the Pacific, Atlantic and Indian Oceans (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded), to 2 decimal places.
+- The percentage of water volume with N:P below 12, globally and within the Pacific and the Indian Ocean, to 1 decimal place.
+- Whether each source's stoichiometry sits at, above or below Redfield, and whether each model reproduces the observed low-N:P volume and its basin distribution.
+
+Expected visualizations:
+- Figure 1, a 4-panel scatter of nitrate (y) against phosphate (x) in micromoles per kilogram over 200-1000 m, one panel per source in the order WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, with identical axis ranges and ticks, each panel showing its own fitted regression line and the Redfield 16:1 line through the origin, distinguishable from one another, and annotated with a, b and R-squared.
+- Figure 2, a 2-by-2 panel of global maps of the 200-1000 m mean N:P minus 16 for the four sources, drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only), on one shared diverging colour scale centred on zero.
+
+Now write the notes.
+
+===== RESPONSE =====
+<knowledge_notes>
+[cmip6-bgc-units-per-volume]
+- `no3`/`po4` are archived in mol m-3; convert to µmol kg-1 with µmol kg-1 = mmol m-3 × 1000 / ρ, where ρ is in kg m-3. The question prescribes a constant ρ = 1025 kg/m3; the fragment prefers the in-situ density for anything below the surface, so state that the constant-density assumption was used (`attrs['density_assumption']`).
+- N:P is a ratio of two tracers put on the mass basis with the same ρ, so it is scale-invariant and needs no conversion; only the µmol kg-1 regression does.
+
+[common-comparison-mask] not applicable: the question asks each source's own means and regression over its own valid cells, not a cell-by-cell model–observation score on one shared mask.
+
+[basin-and-region-definitions]
+- Take basins from the WOA23 mask with `select_basin` and `include_marginal_seas=True` (marginal seas folded into their parent ocean); state that this is a WOA labelling, not the OMIP 10-region one, and that the Southern and Arctic Oceans are separate basins (excluded here).
+- `depth_dependent=False` applies the surface labels through the whole column — what a named ocean usually means; with `depth_dependent=True` a marginal sea's label stops at its sill, so the two choices give different 200–1000 m basin means.
+
+[cmip6-static-grid-fields]
+- The layer thickness that respects partial bottom cells is `volcello` / `areacello` (`cell_thickness_like`), not `lev_bnds` differences: the two differ by more than 1 % in 14 % of GFDL-ESM4 cells and by up to ±50 % in 3.3 % of MPI-ESM1-2-LR cells.
+- Use each model's own `volcello` as the volume weight and report `attrs['volume_source']` alongside the numbers.
+
+[omip-weighted-means-and-integrals]
+- Volume-weight every mean over the 200–1000 m layer (`op='volume_weighted_mean'`), restricting the weights to the same valid cells; take the percentage of volume with N:P between 14 and 18, and below 12, from `compute_exceedance_fraction` and report the m3 behind each percentage.
+- The mean of a ratio is not the ratio of the means: `compute_ratio` gives the cell-by-cell N:P (the headline value); the ratio of the volume-weighted mean `no3` to the volume-weighted mean `po4` is a differently weighted quantity, so both are labelled as the question asks.
+
+[bgc-model-structure-comparison]
+- Interpret cross-model N:P spread as partly structural: fixed N:P per plankton type in GFDL-ESM4, prescribed Redfield organic matter in MPI-ESM1-2-LR, variable C:P in CESM2; "not detailed in paper" does not mean the feature is absent.
+
+[omip-native-grid-vs-regridded]
+- Compute every number (means, ratio of means, exceedance fractions) on each source's own grid with its own areas and volumes; regrid to a regular longitude–latitude grid for Figure 2 only, with 'conservative' for model fields and 'nearest_s2d' for categorical masks, and state the method.
+- Integrate the 200–1000 m layer thickness-weighted on the original levels; vertical interpolation onto another level set changes layer-integrated quantities and is for comparison, not budgets.
+
+[monthly-means-are-time-averages]
+- Build the 1971–2000 climatology with `temporal_aggregate(freq='mean')`, which weights by calendar month length; an equal-weight `op='mean'` over time is not a time average.
+- N:P is nonlinear, so the ratio is formed on each month's field and then averaged (diagnostic first, then average); state this order, since average-then-ratio is the diagnostic of the mean state.
+</knowledge_notes>

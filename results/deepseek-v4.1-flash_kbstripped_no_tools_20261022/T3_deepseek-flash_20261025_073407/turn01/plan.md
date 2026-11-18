@@ -1,0 +1,30 @@
+# Plan
+
+1. Open the raw WOA23 files; select `temperature` for the 1971-2000 climate normal, annual time slice, at 0 m depth, on the 1° grid; select `landsea_01` on the same grid. Define `woa_sst` as that 0 m annual field and `woa_ocean = landsea_01 > 1`. Compute the WOA23 global mean over the whole 1° grid as an unweighted arithmetic mean of all non-missing `woa_sst` cells; record the valid-cell count.
+- Note [omip-weighted-means-and-integrals]: Use area weights for global model means, Σ(field·areacello)/Σ(areacello) over valid cells—not a plain `mean()` on a curvilinear grid; `compute_difference_metrics` weights by area by default and `analyze_correlation` needs `weighting='area'`. The WOA value just computed is the requested whole-1°-grid mean, not an area-weighted mean over valid ocean cells; state which was computed.
+
+2. Open the raw CMIP6 historical files for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR; load `tos` monthly for 1971-01 to 2000-12 and each model’s Ofx `areacello` fixed field. For each model on its native grid, build the valid mask from `tos` and `areacello` themselves, discard fill/missing values, and compute the cell-wise 1971-2000 SST climatology as the time mean over the 360 monthly values. Compute each model’s global mean over its own native ocean grid with its own `areacello` using the area-weighted formula in [omip-weighted-means-and-integrals]; record the total ocean area Σ(areacello) over the valid cells used.
+- Note [missing-values-and-land-cells]: Build each field’s valid mask from the field itself, keep weights masked to those cells, and treat any value near 1e20 as an unmasked fill value, not a result.
+- Note [cmip6-static-grid-fields]: Use each model’s published `areacello` as the only correct area weight; total ocean areas differ by about a per cent, so state the area each mean was taken over rather than rescaling one model to another.
+- Note [cmip6-grid-labels]: GFDL-ESM4 `tos` is on its `gr` 1° archive grid with the regridded land–sea mask, so label its “native-grid” number as an archive-grid number.
+- Note [cmip6-tos-bulk-top-cell]: `tos` is bulk top-cell temperature (CESM2 0–10 m, GFDL-ESM4 0–2 m, MPI-ESM1-2-LR 0–12 m), not skin SST, so the comparison with WOA23 at 0 m is not exactly like-for-like; sea-ice-covered cells carry near-freezing under-ice water and are not missing, so mask consistency matters where WOA masks sea ice.
+- Note [omip-native-grid-vs-regridded]: Compute each model’s global mean on its own native grid with its own cell areas; regrid only for the bias maps, RMSE and pattern correlation, using conservative remapping, and state the method. A native-grid mean and a mean after regridding to 1° are different quantities and should not be expected to agree.
+
+3. Conservatively regrid each model’s native 1971-2000 SST climatology onto the WOA23 1° grid using area-conservative remapping [omip-native-grid-vs-regridded]; store the regridded fields for the shared-mask comparison and Figure 1.
+
+4. Build one shared comparison mask on the WOA23 1° grid from `woa_ocean` (`landsea_01 > 1`), valid `woa_sst`, and the valid regridded cells of all three models; this is the `build_comparison_mask` operation with `ocean_only=True` because WOA23 is the reference. Apply `.where(mask)` to each regridded model climatology and to `woa_sst` before any metric; record the mask cell count and total area.
+- Note [common-comparison-mask]: Put all fields and WOA23 on the 1° grid, build one mask over them with `build_comparison_mask` and apply `.where(mask)` to every field before any metric; `ocean_only=True` is correct here because WOA23 is the reference. Report the bias together with the means `compute_difference_metrics` returns over that shared sample (`mean_data`, `mean_reference`), not means over different cells, and report the mask’s cell count; a mask much smaller than the fields means the products disagree about where the ocean is, not that the models are poor.
+
+5. On the shared mask, for each model compute the area-weighted mean model SST and mean WOA23 SST using 1° cell-area weights proportional to cos(latitude), the area-weighted mean bias delta_SST = mean_model - mean_WOA, the area-weighted RMSE, and the area-weighted spatial Pearson correlation with WOA23; use the area weighting of `compute_difference_metrics` and `analyze_correlation(..., weighting='area')` [omip-weighted-means-and-integrals]. Report these to the requested 2 or 3 decimal places and pair each bias with the two means from the same shared sample.
+
+6. Rank the three models from smallest to largest absolute delta_SST using the unrounded biases from step 5.
+
+7. Draw Figure 1 as a 2×2 global map panel: the three bias fields (regridded model climatology minus WOA23) on the shared comparison cells, all with one shared diverging colour scale centred on zero (symmetric limits set by the largest absolute bias among the three), and the WOA23 0 m reference SST on the same cells with a sequential colour scale. Label every panel and give every colour bar the unit °C.
+
+8. Draw Figure 2 as a bar chart of the four global mean SST values: the native-grid area-weighted means for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR from step 2, and the WOA23 whole-1°-grid mean from step 1. Annotate each bar with its value to 2 decimal places and label the y axis in °C.
+
+9. Use the shared-mask bias fields and Figure 1 to describe the spatial structure of the bias, including the sign and broad regional/latitudinal patterns, not just the global mean.
+
+Other notes:
+- [cmip6-experiments-historical-ssp245] A single historical member cannot separate forced change from internal variability, and a given model year is not expected to match the observed year; the 1971-2000 climatology bias should carry that caveat.
+- The WOA23 bar in Figure 2 uses the whole-1°-grid mean from step 1; the WOA23 mean in the shared-mask comparison in step 5 is a different, area-weighted ocean-mask quantity. The bar chart therefore mixes native-grid area-weighted model means with the requested whole-grid WOA23 mean.

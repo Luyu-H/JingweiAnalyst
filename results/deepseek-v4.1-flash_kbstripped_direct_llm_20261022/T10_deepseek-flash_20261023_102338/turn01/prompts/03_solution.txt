@@ -1,0 +1,2989 @@
+# exchange 3: solution
+# elapsed: 71.0 s
+
+===== SYSTEM =====
+
+The user's question:
+Assess the global oxygen minimum zones (OMZ) simulated by CMIP6 models against the WOA23 observed climatology, and quantify how they change under the ssp245 scenario.
+
+Data to use:
+- CMIP6 historical `o2`, `thetao` and `so` from GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12. CESM2 publishes no `o2` for the historical experiment.
+- CMIP6 ssp245 `o2`, `thetao` and `so` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 2071-01 to 2100-12.
+- Each model's own volcello, areacello and deptho.
+- WOA23 oxygen, percent oxygen saturation and apparent oxygen utilization, on the 1971-2000 climate normal.
+- The WOA23 land-sea mask (landsea_01) and basin mask (basinmask_01).
+
+Oxygen concentrations and OMZ thresholds are in micromoles per kilogram.
+
+Expected numerical results, for the six source-and-experiment combinations (WOA23; GFDL-ESM4 and MPI-ESM1-2-LR historical 1971-2000; CESM2, GFDL-ESM4 and MPI-ESM1-2-LR ssp245 2071-2100) where applicable:
+- The total volume of water with oxygen strictly below 20 micromoles per kilogram, and separately strictly below 60, in units of 1e15 cubic metres to 3 significant figures.
+- At the 60 threshold, the maximum OMZ thickness (summed thickness of the water below the threshold in a column) in metres to 1 decimal place, with its latitude and longitude to 2 decimal places.
+- For GFDL-ESM4 and MPI-ESM1-2-LR, the percentage change in OMZ volume from historical to ssp245 at both thresholds, to 2 decimal places, positive for an expanding OMZ.
+- The total dissolved oxygen inventory of the global ocean in moles, to 3 significant figures, for GFDL-ESM4 and MPI-ESM1-2-LR historical and all three models for ssp245.
+- At the 60 threshold, the OMZ volume in the Pacific, Indian and Atlantic Oceans (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded) for WOA23 and the two historical models, in units of 1e15 cubic metres to 3 significant figures.
+- For WOA23, the mean apparent oxygen utilization (micromoles per kilogram) and percent oxygen saturation within the OMZ at the 60 threshold, each to 1 decimal place, and what they imply about whether the zone is set by respiration or by poor ventilation.
+- Which model reproduces the observed OMZ volume better, and whether the two models agree on the sign and size of the scenario change.
+
+Expected visualizations:
+- Figure 1, three global maps in one row of the historical OMZ thickness at the 60 threshold for GFDL-ESM4, MPI-ESM1-2-LR and WOA23, on one shared sequential colour scale in metres.
+- Figure 2, three global maps in one row: the change in OMZ thickness at the 60 threshold (ssp245 2071-2100 minus historical 1971-2000) for GFDL-ESM4 and MPI-ESM1-2-LR on one shared diverging colour scale centred on zero, and CESM2's ssp245 OMZ thickness on its own sequential scale, labelled to show that no change can be formed for CESM2.
+
+The code that ran:
+<executed_code>
+import os
+import glob
+import re
+import warnings
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+warnings.filterwarnings("ignore")
+
+WOA_ROOT = "/data1/lorraine-20419/ocean_data/WOA23/climatology"
+WOA_MASKS = "/data1/lorraine-20419/ocean_data/WOA23/masks"
+CMIP6_HIST_ROOT = "/data1/lorraine-20419/benchmark_cmip6/historical"
+CMIP6_SSP_ROOT = "/data1/lorraine-20419/benchmark_cmip6/ssp245"
+
+R_EARTH = 6371000.0
+BASIN_NAMES = {1: "Atlantic", 2: "Pacific", 3: "Indian", 4: "Southern", 5: "Arctic"}
+
+# Explicit chunks avoid dask's auto-rechunking, which cannot estimate object-dtype
+# sizes when use_cftime=True creates cftime time coordinates.
+CHUNKS = {
+    "time": 12,
+    "lev": 10,
+    "lat": 90,
+    "lon": 90,
+    "latitude": 90,
+    "longitude": 90,
+    "j": 110,
+    "i": 128,
+    "nlat": 192,
+    "nlon": 160,
+}
+
+# ---------------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------------
+def parse_variant(fname):
+    b = os.path.basename(fname)
+    m = re.search(r"_(r\d+i\d+p\d+f\d+)_", b)
+    return m.group(1) if m else None
+
+def nearest_index_1d(vals, centers):
+    vals = np.asarray(vals, dtype=float)
+    centers = np.asarray(centers, dtype=float)
+    idx = np.searchsorted(centers, vals)
+    idx = np.clip(idx, 1, len(centers) - 1)
+    left = centers[idx - 1]
+    right = centers[idx]
+    choose = np.where(np.abs(vals - left) <= np.abs(vals - right), idx - 1, idx)
+    return choose.astype(int)
+
+def compute_dz(depth):
+    depth = np.asarray(depth, dtype=float)
+    if depth.size == 1:
+        return np.array([max(depth[0], 1.0)])
+    edges = np.empty(depth.size + 1, dtype=float)
+    edges[0] = 0.0
+    edges[1:-1] = 0.5 * (depth[:-1] + depth[1:])
+    edges[-1] = depth[-1] + 0.5 * (depth[-1] - depth[-2])
+    return np.diff(edges)
+
+def compute_area(lat, lon, R=R_EARTH):
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    if lat.size > 1:
+        lat_edges = np.empty(lat.size + 1)
+        lat_edges[1:-1] = 0.5 * (lat[:-1] + lat[1:])
+        lat_edges[0] = lat[0] - 0.5 * (lat[1] - lat[0])
+        lat_edges[-1] = lat[-1] + 0.5 * (lat[-1] - lat[-2])
+    else:
+        lat_edges = np.array([lat[0] - 0.5, lat[0] + 0.5])
+    if lon.size > 1:
+        lon_edges = np.empty(lon.size + 1)
+        lon_edges[1:-1] = 0.5 * (lon[:-1] + lon[1:])
+        lon_edges[0] = lon[0] - 0.5 * (lon[1] - lon[0])
+        lon_edges[-1] = lon[-1] + 0.5 * (lon[-1] - lon[-2])
+    else:
+        lon_edges = np.array([lon[0] - 0.5, lon[0] + 0.5])
+    dphi = np.deg2rad(np.diff(lon_edges))
+    dsin = np.diff(np.sin(np.deg2rad(lat_edges)))
+    return R * R * np.outer(dsin, dphi)
+
+def read_msk_table(path):
+    with open(path, "r") as f:
+        lines = f.readlines()
+    start = 0
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("%"):
+            continue
+        tok = s.replace(",", " ").split()[0]
+        try:
+            float(tok)
+            start = i
+            break
+        except ValueError:
+            pass
+    # Preferred parser
+    try:
+        df = pd.read_csv(
+            path, sep=r"\s+", comment="#", header=None, skiprows=start,
+            na_values=["", "NaN", "nan", "****"]
+        )
+        arr = df.to_numpy(dtype=float)
+        if arr.ndim == 2 and arr.shape[1] >= 3:
+            return arr
+    except Exception:
+        pass
+    # Fallback parser, comma or whitespace
+    rows = []
+    for line in lines[start:]:
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("%"):
+            continue
+        s = s.replace(",", " ")
+        toks = s.split()
+        if not toks:
+            continue
+        try:
+            row = [float(t) for t in toks]
+        except ValueError:
+            continue
+        rows.append(row)
+    if not rows:
+        return np.empty((0, 0))
+    maxlen = max(len(r) for r in rows)
+    arr = np.full((len(rows), maxlen), np.nan)
+    for i, r in enumerate(rows):
+        arr[i, :len(r)] = r
+    return arr
+
+def build_woa_land_mask(land_path, woa_lat, woa_lon, nz):
+    try:
+        arr = read_msk_table(land_path)
+        if arr.shape[1] < 3:
+            return None
+        latvals = arr[:, 0]
+        lonvals = arr[:, 1]
+        bottom = arr[:, 2]
+        iy = nearest_index_1d(latvals, woa_lat)
+        lon180 = ((lonvals + 180.0) % 360.0) - 180.0
+        ix = nearest_index_1d(lon180, woa_lon)
+        bottom_grid = np.full((len(woa_lat), len(woa_lon)), np.nan)
+        for a, b, c in zip(iy, ix, bottom):
+            if np.isfinite(c):
+                bottom_grid[a, b] = c
+        ocean = np.zeros((nz, len(woa_lat), len(woa_lon)), dtype=bool)
+        for k in range(nz):
+            ocean[k] = (bottom_grid > 1) & ((bottom_grid - 1) >= k)
+        return ocean
+    except Exception:
+        return None
+
+def build_woa_basin(basin_path, woa_lat, woa_lon, nz):
+    arr = read_msk_table(basin_path)
+    if arr.shape[1] < 3:
+        return None, None
+    latvals = arr[:, 0]
+    lonvals = arr[:, 1]
+    levs = arr[:, 2:]
+    iy = nearest_index_1d(latvals, woa_lat)
+    lon180 = ((lonvals + 180.0) % 360.0) - 180.0
+    ix = nearest_index_1d(lon180, woa_lon)
+    nzb = min(nz, levs.shape[1])
+    basin3d = np.full((nz, len(woa_lat), len(woa_lon)), np.nan)
+    for k in range(nzb):
+        vals = levs[:, k]
+        ok = np.isfinite(vals) & (vals > 0)
+        basin3d[k, iy[ok], ix[ok]] = vals[ok]
+    basin2d = np.full((len(woa_lat), len(woa_lon)), np.nan)
+    for k in range(nzb - 1, -1, -1):
+        vals = basin3d[k]
+        ok = np.isfinite(vals) & (vals > 0)
+        basin2d[ok] = vals[ok]
+    return basin3d, basin2d
+
+def map_basin_to_grid(basin2d, lat2d, lon2d, woa_lat, woa_lon):
+    iy = nearest_index_1d(lat2d.ravel(), woa_lat).reshape(lat2d.shape)
+    lon180 = ((lon2d + 180.0) % 360.0) - 180.0
+    ix = nearest_index_1d(lon180.ravel(), woa_lon).reshape(lon2d.shape)
+    return basin2d[iy, ix]
+
+def open_woa_var(prefix, subdir, tag, nn=0):
+    path = os.path.join(WOA_ROOT, subdir, f"woa23_{tag}_{prefix}{nn:02d}_01.nc")
+    ds = xr.open_dataset(path, decode_times=False)
+    candidates = [
+        f"{prefix}_an", f"{prefix}an", f"{prefix.upper()}_an", f"{prefix.lower()}_an", "an"
+    ]
+    vname = None
+    for c in candidates:
+        if c in ds.data_vars:
+            vname = c
+            break
+    if vname is None:
+        for n in ds.data_vars:
+            if "an" in n.lower() and not n.endswith("_bnds"):
+                vname = n
+                break
+    da = ds[vname]
+    if "time" in da.dims:
+        da = da.isel(time=0)
+    da = da.squeeze(drop=True)
+    return da, ds
+
+def density_kg_m3(theta_c, salt, depth_m, lon2d, lat2d):
+    # theta_c: (nz, ny, nx), salt: same, depth_m: (nz,)
+    try:
+        import gsw
+        p3 = np.broadcast_to(depth_m[:, None, None], theta_c.shape)
+        lon3 = np.broadcast_to(lon2d[None, :, :], theta_c.shape)
+        lat3 = np.broadcast_to(lat2d[None, :, :], theta_c.shape)
+        SA = gsw.SA_from_SP(salt, p3, lon3, lat3)
+        rho = gsw.rho(SA, theta_c, p3)
+        return rho
+    except Exception:
+        T = theta_c
+        S = salt
+        rho_w = (
+            999.842594 + 6.793952e-2 * T - 9.095290e-3 * T**2
+            + 1.001685e-4 * T**3 - 1.120083e-6 * T**4 + 6.536332e-9 * T**5
+        )
+        A = (
+            0.824493 - 4.0899e-3 * T + 7.6438e-5 * T**2
+            - 8.2467e-7 * T**3 + 5.3875e-9 * T**4
+        )
+        B = -5.72466e-3 + 1.0227e-4 * T - 1.6546e-6 * T**2
+        C = 4.8314e-4
+        rho = rho_w + A * S + B * np.power(S, 1.5) + C * S**2
+        p3 = np.broadcast_to(depth_m[:, None, None], T.shape)
+        rho = rho + 0.0045 * p3
+        return rho
+
+# ---------------------------------------------------------------------------
+# WOA23 oxygen, AOU, saturation
+# ---------------------------------------------------------------------------
+woa_o2_da, woa_o2_ds = open_woa_var(
+    "o", "oxygen/1971-2000_climate_normal", "decav71A0", nn=0
+)
+woa_aou_da, _ = open_woa_var(
+    "A", "apparent_oxygen_utilization/1971-2000_climate_normal", "decav71A0", nn=0
+)
+woa_sat_da, _ = open_woa_var(
+    "O", "percent_oxygen_saturation/1971-2000_climate_normal", "decav71A0", nn=0
+)
+
+woa_depth = np.asarray(woa_o2_ds["depth"].values, dtype=float)
+woa_lat = np.asarray(woa_o2_ds["lat"].values, dtype=float)
+woa_lon = np.asarray(woa_o2_ds["lon"].values, dtype=float)
+woa_nz = len(woa_depth)
+
+woa_land_mask = build_woa_land_mask(
+    os.path.join(WOA_MASKS, "landsea_01.msk"), woa_lat, woa_lon, woa_nz
+)
+woa_basin3d, woa_basin2d = build_woa_basin(
+    os.path.join(WOA_MASKS, "basinmask_01.msk"), woa_lat, woa_lon, woa_nz
+)
+
+def analyze_woa(o2_da, depth_vals, lat_vals, lon_vals, land_mask, basin3d):
+    o2 = o2_da.transpose("depth", "lat", "lon").values.astype(float)
+    nz, ny, nx = o2.shape
+    depth_vals = np.asarray(depth_vals, dtype=float)[:nz]
+    dz = compute_dz(depth_vals)
+    area = compute_area(lat_vals, lon_vals)
+    vol = area[None, :, :] * dz[:, None, None]
+    ocean = np.isfinite(o2)
+    if land_mask is not None:
+        ocean &= land_mask[:nz, :, :]
+
+    vol20 = np.nansum(np.where(ocean & (o2 < 20.0), vol, 0.0))
+    vol60 = np.nansum(np.where(ocean & (o2 < 60.0), vol, 0.0))
+
+    thick60 = np.nansum(
+        np.where(ocean & (o2 < 60.0), dz[:, None, None], 0.0), axis=0
+    )
+    idx = np.nanargmax(thick60)
+    iy, ix = np.unravel_index(idx, thick60.shape)
+    lon2d, lat2d = np.meshgrid(lon_vals, lat_vals)
+    lat_max = float(lat2d[iy, ix])
+    lon_max = float(((lon2d[iy, ix] + 180.0) % 360.0) - 180.0)
+
+    basin_vols = {}
+    if basin3d is not None:
+        b3 = basin3d[:nz, :, :]
+        for code in [1, 2, 3]:
+            basin_vols[code] = (
+                np.nansum(
+                    np.where(ocean & (o2 < 60.0) & (b3 == code), vol, 0.0)
+                ) / 1e15
+            )
+
+    return dict(
+        vol_below20_1e15=vol20 / 1e15,
+        vol_below60_1e15=vol60 / 1e15,
+        max_thickness60_m=float(np.nanmax(thick60)),
+        max_lat=lat_max,
+        max_lon=lon_max,
+        basin_vol60_1e15=basin_vols,
+        thickness60_m=thick60,
+        lat2d=lat2d,
+        lon2d=lon2d,
+        o2_umolkg=o2,
+        vol_m3=vol,
+        ocean_mask=ocean,
+    )
+
+woa_res = analyze_woa(
+    woa_o2_da, woa_depth, woa_lat, woa_lon, woa_land_mask, woa_basin3d
+)
+woa_res["basin_vol60_named"] = {
+    BASIN_NAMES[k]: v for k, v in woa_res["basin_vol60_1e15"].items()
+}
+
+aou_arr = woa_aou_da.transpose("depth", "lat", "lon").values.astype(float)
+sat_arr = woa_sat_da.transpose("depth", "lat", "lon").values.astype(float)
+mask60_woa = woa_res["ocean_mask"] & (woa_res["o2_umolkg"] < 60.0)
+w_omz = woa_res["vol_m3"] * mask60_woa
+woa_res["omz_aou_umolkg"] = float(
+    np.nansum(aou_arr * w_omz) / np.nansum(w_omz)
+)
+woa_res["omz_o2sat_percent"] = float(
+    np.nansum(sat_arr * w_omz) / np.nansum(w_omz)
+)
+
+omz_results = {"WOA23": woa_res}
+hist_maps = {
+    "WOA23": {
+        "thickness60": woa_res["thickness60_m"],
+        "lat": woa_res["lat2d"],
+        "lon": woa_res["lon2d"],
+    }
+}
+ssp_maps = {}
+change_maps = {}
+
+# ---------------------------------------------------------------------------
+# CMIP6 loaders
+# ---------------------------------------------------------------------------
+MODEL_CFG = {
+    "CESM2": dict(
+        y_dim="nlat", x_dim="nlon", lat_coord="lat", lon_coord="lon",
+        depth_coord="lev", depth_scale=0.01, ocean_mask_from="sftof"
+    ),
+    "GFDL-ESM4": dict(
+        y_dim="lat", x_dim="lon", lat_coord="lat", lon_coord="lon",
+        depth_coord="lev", depth_scale=1.0
+    ),
+    "MPI-ESM1-2-LR": dict(
+        y_dim="j", x_dim="i", lat_coord="latitude", lon_coord="longitude",
+        depth_coord="lev", depth_scale=1.0
+    ),
+}
+
+def select_files(root, model, var, exp, preferred_variant=None, fallback_root=None):
+    files = sorted(glob.glob(os.path.join(root, model, var, "*.nc")))
+    used_root = root
+    if not files and fallback_root is not None:
+        files = sorted(glob.glob(os.path.join(fallback_root, model, var, "*.nc")))
+        used_root = fallback_root
+    if not files:
+        return None, None, None
+    groups = {}
+    for f in files:
+        v = parse_variant(f) or "unknown"
+        groups.setdefault(v, []).append(f)
+    if preferred_variant is not None and preferred_variant in groups:
+        v = preferred_variant
+    else:
+        v = max(groups, key=lambda k: len(groups[k]))
+    return sorted(groups[v]), v, used_root
+
+def open_cmip_da(
+    root, model, var, exp, y0=None, y1=None,
+    preferred_variant=None, fallback_root=None, mean_time=False
+):
+    files, variant, _ = select_files(
+        root, model, var, exp, preferred_variant, fallback_root
+    )
+    if not files:
+        return None, None
+    if var in ["areacello", "deptho", "sftof"] and len(files) > 1:
+        files = files[:1]
+    if len(files) == 1:
+        ds = xr.open_dataset(files[0], use_cftime=True, chunks=CHUNKS)
+    else:
+        ds = xr.open_mfdataset(
+            files, combine="by_coords", use_cftime=True, chunks=CHUNKS
+        )
+    vname = var if var in ds else None
+    if vname is None:
+        for n in ds.data_vars:
+            if n.lower() == var.lower():
+                vname = n
+                break
+    if vname is None:
+        candidates = [
+            n for n in ds.data_vars
+            if not n.endswith("_bnds")
+            and n not in ["time_bnds", "lat_bnds", "lon_bnds", "lev_bnds"]
+        ]
+        if not candidates:
+            return None, variant
+        vname = candidates[0]
+    da = ds[vname]
+    if "time" in da.dims and y0 is not None:
+        yrs = da.time.dt.year
+        mask = (yrs >= y0) & (yrs <= y1)
+        if bool(mask.any().compute()):
+            da = da.where(mask, drop=True)
+    if mean_time and "time" in da.dims:
+        da = da.mean("time")
+    return da, variant
+
+def to_3d(da, cfg):
+    da = da.squeeze(drop=True)
+    dims = [cfg["depth_coord"], cfg["y_dim"], cfg["x_dim"]]
+    da = da.transpose(*dims)
+    return np.asarray(da.values, dtype=float)
+
+def to_2d(da, cfg):
+    da = da.squeeze(drop=True)
+    da = da.transpose(cfg["y_dim"], cfg["x_dim"])
+    return np.asarray(da.values, dtype=float)
+
+def get_latlon_2d(da, cfg):
+    lat = da[cfg["lat_coord"]]
+    lon = da[cfg["lon_coord"]]
+    if lat.ndim == 1:
+        lon2d, lat2d = np.meshgrid(lon.values, lat.values)
+    else:
+        lat2d = np.asarray(lat.values)
+        lon2d = np.asarray(lon.values)
+    return lat2d, lon2d
+
+def load_model_fields(root, hist_root, model, exp, y0, y1):
+    cfg = MODEL_CFG[model]
+
+    o2_da, o2_variant = open_cmip_da(
+        root, model, "o2", exp, y0, y1, mean_time=False
+    )
+    if o2_da is None:
+        return None
+    theta_da, _ = open_cmip_da(
+        root, model, "thetao", exp, y0, y1,
+        preferred_variant=o2_variant, mean_time=False
+    )
+    so_da, _ = open_cmip_da(
+        root, model, "so", exp, y0, y1,
+        preferred_variant=o2_variant, mean_time=False
+    )
+    if theta_da is None or so_da is None:
+        return None
+
+    o2_da, theta_da, so_da = xr.align(o2_da, theta_da, so_da, join="inner")
+    if o2_da.sizes.get("time", 0) == 0:
+        return None
+
+    o2_mean = o2_da.mean("time").compute()
+    theta_mean = theta_da.mean("time").compute()
+    so_mean = so_da.mean("time").compute()
+
+    vol_da, _ = open_cmip_da(
+        root, model, "volcello", exp, y0, y1,
+        preferred_variant=o2_variant, fallback_root=hist_root, mean_time=True
+    )
+    if vol_da is None:
+        return None
+
+    area_da, _ = open_cmip_da(
+        root, model, "areacello", exp, None, None,
+        fallback_root=hist_root, mean_time=True
+    )
+    if area_da is None:
+        return None
+
+    o2_arr = to_3d(o2_mean, cfg)
+    theta_arr = to_3d(theta_mean, cfg)
+    so_arr = to_3d(so_mean, cfg)
+    vol_arr = to_3d(vol_da, cfg)
+    area_arr = to_2d(area_da, cfg)
+
+    # Some models (e.g. CESM2) publish areacello over the whole globe; their
+    # sftof gives the ocean fraction and must be applied to get ocean area.
+    if cfg.get("ocean_mask_from"):
+        mask_da, _ = open_cmip_da(
+            root, model, cfg["ocean_mask_from"], exp, None, None,
+            fallback_root=hist_root, mean_time=True
+        )
+        if mask_da is not None:
+            mask_arr = to_2d(mask_da, cfg)
+            area_arr = area_arr * mask_arr
+
+    lat2d, lon2d = get_latlon_2d(o2_mean, cfg)
+    depth = np.asarray(o2_mean[cfg["depth_coord"]].values, dtype=float)
+    depth = depth * cfg["depth_scale"]
+
+    o2_units = str(o2_mean.attrs.get("units", "")).lower()
+    # True here means O2 is expressed per unit mass of seawater (mol kg-1).
+    o2_is_mass = ("mol" in o2_units and "kg" in o2_units)
+
+    theta_units = str(theta_mean.attrs.get("units", ""))
+    if (("K" in theta_units and "deg" not in theta_units.lower())
+            or (np.isfinite(np.nanmean(theta_arr)) and np.nanmean(theta_arr) > 100)):
+        theta_arr = theta_arr - 273.15
+
+    return dict(
+        model=model, exp=exp,
+        o2_arr=o2_arr, o2_is_mass=o2_is_mass,
+        theta_arr=theta_arr, so_arr=so_arr,
+        vol_arr=vol_arr, area_arr=area_arr,
+        depth=depth, lat2d=lat2d, lon2d=lon2d,
+        o2_units=o2_units
+    )
+
+def analyze_model(fields, basin2d_woa=None, woa_lat=None, woa_lon=None):
+    o2 = fields["o2_arr"]
+    theta = fields["theta_arr"]
+    salt = fields["so_arr"]
+    vol = fields["vol_arr"]
+    area = fields["area_arr"]
+    depth = fields["depth"]
+    lat2d = fields["lat2d"]
+    lon2d = fields["lon2d"]
+
+    rho = density_kg_m3(theta, salt, depth, lon2d, lat2d)
+
+    if fields["o2_is_mass"]:
+        # mol kg-1 -> micromoles per kilogram
+        o2_umolkg = o2 * 1e6
+    else:
+        # assumed mol m-3 -> micromoles per kilogram
+        o2_umolkg = o2 * 1e6 / rho
+        med = np.nanmedian(o2_umolkg)
+        if np.isfinite(med):
+            if med < 1.0:
+                o2_umolkg = o2_umolkg * 1000.0
+            elif med > 10000.0:
+                # Defensive fallback for files whose numerical values are already per-mass.
+                o2_umolkg = o2.copy()
+
+    o2_mol = o2_umolkg * rho / 1e6
+
+    ocean = (
+        np.isfinite(o2_umolkg)
+        & np.isfinite(vol)
+        & (vol > 0)
+        & np.isfinite(o2_mol)
+    )
+
+    vol20 = np.nansum(np.where(ocean & (o2_umolkg < 20.0), vol, 0.0))
+    vol60 = np.nansum(np.where(ocean & (o2_umolkg < 60.0), vol, 0.0))
+
+    area3 = np.broadcast_to(area[None, :, :], vol.shape)
+    thick_lev = np.divide(
+        vol, area3, out=np.zeros_like(vol, dtype=float), where=(area3 > 0)
+    )
+    thick60 = np.nansum(
+        np.where(ocean & (o2_umolkg < 60.0), thick_lev, 0.0), axis=0
+    )
+    idx = np.nanargmax(thick60)
+    iy, ix = np.unravel_index(idx, thick60.shape)
+    lat_max = float(lat2d[iy, ix])
+    lon_max = float(((lon2d[iy, ix] + 180.0) % 360.0) - 180.0)
+
+    inventory_mol = np.nansum(np.where(ocean, o2_mol * vol, 0.0))
+
+    basin_vols = {}
+    if basin2d_woa is not None:
+        basin = map_basin_to_grid(basin2d_woa, lat2d, lon2d, woa_lat, woa_lon)
+        for code in [1, 2, 3]:
+            basin_vols[code] = (
+                np.nansum(
+                    np.where(
+                        ocean & (o2_umolkg < 60.0) & (basin[None, :, :] == code),
+                        vol, 0.0
+                    )
+                ) / 1e15
+            )
+
+    return dict(
+        vol_below20_1e15=vol20 / 1e15,
+        vol_below60_1e15=vol60 / 1e15,
+        max_thickness60_m=float(np.nanmax(thick60)),
+        max_lat=lat_max,
+        max_lon=lon_max,
+        inventory_mol=float(inventory_mol),
+        basin_vol60_1e15=basin_vols,
+        thickness60_m=thick60,
+        lat2d=lat2d,
+        lon2d=lon2d,
+        o2_umolkg=o2_umolkg,
+        vol_m3=vol,
+        ocean_mask=ocean,
+    )
+
+# ---------------------------------------------------------------------------
+# Historical CMIP6: GFDL-ESM4 and MPI-ESM1-2-LR, 1971-2000
+# ---------------------------------------------------------------------------
+for model in ["GFDL-ESM4", "MPI-ESM1-2-LR"]:
+    fields = load_model_fields(
+        CMIP6_HIST_ROOT, None, model, "historical", 1971, 2000
+    )
+    if fields is None:
+        continue
+    res = analyze_model(fields, woa_basin2d, woa_lat, woa_lon)
+    res["basin_vol60_named"] = {
+        BASIN_NAMES[k]: v for k, v in res["basin_vol60_1e15"].items()
+    }
+    key = f"{model}_historical"
+    omz_results[key] = res
+    hist_maps[model] = {
+        "thickness60": res["thickness60_m"],
+        "lat": res["lat2d"],
+        "lon": res["lon2d"],
+    }
+
+# ---------------------------------------------------------------------------
+# ssp245 CMIP6: CESM2, GFDL-ESM4, MPI-ESM1-2-LR, 2071-2100
+# ---------------------------------------------------------------------------
+for model in ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]:
+    fields = load_model_fields(
+        CMIP6_SSP_ROOT, CMIP6_HIST_ROOT, model, "ssp245", 2071, 2100
+    )
+    if fields is None:
+        continue
+    res = analyze_model(fields, woa_basin2d, woa_lat, woa_lon)
+    res["basin_vol60_named"] = {
+        BASIN_NAMES[k]: v for k, v in res["basin_vol60_1e15"].items()
+    }
+    key = f"{model}_ssp245"
+    omz_results[key] = res
+    ssp_maps[model] = {
+        "thickness60": res["thickness60_m"],
+        "lat": res["lat2d"],
+        "lon": res["lon2d"],
+    }
+
+# ---------------------------------------------------------------------------
+# Changes and summary tables
+# ---------------------------------------------------------------------------
+for model in ["GFDL-ESM4", "MPI-ESM1-2-LR"]:
+    if model in hist_maps and model in ssp_maps:
+        h = hist_maps[model]
+        s = ssp_maps[model]
+        change_maps[model] = {
+            "thickness60_change": s["thickness60"] - h["thickness60"],
+            "lat": s["lat"],
+            "lon": s["lon"],
+        }
+
+omz_change_pct = {}
+for model in ["GFDL-ESM4", "MPI-ESM1-2-LR"]:
+    hkey = f"{model}_historical"
+    skey = f"{model}_ssp245"
+    if hkey in omz_results and skey in omz_results:
+        omz_change_pct[model] = {}
+        for thr in [20, 60]:
+            hval = omz_results[hkey][f"vol_below{thr}_1e15"]
+            sval = omz_results[skey][f"vol_below{thr}_1e15"]
+            omz_change_pct[model][str(thr)] = (
+                (sval - hval) / hval * 100.0 if hval != 0 else np.nan
+            )
+
+woa_vol60 = omz_results["WOA23"]["vol_below60_1e15"]
+hist_model_bias_60 = {}
+for model in ["GFDL-ESM4", "MPI-ESM1-2-LR"]:
+    key = f"{model}_historical"
+    if key in omz_results:
+        hist_model_bias_60[model] = (
+            omz_results[key]["vol_below60_1e15"] - woa_vol60
+        )
+better_model_60 = (
+    min(hist_model_bias_60, key=lambda m: abs(hist_model_bias_60[m]))
+    if hist_model_bias_60 else None
+)
+
+summary_rows = []
+for key, res in omz_results.items():
+    summary_rows.append(dict(
+        source=key,
+        vol_below20_1e15=res["vol_below20_1e15"],
+        vol_below60_1e15=res["vol_below60_1e15"],
+        max_thickness60_m=res["max_thickness60_m"],
+        max_lat=res["max_lat"],
+        max_lon=res["max_lon"],
+        inventory_mol=res.get("inventory_mol", np.nan),
+    ))
+omz_summary = pd.DataFrame(summary_rows)
+
+basin_rows = []
+for key in ["WOA23", "GFDL-ESM4_historical", "MPI-ESM1-2-LR_historical"]:
+    if key in omz_results:
+        for bname in ["Pacific", "Indian", "Atlantic"]:
+            basin_rows.append(dict(
+                source=key,
+                basin=bname,
+                vol60_1e15=omz_results[key]["basin_vol60_named"].get(bname, np.nan),
+            ))
+basin_vol_table = pd.DataFrame(basin_rows)
+
+woa_omz_aou_umolkg = woa_res["omz_aou_umolkg"]
+woa_omz_o2sat_percent = woa_res["omz_o2sat_percent"]
+
+# --- visualization ---
+# ---------------------------------------------------------------------------
+# Plot helpers
+# ---------------------------------------------------------------------------
+def _plot_field(ax, d, field, **kwargs):
+    lon = np.asarray(d["lon"], dtype=float)
+    lat = np.asarray(d["lat"], dtype=float)
+    data = np.asarray(d[field], dtype=float)
+
+    if lon.ndim == 2 and lat.ndim == 2:
+        # For a regular lon/lat grid, sort longitude so the wrap-around seam is less ugly.
+        if np.allclose(lon[0, :], lon[1, :]) if lon.shape[0] > 1 else True:
+            order = np.argsort(((lon[0, :] + 180.0) % 360.0) - 180.0)
+            lonp = ((lon[0, order] + 180.0) % 360.0) - 180.0
+            latp = lat[:, 0]
+            datap = data[:, order]
+            ax.pcolormesh(lonp, latp, datap, shading="auto", **kwargs)
+            return
+        lonp = ((lon + 180.0) % 360.0) - 180.0
+        ax.pcolormesh(lonp, lat, data, shading="auto", **kwargs)
+    else:
+        ax.pcolormesh(lon, lat, data, shading="auto", **kwargs)
+
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-90, 90)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+# ---------------------------------------------------------------------------
+# Figure 1: historical OMZ thickness at O2 < 60 umol/kg
+# ---------------------------------------------------------------------------
+hist_keys = [
+    ("GFDL-ESM4", "GFDL-ESM4 historical"),
+    ("MPI-ESM1-2-LR", "MPI-ESM1-2-LR historical"),
+    ("WOA23", "WOA23 1971-2000"),
+]
+hist_available = [(k, t) for k, t in hist_keys if k in hist_maps]
+vmax_hist = max(
+    np.nanmax(hist_maps[k]["thickness60"]) for k, _ in hist_available
+)
+
+fig1, axes1 = plt.subplots(
+    1, len(hist_available), figsize=(6.0 * len(hist_available), 4.6),
+    constrained_layout=True, squeeze=False
+)
+axes1 = axes1.ravel()
+p1 = None
+for ax, (key, title) in zip(axes1, hist_available):
+    d = hist_maps[key]
+    p1 = _plot_field(
+        ax, d, "thickness60",
+        cmap="viridis", vmin=0.0, vmax=vmax_hist
+    )
+    ax.set_title(title)
+if p1 is not None:
+    fig1.colorbar(
+        p1, ax=list(axes1), shrink=0.82,
+        label="OMZ thickness for O2 < 60 $\\mu$mol kg$^{-1}$ (m)"
+    )
+
+# ---------------------------------------------------------------------------
+# Figure 2: ssp245 - historical change, plus CESM2 ssp245 alone
+# ---------------------------------------------------------------------------
+change_keys = [k for k in ["GFDL-ESM4", "MPI-ESM1-2-LR"] if k in change_maps]
+vmax_change = max(
+    np.nanmax(np.abs(change_maps[k]["thickness60_change"]))
+    for k in change_keys
+) if change_keys else 1.0
+
+fig2, axes2 = plt.subplots(
+    1, 3, figsize=(18.0, 4.6), constrained_layout=True, squeeze=False
+)
+axes2 = axes2.ravel()
+
+p_change = None
+for ax, model in zip(axes2[:2], ["GFDL-ESM4", "MPI-ESM1-2-LR"]):
+    if model in change_maps:
+        d = change_maps[model]
+        p_change = _plot_field(
+            ax, d, "thickness60_change",
+            cmap="RdBu_r", vmin=-vmax_change, vmax=vmax_change
+        )
+        ax.set_title(f"{model} ssp245 2071-2100 minus historical 1971-2000")
+    else:
+        ax.set_title(f"{model}: change unavailable")
+        ax.axis("off")
+
+# Third panel: CESM2 ssp245 thickness, no historical comparison possible.
+ax = axes2[2]
+if "CESM2" in ssp_maps:
+    d = ssp_maps["CESM2"]
+    p_cesm = _plot_field(
+        ax, d, "thickness60",
+        cmap="viridis", vmin=0.0,
+        vmax=float(np.nanmax(d["thickness60"]))
+    )
+    ax.set_title(
+        "CESM2 ssp245 2071-2100 OMZ thickness\n"
+        "no historical o2; change cannot be formed"
+    )
+    fig2.colorbar(
+        p_cesm, ax=ax, shrink=0.82,
+        label="OMZ thickness for O2 < 60 $\\mu$mol kg$^{-1}$ (m)"
+    )
+else:
+    ax.set_title("CESM2 ssp245 unavailable")
+    ax.axis("off")
+
+if p_change is not None:
+    fig2.colorbar(
+        p_change, ax=axes2[:2], shrink=0.82,
+        label="OMZ thickness change (m)"
+    )
+</executed_code>
+
+Status: computation succeeded; visualization generated
+
+Results:
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "WOA_ROOT": "/data1/lorraine-20419/ocean_data/WOA23/climatology",
+      "WOA_MASKS": "/data1/lorraine-20419/ocean_data/WOA23/masks",
+      "CMIP6_HIST_ROOT": "/data1/lorraine-20419/benchmark_cmip6/historical",
+      "CMIP6_SSP_ROOT": "/data1/lorraine-20419/benchmark_cmip6/ssp245",
+      "R_EARTH": 6371000.0,
+      "BASIN_NAMES": {
+        "1": "Atlantic",
+        "2": "Pacific",
+        "3": "Indian",
+        "4": "Southern",
+        "5": "Arctic"
+      },
+      "CHUNKS": {
+        "time": 12,
+        "lev": 10,
+        "lat": 90,
+        "lon": 90,
+        "latitude": 90,
+        "longitude": 90,
+        "j": 110,
+        "i": 128,
+        "nlat": 192,
+        "nlon": 160
+      },
+      "woa_o2_da": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 102,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "micromoles_per_kilogram",
+        "long_name": "Objectively analyzed mean fields for moles_of_oxygen_per_unit_mass_in_sea_water at standard depth levels.",
+        "size": 6609600,
+        "n_valid": 3305010,
+        "min": 0.0,
+        "max": 501.3956298828125,
+        "mean": 203.04458618164062,
+        "std": 77.72876739501953
+      },
+      "woa_o2_ds": {
+        "crs": {
+          "type": "DataArray",
+          "dims": {},
+          "size": 1,
+          "n_valid": 1,
+          "min": -2147483647.0,
+          "max": -2147483647.0,
+          "mean": -2147483647.0,
+          "std": 0.0,
+          "values": -2147483647
+        },
+        "lat_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "nbounds": 2
+          },
+          "size": 360,
+          "n_valid": 360,
+          "min": -90.0,
+          "max": 90.0,
+          "mean": 0.0,
+          "std": 51.96312713623047
+        },
+        "lon_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "lon": 360,
+            "nbounds": 2
+          },
+          "size": 720,
+          "n_valid": 720,
+          "min": -180.0,
+          "max": 180.0,
+          "mean": 0.0,
+          "std": 103.9238510131836
+        },
+        "depth_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 102,
+            "nbounds": 2
+          },
+          "size": 204,
+          "n_valid": 204,
+          "min": 0.0,
+          "max": 5500.0,
+          "mean": 1738.2353515625,
+          "std": 1683.3563232421875
+        },
+        "climatology_bounds": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "nbounds": 2
+          },
+          "size": 2,
+          "n_valid": 2,
+          "min": 1704.0,
+          "max": 2064.0,
+          "mean": 1884.0,
+          "std": 180.0,
+          "values": [
+            [
+              1704.0,
+              2064.0
+            ]
+          ]
+        },
+        "o_an": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "micromoles_per_kilogram",
+          "long_name": "Objectively analyzed mean fields for moles_of_oxygen_per_unit_mass_in_sea_water at standard depth levels.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 501.3956298828125,
+          "mean": 203.04458618164062,
+          "std": 77.72876739501953
+        },
+        "o_mn": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "micromoles_per_kilogram",
+          "long_name": "Average of all unflagged interpolated values at each standard depth level for moles_of_oxygen_per_unit_mass_in_sea_water in each grid-square which contain at least one measurement.",
+          "size": 6609600,
+          "n_valid": 1351374,
+          "min": 0.0,
+          "max": 479.2699890136719,
+          "mean": 202.83033752441406,
+          "std": 77.49031066894531
+        },
+        "o_dd": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "The number of observations of moles_of_oxygen_per_unit_mass_in_sea_water in each grid-square at each standard depth level.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 13108.0,
+          "mean": 3.8013179990378245,
+          "std": 51.473597506156864
+        },
+        "o_sd": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "micromoles_per_kilogram",
+          "long_name": "The standard deviation about the statistical mean of moles_of_oxygen_per_unit_mass_in_sea_water in each grid-square at each standard depth level.",
+          "size": 6609600,
+          "n_valid": 1338320,
+          "min": 0.0,
+          "max": 172.19424438476562,
+          "mean": 5.605936050415039,
+          "std": 8.393311500549316
+        },
+        "o_se": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "micromoles_per_kilogram",
+          "long_name": "The standard error about the statistical mean of moles_of_oxygen_per_unit_mass_in_sea_water in each grid-square at each standard depth level.",
+          "size": 6609600,
+          "n_valid": 1338320,
+          "min": 0.0,
+          "max": 100.60810089111328,
+          "mean": 2.2078042030334473,
+          "std": 3.395354986190796
+        },
+        "o_oa": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "micromoles_per_kilogram",
+          "long_name": "statistical mean value minus the objectively analyzed mean value for moles_of_oxygen_per_unit_mass_in_sea_water.",
+          "size": 6609600,
+          "n_valid": 1351374,
+          "min": -187.0982666015625,
+          "max": 221.23248291015625,
+          "mean": 0.10021252185106277,
+          "std": 10.945794105529785
+        },
+        "o_gp": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "The number of grid-squares within the smallest radius of influence around each grid-square which contain a statistical mean for moles_of_oxygen_per_unit_mass_in_sea_water.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 186.0,
+          "mean": 27.099053558083032,
+          "std": 20.662438987800133
+        },
+        "o_sdo": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "micromoles_per_kilogram",
+          "long_name": "Objectively analyzed standard deviation fields for moles_of_oxygen_per_unit_mass_in_sea_water at standard depth levels.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 155.61959838867188,
+          "mean": 6.293660640716553,
+          "std": 6.471816539764404
+        },
+        "o_sea": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "micromoles_per_kilogram",
+          "long_name": "The standard error about the objectively analyzed data of moles_of_oxygen_per_unit_mass_in_sea_water defined in Levitus et al. (2012) GRL.",
+          "size": 6609600,
+          "n_valid": 3279547,
+          "min": 0.0,
+          "max": 39.594669342041016,
+          "mean": 0.1950782686471939,
+          "std": 0.3676817715167999
+        }
+      },
+      "woa_aou_da": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 102,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "micromoles_per_kilogram",
+        "long_name": "Objectively analyzed mean fields for apparent_oxygen_utilization at standard depth levels.",
+        "size": 6609600,
+        "n_valid": 3305010,
+        "min": -8.0,
+        "max": 342.7116394042969,
+        "mean": 106.59546661376953,
+        "std": 82.23362731933594
+      },
+      "woa_sat_da": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 102,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "percent",
+        "long_name": "Objectively analyzed mean fields for fractional_saturation_of_oxygen_in_sea_water at standard depth levels.",
+        "size": 6609600,
+        "n_valid": 3305010,
+        "min": 0.19625180959701538,
+        "max": 141.1356201171875,
+        "mean": 66.7856674194336,
+        "std": 26.16314697265625
+      },
+      "woa_depth": {
+        "type": "ndarray",
+        "shape": [
+          102
+        ],
+        "size": 102,
+        "n_valid": 102,
+        "min": 0.0,
+        "max": 5500.0,
+        "mean": 1738.235294117647,
+        "std": 1683.6734242538364
+      },
+      "woa_lat": {
+        "type": "ndarray",
+        "shape": [
+          180
+        ],
+        "size": 180,
+        "n_valid": 180,
+        "min": -89.5,
+        "max": 89.5,
+        "mean": 0.0,
+        "std": 51.96072234550504
+      },
+      "woa_lon": {
+        "type": "ndarray",
+        "shape": [
+          360
+        ],
+        "size": 360,
+        "n_valid": 360,
+        "min": -179.5,
+        "max": 179.5,
+        "mean": 0.0,
+        "std": 103.92264751567228
+      },
+      "woa_nz": 102,
+      "woa_land_mask": {
+        "type": "ndarray",
+        "shape": [
+          102,
+          180,
+          360
+        ],
+        "size": 6609600,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "woa_basin3d": {
+        "type": "ndarray",
+        "shape": [
+          102,
+          180,
+          360
+        ],
+        "size": 6609600,
+        "n_valid": 3305010,
+        "min": 1.0,
+        "max": 60.0,
+        "mean": 6.333735147548722,
+        "std": 8.707665229930845
+      },
+      "woa_basin2d": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "n_valid": 41088,
+        "min": 1.0,
+        "max": 56.0,
+        "mean": 5.052132009345795,
+        "std": 5.361917020836556
+      },
+      "woa_res": {
+        "vol_below20_1e15": 14.205371528553952,
+        "vol_below60_1e15": 80.4700227117667,
+        "max_thickness60_m": 3125.0,
+        "max_lat": 7.5,
+        "max_lon": 121.5,
+        "basin_vol60_1e15": {
+          "1": 0.7766809131883785,
+          "2": 67.25732298527248,
+          "3": 9.97042853059144
+        },
+        "thickness60_m": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 64800,
+          "min": 0.0,
+          "max": 3125.0,
+          "mean": 116.78738425925926,
+          "std": 345.13848785884664
+        },
+        "lat2d": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 64800,
+          "min": -89.5,
+          "max": 89.5,
+          "mean": 0.0,
+          "std": 51.96072234550504
+        },
+        "lon2d": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 64800,
+          "min": -179.5,
+          "max": 179.5,
+          "mean": 0.0,
+          "std": 103.92264751567228
+        },
+        "o2_umolkg": {
+          "type": "ndarray",
+          "shape": [
+            102,
+            180,
+            360
+          ],
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 501.3956298828125,
+          "mean": 203.04458487720416,
+          "std": 77.7287682358976
+        },
+        "vol_m3": {
+          "type": "ndarray",
+          "shape": [
+            102,
+            180,
+            360
+          ],
+          "size": 6609600,
+          "n_valid": 6609600,
+          "min": 269740588.9742707,
+          "max": 1236368399026.1116,
+          "mean": 428294877012.12244,
+          "std": 382096499545.4652
+        },
+        "ocean_mask": {
+          "type": "ndarray",
+          "shape": [
+            102,
+            180,
+            360
+          ],
+          "size": 6609600,
+          "values": [
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False",
+            "False"
+          ]
+        },
+        "basin_vol60_named": {
+          "Atlantic": 0.7766809131883785,
+          "Pacific": 67.25732298527248,
+          "Indian": 9.97042853059144
+        },
+        "omz_aou_umolkg": 271.28826430868935,
+        "omz_o2sat_percent": 11.304052695522708
+      },
+      "aou_arr": {
+        "type": "ndarray",
+        "shape": [
+          102,
+          180,
+          360
+        ],
+        "size": 6609600,
+        "n_valid": 3305010,
+        "min": -8.0,
+        "max": 342.7116394042969,
+        "mean": 106.59546688168442,
+        "std": 82.23362389232545
+      },
+      "sat_arr": {
+        "type": "ndarray",
+        "shape": [
+          102,
+          180,
+          360
+        ],
+        "size": 6609600,
+        "n_valid": 3305010,
+        "min": 0.19625180959701538,
+        "max": 141.1356201171875,
+        "mean": 66.78566405003065,
+        "std": 26.163146230821678
+      },
+      "mask60_woa": {
+        "type": "ndarray",
+        "shape": [
+          102,
+          180,
+          360
+        ],
+        "size": 6609600,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "w_omz": {
+        "type": "ndarray",
+        "shape": [
+          102,
+          180,
+          360
+        ],
+        "size": 6609600,
+        "n_valid": 6609600,
+        "min": 0.0,
+        "max": 1228467620803.03,
+        "mean": 12174719001.417137,
+        "std": 76081266492.82213
+      },
+      "omz_results": {
+        "WOA23": {
+          "vol_below20_1e15": 14.205371528553952,
+          "vol_below60_1e15": 80.4700227117667,
+          "max_thickness60_m": 3125.0,
+          "max_lat": 7.5,
+          "max_lon": 121.5,
+          "basin_vol60_1e15": {
+            "1": 0.7766809131883785,
+            "2": 67.25732298527248,
+            "3": 9.97042853059144
+          },
+          "thickness60_m": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.0,
+            "max": 3125.0,
+            "mean": 116.78738425925926,
+            "std": 345.13848785884664
+          },
+          "lat2d": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -89.5,
+            "max": 89.5,
+            "mean": 0.0,
+            "std": 51.96072234550504
+          },
+          "lon2d": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -179.5,
+            "max": 179.5,
+            "mean": 0.0,
+            "std": 103.92264751567228
+          },
+          "o2_umolkg": {
+            "type": "ndarray",
+            "shape": [
+              102,
+              180,
+              360
+            ],
+            "size": 6609600,
+            "n_valid": 3305010,
+            "min": 0.0,
+            "max": 501.3956298828125,
+            "mean": 203.04458487720416,
+            "std": 77.7287682358976
+          },
+          "vol_m3": {
+            "type": "ndarray",
+            "shape": [
+              102,
+              180,
+              360
+            ],
+            "size": 6609600,
+            "n_valid": 6609600,
+            "min": 269740588.9742707,
+            "max": 1236368399026.1116,
+            "mean": 428294877012.12244,
+            "std": 382096499545.4652
+          },
+          "ocean_mask": {
+            "type": "ndarray",
+            "shape": [
+              102,
+              180,
+              360
+            ],
+            "size": 6609600,
+            "values": [
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False"
+            ]
+          },
+          "basin_vol60_named": {
+            "Atlantic": 0.7766809131883785,
+            "Pacific": 67.25732298527248,
+            "Indian": 9.97042853059144
+          },
+          "omz_aou_umolkg": 271.28826430868935,
+          "omz_o2sat_percent": 11.304052695522708
+        },
+        "GFDL-ESM4_historical": {
+          "vol_below20_1e15": 43.09663161741126,
+          "vol_below60_1e15": 105.13736263399537,
+          "max_thickness60_m": 4343.159969257412,
+          "max_lat": 13.5,
+          "max_lon": -93.5,
+          "inventory_mol": 2.203574173396231e+17,
+          "basin_vol60_1e15": {
+            "1": 5.764040629112544,
+            "2": 92.68198291539655,
+            "3": 3.47694638006976
+          },
+          "thickness60_m": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.0,
+            "max": 4343.159969257412,
+            "mean": 142.6389942798066,
+            "std": 495.41690608256596
+          },
+          "lat2d": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -89.5,
+            "max": 89.5,
+            "mean": 0.0,
+            "std": 51.96072234550504
+          },
+          "lon2d": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.5,
+            "max": 359.50000000000006,
+            "mean": 180.0,
+            "std": 103.92264751567228
+          },
+          "o2_umolkg": {
+            "type": "ndarray",
+            "shape": [
+              35,
+              180,
+              360
+            ],
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": -27.173462231919434,
+            "max": 488.1127069366336,
+            "mean": 201.1736012619035,
+            "std": 79.26605102310822
+          },
+          "vol_m3": {
+            "type": "ndarray",
+            "shape": [
+              35,
+              180,
+              360
+            ],
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 324.15374755859375,
+            "max": 6196801044480.0,
+            "mean": 1100420923230.5413,
+            "std": 1469115452693.025
+          },
+          "ocean_mask": {
+            "type": "ndarray",
+            "shape": [
+              35,
+              180,
+              360
+            ],
+            "size": 2268000,
+            "values": [
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False"
+            ]
+          },
+          "basin_vol60_named": {
+            "Atlantic": 5.764040629112544,
+            "Pacific": 92.68198291539655,
+            "Indian": 3.47694638006976
+          }
+        },
+        "MPI-ESM1-2-LR_historical": {
+          "vol_below20_1e15": 91.98054015562548,
+          "vol_below60_1e15": 213.85748169015295,
+          "max_thickness60_m": 4960.000003028696,
+          "max_lat": -9.390618769080845,
+          "max_lon": -81.22118768501747,
+          "inventory_mol": 2.2530351817239622e+17,
+          "basin_vol60_1e15": {
+            "1": 11.08868555190272,
+            "2": 181.66979657870542,
+            "3": 16.004609368162303
+          },
+          "thickness60_m": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": 0.0,
+            "max": 4960.000003028696,
+            "mean": 160.5701881721599,
+            "std": 591.0015901036329
+          },
+          "lat2d": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": -83.96550988220439,
+            "max": 89.72660369238089,
+            "mean": 11.336055347692735,
+            "std": 55.357212731498535
+          },
+          "lon2d": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": 0.0071753680209129525,
+            "max": 359.99604092487033,
+            "mean": 210.8956971346869,
+            "std": 115.14908977381505
+          },
+          "o2_umolkg": {
+            "type": "ndarray",
+            "shape": [
+              40,
+              220,
+              256
+            ],
+            "size": 2252800,
+            "n_valid": 1089671,
+            "min": 0.04548159421783668,
+            "max": 394.87329824163095,
+            "mean": 231.20462529032525,
+            "std": 82.8663059823773
+          },
+          "vol_m3": {
+            "type": "ndarray",
+            "shape": [
+              40,
+              220,
+              256
+            ],
+            "size": 2252800,
+            "n_valid": 1089671,
+            "min": 1136050432.0,
+            "max": 26849056915456.0,
+            "mean": 1247278821033.7039,
+            "std": 2034768928121.9226
+          },
+          "ocean_mask": {
+            "type": "ndarray",
+            "shape": [
+              40,
+              220,
+              256
+            ],
+            "size": 2252800,
+            "values": [
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False"
+            ]
+          },
+          "basin_vol60_named": {
+            "Atlantic": 11.08868555190272,
+            "Pacific": 181.66979657870542,
+            "Indian": 16.004609368162303
+          }
+        },
+        "CESM2_ssp245": {
+          "vol_below20_1e15": 60.88225411372237,
+          "vol_below60_1e15": 164.59156844310118,
+          "max_thickness60_m": 36.3189182381499,
+          "max_lat": 7.446498088645263,
+          "max_lon": 121.43602548316181,
+          "inventory_mol": 2.0158220245998704e+17,
+          "basin_vol60_1e15": {
+            "1": 13.700912712318976,
+            "2": 117.98924932258612,
+            "3": 25.377075311382526
+          },
+          "thickness60_m": {
+            "type": "ndarray",
+            "shape": [
+              384,
+              320
+            ],
+            "size": 122880,
+            "n_valid": 122880,
+            "min": 0.0,
+            "max": 36.3189182381499,
+            "mean": 2.998699608328307,
+            "std": 5.900684670269917
+          },
+          "lat2d": {
+            "type": "ndarray",
+            "shape": [
+              384,
+              320
+            ],
+            "size": 122880,
+            "n_valid": 122880,
+            "min": -79.2205226074621,
+            "max": 89.70640964187461,
+            "mean": 2.791601116953018,
+            "std": 43.44720217375342
+          },
+          "lon2d": {
+            "type": "ndarray",
+            "shape": [
+              384,
+              320
+            ],
+            "size": 122880,
+            "n_valid": 122880,
+            "min": 0.014731101635748343,
+            "max": 359.99602043021787,
+            "mean": 185.76465359587667,
+            "std": 106.55290281820834
+          },
+          "o2_umolkg": {
+            "type": "ndarray",
+            "shape": [
+              60,
+              384,
+              320
+            ],
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 2.510081357431279,
+            "max": 400.2825260423434,
+            "mean": 168.47022395017294,
+            "std": 84.37219854577576
+          },
+          "vol_m3": {
+            "type": "ndarray",
+            "shape": [
+              60,
+              384,
+              320
+            ],
+            "size": 7372800,
+            "n_valid": 7372800,
+            "min": 3341192448.0,
+            "max": 1822102913024.0,
+            "mean": 376662966104.7352,
+            "std": 444155523327.8274
+          },
+          "ocean_mask": {
+            "type": "ndarray",
+            "shape": [
+              60,
+              384,
+              320
+            ],
+            "size": 7372800,
+            "values": [
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False"
+            ]
+          },
+          "basin_vol60_named": {
+            "Atlantic": 13.700912712318976,
+            "Pacific": 117.98924932258612,
+            "Indian": 25.377075311382526
+          }
+        },
+        "GFDL-ESM4_ssp245": {
+          "vol_below20_1e15": 41.348473966274945,
+          "vol_below60_1e15": 109.78645713183174,
+          "max_thickness60_m": 4318.1849864751475,
+          "max_lat": 13.5,
+          "max_lon": -93.5,
+          "inventory_mol": 2.1500209078386166e+17,
+          "basin_vol60_1e15": {
+            "1": 5.624230584523936,
+            "2": 97.77035492325629,
+            "3": 3.100896344168832
+          },
+          "thickness60_m": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.0,
+            "max": 4318.1849864751475,
+            "mean": 150.0129269469707,
+            "std": 514.4356498667865
+          },
+          "lat2d": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -89.5,
+            "max": 89.5,
+            "mean": 0.0,
+            "std": 51.96072234550504
+          },
+          "lon2d": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.5,
+            "max": 359.50000000000006,
+            "mean": 180.0,
+            "std": 103.92264751567228
+          },
+          "o2_umolkg": {
+            "type": "ndarray",
+            "shape": [
+              35,
+              180,
+              360
+            ],
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": -21.06839666851104,
+            "max": 457.69125790032757,
+            "mean": 197.07876233741663,
+            "std": 78.62102148166232
+          },
+          "vol_m3": {
+            "type": "ndarray",
+            "shape": [
+              35,
+              180,
+              360
+            ],
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 324.22174072265625,
+            "max": 6196820443136.0,
+            "mean": 1100429424611.9392,
+            "std": 1469121084079.384
+          },
+          "ocean_mask": {
+            "type": "ndarray",
+            "shape": [
+              35,
+              180,
+              360
+            ],
+            "size": 2268000,
+            "values": [
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False"
+            ]
+          },
+          "basin_vol60_named": {
+            "Atlantic": 5.624230584523936,
+            "Pacific": 97.77035492325629,
+            "Indian": 3.100896344168832
+          }
+        },
+        "MPI-ESM1-2-LR_ssp245": {
+          "vol_below20_1e15": 89.17887101666099,
+          "vol_below60_1e15": 212.3171799447306,
+          "max_thickness60_m": 4950.000002650109,
+          "max_lat": -9.390618769080845,
+          "max_lon": -81.22118768501747,
+          "inventory_mol": 2.2005574512276102e+17,
+          "basin_vol60_1e15": {
+            "1": 10.3275489712128,
+            "2": 181.6061472144425,
+            "3": 15.510082582085632
+          },
+          "thickness60_m": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": 0.0,
+            "max": 4950.000002650109,
+            "mean": 159.74911217058713,
+            "std": 596.8332155667408
+          },
+          "lat2d": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": -83.96550988220439,
+            "max": 89.72660369238089,
+            "mean": 11.336055347692735,
+            "std": 55.357212731498535
+          },
+          "lon2d": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": 0.0071753680209129525,
+            "max": 359.99604092487033,
+            "mean": 210.8956971346869,
+            "std": 115.14908977381505
+          },
+          "o2_umolkg": {
+            "type": "ndarray",
+            "shape": [
+              40,
+              220,
+              256
+            ],
+            "size": 2252800,
+            "n_valid": 1089671,
+            "min": 0.04617479608239812,
+            "max": 391.5584055277496,
+            "mean": 225.30421467382212,
+            "std": 80.08816125863105
+          },
+          "vol_m3": {
+            "type": "ndarray",
+            "shape": [
+              40,
+              220,
+              256
+            ],
+            "size": 2252800,
+            "n_valid": 1089671,
+            "min": 1136050432.0,
+            "max": 26849056915456.0,
+            "mean": 1247278821033.7039,
+            "std": 2034768928121.9226
+          },
+          "ocean_mask": {
+            "type": "ndarray",
+            "shape": [
+              40,
+              220,
+              256
+            ],
+            "size": 2252800,
+            "values": [
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False",
+              "False"
+            ]
+          },
+          "basin_vol60_named": {
+            "Atlantic": 10.3275489712128,
+            "Pacific": 181.6061472144425,
+            "Indian": 15.510082582085632
+          }
+        }
+      },
+      "hist_maps": {
+        "WOA23": {
+          "thickness60": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.0,
+            "max": 3125.0,
+            "mean": 116.78738425925926,
+            "std": 345.13848785884664
+          },
+          "lat": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -89.5,
+            "max": 89.5,
+            "mean": 0.0,
+            "std": 51.96072234550504
+          },
+          "lon": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -179.5,
+            "max": 179.5,
+            "mean": 0.0,
+            "std": 103.92264751567228
+          }
+        },
+        "GFDL-ESM4": {
+          "thickness60": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.0,
+            "max": 4343.159969257412,
+            "mean": 142.6389942798066,
+            "std": 495.41690608256596
+          },
+          "lat": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -89.5,
+            "max": 89.5,
+            "mean": 0.0,
+            "std": 51.96072234550504
+          },
+          "lon": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.5,
+            "max": 359.50000000000006,
+            "mean": 180.0,
+            "std": 103.92264751567228
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "thickness60": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": 0.0,
+            "max": 4960.000003028696,
+            "mean": 160.5701881721599,
+            "std": 591.0015901036329
+          },
+          "lat": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": -83.96550988220439,
+            "max": 89.72660369238089,
+            "mean": 11.336055347692735,
+            "std": 55.357212731498535
+          },
+          "lon": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": 0.0071753680209129525,
+            "max": 359.99604092487033,
+            "mean": 210.8956971346869,
+            "std": 115.14908977381505
+          }
+        }
+      },
+      "ssp_maps": {
+        "CESM2": {
+          "thickness60": {
+            "type": "ndarray",
+            "shape": [
+              384,
+              320
+            ],
+            "size": 122880,
+            "n_valid": 122880,
+            "min": 0.0,
+            "max": 36.3189182381499,
+            "mean": 2.998699608328307,
+            "std": 5.900684670269917
+          },
+          "lat": {
+            "type": "ndarray",
+            "shape": [
+              384,
+              320
+            ],
+            "size": 122880,
+            "n_valid": 122880,
+            "min": -79.2205226074621,
+            "max": 89.70640964187461,
+            "mean": 2.791601116953018,
+            "std": 43.44720217375342
+          },
+          "lon": {
+            "type": "ndarray",
+            "shape": [
+              384,
+              320
+            ],
+            "size": 122880,
+            "n_valid": 122880,
+            "min": 0.014731101635748343,
+            "max": 359.99602043021787,
+            "mean": 185.76465359587667,
+            "std": 106.55290281820834
+          }
+        },
+        "GFDL-ESM4": {
+          "thickness60": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.0,
+            "max": 4318.1849864751475,
+            "mean": 150.0129269469707,
+            "std": 514.4356498667865
+          },
+          "lat": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -89.5,
+            "max": 89.5,
+            "mean": 0.0,
+            "std": 51.96072234550504
+          },
+          "lon": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.5,
+            "max": 359.50000000000006,
+            "mean": 180.0,
+            "std": 103.92264751567228
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "thickness60": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": 0.0,
+            "max": 4950.000002650109,
+            "mean": 159.74911217058713,
+            "std": 596.8332155667408
+          },
+          "lat": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": -83.96550988220439,
+            "max": 89.72660369238089,
+            "mean": 11.336055347692735,
+            "std": 55.357212731498535
+          },
+          "lon": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": 0.0071753680209129525,
+            "max": 359.99604092487033,
+            "mean": 210.8956971346869,
+            "std": 115.14908977381505
+          }
+        }
+      },
+      "change_maps": {
+        "GFDL-ESM4": {
+          "thickness60_change": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -725.0566735433553,
+            "max": 1000.103223352385,
+            "mean": 7.373932667164084,
+            "std": 65.03294765581035
+          },
+          "lat": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -89.5,
+            "max": 89.5,
+            "mean": 0.0,
+            "std": 51.96072234550504
+          },
+          "lon": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.5,
+            "max": 359.50000000000006,
+            "mean": 180.0,
+            "std": 103.92264751567228
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "thickness60_change": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": -1230.9999910804142,
+            "max": 854.9999949476928,
+            "mean": -0.8210760015728017,
+            "std": 57.724608852839054
+          },
+          "lat": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": -83.96550988220439,
+            "max": 89.72660369238089,
+            "mean": 11.336055347692735,
+            "std": 55.357212731498535
+          },
+          "lon": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": 0.0071753680209129525,
+            "max": 359.99604092487033,
+            "mean": 210.8956971346869,
+            "std": 115.14908977381505
+          }
+        }
+      },
+      "MODEL_CFG": {
+        "CESM2": {
+          "y_dim": "nlat",
+          "x_dim": "nlon",
+          "lat_coord": "lat",
+          "lon_coord": "lon",
+          "depth_coord": "lev",
+          "depth_scale": 0.01,
+          "ocean_mask_from": "sftof"
+        },
+        "GFDL-ESM4": {
+          "y_dim": "lat",
+          "x_dim": "lon",
+          "lat_coord": "lat",
+          "lon_coord": "lon",
+          "depth_coord": "lev",
+          "depth_scale": 1.0
+        },
+        "MPI-ESM1-2-LR": {
+          "y_dim": "j",
+          "x_dim": "i",
+          "lat_coord": "latitude",
+          "lon_coord": "longitude",
+          "depth_coord": "lev",
+          "depth_scale": 1.0
+        }
+      },
+      "omz_change_pct": {
+        "GFDL-ESM4": {
+          "20": -4.056367250822573,
+          "60": 4.421924215486383
+        },
+        "MPI-ESM1-2-LR": {
+          "20": -3.0459368190534986,
+          "60": -0.7202468359998757
+        }
+      },
+      "woa_vol60": 80.4700227117667,
+      "hist_model_bias_60": {
+        "GFDL-ESM4": 24.667339922228663,
+        "MPI-ESM1-2-LR": 133.38745897838623
+      },
+      "better_model_60": "GFDL-ESM4",
+      "summary_rows": [
+        {
+          "source": "WOA23",
+          "vol_below20_1e15": 14.205371528553952,
+          "vol_below60_1e15": 80.4700227117667,
+          "max_thickness60_m": 3125.0,
+          "max_lat": 7.5,
+          "max_lon": 121.5,
+          "inventory_mol": NaN
+        },
+        {
+          "source": "GFDL-ESM4_historical",
+          "vol_below20_1e15": 43.09663161741126,
+          "vol_below60_1e15": 105.13736263399537,
+          "max_thickness60_m": 4343.159969257412,
+          "max_lat": 13.5,
+          "max_lon": -93.5,
+          "inventory_mol": 2.203574173396231e+17
+        },
+        {
+          "source": "MPI-ESM1-2-LR_historical",
+          "vol_below20_1e15": 91.98054015562548,
+          "vol_below60_1e15": 213.85748169015295,
+          "max_thickness60_m": 4960.000003028696,
+          "max_lat": -9.390618769080845,
+          "max_lon": -81.22118768501747,
+          "inventory_mol": 2.2530351817239622e+17
+        },
+        {
+          "source": "CESM2_ssp245",
+          "vol_below20_1e15": 60.88225411372237,
+          "vol_below60_1e15": 164.59156844310118,
+          "max_thickness60_m": 36.3189182381499,
+          "max_lat": 7.446498088645263,
+          "max_lon": 121.43602548316181,
+          "inventory_mol": 2.0158220245998704e+17
+        },
+        {
+          "source": "GFDL-ESM4_ssp245",
+          "vol_below20_1e15": 41.348473966274945,
+          "vol_below60_1e15": 109.78645713183174,
+          "max_thickness60_m": 4318.1849864751475,
+          "max_lat": 13.5,
+          "max_lon": -93.5,
+          "inventory_mol": 2.1500209078386166e+17
+        },
+        {
+          "source": "MPI-ESM1-2-LR_ssp245",
+          "vol_below20_1e15": 89.17887101666099,
+          "vol_below60_1e15": 212.3171799447306,
+          "max_thickness60_m": 4950.000002650109,
+          "max_lat": -9.390618769080845,
+          "max_lon": -81.22118768501747,
+          "inventory_mol": 2.2005574512276102e+17
+        }
+      ],
+      "omz_summary": "                     source  vol_below20_1e15  ...     max_lon  inventory_mol\n0                     WOA23         14.205372  ...  121.500000            NaN\n1      GFDL-ESM4_historical         43.096632  ...  -93.500000   2.203574e+17\n2  MPI-ESM1-2-LR_historical         91.980540  ...  -81.221188   2.253035e+17\n3              CESM2_ssp245         60.882254  ...  121.436025   2.015822e+17\n4          GFDL-ESM4_ssp245         41.348474  ...  -93.500000   2.150021e+17\n5      MPI-ESM1-2-LR_ssp245         89.178871  ...  -81.221188   2.200557e+17\n\n[6 rows x 7 columns]",
+      "basin_rows": [
+        {
+          "source": "WOA23",
+          "basin": "Pacific",
+          "vol60_1e15": 67.25732298527248
+        },
+        {
+          "source": "WOA23",
+          "basin": "Indian",
+          "vol60_1e15": 9.97042853059144
+        },
+        {
+          "source": "WOA23",
+          "basin": "Atlantic",
+          "vol60_1e15": 0.7766809131883785
+        },
+        {
+          "source": "GFDL-ESM4_historical",
+          "basin": "Pacific",
+          "vol60_1e15": 92.68198291539655
+        },
+        {
+          "source": "GFDL-ESM4_historical",
+          "basin": "Indian",
+          "vol60_1e15": 3.47694638006976
+        },
+        {
+          "source": "GFDL-ESM4_historical",
+          "basin": "Atlantic",
+          "vol60_1e15": 5.764040629112544
+        },
+        {
+          "source": "MPI-ESM1-2-LR_historical",
+          "basin": "Pacific",
+          "vol60_1e15": 181.66979657870542
+        },
+        {
+          "source": "MPI-ESM1-2-LR_historical",
+          "basin": "Indian",
+          "vol60_1e15": 16.004609368162303
+        },
+        {
+          "source": "MPI-ESM1-2-LR_historical",
+          "basin": "Atlantic",
+          "vol60_1e15": 11.08868555190272
+        }
+      ],
+      "basin_vol_table": "                     source     basin  vol60_1e15\n0                     WOA23   Pacific   67.257323\n1                     WOA23    Indian    9.970429\n2                     WOA23  Atlantic    0.776681\n3      GFDL-ESM4_historical   Pacific   92.681983\n4      GFDL-ESM4_historical    Indian    3.476946\n5      GFDL-ESM4_historical  Atlantic    5.764041\n6  MPI-ESM1-2-LR_historical   Pacific  181.669797\n7  MPI-ESM1-2-LR_historical    Indian   16.004609\n8  MPI-ESM1-2-LR_historical  Atlantic   11.088686",
+      "woa_omz_aou_umolkg": 271.28826430868935,
+      "woa_omz_o2sat_percent": 11.304052695522708
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T10_deepseek-flash_20261023_102338/turn01/figures/visualization_T10_deepseek-flash_20261023_102338_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T10_deepseek-flash_20261023_102338/turn01/figures/visualization_T10_deepseek-flash_20261023_102338_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Answer the user's question inside <solution></solution> tags, based on these results.
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+
+**OMZ assessment against WOA23 and SSP2-4.5 changes**
+
+I use O₂ < 60 µmol kg⁻¹ as the main OMZ threshold and also report the stricter < 20 µmol kg⁻¹ threshold. Volumes are integrated with each model’s `volcello`; WOA23 volumes use the WOA grid-cell volumes. Thickness is the column-integrated thickness of water below the threshold. Basin volumes use the WOA23 basin mask.
+
+### 1. Global OMZ volume and maximum thickness at O₂ < 60 µmol kg⁻¹
+
+| Source / experiment | V(O₂<20) [10¹⁵ m³] | V(O₂<60) [10¹⁵ m³] | Max thickness at <60 [m] | Latitude [°] | Longitude [°] |
+|---|---:|---:|---:|---:|---:|
+| WOA23 1971–2000 | 14.2 | 80.5 | 3125.0 | 7.50 | 121.50 |
+| GFDL-ESM4 historical | 43.1 | 105 | 4343.2 | 13.50 | −93.50 |
+| MPI-ESM1-2-LR historical | 92.0 | 214 | 4960.0 | −9.39 | −81.22 |
+| CESM2 ssp245 | 60.9 | 165 | 36.3* | 7.45 | 121.44 |
+| GFDL-ESM4 ssp245 | 41.3 | 110 | 4318.2 | 13.50 | −93.50 |
+| MPI-ESM1-2-LR ssp245 | 89.2 | 212 | 4950.0 | −9.39 | −81.22 |
+
+\*The CESM2 maximum thickness printed by the code is almost certainly an area-normalization artefact: CESM2 `sftof` is likely in percent and was used directly rather than divided by 100 when forming grid-cell thickness. If so, the corrected CESM2 maximum would be about **3630 m**; CESM2 OMZ volumes and oxygen inventory are not affected by this issue.
+
+Both historical CMIP6 models strongly overestimate the observed OMZ volume. At the <60 threshold, GFDL-ESM4 is much closer to WOA23 (105 vs 80.5 ×10¹⁵ m³) than MPI-ESM1-2-LR (214 vs 80.5 ×10¹⁵ m³). At the <20 threshold both are far too voluminous, but GFDL-ESM4 is still less biased (43.1 vs 14.2) than MPI (92.0 vs 14.2).
+
+### 2. Historical → SSP2-4.5 percentage change
+
+Positive values mean an expanding OMZ.
+
+| Model | ΔV(O₂<20) [%] | ΔV(O₂<60) [%] |
+|---|---:|---:|
+| GFDL-ESM4 | −4.06 | +4.42 |
+| MPI-ESM1-2-LR | −3.05 | −0.72 |
+
+At <20 µmol kg⁻¹, both models simulate a small contraction, and they roughly agree in sign and modest magnitude. At <60 µmol kg⁻¹ they do not agree in sign: GFDL-ESM4 shows a modest expansion (+4.42%), whereas MPI-ESM1-2-LR shows a near-neutral slight contraction (−0.72%). Thus these two models do not provide a robust consensus for the 60-threshold OMZ change.
+
+### 3. Global dissolved oxygen inventory
+
+| Source | Inventory [mol] |
+|---|---:|
+| GFDL-ESM4 historical | 2.20 ×10¹⁷ |
+| MPI-ESM1-2-LR historical | 2.25 ×10¹⁷ |
+| CESM2 ssp245 | 2.02 ×10¹⁷ |
+| GFDL-ESM4 ssp245 | 2.15 ×10¹⁷ |
+| MPI-ESM1-2-LR ssp245 | 2.20 ×10¹⁷ |
+
+### 4. Basin partition of the <60 µmol kg⁻¹ OMZ volume
+
+Units: 10¹⁵ m³.
+
+| Source | Pacific | Indian | Atlantic |
+|---|---:|---:|---:|
+| WOA23 | 67.3 | 9.97 | 0.777 |
+| GFDL-ESM4 historical | 92.7 | 3.48 | 5.76 |
+| MPI-ESM1-2-LR historical | 182 | 16.0 | 11.1 |
+
+The Pacific dominates the OMZ volume in all cases. MPI-ESM1-2-LR greatly overestimates the Pacific and Indian OMZ volumes relative to WOA23. GFDL-ESM4 is closer in total volume, although it places more OMZ volume in the Atlantic than WOA23.
+
+### 5. WOA23 AOU and oxygen saturation within the <60 OMZ
+
+Volume-weighted values within the WOA23 <60 µmol kg⁻¹ OMZ:
+
+- Mean apparent oxygen utilization: **271.3 µmol kg⁻¹**
+- Mean percent oxygen saturation: **11.3%**
+
+The very high AOU and very low saturation indicate that the observed OMZ is strongly respiration-driven: a large amount of oxygen has been consumed after the water was last ventilated. Sluggish ventilation is still required to allow this respiratory oxygen deficit to accumulate, but the high AOU shows that the zone is not merely a poorly ventilated water mass with little oxygen utilization. It is primarily an oxygen-depleted, respiration-dominated zone.
+
+### 6. Overall model skill and interpretation
+
+**GFDL-ESM4 reproduces the observed <60 µmol kg⁻¹ OMZ volume better than MPI-ESM1-2-LR.** Its historical volume is about 31% above WOA23, whereas MPI is about 166% above WOA23. Both models overestimate the stricter <20 µmol kg⁻¹ volume, but GFDL-ESM4 is again closer.
+
+For the scenario change, the two models disagree at the 60 threshold. GFDL-ESM4 predicts a modest expansion (+4.42%), while MPI predicts a very small contraction (−0.72%). At 20, both predict a small contraction (−4.06% and −3.05%). Therefore, these two CMIP6 models do not give a consistent picture of strong OMZ expansion under SSP2-4.5; GFDL-ESM4 suggests slight 60-threshold expansion, MPI suggests near-stability/slight contraction, and both suggest slight shrinking of the most severe <20 water.
+
+CESM2 cannot be used to form a historical-to-future change because it publishes no historical `o2` in this dataset. Its SSP2-4.5 <60 OMZ volume is 165 ×10¹⁵ m³, intermediate between GFDL-ESM4 and MPI-ESM1-2-LR, but no change can be quantified.
+
+### 7. Figures
+
+- **Figure 1** shows historical <60 OMZ thickness for GFDL-ESM4, MPI-ESM1-2-LR and WOA23 on a common sequential scale. The models produce much thicker and more widespread OMZs than WOA23, especially in the eastern tropical Pacific, with MPI-ESM1-2-LR showing the largest values.
+- **Figure 2** shows the SSP2-4.5 minus historical thickness change for GFDL-ESM4 and MPI-ESM1-2-LR on a common diverging scale centered on zero. GFDL-ESM4 has a net modest expansion at the 60 threshold, while MPI has a near-zero/slight contraction with substantial regional thickening and thinning. CESM2’s SSP2-4.5 OMZ thickness is shown separately on its own sequential scale, labelled as having no historical comparison and therefore no computable change.
+
+</solution>

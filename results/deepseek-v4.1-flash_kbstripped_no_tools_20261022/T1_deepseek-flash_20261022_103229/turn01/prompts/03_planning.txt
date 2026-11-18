@@ -1,0 +1,174 @@
+# exchange 3: planning
+# elapsed: 24.0 s
+
+===== SYSTEM =====
+You are an oceanographic data analysis assistant with conversation history support.
+
+
+
+Available tools: none. There are no project functions in this setting; the analysis code opens
+the datasets' raw files itself with numpy, pandas and xarray.
+
+Available datasets:
+{
+  "woa23": {
+    "description": "[climatology] World Ocean Atlas 2023 (NOAA/NCEI) 1.00 degree objectively analysed climatology. Temperature and salinity come on two climate normals, 1971-2000 and 1991-2020; oxygen, apparent oxygen utilization and percent oxygen saturation each provide both a 1971-2000 normal (the default) and a 1965-2022 all-period (all) composite; nutrients provide only the 1965-2022 all-period composite. Variables: apparent_oxygen_utilization, nitrate, oxygen, percent_oxygen_saturation, phosphate, salinity, silicate, temperature."
+  },
+  "glodap": {
+    "description": "[climatology] GLODAPv2 global ocean carbon chemistry mapped climatology (DIVA objective analysis), built from 1972-2013 input data. No time dimension, 33 standard depth levels. Variables: Cant, NO3, OmegaA, OmegaC, PI_TCO2, PO4, TAlk, TCO2, oxygen, pHts25p0, pHtsinsitutp, salinity, silicate, temperature. Climatology period 1972-2013."
+  },
+  "seanoe_mld": {
+    "description": "[climatology] Global ocean mixed layer depth (MLD) monthly climatology from the LOPS laboratory. The criterion is a potential density increase of 0.03 kg/m3 relative to the reference depth. Based on a month-by-month objective analysis of 1970-2021 Argo and WOD profiles. Variables: mask, mld_dr003, n_obs. Climatology period 1970-2021."
+  },
+  "ersst": {
+    "description": "[timeseries] NOAA Extended Reconstructed SST v5 (in situ observations only), monthly mean, 1854 to present. Surface only, no vertical dimension. Variables: sst."
+  },
+  "cpc_indices": {
+    "description": "[index] NOAA monthly climate indices. The four Nino products are CPC ENSO monitoring indices, giving regional mean SST and its anomaly in degC. The PDO product is a NOAA NCEI pattern index and is dimensionless; it is kept here so the monthly indices live together, despite the dataset id naming CPC. Products: ersst5_81-10, ersst5_91-20, oisst, oni, pdo."
+  },
+  "cmip6_historical": {
+    "description": "[timeseries] CMIP6 historical (all-forcing historical simulation) ocean component, Omon monthly frequency plus Ofx fixed fields. Three models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 1850-01 to 2014-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  },
+  "cmip6_ssp245": {
+    "description": "[timeseries] CMIP6 ScenarioMIP ssp245 (SSP2-4.5, concentration-driven). Grid and coordinate definitions are the same as historical; they differ in time range, variant label and variable coverage. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 2015-01 to 2100-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  }
+}
+
+Domain knowledge retrieved for this question (grouped by [fragment-id] (severity)):
+<domain_knowledge>
+[anomaly-baselines-and-climate-indices] (must)
+- Build each model's index with `compute_enso_nino_index` on its own output and do not pass `climatology='woa23'`: the anomaly must come from the field's own 1950-2014 monthly climatology, else the model's mean-state bias enters the index and it is no longer an ENSO index.
+- Match each month against the climatology of its own calendar month (this removes the seasonal cycle) and state the climatology and baseline used — the tools record both in the result's attrs; the exceedance metric here counts months with |anomaly| > 1.0, so persistence (`min_duration`) plays no role.
+
+[omip-weighted-means-and-integrals] (should)
+- The Nino 3.4 average over 5S-5N, 170W-120W must be area-weighted on each source's grid with weights restricted to the same valid cells as the data (NaN-aware); an unweighted `mean()` over (y, x) is wrong on a curvilinear grid.
+
+[cmip6-tos-bulk-top-cell] (should)
+- `tos` is the bulk temperature of the top model cell, not a skin value, and is archived for these historical runs, so use it directly with the default `depth_level=None` — no first-level `thetao` substitute is needed.
+- The model-minus-ERSSTv5 amplitude difference is therefore a bulk-top-cell-versus-observation comparison; do not describe `tos` as a skin temperature.
+
+[cmip6-experiments-historical-ssp245] (should)
+- Coupled historical runs have their own internal variability: compare only statistics (the index standard deviation, the seasonal-cycle statistics), never individual years or event timing — a model's peak month or El Nino year need not match the observed one.
+- With a single member per model, differences in amplitude between models and ERSSTv5 cannot be split into forced versus internal-variability parts; state this caveat.
+
+[cmip6-grid-labels] (should)
+- GFDL-ESM4 is `gr`: its values are already remapped to a 1x1 degree grid with a regridded land–sea mask, so label its numbers as taken on that archive grid.
+- Horizontal resolution differs about 2.5x between CESM2 (100 km) and MPI-ESM1-2-LR (250 km); features narrower than the coarse grid are not comparable in amplitude.
+
+[omip-native-grid-vs-regridded] (should)
+- Compute every number (regional index, its standard deviation, per-month standard deviations) on each source's own grid with its own cell areas; the two cell-by-cell comparisons here need no regridding, so no regrid method is quoted.
+
+[cmip6-static-grid-fields] (should)
+- Use each model's published `areacello` as the area weight (it is the tracer-cell area, zero or missing over land) and report the origin recorded in `attrs['area_source']` when it feeds the regional average.
+
+[model-gfdl-esm4-reported-biases] (info)
+- GFDL-ESM4's ENSO is reported slightly stronger than observed with a longer period (~4 years against ~3.3), so a positive amplitude bias for GFDL-ESM4 is consistent with its documentation; these are context, not target values.
+</domain_knowledge>
+
+Data selection rules:
+1. <selected_data> must contain dataset IDs exactly as listed above (e.g. woa23, cmip6_historical).
+   Never put a file path there, and never invent a name. One dataset ID holds many variables, and
+   CMIP6 also holds several models; those are chosen in the next step, not here.
+2. Long-term trends, interannual variability and scenario projections need a timeseries dataset
+   (cmip6_historical, cmip6_ssp245, ersst). Mean state, seasonal cycle and vertical structure need a
+   climatology (woa23, glodap, seanoe_mld). A question about the ENSO monitoring index itself needs
+   cpc_indices.
+3. Select several datasets, comma-separated, when the question compares a model against observations
+   or needs variables that live in different products.
+4. Reading data: there are no loading functions. The code step opens the raw files of the datasets
+   you select and is shown where they live and how they are laid out; plan the reading as part of
+   the steps.
+5. Regional and global means are area- or volume-weighted, never plain averages over lat/lon: plan
+   where the weights come from (for CMIP6, the model's own areacello / volcello fixed fields).
+
+How to write the plan:
+1. Write the plan as numbered steps, each naming the datasets, variables and models it needs.
+   End it with an "Other notes:" section, one line each, holding only the caveats the answer must
+   state.
+2. Add no computational constraint of your own. Every definition, weighting, mask, threshold,
+   interpolation, filter or correction a step applies must come from the question or from what is
+   given above (the dataset descriptions, and any domain knowledge); do not devise one that
+   none of them states (an extra mask, a partial-layer weighting, a screening threshold).
+3. There are no project tools to call: plan every step as an operation the code performs on the raw
+   data with the standard libraries (numpy, pandas, xarray).
+4. Do not round intermediate values: later steps use the unrounded results of earlier ones, and a
+   value is rounded only where it is reported, to the precision the question asks for.
+5. The steps, any notes under them and Other notes all go inside the <plan> tags; nothing outside them
+   is passed on to the later steps.
+
+How to use the domain knowledge:
+1. Priority: definitions and procedures the user states explicitly in the question come first, the
+   dataset descriptions second, the knowledge fragments last. Use the fragments to settle
+   choices the question leaves open and to find the caveats that must be stated. When a fragment
+   conflicts with what the question prescribes, follow the question and record the difference under
+   Other notes so the answer can explain it.
+2. Under the step where a piece of knowledge FIRST matters, add one line "- Note [fragment-id]: ..."
+   carrying what to do (the formula, threshold, unit conversion or check). Each
+   fragment gets exactly ONE such note line in the whole plan, under a step or under Other notes, not
+   both. A later step that also depends on it names "[fragment-id]" inline in its own text, with no
+   further note line and no restatement - the next stage reads the whole plan. Do not copy the
+   knowledge text into the plan.
+3. Other notes also hold the differences between the question's definition and the protocol; a line
+   that comes from a fragment takes the form "- [fragment-id] ...".
+4. Cite every fragment of severity must at least once, in a step or under Other notes. Fragments of
+   severity should or info that end up unused may be left out.
+5. The notes may name functions of this project in backticks (`compute_basic_stat`,
+   `load_regular_data`, ...). None of them exists in this setting: read such a name as the operation
+   it stands for, and plan that operation on the raw data.
+
+Analyze the user's question and select appropriate data. Follow this format strictly:
+<plan>numbered steps: the datasets, variables and models each step needs, with the knowledge notes under each step, then Other notes</plan>
+<selected_data>comma-separated list of dataset IDs you will use</selected_data>
+
+IMPORTANT: Your response MUST contain all required XML tags, and tags must be properly closed.
+
+
+===== USER =====
+User question: Assess the ENSO amplitude simulated by three CMIP6 historical runs against ERSSTv5 observations over 1950-01 to 2014-12.
+
+Data to use:
+- CMIP6 historical variable `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1950-01 to 2014-12, each on its own native grid with its own published cell areas.
+- ERSSTv5 monthly SST over the same window, on its native 2-degree grid.
+
+Expected numerical results, based on the monthly Nino 3.4 index of each of the four sources over 1950-01 to 2014-12: the SST anomaly over 5S-5N, 170W-120W, each source relative to a 1950-2014 monthly climatology. Standard deviations are population standard deviations (ddof = 0).
+- For each source, the standard deviation of its Nino 3.4 anomaly over all 780 months, in degrees Celsius to 2 decimal places.
+- For each model, the amplitude bias (model minus ERSSTv5 standard deviation) in degrees Celsius to 2 decimal places and the amplitude ratio (model divided by ERSSTv5) to 2 decimal places, and the ranking of the three models from smallest to largest absolute amplitude bias.
+- For each source, the standard deviation of the anomaly for each of the 12 calendar months, in degrees Celsius to 2 decimal places (48 values).
+- For each source, the calendar month of largest standard deviation and its value, the calendar month of smallest standard deviation, and the largest-to-smallest ratio to 2 decimal places; and whether each model reproduces the observed peak month and strength of seasonal phase locking.
+- For each source, the number and the percentage (to 1 decimal place) of months whose Nino 3.4 anomaly strictly exceeds 1.0 degrees Celsius in absolute value.
+
+Expected visualizations:
+- Figure 1, a line plot of the seasonal cycle of amplitude: calendar month (January to December) on the x axis, standard deviation in degrees Celsius on the y axis, four curves on one axis, the observations visually distinct from the three models, and each curve's peak month marked.
+- Figure 2, four stacked panels sharing one time axis over 1950-2014, in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, each showing that source's Nino 3.4 anomaly series on an identical y-axis range that contains every series, with the +1.0 and -1.0 degrees Celsius levels marked and each panel annotated with its standard deviation and exceedance percentage.
+
+Now output your reasoning and selections.
+
+===== RESPONSE =====
+<plan>
+1. Open the raw files with xarray/numpy/pandas: `ersst` monthly `sst` for 1950-01 to 2014-12 on its native 2-degree grid; and `cmip6_historical` monthly `tos` for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR over the same window, each retained on its own native/archive grid. Also load each CMIP6 model’s published `areacello` fixed field for weighting. Do not substitute `thetao` for `tos`.
+- Note [cmip6-tos-bulk-top-cell]: use `tos` directly with the default `depth_level=None`; it is the bulk temperature of the top model cell, not a skin value.
+- Note [cmip6-static-grid-fields]: use each model’s published `areacello` as the area weight, with zero/missing values over land, and report the origin recorded in `attrs['area_source']` when it feeds the regional average.
+- Note [cmip6-grid-labels]: GFDL-ESM4 is on the archive `gr` 1x1 degree regridded grid with a regridded land-sea mask; CESM2 and MPI-ESM1-2-LR native horizontal resolutions differ by about 2.5x, so narrow features are not comparable in amplitude across grids.
+
+2. For each of the four sources, compute the monthly Nino 3.4 regional mean SST over 5S-5N, 170W-120W on that source’s own grid. For CMIP6 use the model’s `areacello`; for ERSSTv5 on its regular 2-degree grid use cosine-latitude cell-area weights. Restrict weights to the same valid cells as the data and keep the operation NaN-aware. Do not regrid any source.
+- Note [omip-weighted-means-and-integrals]: the Nino 3.4 average must be area-weighted with weights restricted to the same valid cells as the data; an unweighted mean over latitude/longitude is wrong on a curvilinear grid.
+- Note [omip-native-grid-vs-regridded]: compute every index and statistic on each source’s own grid with its own cell areas; no regridding is needed, so no regrid method is quoted.
+
+3. Build each source’s monthly Nino 3.4 anomaly series over 1950-01 to 2014-12 by subtracting that source’s own 1950-2014 monthly climatology, matching each month to the climatology of its own calendar month. Record and report the climatology and baseline used for each source.
+- Note [anomaly-baselines-and-climate-indices]: do not use `climatology='woa23'`; each anomaly must come from the field’s own 1950-2014 monthly climatology, with calendar-month matching, and the exceedance metric counts months with |anomaly| > 1.0 degree Celsius, so persistence (`min_duration`) plays no role.
+
+4. For each source, compute the population standard deviation (`ddof=0`) of the Nino 3.4 anomaly over all 780 months. For each model, compute amplitude bias as model standard deviation minus the ERSSTv5 standard deviation, amplitude ratio as model standard deviation divided by the ERSSTv5 standard deviation, and rank the three models from smallest to largest absolute amplitude bias. Also compute, for each source, the population standard deviation of the anomaly for each of the 12 calendar months, identify the calendar month of largest and smallest standard deviation, and compute the largest-to-smallest ratio. Compare only these statistics between models and observations.
+- Note [cmip6-experiments-historical-ssp245]: coupled historical runs have their own internal variability, so compare only statistics and never individual years or event timing; with one member per model, differences in amplitude cannot be split into forced versus internal-variability parts.
+
+5. For each source, count the months over 1950-01 to 2014-12 whose Nino 3.4 anomaly strictly exceeds 1.0 degree Celsius in absolute value, and compute the percentage of the 780 months to 1 decimal place, using the strict |anomaly| > 1.0 criterion from [anomaly-baselines-and-climate-indices].
+
+6. Make Figure 1 using the 12 monthly standard deviations for ERSSTv5, CESM2, GFDL-ESM4 and MPI-ESM1-2-LR: calendar month January-December on the x axis, standard deviation in degrees Celsius on the y axis, four curves on one axis, with observations visually distinct and each curve’s peak month marked. Make Figure 2 as four stacked panels in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, sharing one time axis over 1950-2014 and an identical y-axis range containing every anomaly series, with +1.0 and -1.0 degree Celsius levels marked and each panel annotated with its full-period standard deviation and exceedance percentage.
+
+Other notes:
+- Each source’s anomaly is relative to that source’s own 1950-2014 monthly climatology; no external climatology such as `woa23` is used.
+- The model-minus-ERSSTv5 amplitude difference compares each model’s bulk top-cell `tos` with an observational SST product; `tos` is not a skin temperature.
+- With a single historical member per model, model-versus-ERSSTv5 differences cannot be separated into forced response and internal variability.
+- GFDL-ESM4 numbers are on the archive 1x1 degree `gr` grid; CESM2 and MPI-ESM1-2-LR are on grids whose horizontal resolutions differ by about 2.5x, so features narrower than the coarse grid are not comparable in amplitude.
+- [model-gfdl-esm4-reported-biases] GFDL-ESM4’s documented slightly stronger ENSO with a longer period makes a positive amplitude bias for GFDL-ESM4 consistent with its documentation; this is context, not a target value.
+
+<selected_data>cmip6_historical, ersst</selected_data>

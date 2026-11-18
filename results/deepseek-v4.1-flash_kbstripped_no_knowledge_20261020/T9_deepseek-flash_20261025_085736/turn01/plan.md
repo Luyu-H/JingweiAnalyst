@@ -1,0 +1,17 @@
+# Plan
+
+1. Load ERSSTv5 monthly `sst` for 1950-01 to 2014-12 over the PDO domain 20N–70N, 110E–100W (treated as 110E–260E across the dateline) with `load_regular_data`, then regrid bilinearly to the 1-degree grid with `regrid_horizontal`. Load CMIP6 historical monthly `tos` for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR over the same months and domain with `load_regular_data`, then regrid each model bilinearly to the 1-degree grid with `regrid_horizontal`.
+2. For each of the four SST fields (ERSSTv5 and the three CMIP6 models), compute monthly anomalies relative to its own 1950-2014 monthly climatology using `compute_anomaly_vs_own_climatology`.
+3. For each anomaly field, compute the leading EOF/PDO mode over 20N–70N, 110E–100W with `compute_pdo_index`: return the percentage of variance explained, the regression pattern in degrees Celsius per standard deviation (the mode amplitude), and the standardized monthly principal-component index.
+4. Build the common comparison mask for the four regression patterns with `build_comparison_mask`, then compute the spatial Pearson correlation of each model regression pattern against the ERSSTv5 regression pattern using `analyze_correlation`; identify the model with the highest pattern correlation.
+5. For each standardized monthly index, compute the lag-12-month autocorrelation using `analyze_correlation` as the self-correlation at a 12-month lag.
+6. Load the published PDO monthly series from `cpc_indices` product `pdo` for 1950-2014 using `load_regular_data`, and compute its Pearson correlation with the ERSSTv5-derived standardized PDO index using `analyze_correlation`.
+7. Use `temporal_aggregate` to form the 108-month (9-year) centred running mean of the ERSSTv5 standardized index. Use `detect_threshold_events` with threshold zero on the smoothed series to locate zero-crossing episodes, then apply the specified rule that a crossing less than 3 years after the last counted transition is merged into it, keeping the earlier year; list the resulting transition years and compare them with documented Pacific climate shifts.
+8. Produce Figure 1: a 2-by-2 panel of the regression patterns in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, using one diverging colour scale centred on zero labelled in degrees Celsius per standard deviation, with each panel annotated by its explained variance and, for models, its pattern correlation with observations.
+9. Produce Figure 2: a single time-series panel showing the standardized indices of all four sources plus the published PDO series as a distinguishable fifth line, with the 9-year smoothed ERSSTv5 curve and detected transition years marked, and the y-axis labelled as a standardized index.
+
+Other notes:
+- The correlation with the published PDO measures temporal/phase agreement with an existing index; it does not independently validate the EOF/regression calculation, prove a physical mechanism, or demonstrate model skill beyond agreement with that shared index.
+- Pattern correlation measures spatial similarity only; amplitude and persistence must be assessed separately from the amplitude in degrees Celsius per standard deviation and the lag-12 autocorrelation.
+- Transition-year matches should be reported as correspondences with documented Pacific shifts such as 1976/77, 1988/89 and 1998/99 where detected, not as causal attribution.
+- Report variance explained to 1 decimal place, amplitudes to 3 decimal places, and autocorrelations/correlations to 3 decimal places, rounding only the final reported values and not intermediate results.

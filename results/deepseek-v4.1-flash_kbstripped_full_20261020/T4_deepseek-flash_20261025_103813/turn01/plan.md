@@ -1,0 +1,34 @@
+# Plan
+
+1. Load CMIP6 historical monthly data for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR over 1971-01 to 2000-12 using `load_regular_data`: `thetao`, `so` and `mlotst`. Also load each model’s published `areacello` with `load_areas` and its depth levels/layer boundaries with `load_depth_levels`.
+- Note [missing-values-and-land-cells]: let xarray decode 1e20 to NaN; build each field’s valid mask from that field itself, because masks differ between variables of the same model, and mask the area weights to the same cells.
+
+2. For every model and every month from 1971 to 2000, compute the potential density anomaly from that month’s `thetao` and `so` using `compute_potential_density_anomaly` on the potential-temperature route, with practical salinity converted to absolute salinity only inside the TEOS-10 density calculation and a fixed-reference sigma for the MLD criterion.
+- Note [cmip6-thetao-potential-temperature]: `thetao` is potential temperature referenced to the surface; compute density by the potential-temperature route, never as TEOS-10 Conservative Temperature, and use a fixed-reference sigma for the criterion.
+- Note [cmip6-so-practical-salinity]: `so` is practical salinity; its units string “0.001” does not mean the values need rescaling, and S_P is converted to S_A only inside the gsw/TEOS-10 density routines.
+
+3. For each model and month, compute the operator MLD from that month’s density profile using `compute_mixed_layer_depth`: density criterion, threshold 0.03 kg m-3 relative to `ref_depth` equal to the model’s shallowest depth level, with the crossing depth interpolated between the bracketing levels. Do this before any time averaging.
+- Note [cmip6-mlotst-definition]: use the 0.03 kg m-3 threshold and `ref_depth` = the model’s shallowest level, not 10 m; the offline MLD from monthly means is expected to be shallower than `mlotst`. Drop columns where the threshold is never reached, report the area excluded, and state that `mlotst` fills these differently: CESM2 0 m, GFDL-ESM4/MPI-ESM1-2-LR approximately the full column. State the three residual causes — reference level, sigma0 difference versus OMIP’s displaced-parcel comparison at local pressure p(k), and MLD-of-mean versus mean-of-MLDs — and do not treat the residual as model error.
+- Note [monthly-means-are-time-averages]: compute each month’s MLD from that month’s `thetao`/`so` and then average the MLDs; never average temperature and salinity first. A calendar-month climatology over 30 years is the plain mean of that month’s values across years; day weights in `temporal_aggregate` matter only when averaging across different calendar months.
+
+4. For each model and each of March and September, build the comparison mask over the 30 instances of that month using `build_comparison_mask` on the monthly operator MLD and the monthly `mlotst`, requiring both fields to be defined in all 30 Marches or all 30 Septembers. Apply that same mask to the operator MLD, to `mlotst` and to the `areacello` weights.
+- Note [common-comparison-mask]: build one mask over the fields being compared and apply it to every field and to the weights; keep WOA23’s land-sea mask out because WOA23 is not part of this comparison. The question prescribes per-model all-30-instance masks for the six headline numbers, so coverage is reported rather than rescaling the per-model scores to a cross-model domain.
+
+5. Form the March and September climatologies with `temporal_aggregate` on the masked monthly operator MLD and on the masked monthly `mlotst`, using climatological-monthly aggregation and then selecting March and September. These are the plain 30-year means of that calendar month. Compute the difference field `operator_MLD_climatology - mlotst_climatology` on the common mask.
+
+6. For each model and month, compute the requested metrics on the common-mask native grid: mean difference and root-mean-square difference with `compute_difference_metrics` using operator MLD minus `mlotst`; spatial Pearson correlation with `analyze_correlation` at zero lag; and the percentage of common-mask area with absolute difference greater than 20 m using `compute_exceedance_fraction` by area with `areacello`. Use `compute_basic_stat` with `areacello` to compute the model’s total ocean area, the common-mask area, the coverage percentage relative to total ocean area, and the area excluded because the threshold was never reached or a field was missing.
+- Note [cmip6-static-grid-fields]: use each model’s own published `areacello` as the area weights for the >20 m exceedance and coverage percentages; total ocean area differs between models by about a per cent, so state the area each integral covers rather than rescaling.
+
+7. Rank the three models by internal consistency using the mean of their March and September RMSDs, lower being more consistent, with bias, correlation, exceedance percentage and coverage as supporting diagnostics. Use the six difference maps and the >20 m exceedance field to describe where the disagreement concentrates.
+- Note [cmip6-grid-labels]: GFDL-ESM4 is `gr`, already remapped to 1° with a regridded land-sea mask, which adds a resolution/remapping difference; its 100 km resolution versus MPI’s 250 km makes narrow features non-comparable in amplitude.
+
+8. Build Figure 1 as a 3-by-2 panel of global maps of operator MLD minus `mlotst`, rows CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, columns March and September. Use `regrid_horizontal` to put each field on a common regular longitude-latitude grid for display only, then draw true geographic maps with one shared diverging colour scale centred on zero across all six panels. Do not use the regridded fields for any metric.
+
+9. Build Figure 2 as a 3-by-2 panel of scatter plots in the same layout, using the native common-mask cells: operator MLD on the x axis and `mlotst` on the y axis, one point per ocean cell. Use logarithmic axes with one identical range and identical ticks across all six panels, a dashed y = x reference line, and annotate each panel with its bias, RMSD and correlation from step 6.
+
+10. Summarize the ranking and regions of disagreement from Figure 1 and the exceedance field, and explain that exact agreement is not expected because of the reference level, the sigma0 versus displaced-parcel comparison, MLD-of-mean versus mean-of-MLDs, and the use of monthly-mean T/S for the operator MLD.
+
+Other notes:
+- Ranking criterion: models are ordered by the average of their March and September RMSDs, lower RMSD indicating greater internal consistency; bias and correlation are supporting diagnostics.
+- The six headline metrics are computed on each model’s own per-model all-30-instance mask and native grid; the regular-grid remapping is used only for Figure 1.
+- If any common-mask cells have non-positive MLD values, logarithmic axes cannot display them; such cells, if present, are stated separately and are not used to alter the metrics.

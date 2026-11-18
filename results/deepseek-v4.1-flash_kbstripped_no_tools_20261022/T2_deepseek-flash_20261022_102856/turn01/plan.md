@@ -1,0 +1,28 @@
+# Plan
+
+1. **Load ERSSTv5 and the CPC indices.** Open the raw ERSSTv5 monthly files (`ersst`) and extract the `sst` field on its native 2° grid for 1950-01 to 2023-12. In parallel open the `cpc_indices` files and extract the four monthly series over the same months: the Nino 3.4 anomaly column of `ersst5_91-20` (main reference, 1991-2020 baseline), the Nino 3.4 anomaly column of `ersst5_81-10` (control, 1981-2010 baseline), and `oni` (official 3-month running index). Align all series on a common monthly time axis and note the exact variable/column names found in the files.
+
+2. **Build RECON_9120.** From the ERSSTv5 field alone, compute a monthly climatology for 1991-2020 (one value per calendar month, per grid cell), subtract it month-by-month to get the SST anomaly, then average the anomaly over the Nino 3.4 box 5°S–5°N, 170°W–120°W with cos(latitude) area weights.
+   - Note [omip-weighted-means-and-integrals]: this regional average is physical, so use area weights (cos lat), not a plain mean over the box, and restrict the weights to exactly the cells that are valid in the data so land/missing cells stay out of the denominator.
+   - Note [anomaly-baselines-and-climate-indices]: the anomaly must be built from ERSSTv5's *own* 1991-2020 monthly climatology, matched month to calendar month (which removes the seasonal cycle); record the climatology and baseline used. Count events operationally by persistence, i.e. at least `min_duration` = 5 consecutive overlapping 3-month seasons beyond the threshold, never a single step over threshold.
+   The result is the monthly RECON_9120 series, 1950-01 to 2023-12.
+
+3. **Build RECON_8110.** Repeat step 2 identically but with an ERSSTv5 monthly climatology over 1981-2010, keeping the same region, weights and valid-cell mask, to get RECON_8110 on the 1981-2010 baseline.
+
+4. **Running means and event detection for RECON_9120.** Form the 3-month centred running mean of RECON_9120 (edges undefined). Detect El Nino events as runs of at least 5 consecutive overlapping 3-month seasons with running-mean value ≥ +0.5 °C, and La Nina events as runs of at least 5 consecutive seasons with value ≤ −0.5 °C, applying the persistence rule from [anomaly-baselines-and-climate-indices]. Report the number of El Nino events 1950-2023 and, for the three events with the highest peak, the peak value (the maximum of the centred 3-month running mean inside the event, reported at its centre month) in °C to 2 decimals with year and month.
+
+5. **Compare RECON_9120 with the published CPC 1991-2020 series.** Over 1950-01 to 2023-12, pair the two series month by month and compute the Pearson correlation (6 dp), the RMSE (4 dp) and the largest absolute deviation (4 dp) together with the year and month in which it occurs. Use unrounded series throughout and round only for reporting.
+   - Note [serial-correlation-and-significance]: these are two estimates of the same quantity (an index rebuilt from a gridded field versus the published index), so correlate them as they are with no detrending — the shared trend is part of the agreement being checked.
+
+6. **Event analysis for the CPC ONI.** Apply the identical criterion (≥ +0.5 °C sustained for at least 5 consecutive overlapping 3-month seasons) to the `oni` series and report the El Nino count and the three highest peaks with year/month and value (2 dp). Since ONI is already the official 3-month running mean, apply the threshold directly to it rather than smoothing it a second time; state this. Then explain the difference in count between RECON_9120 and ONI by comparing their baselines/climatologies and the region/smoothing conventions.
+
+7. **Baseline offsets.** Over the common months 1950-01 to 2020-12, compute the unweighted (plain) mean across months of RECON_8110 − RECON_9120 (reconstructed offset, 3 dp) and of the published `ersst5_81-10` Nino 3.4 anomaly minus `ersst5_91-20` Nino 3.4 anomaly (published offset, 3 dp), and quantify their agreement (their difference, and the closeness of the two 3-dp values, plus their month-by-month agreement if the two offsets are not exactly constant).
+
+8. **Figure 1.** Two rows sharing a 1950-2023 time axis. Upper row: RECON_9120 and the CPC 1991-2020 monthly anomalies, their 3-month running means, horizontal +0.5 and −0.5 °C thresholds, and shaded patches between the threshold and the running-mean curve — warm shading during the El Nino events and cool shading during the La Nina events detected in step 4. Lower row: RECON_9120 minus CPC on its own vertical scale. Both y axes labelled in °C.
+
+9. **Figure 2.** Square scatter of RECON_9120 (y) against the CPC 1991-2020 series (x), one point per month, with identical axis limits and ticks on both axes, a 1:1 reference line, and the step-5 correlation and RMSE annotated.
+
+Other notes:
+- [anomaly-baselines-and-climate-indices] The ERSSTv5-built RECON_9120/RECON_8110 and the CPC series are two reconstructions of the same index; the reconstructed and published baseline offsets may differ by one near-constant amount per calendar month, which is an offset between baselines, not an error of either series — state this when reporting the offset comparison.
+- The CPC ONI uses its own 30-year base periods (updated every 5 years) and is a 3-month running mean, so it is not on the same fixed 1991-2020 baseline as RECON_9120; this baseline/smoothing difference is the reason to give for any mismatch in El Nino counts and peak values.
+- Report all intermediate results unrounded; round only the values printed (correlation 6 dp, RMSE and max deviation 4 dp, offsets 3 dp, peaks 2 dp).

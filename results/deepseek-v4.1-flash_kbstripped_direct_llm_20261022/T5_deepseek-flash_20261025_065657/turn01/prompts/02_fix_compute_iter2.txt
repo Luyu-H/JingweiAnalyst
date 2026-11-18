@@ -1,0 +1,2452 @@
+# exchange 2: fix_compute_iter2
+# elapsed: 101.4 s
+
+===== SYSTEM =====
+You are a code debugging expert.
+
+===== USER =====
+The following compute code failed to execute:
+
+<failed_code>
+import os
+import glob
+import re
+from scipy import stats
+
+# -----------------------------------------------------------------------------
+# Paths and model metadata
+# -----------------------------------------------------------------------------
+WOA_ROOT = "/data1/lorraine-20419/ocean_data/WOA23/climatology"
+WOA_MASKS_ROOT = "/data1/lorraine-20419/ocean_data/WOA23/masks"
+HIST_ROOT = "/data1/lorraine-20419/benchmark_cmip6/historical"
+SSP_ROOT = "/data1/lorraine-20419/benchmark_cmip6/ssp245"
+
+MODELS = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+MODEL_INFO = {
+    "CESM2": {"lat_coord": "lat", "lon_coord": "lon", "depth_scale": 0.01},
+    "GFDL-ESM4": {"lat_coord": "lat", "lon_coord": "lon", "depth_scale": 1.0},
+    "MPI-ESM1-2-LR": {"lat_coord": "latitude", "lon_coord": "longitude", "depth_scale": 1.0},
+}
+
+# -----------------------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------------------
+def _depth_name(ds):
+    for n in ["lev", "depth", "deptht", "z", "st_ocean"]:
+        if n in ds.dims or n in ds.coords:
+            return n
+    return None
+
+
+def _get_data_var(ds, name):
+    if name in ds:
+        return ds[name]
+    for v in ds.data_vars:
+        if v.lower() == name.lower():
+            return ds[v]
+    return ds[list(ds.data_vars)[0]]
+
+
+def _depth_values_m(ds, name, default_scale=1.0):
+    da = ds[name]
+    vals = np.asarray(da.values, dtype=float)
+    units = str(da.attrs.get("units", "")).strip().lower()
+    if "cm" in units or "centimeter" in units or "centimetre" in units:
+        vals = vals * 0.01
+    elif units in ("m", "meter", "meters", "metre", "metres") or units.endswith(" m"):
+        pass
+    else:
+        vals = vals * default_scale
+    return vals
+
+
+def _find_model_files(root, model, var, exp=None):
+    d = os.path.join(root, model, var)
+    files = sorted(glob.glob(os.path.join(d, f"{var}_*.nc")))
+    if exp is not None:
+        files_exp = [f for f in files if f"_{exp}_" in os.path.basename(f)]
+        if files_exp:
+            files = files_exp
+    return files
+
+
+def _variant_from_files(files):
+    out = set()
+    for f in files:
+        m = re.search(r"_(r\d+i\d+p\d+f\d+)_", os.path.basename(f))
+        if m:
+            out.add(m.group(1))
+    return sorted(out)
+
+
+def _open_cmip_dataset(root, model, var, exp, time_slice=None,
+                       fallback_root=None, fallback_exp=None):
+    files = _find_model_files(root, model, var, exp)
+    if not files and fallback_root is not None:
+        files = _find_model_files(fallback_root, model, var, fallback_exp or exp)
+    if not files:
+        d = os.path.join(root, model, var)
+        files = sorted(glob.glob(os.path.join(d, f"{var}_*.nc")))
+    if not files:
+        raise FileNotFoundError(f"No files found for {model} {var} under {root}")
+
+    if len(files) == 1:
+        ds = xr.open_dataset(files[0], decode_times=True, use_cftime=True)
+    else:
+        ds = xr.open_mfdataset(files, combine="by_coords", decode_times=True,
+                               use_cftime=True)
+
+    if time_slice is not None and "time" in ds.dims:
+        ds = ds.sel(time=slice(time_slice[0], time_slice[1]))
+    return ds
+
+
+def _build_sss_monthly(ds_so, ds_vol, info):
+    so = _get_data_var(ds_so, "so")
+    dname = _depth_name(ds_so)
+    dep = _depth_values_m(ds_so, dname, info.get("depth_scale", 1.0))
+    lev_idx = np.where((dep >= 0.0) & (dep <= 10.0))[0]
+    if len(lev_idx) == 0:
+        lev_idx = np.array([0])
+
+    so_sel = so.isel({dname: lev_idx})
+
+    vol = _get_data_var(ds_vol, "volcello")
+    dname_v = _depth_name(ds_vol)
+    vol_sel = vol.isel({dname_v: lev_idx})
+    if "time" in vol_sel.dims:
+        vol_sel = vol_sel.isel(time=0, drop=True)
+    if dname_v != dname:
+        vol_sel = vol_sel.rename({dname_v: dname})
+
+    num = (so_sel * vol_sel).sum(dim=dname)
+    den = vol_sel.sum(dim=dname)
+    return num / den
+
+
+def _area_weighted_global_mean(da, area_np):
+    ydim, xdim = da.dims[-2], da.dims[-1]
+    area_np = np.asarray(area_np, dtype=float)
+    area_np = np.where(np.isfinite(area_np) & (area_np > 0), area_np, np.nan)
+    area_da = xr.DataArray(
+        area_np,
+        dims=(ydim, xdim),
+        coords={ydim: da[ydim], xdim: da[xdim]},
+    )
+    mask = np.isfinite(da) & np.isfinite(area_da)
+    num = (da.where(mask) * area_da).sum(dim=(ydim, xdim), skipna=True)
+    den = area_da.where(mask).sum(dim=(ydim, xdim), skipna=True)
+    return num / den
+
+
+def _regrid_to_woa(field, lon2d, lat2d, area2d, woa_lat, woa_lon):
+    f = np.asarray(field, dtype=float)
+    lon = np.asarray(lon2d, dtype=float)
+    lat = np.asarray(lat2d, dtype=float)
+    area = np.asarray(area2d, dtype=float)
+    if f.ndim != 2:
+        raise ValueError("field must be 2-D")
+
+    ny, nx = len(woa_lat), len(woa_lon)
+    mask = (
+        np.isfinite(f) & np.isfinite(lon) & np.isfinite(lat)
+        & np.isfinite(area) & (area > 0)
+    )
+    out_flat = np.full(ny * nx, np.nan, dtype=float)
+    if not np.any(mask):
+        return out_flat.reshape(ny, nx)
+
+    lonm = ((lon[mask] + 180.0) % 360.0) - 180.0
+    latm = lat[mask]
+    i = np.floor(lonm + 180.0).astype(int)
+    j = np.floor(latm + 90.0).astype(int)
+    i = np.clip(i, 0, nx - 1)
+    j = np.clip(j, 0, ny - 1)
+    flat = j * nx + i
+
+    w = area[mask]
+    num = np.bincount(flat, weights=f[mask] * w, minlength=ny * nx)
+    den = np.bincount(flat, weights=w, minlength=ny * nx)
+    good = den > 0
+    out_flat[good] = num[good] / den[good]
+    return out_flat.reshape(ny, nx)
+
+
+def _linear_trend_stats(years, values):
+    years = np.asarray(years, dtype=float)
+    values = np.asarray(values, dtype=float)
+    mask = np.isfinite(years) & np.isfinite(values)
+    x = years[mask]
+    y = values[mask]
+    n = len(x)
+
+    out = dict(
+        n=n,
+        slope_psu_per_decade=np.nan,
+        ci_low_psu_per_decade=np.nan,
+        ci_high_psu_per_decade=np.nan,
+        r2=np.nan,
+        p=np.nan,
+        excludes_zero=False,
+        intercept=np.nan,
+        slope_per_year=np.nan,
+    )
+    if n < 3:
+        return out
+
+    xmean = x.mean()
+    ymean = y.mean()
+    Sxx = ((x - xmean) ** 2).sum()
+    if Sxx <= 0:
+        return out
+
+    Sxy = ((x - xmean) * (y - ymean)).sum()
+    slope = Sxy / Sxx
+    intercept = ymean - slope * xmean
+    resid = y - (intercept + slope * x)
+    SSE = (resid ** 2).sum()
+    SST = ((y - ymean) ** 2).sum()
+    r2 = 1.0 - SSE / SST if SST > 0 else np.nan
+    se = np.sqrt(SSE / (n - 2) / Sxx)
+    tcrit = stats.t.ppf(0.975, n - 2)
+    ci_low = slope - tcrit * se
+    ci_high = slope + tcrit * se
+    p = 2.0 * stats.t.sf(np.abs(slope / se), n - 2) if se > 0 else 1.0
+
+    out.update(dict(
+        slope_psu_per_decade=slope * 10.0,
+        ci_low_psu_per_decade=ci_low * 10.0,
+        ci_high_psu_per_decade=ci_high * 10.0,
+        r2=r2,
+        p=p,
+        excludes_zero=bool(ci_low > 0 or ci_high < 0),
+        intercept=intercept,
+        slope_per_year=slope,
+    ))
+    return out
+
+
+def _trend_map(annual_da):
+    years = annual_da["year"].values.astype(float)
+    y = np.asarray(annual_da.values, dtype=float)
+    mask = np.isfinite(y)
+    x = years[:, None, None]
+
+    x0 = np.where(mask, x, 0.0)
+    y0 = np.where(mask, y, 0.0)
+    count = mask.sum(axis=0).astype(float)
+    count_safe = np.where(count > 0, count, np.nan)
+
+    xmean = x0.sum(axis=0) / count_safe
+    ymean = y0.sum(axis=0) / count_safe
+
+    Sxx = np.where(mask, (x - xmean[None, :, :]) ** 2, 0.0).sum(axis=0)
+    Sxy = np.where(mask, (x - xmean[None, :, :]) * (y - ymean[None, :, :]), 0.0).sum(axis=0)
+    slope = Sxy / Sxx
+    intercept = ymean - slope * xmean
+
+    resid = np.where(mask, y - (intercept[None, :, :] + slope[None, :, :] * x), 0.0)
+    SSE = (resid ** 2).sum(axis=0)
+    SST = np.where(mask, (y - ymean[None, :, :]) ** 2, 0.0).sum(axis=0)
+    r2 = 1.0 - SSE / SST
+
+    se = np.sqrt(SSE / (count - 2.0) / Sxx)
+    tval = slope / se
+    p = 2.0 * stats.t.sf(np.abs(tval), count - 2.0)
+
+    bad = (count < 3) | (Sxx <= 0) | ~np.isfinite(slope)
+    slope = np.where(bad, np.nan, slope)
+    r2 = np.where(bad, np.nan, r2)
+    p = np.where(bad, np.nan, p)
+    return slope * 10.0, p, r2
+
+
+def _weighted_mean_field(field, mask, area):
+    m = mask & np.isfinite(field)
+    if not np.any(m):
+        return np.nan
+    return np.nansum(field[m] * area[m]) / np.nansum(area[m])
+
+
+def _read_msk_numeric(path):
+    with open(path, "r", errors="ignore") as f:
+        lines = f.readlines()
+
+    start = 0
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("!"):
+            continue
+        parts = re.split(r"[\s,]+", s)
+        if len(parts) >= 2:
+            try:
+                float(parts[0])
+                float(parts[1])
+                start = i
+                break
+            except ValueError:
+                continue
+
+    df = pd.read_csv(
+        path,
+        sep=r"[\s,]+",
+        comment="#",
+        header=None,
+        skiprows=start,
+        engine="python",
+    )
+    df = df.dropna(axis=1, how="all")
+    for c in [0, 1]:
+        df = df[pd.to_numeric(df[c], errors="coerce").notna()]
+    return df
+
+
+def _woa_layer_thickness(depth):
+    z = np.asarray(depth, dtype=float)
+    dz = np.empty_like(z)
+    if len(z) > 1:
+        dz[:-1] = z[1:] - z[:-1]
+        dz[-1] = dz[-2]
+    elif len(z) == 1:
+        dz[0] = 1.0
+    return np.abs(dz)
+
+
+# -----------------------------------------------------------------------------
+# WOA23 salinity, land-sea mask and basin mask
+# -----------------------------------------------------------------------------
+woa_file = os.path.join(
+    WOA_ROOT,
+    "salinity",
+    "1971-2000_climate_normal",
+    "woa23_decav71A0_s00_01.nc",
+)
+woa_ds = xr.open_dataset(woa_file, decode_times=False)
+
+woa_var = None
+for cand in ["s_an", "salinity", "s", "so"]:
+    if cand in woa_ds:
+        woa_var = cand
+        break
+if woa_var is None:
+    for cand in woa_ds.data_vars:
+        if cand.endswith("_an") or "sal" in cand.lower():
+            woa_var = cand
+            break
+if woa_var is None:
+    woa_var = list(woa_ds.data_vars)[0]
+
+woa_da = woa_ds[woa_var]
+if "time" in woa_da.dims:
+    woa_da = woa_da.isel(time=0, drop=True)
+
+woa_depth_name = _depth_name(woa_ds)
+woa_depth = np.asarray(woa_ds[woa_depth_name].values, dtype=float)
+woa_lat = np.asarray(woa_ds["lat"].values, dtype=float)
+woa_lon = np.asarray(woa_ds["lon"].values, dtype=float)
+ny_woa, nx_woa = len(woa_lat), len(woa_lon)
+
+R_EARTH = 6371000.0
+woa_area = (
+    R_EARTH ** 2
+    * np.deg2rad(woa_lat[1] - woa_lat[0])
+    * np.deg2rad(woa_lon[1] - woa_lon[0])
+    * np.cos(np.deg2rad(woa_lat))[:, None]
+    * np.ones((1, nx_woa))
+)
+
+# Land-sea mask: ocean is mask > 1.
+df_land = _read_msk_numeric(os.path.join(WOA_MASKS_ROOT, "landsea_01.msk"))
+lat_land = df_land.iloc[:, 0].values.astype(float)
+lon_land = df_land.iloc[:, 1].values.astype(float)
+val_land = df_land.iloc[:, 2].values.astype(float)
+
+landsea_arr = np.full((ny_woa, nx_woa), np.nan, dtype=float)
+j_land = np.clip(
+    np.round((lat_land - woa_lat[0]) / (woa_lat[1] - woa_lat[0])).astype(int),
+    0, ny_woa - 1,
+)
+i_land = np.mod(
+    np.round((lon_land - woa_lon[0]) / (woa_lon[1] - woa_lon[0])).astype(int),
+    nx_woa,
+)
+landsea_arr[j_land, i_land] = val_land
+woa_ocean = landsea_arr > 1.0
+
+# Basin mask: take the surface basin value from the sparse table.
+df_basin = _read_msk_numeric(os.path.join(WOA_MASKS_ROOT, "basinmask_01.msk"))
+lat_basin = df_basin.iloc[:, 0].values.astype(float)
+lon_basin = df_basin.iloc[:, 1].values.astype(float)
+basin_surface_val = df_basin.iloc[:, 2].values.astype(float)
+
+basin_surface = np.full((ny_woa, nx_woa), np.nan, dtype=float)
+j_basin = np.clip(
+    np.round((lat_basin - woa_lat[0]) / (woa_lat[1] - woa_lat[0])).astype(int),
+    0, ny_woa - 1,
+)
+i_basin = np.mod(
+    np.round((lon_basin - woa_lon[0]) / (woa_lon[1] - woa_lon[0])).astype(int),
+    nx_woa,
+)
+basin_surface[j_basin, i_basin] = basin_surface_val
+
+basin_codes = np.unique(basin_surface[np.isfinite(basin_surface)])
+if basin_codes.size == 0:
+    basin_fold = np.full_like(basin_surface, np.nan)
+elif np.nanmax(basin_codes) <= 5:
+    # Compact WOA13-style coding: 1 Atlantic, 2 Pacific, 3 Indian, 4 Arctic, 5 Southern.
+    basin_fold = np.full_like(basin_surface, np.nan)
+    basin_fold[np.isin(basin_surface, [1])] = 1  # Atlantic
+    basin_fold[np.isin(basin_surface, [2])] = 2  # Pacific
+    basin_fold[np.isin(basin_surface, [3])] = 3  # Indian
+else:
+    # Extended WOA13-style coding with marginal seas.
+    basin_fold = np.full_like(basin_surface, np.nan)
+    basin_fold[np.isin(basin_surface, [1, 4, 5, 6])] = 1  # Atlantic + Mediterranean/Black/Baltic
+    basin_fold[np.isin(basin_surface, [2])] = 2           # Pacific
+    basin_fold[np.isin(basin_surface, [3, 7, 8])] = 3     # Indian + Red Sea/Persian Gulf
+    # 9 Arctic and 10 Southern remain NaN (excluded).
+
+# WOA23 SSS over levels whose depths are in 0-10 m, weighted by full layer volume.
+woa_lev_idx = np.where((woa_depth >= 0.0) & (woa_depth <= 10.0))[0]
+if len(woa_lev_idx) == 0:
+    woa_lev_idx = np.array([0])
+
+woa_dz = _woa_layer_thickness(woa_depth)
+woa_s_sel = np.asarray(
+    woa_da.isel({woa_depth_name: woa_lev_idx}).values, dtype=float
+)
+woa_vol = woa_dz[woa_lev_idx][:, None, None] * woa_area[None, :, :]
+
+valid_woa = np.isfinite(woa_s_sel)
+num_woa = np.nansum(np.where(valid_woa, woa_s_sel * woa_vol, np.nan), axis=0)
+den_woa = np.nansum(np.where(valid_woa, woa_vol, np.nan), axis=0)
+with np.errstate(invalid="ignore", divide="ignore"):
+    woa_sss_np = num_woa / den_woa
+woa_sss_np[~woa_ocean] = np.nan
+
+m_woa_global = woa_ocean & np.isfinite(woa_sss_np)
+woa_sss_global_mean = (
+    np.nansum(woa_sss_np[m_woa_global] * woa_area[m_woa_global])
+    / np.nansum(woa_area[m_woa_global])
+)
+
+# -----------------------------------------------------------------------------
+# CMIP6 processing
+# -----------------------------------------------------------------------------
+sss_global_mean = {}
+sss_global_bias = {}
+rmse_against_woa = {}
+corr_against_woa = {}
+bias_maps = {}
+
+trend_hist_stats = {}
+trend_ssp_stats = {}
+trend_ratio = {}
+trend_ratio_meaning = {}
+trend_maps = {}
+trend_p_maps = {}
+
+delta_sss = {}
+variant_caveats = {}
+variant_hist = {}
+variant_ssp = {}
+global_series = {}
+
+for model in MODELS:
+    info = MODEL_INFO[model]
+
+    hist_so_files = _find_model_files(HIST_ROOT, model, "so", "historical")
+    ssp_so_files = _find_model_files(SSP_ROOT, model, "so", "ssp245")
+    vh = _variant_from_files(hist_so_files)
+    vs = _variant_from_files(ssp_so_files)
+    variant_hist[model] = vh
+    variant_ssp[model] = vs
+
+    if vh and vs and vh != vs:
+        variant_caveats[model] = (
+            f"historical so variant {','.join(vh)} vs ssp245 so variant "
+            f"{','.join(vs)}; the delta mixes different ensemble members."
+        )
+    elif vh and vs:
+        variant_caveats[model] = (
+            f"same so variant {','.join(vh)} in both experiments; no "
+            "ensemble-member mismatch."
+        )
+    else:
+        variant_caveats[model] = (
+            "variant label could not be parsed for one experiment; check filenames."
+        )
+
+    ds_so_hist = _open_cmip_dataset(
+        HIST_ROOT, model, "so", "historical",
+        time_slice=("1950-01-01", "2014-12-31"),
+    )
+    ds_so_ssp = _open_cmip_dataset(
+        SSP_ROOT, model, "so", "ssp245",
+        time_slice=("2071-01-01", "2100-12-31"),
+    )
+
+    ds_vol_hist = _open_cmip_dataset(
+        HIST_ROOT, model, "volcello", "historical",
+    )
+    ds_vol_ssp = _open_cmip_dataset(
+        SSP_ROOT, model, "volcello", "ssp245",
+        fallback_root=HIST_ROOT, fallback_exp="historical",
+    )
+
+    ds_area = _open_cmip_dataset(
+        HIST_ROOT, model, "areacello", "historical",
+        fallback_root=SSP_ROOT, fallback_exp="ssp245",
+    )
+    area_da = _get_data_var(ds_area, "areacello")
+    if "time" in area_da.dims:
+        area_da = area_da.isel(time=0, drop=True)
+    area2d = np.asarray(area_da.values, dtype=float)
+    area2d = np.where(np.isfinite(area2d) & (area2d > 0), area2d, np.nan)
+
+    lon_da = ds_so_hist[info["lon_coord"]]
+    lat_da = ds_so_hist[info["lat_coord"]]
+    if lon_da.ndim == 1 and lat_da.ndim == 1:
+        lon2d, lat2d = np.meshgrid(
+            np.asarray(lon_da.values, dtype=float),
+            np.asarray(lat_da.values, dtype=float),
+        )
+    else:
+        lon2d = np.asarray(lon_da.values, dtype=float)
+        lat2d = np.asarray(lat_da.values, dtype=float)
+
+    sss_hist_monthly = _build_sss_monthly(ds_so_hist, ds_vol_hist, info)
+    sss_ssp_monthly = _build_sss_monthly(ds_so_ssp, ds_vol_ssp, info)
+
+    years_h = np.array([t.year for t in sss_hist_monthly.indexes["time"]])
+    sss_hist_monthly = sss_hist_monthly.assign_coords(year=("time", years_h))
+    annual_hist_sss = sss_hist_monthly.groupby("year").mean("time").compute()
+
+    years_s = np.array([t.year for t in sss_ssp_monthly.indexes["time"]])
+    sss_ssp_monthly = sss_ssp_monthly.assign_coords(year=("time", years_s))
+    annual_ssp_sss = sss_ssp_monthly.groupby("year").mean("time").compute()
+
+    annual_global_hist = _area_weighted_global_mean(
+        annual_hist_sss, area2d
+    ).compute()
+    annual_global_ssp = _area_weighted_global_mean(
+        annual_ssp_sss, area2d
+    ).compute()
+
+    sss_hist_clim = annual_hist_sss.sel(year=slice(1971, 2000)).mean("year")
+    sss_hist_9514 = annual_hist_sss.sel(year=slice(1995, 2014)).mean("year")
+    sss_ssp_mean = annual_ssp_sss.mean("year")
+
+    sss_global_mean[model] = float(
+        annual_global_hist.sel(year=slice(1971, 2000)).mean().values
+    )
+    sss_global_bias[model] = sss_global_mean[model] - woa_sss_global_mean
+
+    model_clim_regrid = _regrid_to_woa(
+        sss_hist_clim.values, lon2d, lat2d, area2d, woa_lat, woa_lon
+    )
+    bias = model_clim_regrid - woa_sss_np
+    bias_maps[model] = bias
+
+    m_cmp = (
+        woa_ocean
+        & np.isfinite(woa_sss_np)
+        & np.isfinite(model_clim_regrid)
+    )
+    rmse_against_woa[model] = float(
+        np.sqrt(np.mean((model_clim_regrid[m_cmp] - woa_sss_np[m_cmp]) ** 2))
+    )
+    corr_against_woa[model] = float(
+        np.corrcoef(model_clim_regrid[m_cmp], woa_sss_np[m_cmp])[0, 1]
+    )
+
+    trend_hist_stats[model] = _linear_trend_stats(
+        annual_global_hist["year"].values, annual_global_hist.values
+    )
+    trend_ssp_stats[model] = _linear_trend_stats(
+        annual_global_ssp["year"].values, annual_global_ssp.values
+    )
+
+    sh = trend_hist_stats[model]["slope_psu_per_decade"]
+    ss = trend_ssp_stats[model]["slope_psu_per_decade"]
+    if np.isfinite(sh) and abs(sh) > 1e-12:
+        trend_ratio[model] = ss / sh
+    else:
+        trend_ratio[model] = np.nan
+
+    if (trend_hist_stats[model]["excludes_zero"]
+            and trend_ssp_stats[model]["excludes_zero"]):
+        trend_ratio_meaning[model] = (
+            "ratio pairs slopes from disjoint periods and different forcings; "
+            "it is not a continuation slope and should be read only as a "
+            "descriptive comparison."
+        )
+    else:
+        trend_ratio_meaning[model] = (
+            "ratio is not meaningful because at least one segment's 95% CI "
+            "includes zero (or the historical slope is near zero), so it is "
+            "numerically unstable."
+        )
+
+    tr_map, p_map, _ = _trend_map(annual_hist_sss)
+    trend_maps[model] = _regrid_to_woa(
+        tr_map, lon2d, lat2d, area2d, woa_lat, woa_lon
+    )
+    trend_p_maps[model] = _regrid_to_woa(
+        p_map, lon2d, lat2d, area2d, woa_lat, woa_lon
+    )
+
+    model_hist9514_regrid = _regrid_to_woa(
+        sss_hist_9514.values, lon2d, lat2d, area2d, woa_lat, woa_lon
+    )
+    model_ssp_regrid = _regrid_to_woa(
+        sss_ssp_mean.values, lon2d, lat2d, area2d, woa_lat, woa_lon
+    )
+    delta_regrid = model_ssp_regrid - model_hist9514_regrid
+
+    delta_sss[model] = {
+        "global": _weighted_mean_field(delta_regrid, woa_ocean, woa_area),
+        "Atlantic": _weighted_mean_field(
+            delta_regrid, woa_ocean & (basin_fold == 1), woa_area
+        ),
+        "Indian": _weighted_mean_field(
+            delta_regrid, woa_ocean & (basin_fold == 3), woa_area
+        ),
+        "Pacific": _weighted_mean_field(
+            delta_regrid, woa_ocean & (basin_fold == 2), woa_area
+        ),
+    }
+
+    hist_years = annual_global_hist["year"].values
+    hist_vals = annual_global_hist.values
+    ssp_years = annual_global_ssp["year"].values
+    ssp_vals = annual_global_ssp.values
+
+    hist_fit = (
+        trend_hist_stats[model]["intercept"]
+        + trend_hist_stats[model]["slope_per_year"] * hist_years
+    )
+    ssp_fit = (
+        trend_ssp_stats[model]["intercept"]
+        + trend_ssp_stats[model]["slope_per_year"] * ssp_years
+    )
+
+    global_series[model] = dict(
+        hist_years=hist_years,
+        hist_sss=hist_vals,
+        ssp_years=ssp_years,
+        ssp_sss=ssp_vals,
+        hist_fit=hist_fit,
+        ssp_fit=ssp_fit,
+    )
+</failed_code>
+
+<error_info>
+Error Type: ParserError
+Error Message: Expected 42 fields in line 5, saw 43. Error could possibly be due to quotes being ignored when a multi-char delimiter is used.
+
+
+Traceback:
+Traceback (most recent call last):
+  File "/home/lorraine/projects/2025-jingwei_QA_GMD/src/models/agent_with_tools.py", line 721, in _safe_execute_tool
+    exec(code, sandbox_globals)
+  File "<string>", line 367, in <module>
+  File "<string>", line 280, in _read_msk_numeric
+  File "/home/lorraine/miniconda3/envs/jingwei_QA/lib/python3.11/site-packages/pandas/io/parsers/readers.py", line 1026, in read_csv
+    return _read(filepath_or_buffer, kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lorraine/miniconda3/envs/jingwei_QA/lib/python3.11/site-packages/pandas/io/parsers/readers.py", line 626, in _read
+    return parser.read(nrows)
+           ^^^^^^^^^^^^^^^^^^
+  File "/home/lorraine/miniconda3/envs/jingwei_QA/lib/python3.11/site-packages/pandas/io/parsers/readers.py", line 1923, in read
+    ) = self._engine.read(  # type: ignore[attr-defined]
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lorraine/miniconda3/envs/jingwei_QA/lib/python3.11/site-packages/pandas/io/parsers/python_parser.py", line 288, in read
+    alldata = self._rows_to_cols(content)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lorraine/miniconda3/envs/jingwei_QA/lib/python3.11/site-packages/pandas/io/parsers/python_parser.py", line 1063, in _rows_to_cols
+    self._alert_malformed(msg, row_num + 1)
+  File "/home/lorraine/miniconda3/envs/jingwei_QA/lib/python3.11/site-packages/pandas/io/parsers/python_parser.py", line 781, in _alert_malformed
+    raise ParserError(msg)
+pandas.errors.ParserError: Expected 42 fields in line 5, saw 43. Error could possibly be due to quotes being ignored when a multi-char delimiter is used.
+
+</error_info>
+
+Original task: Assess sea surface salinity (SSS) in three CMIP6 models: their mean-state bias against observations, their historical trend, and their end-of-century change under the ssp245 scenario.
+
+Data to use:
+- CMIP6 historical `so` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1950-01 to 2014-12.
+- CMIP6 ssp245 `so` from the same three models, monthly, 2071-01 to 2100-12.
+- Each model's own areacello and volcello.
+- WOA23 salinity, the 1971-2000 climate normal, annual, objectively analysed.
+- The WOA23 1-degree land-sea mask (landsea_01, ocean is value > 1) and basin mask (basinmask_01).
+
+SSS at each grid cell is the mean salinity of its levels whose depths lie within 0-10 m (WOA23: 0, 5 and 10 m; one or two levels per model), each level weighted by its full cell volume rather than by its overlap with 0-10 m, defined the same way for the models and for WOA23, reported in psu.
+
+Expected numerical results:
+- The global mean 1971-2000 SSS of each model and of WOA23, to 2 decimal places, and each model's difference from WOA23 to 2 decimal places.
+- For each model, the RMSE against WOA23 in psu to 2 decimal places and the spatial Pearson correlation with WOA23 to 3 decimal places, on the WOA23 1-degree grid.
+- For each model, the linear trend of the annual global mean SSS over historical 1950-2014 and over ssp245 2071-2100, each in psu per decade to 3 significant figures with its 95 per cent confidence interval, its R-squared, and whether the interval excludes zero; and the ratio of the ssp245 slope to the historical slope to 1 decimal place, with a statement of whether that ratio is meaningful.
+- For each model, the mean change delta SSS (ssp245 2071-2100 mean minus historical 1995-2014 mean) in psu to 2 decimal places, for the global ocean and for the Atlantic, Indian and Pacific basins (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded), together with any caveat arising from the ensemble members used for each model's two experiments.
+
+Expected visualizations:
+- Figure 1, three global maps in one row, one per model, of the SSS bias (model 1971-2000 climatology minus WOA23) on the cells of that comparison, one diverging colour scale centred on zero shared by all three panels, with the colour bar labelled in psu.
+- Figure 2, three global maps in one row, one per model, of the cell-by-cell linear trend of annual-mean SSS over 1950-2014 in psu per decade, drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only) with one shared diverging colour scale centred on zero, and cells significant at p < 0.05 stippled on top of the trend field.
+- Figure 3, a single time-series panel of the global mean SSS of all three models, with the historical 1950-2014 and ssp245 2071-2100 segments drawn separately (the 2015-2070 gap left empty), each segment overlaid with its own fitted line, the y axis labelled in psu, and each model in a colour used consistently across all three figures.
+
+Datasets available on this machine:
+{
+  "woa23": {
+    "kind": "climatology",
+    "root": "/data1/lorraine-20419/ocean_data/WOA23/climatology",
+    "masks_root": "/data1/lorraine-20419/ocean_data/WOA23/masks",
+    "description": "World Ocean Atlas 2023 (NOAA/NCEI) 1.00 degree objectively analysed climatology. Temperature and salinity come on two climate normals, 1971-2000 and 1991-2020; oxygen, apparent oxygen utilization and percent oxygen saturation each provide both a 1971-2000 normal (the default) and a 1965-2022 all-period (all) composite; nutrients provide only the 1965-2022 all-period composite.",
+    "grid": {
+      "type": "regular",
+      "resolution": 1.0,
+      "lat": [
+        -89.5,
+        89.5
+      ],
+      "lon": [
+        -179.5,
+        179.5
+      ],
+      "lon_convention": "-180_180"
+    },
+    "filename_template": "woa23_{tag}_{prefix}{nn:02d}_01.nc",
+    "time": {
+      "decode": false,
+      "slices": {
+        "annual": [
+          0
+        ],
+        "monthly": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "seasonal": [
+          13,
+          14,
+          15,
+          16
+        ]
+      },
+      "season_names": {
+        "13": "winter",
+        "14": "spring",
+        "15": "summer",
+        "16": "autumn"
+      }
+    },
+    "fields": {
+      "an": "objectively analysed mean field",
+      "mn": "statistical mean of interpolated observations",
+      "dd": "number of observations per grid cell per standard level",
+      "sd": "standard deviation of the statistical mean",
+      "se": "standard error of the statistical mean",
+      "oa": "statistical mean minus objectively analysed mean",
+      "gp": "number of grid points with statistical mean within radius of influence",
+      "sea": "standard error of the objectively analysed mean",
+      "sdo": "standard deviation of the objectively analysed field (t/s only, all time slices; o annual mean only)",
+      "ma": "seasonal/monthly-only field (absent from the annual-mean files, nn=00)"
+    },
+    "default_field": "an",
+    "period_priority": [
+      "1971-2000",
+      "1991-2020",
+      "all"
+    ],
+    "aliases": {
+      "t": "temperature",
+      "temp": "temperature",
+      "thetao": "temperature",
+      "sst": "temperature",
+      "tos": "temperature",
+      "s": "salinity",
+      "so": "salinity",
+      "salt": "salinity",
+      "o": "oxygen",
+      "o2": "oxygen",
+      "n": "nitrate",
+      "no3": "nitrate",
+      "p": "phosphate",
+      "po4": "phosphate",
+      "i": "silicate",
+      "si": "silicate",
+      "sio2": "silicate",
+      "aou": "apparent_oxygen_utilization",
+      "o2sat": "percent_oxygen_saturation",
+      "osat": "percent_oxygen_saturation",
+      "po2sat": "percent_oxygen_saturation"
+    },
+    "variables": {
+      "temperature": {
+        "prefix": "t",
+        "units": "degrees_celsius",
+        "standard_name": "sea_water_temperature",
+        "periods": {
+          "1971-2000": {
+            "subdir": "temperature/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 102
+            }
+          },
+          "1991-2020": {
+            "subdir": "temperature/1991-2020_climate_normal",
+            "tag": "decav91C0",
+            "time_epoch": "1991-01-01",
+            "depth_levels": {
+              "monthly": 57
+            }
+          }
+        }
+      },
+      "salinity": {
+        "prefix": "s",
+        "units": "1",
+        "standard_name": "sea_water_practical_salinity",
+        "periods": {
+          "1971-2000": {
+            "subdir": "salinity/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 102
+            }
+          },
+          "1991-2020": {
+            "subdir": "salinity/1991-2020_climate_normal",
+            "tag": "decav91C0",
+            "time_epoch": "1991-01-01",
+            "depth_levels": {
+              "monthly": 57
+            }
+          }
+        }
+      },
+      "oxygen": {
+        "prefix": "o",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_oxygen_per_unit_mass_in_sea_water",
+        "periods": {
+          "1971-2000": {
+            "subdir": "oxygen/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          },
+          "all": {
+            "subdir": "oxygen/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          }
+        }
+      },
+      "nitrate": {
+        "prefix": "n",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_nitrate_per_unit_mass_in_sea_water",
+        "periods": {
+          "all": {
+            "subdir": "nitrate/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 43,
+              "seasonal": 43
+            }
+          }
+        }
+      },
+      "phosphate": {
+        "prefix": "p",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_phosphate_per_unit_mass_in_sea_water",
+        "periods": {
+          "all": {
+            "subdir": "phosphate/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 43,
+              "seasonal": 43
+            }
+          }
+        }
+      },
+      "silicate": {
+        "prefix": "i",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_silicate_per_unit_mass_in_sea_water",
+        "periods": {
+          "all": {
+            "subdir": "silicate/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 43,
+              "seasonal": 43
+            }
+          }
+        }
+      },
+      "apparent_oxygen_utilization": {
+        "prefix": "A",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "apparent_oxygen_utilization_in_sea_water",
+        "periods": {
+          "1971-2000": {
+            "subdir": "apparent_oxygen_utilization/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          },
+          "all": {
+            "subdir": "apparent_oxygen_utilization/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          }
+        }
+      },
+      "percent_oxygen_saturation": {
+        "prefix": "O",
+        "units": "percent",
+        "standard_name": "fractional_saturation_of_oxygen_in_sea_water",
+        "periods": {
+          "1971-2000": {
+            "subdir": "percent_oxygen_saturation/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          },
+          "all": {
+            "subdir": "percent_oxygen_saturation/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          }
+        }
+      }
+    },
+    "depth_reference_file": "nitrate/all_time_periods/woa23_all_n00_01.nc",
+    "masks": {
+      "basin": {
+        "file": "basinmask_01.msk",
+        "note": "Sparse table (41090 rows < 180x360), ocean grid points only. Gives a basin number for each of the 102 standard levels; levels below the sea floor are empty fields. Longitude convention -180~180. Labelling follows WOA13."
+      },
+      "landsea": {
+        "file": "landsea_01.msk",
+        "note": "Full grid table (64800 points + 2 header/comment rows). Bottom_Standard_Level is not 0/1: 1 = land; for every other point (value - 1) is exactly the index of the deepest standard level with data there, verified cell by cell against the WOA23 nitrate field (all 37712 points with mask <= 102 match exactly). Values above 103 mean the sea floor is deeper than the 5500 m bottom of the climatology, and index WOA's longer list of standard levels (down to 138 at the deepest trenches), which has no counterpart on the 102-level axis. The ocean points selected by mask > 1 (41088 of them) are exactly the points where WOA23 has data. Row order is not raster-scan order, so the index must be rebuilt from the Latitude/Longitude columns."
+      }
+    },
+    "notes": [
+      "The directory layout is climatology/<variable>/<period>/; the \"temperature_1971-2000\" spelling in DATA_METADATA.md section 7.2 is wrong.",
+      "The time epoch varies with the period (1971 / 1991 / 1965); DATA_METADATA.md section 7.5 is wrong to claim a uniform 1971.",
+      "Temperature, salinity, oxygen, apparent oxygen utilization and percent oxygen saturation all publish a 1971-2000 normal. The NUTRIENTS (nitrate, phosphate, silicate) do not. They exist only as the 1965-2022 all-period composite, so any model comparison against them carries a period mismatch that cannot be removed, and it must be stated.",
+      "Only temperature and salinity also publish the 1991-2020 normal."
+    ]
+  },
+  "glodap": {
+    "kind": "climatology",
+    "root": "/data1/lorraine-20419/ocean_data/GLODAPv2.2016b_MappedClimatologies",
+    "description": "GLODAPv2 global ocean carbon chemistry mapped climatology (DIVA objective analysis), built from 1972-2013 input data. No time dimension, 33 standard depth levels.",
+    "grid": {
+      "type": "regular",
+      "resolution": 1.0,
+      "lat": [
+        -89.5,
+        89.5
+      ],
+      "lon": [
+        20.5,
+        379.5
+      ],
+      "lon_convention": "20_380"
+    },
+    "filename_template": "GLODAPv2.2016b.{varfile}.nc",
+    "climatology_years": "1972-2013",
+    "depth": {
+      "source_variable": "Depth",
+      "dim": "depth_surface",
+      "levels": [
+        0,
+        10,
+        20,
+        30,
+        50,
+        75,
+        100,
+        125,
+        150,
+        200,
+        250,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900,
+        1000,
+        1100,
+        1200,
+        1300,
+        1400,
+        1500,
+        1750,
+        2000,
+        2500,
+        3000,
+        3500,
+        4000,
+        4500,
+        5000,
+        5500
+      ]
+    },
+    "fields": {
+      "main": "{var}",
+      "error": "{var}_error",
+      "relerr": "{var}_relerr",
+      "input_mean": "Input_mean",
+      "input_std": "Input_std",
+      "input_n": "Input_N"
+    },
+    "default_field": "main",
+    "aliases": {
+      "no3": "NO3",
+      "nitrate": "NO3",
+      "po4": "PO4",
+      "phosphate": "PO4",
+      "si": "silicate",
+      "sio2": "silicate",
+      "o2": "oxygen",
+      "dic": "TCO2",
+      "tco2": "TCO2",
+      "talk": "TAlk",
+      "alkalinity": "TAlk",
+      "cant": "Cant",
+      "temp": "temperature",
+      "thetao": "temperature",
+      "so": "salinity",
+      "ph": "pHtsinsitutp"
+    },
+    "variables": {
+      "temperature": {
+        "varfile": "temperature",
+        "units": "degrees celcius"
+      },
+      "salinity": {
+        "varfile": "salinity",
+        "units": ""
+      },
+      "oxygen": {
+        "varfile": "oxygen",
+        "units": "micro-mol kg-1"
+      },
+      "NO3": {
+        "varfile": "NO3",
+        "units": "micro-mol kg-1"
+      },
+      "PO4": {
+        "varfile": "PO4",
+        "units": "micro-mol kg-1"
+      },
+      "silicate": {
+        "varfile": "silicate",
+        "units": "micro-mol kg-1"
+      },
+      "TCO2": {
+        "varfile": "TCO2",
+        "units": "micro-mol kg-1"
+      },
+      "PI_TCO2": {
+        "varfile": "PI_TCO2",
+        "units": "micro-mol kg-1"
+      },
+      "Cant": {
+        "varfile": "Cant",
+        "units": "micro-mol kg-1"
+      },
+      "TAlk": {
+        "varfile": "TAlk",
+        "units": "micro-mol kg-1"
+      },
+      "pHtsinsitutp": {
+        "varfile": "pHtsinsitutp",
+        "units": ""
+      },
+      "pHts25p0": {
+        "varfile": "pHts25p0",
+        "units": ""
+      },
+      "OmegaA": {
+        "varfile": "OmegaA",
+        "units": ""
+      },
+      "OmegaC": {
+        "varfile": "OmegaC",
+        "units": ""
+      }
+    },
+    "notes": [
+      "The units attribute of Input_mean / Input_std is hard-coded to \"micro-mol kg-1\" in every file. That is an error in the product metadata; take the units from the main variable.",
+      "temperature's units string is spelt \"degrees celcius\" (a typo in the source), which cf_units/pint cannot parse.",
+      "The units attribute of salinity / pH / Omega is an empty string.",
+      "The global Comment attribute is mojibake and unusable."
+    ]
+  },
+  "seanoe_mld": {
+    "kind": "climatology",
+    "root": "/data1/lorraine-20419/ocean_data/SEANOE",
+    "description": "Global ocean mixed layer depth (MLD) monthly climatology from the LOPS laboratory. The criterion is a potential density increase of 0.03 kg/m3 relative to the reference depth. Based on a month-by-month objective analysis of 1970-2021 Argo and WOD profiles.",
+    "grid": {
+      "type": "regular",
+      "resolution": 1.0,
+      "lat": [
+        -89.5,
+        89.5
+      ],
+      "lon": [
+        -179.5,
+        179.5
+      ],
+      "lon_convention": "-180_180"
+    },
+    "climatology_years": "1970-2021",
+    "time": {
+      "decode": false,
+      "dim": "time",
+      "values": [
+        14,
+        45,
+        73,
+        104,
+        134,
+        165,
+        195,
+        226,
+        257,
+        287,
+        318,
+        348
+      ],
+      "interpretation": "day of year at the centre of each month, mapped directly to month = 1..12"
+    },
+    "depth": null,
+    "default_version": "v2024",
+    "versions": {
+      "v2024": {
+        "file": "mld_dr003_ref5m_v2024.nc",
+        "reference_depth_m": 5,
+        "doi": "10.17882/98226",
+        "valid_range": [
+          5.0,
+          1236.94
+        ]
+      },
+      "v2023": {
+        "file": "mld_dr003_ref10m_v2023.nc",
+        "reference_depth_m": 10,
+        "doi": "10.17882/91774",
+        "valid_range": [
+          10.01,
+          1221.18
+        ]
+      }
+    },
+    "variables": {
+      "mld_dr003": {
+        "units": "m",
+        "long_name": "mixed layer depth"
+      },
+      "n_obs": {
+        "units": "count",
+        "long_name": "number of profiles per cell per month"
+      },
+      "mask": {
+        "units": "1",
+        "long_name": "land/sea mask, 0=land 1=ocean",
+        "dims": [
+          "lat",
+          "lon"
+        ]
+      }
+    },
+    "default_variable": "mld_dr003",
+    "notes": [
+      "Every coordinate and variable spells its units attribute `unit`, not CF's `units`, so CF tools do not pick it up; the opener rewrites it to units.",
+      "v2023 references 10 m and v2024 references 5 m, so their MLD lower bounds differ; the two versions cannot be swapped or differenced directly.",
+      "The Timestamp attribute of the v2024 file says 2023, a slip in the product metadata."
+    ]
+  },
+  "ersst": {
+    "kind": "timeseries",
+    "root": "/data1/lorraine-20419/ocean_data/ERSSTv5",
+    "file": "sst.mnmean.nc",
+    "description": "NOAA Extended Reconstructed SST v5 (in situ observations only), monthly mean, 1854 to present. Surface only, no vertical dimension.",
+    "grid": {
+      "type": "regular",
+      "resolution": 2.0,
+      "lat": [
+        -88.0,
+        88.0
+      ],
+      "lon": [
+        0.0,
+        358.0
+      ],
+      "lon_convention": "0_360",
+      "lat_order": "descending"
+    },
+    "time": {
+      "decode": true,
+      "frequency": "monthly",
+      "range": [
+        "1854-01-01",
+        "2026-08-01"
+      ],
+      "stamp": "month_start"
+    },
+    "depth": null,
+    "variables": {
+      "sst": {
+        "units": "degC",
+        "long_name": "Monthly Means of Sea Surface Temperature",
+        "valid_range": [
+          -1.8,
+          45.0
+        ]
+      }
+    },
+    "default_variable": "sst",
+    "notes": [
+      "The global climatology attribute states that the product's internal climatology is based on 1971-2000, but the file stores absolute temperature, not anomalies.",
+      "This is a near-real-time copy (data_modified 2026-09-03); the trailing months may be revised."
+    ]
+  },
+  "cpc_indices": {
+    "kind": "index",
+    "root": "/data1/lorraine-20419/ocean_data/CPC",
+    "description": "NOAA monthly climate indices. The four Nino products are CPC ENSO monitoring indices, giving regional mean SST and its anomaly in degC. The PDO product is a NOAA NCEI pattern index and is dimensionless; it is kept here so the monthly indices live together, despite the dataset id naming CPC.",
+    "default_product": "ersst5_91-20",
+    "products": {
+      "oni": {
+        "file": "oni.ascii.txt",
+        "columns": [
+          "SEAS",
+          "YR",
+          "TOTAL",
+          "ANOM"
+        ],
+        "layout": "seasonal",
+        "range": [
+          "DJF 1950",
+          "JJA 2026"
+        ],
+        "note": "ONI is a 3-month running mean of Nino3.4 SST; the official baseline is a 30-year centred normal rolled forward every 5 years."
+      },
+      "ersst5_91-20": {
+        "file": "ersst5.nino.mth.91-20.ascii",
+        "columns": [
+          "YR",
+          "MON",
+          "NINO1+2",
+          "ANOM",
+          "NINO3",
+          "ANOM",
+          "NINO4",
+          "ANOM",
+          "NINO3.4",
+          "ANOM"
+        ],
+        "layout": "monthly",
+        "baseline": "1991-2020",
+        "range": [
+          "1950-01",
+          "2026-06"
+        ],
+        "note": "the operational baseline CPC has used for all its indices since 2021-01; use this one for routine analysis."
+      },
+      "ersst5_81-10": {
+        "file": "ersst5.nino.mth.81-10.ascii",
+        "columns": [
+          "YR",
+          "MON",
+          "NINO1+2",
+          "ANOM",
+          "NINO3",
+          "ANOM",
+          "NINO4",
+          "ANOM",
+          "NINO3.4",
+          "ANOM"
+        ],
+        "layout": "monthly",
+        "baseline": "1981-2010",
+        "range": [
+          "1950-01",
+          "2020-12"
+        ],
+        "note": "archive of the old baseline, discontinued in 2020-12."
+      },
+      "oisst": {
+        "file": "sstoi.indices",
+        "columns": [
+          "YR",
+          "MON",
+          "NINO1+2",
+          "ANOM",
+          "NINO3",
+          "ANOM",
+          "NINO4",
+          "ANOM",
+          "NINO3.4",
+          "ANOM"
+        ],
+        "layout": "monthly",
+        "source": "OI SST",
+        "range": [
+          "1982-01",
+          "2026-08"
+        ]
+      },
+      "pdo": {
+        "file": "ersst.v6.pdo.dat",
+        "columns": [
+          "Year",
+          "Jan",
+          "Feb",
+          "Mar",
+          "Apr",
+          "May",
+          "Jun",
+          "Jul",
+          "Aug",
+          "Sep",
+          "Oct",
+          "Nov",
+          "Dec"
+        ],
+        "layout": "year_rows",
+        "source": "NOAA NCEI",
+        "sst_product": "ERSST v6",
+        "domain": "North Pacific",
+        "units": "1",
+        "missing_value": 99.99,
+        "range": [
+          "1850-01",
+          "2026-08"
+        ],
+        "note": "The leading principal component of North Pacific SST anomalies, published by NCEI rather than CPC and built from ERSST v6. The gridded `ersst` dataset in this registry is v5, so an index reconstructed from it and this published series rest on different SST products; their difference is not purely an operator difference and must be reported as such."
+      }
+    },
+    "regions": {
+      "NINO1+2": {
+        "lat": [
+          -10,
+          0
+        ],
+        "lon": [
+          -90,
+          -80
+        ]
+      },
+      "NINO3": {
+        "lat": [
+          -5,
+          5
+        ],
+        "lon": [
+          -150,
+          -90
+        ]
+      },
+      "NINO3.4": {
+        "lat": [
+          -5,
+          5
+        ],
+        "lon": [
+          -170,
+          -120
+        ]
+      },
+      "NINO4": {
+        "lat": [
+          -5,
+          5
+        ],
+        "lon": [
+          160,
+          -150
+        ]
+      }
+    },
+    "notes": [
+      "The three Nino files overlap in time but differ in baseline and in how they are produced, so their values must not be mixed.",
+      "The pdo product is a different kind of quantity from the Nino ones. It is a dimensionless pattern index over a whole basin, with no absolute value and no region to select, and comes from a different SST product version, so it is not interchangeable with them.",
+      "The raw header has four columns all named ANOM; the opener renames them to <region>_ANOM."
+    ]
+  },
+  "cmip6_historical": {
+    "kind": "timeseries",
+    "root": "/data1/lorraine-20419/benchmark_cmip6/historical",
+    "experiment": "historical",
+    "description": "CMIP6 historical (all-forcing historical simulation) ocean component, Omon monthly frequency plus Ofx fixed fields. Three models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR.",
+    "layout": "{root}/{model}/{variable}/",
+    "filename_template": "{variable}_{table}_{model}_{experiment}_{variant}_{grid}[_{YYYYMM-YYYYMM}].nc",
+    "time": {
+      "decode": true,
+      "use_cftime": true,
+      "frequency": "monthly",
+      "range": [
+        "1850-01",
+        "2014-12"
+      ],
+      "n_steps": 1980,
+      "normalize_to": "month_start"
+    },
+    "models": {
+      "CESM2": {
+        "institution": "NCAR",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "nlat",
+        "x_dim": "nlon",
+        "shape": [
+          384,
+          320
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "centimeters",
+        "depth_scale": 0.01,
+        "n_levels": 60,
+        "calendar": "noleap",
+        "ocean_mask_from": "sftof",
+        "notes": [
+          "lev is in centimetres and must be multiplied by depth_scale to get metres (500 cm -> 5 m, 537500 cm -> 5375 m).",
+          "But lev_bnds in the same file declares its units as m rather than centimetres, so the layer bounds are already in metres. Applying lev's conversion factor to lev_bnds as well would make layer thicknesses 100 times too small and corrupt vertical integrals outright. load_depth_levels converts each according to its own declared units.",
+          "The raw areacello carries no land-sea mask and covers the whole globe (0.990 of the Earth's surface), whereas GFDL-ESM4 and MPI-ESM1-2-LR publish theirs already masked to the ocean (0.708 / 0.718). After the opener applies the ocean_mask_from above it comes to 0.7068, the same order as the other two models.",
+          "chl has only 15 levels (the top 150 m), unlike the other three-dimensional variables."
+        ]
+      },
+      "GFDL-ESM4": {
+        "institution": "NOAA-GFDL",
+        "grid_type": "regular",
+        "grid_label": "gr",
+        "y_dim": "lat",
+        "x_dim": "lon",
+        "shape": [
+          180,
+          360
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 35,
+        "calendar": "noleap",
+        "notes": [
+          "The only model that can be sliced directly by lat/lon.",
+          "volcello is Omon (time-varying, split across files), not an Ofx fixed field."
+        ]
+      },
+      "MPI-ESM1-2-LR": {
+        "institution": "MPI-M",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "j",
+        "x_dim": "i",
+        "shape": [
+          220,
+          256
+        ],
+        "lat_coord": "latitude",
+        "lon_coord": "longitude",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 40,
+        "calendar": "proleptic_gregorian",
+        "notes": [
+          "wo / wmo use 41 interface levels (0 ~ 6020 m); the coordinate is still named lev (DATA_METADATA.md is wrong to call it lev_2)."
+        ]
+      }
+    },
+    "fixed_field_table": "Ofx",
+    "fixed_fields": [
+      "areacello",
+      "deptho",
+      "sftof",
+      "volcello"
+    ],
+    "notes": [
+      "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1.",
+      "In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory.",
+      "CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof.",
+      "so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+    ]
+  },
+  "cmip6_ssp245": {
+    "kind": "timeseries",
+    "root": "/data1/lorraine-20419/benchmark_cmip6/ssp245",
+    "experiment": "ssp245",
+    "description": "CMIP6 ScenarioMIP ssp245 (SSP2-4.5, concentration-driven). Grid and coordinate definitions are the same as historical; they differ in time range, variant label and variable coverage.",
+    "layout": "{root}/{model}/{variable}/",
+    "filename_template": "{variable}_{table}_{model}_{experiment}_{variant}_{grid}[_{YYYYMM-YYYYMM}].nc",
+    "time": {
+      "decode": true,
+      "use_cftime": true,
+      "frequency": "monthly",
+      "range": [
+        "2015-01",
+        "2100-12"
+      ],
+      "n_steps": 1032,
+      "normalize_to": "month_start"
+    },
+    "models": {
+      "CESM2": {
+        "institution": "NCAR",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "nlat",
+        "x_dim": "nlon",
+        "shape": [
+          384,
+          320
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "centimeters",
+        "depth_scale": 0.01,
+        "n_levels": 60,
+        "calendar": "noleap",
+        "ocean_mask_from": "sftof",
+        "notes": [
+          "lev is in centimetres and must be multiplied by depth_scale to get metres (500 cm -> 5 m, 537500 cm -> 5375 m).",
+          "But lev_bnds in the same file declares its units as m rather than centimetres, so the layer bounds are already in metres. Applying lev's conversion factor to lev_bnds as well would make layer thicknesses 100 times too small and corrupt vertical integrals outright. load_depth_levels converts each according to its own declared units.",
+          "The raw areacello carries no land-sea mask and covers the whole globe (0.990 of the Earth's surface), whereas GFDL-ESM4 and MPI-ESM1-2-LR publish theirs already masked to the ocean (0.708 / 0.718). After the opener applies the ocean_mask_from above it comes to 0.7068, the same order as the other two models.",
+          "chl has only 15 levels (the top 150 m), unlike the other three-dimensional variables."
+        ]
+      },
+      "GFDL-ESM4": {
+        "institution": "NOAA-GFDL",
+        "grid_type": "regular",
+        "grid_label": "gr",
+        "y_dim": "lat",
+        "x_dim": "lon",
+        "shape": [
+          180,
+          360
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 35,
+        "calendar": "noleap",
+        "notes": [
+          "The only model that can be sliced directly by lat/lon.",
+          "volcello is Omon (time-varying, split across files), not an Ofx fixed field."
+        ]
+      },
+      "MPI-ESM1-2-LR": {
+        "institution": "MPI-M",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "j",
+        "x_dim": "i",
+        "shape": [
+          220,
+          256
+        ],
+        "lat_coord": "latitude",
+        "lon_coord": "longitude",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 40,
+        "calendar": "proleptic_gregorian",
+        "notes": [
+          "wo / wmo use 41 interface levels (0 ~ 6020 m); the coordinate is still named lev (DATA_METADATA.md is wrong to call it lev_2)."
+        ]
+      }
+    },
+    "fixed_field_table": "Ofx",
+    "fixed_fields": [
+      "areacello",
+      "deptho",
+      "sftof",
+      "volcello"
+    ],
+    "fixed_field_fallback": "cmip6_historical",
+    "notes": [
+      "tos and mlotst are missing from ssp245 for all three models (historical has them); for scenario-period SST, the top level of thetao is a usable approximation.",
+      "The bulk of CESM2's ssp245 is r10i1p1f1, but the deptho and sftof fixed fields are r1i1p1f1.",
+      "ssp245/CESM2 has o2 and o2sat (historical/CESM2 does not); ph in ssp245/MPI-ESM1-2-LR is r1i1p1f1 (historical is r10).",
+      "CESM2's ssp245 calendar attribute is written 365_day and historical's noleap; the two are equivalent but the strings differ."
+    ]
+  }
+}
+
+Fix this compute block and output the corrected, complete version inside <execute></execute> tags.
+
+
+===== RESPONSE =====
+<execute>
+import os
+import glob
+import re
+import warnings
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+from scipy import stats
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
+
+try:
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    HAVE_CARTOPY = True
+except Exception:
+    HAVE_CARTOPY = False
+
+warnings.filterwarnings("ignore")
+
+# -----------------------------------------------------------------------------
+# Paths and model metadata
+# -----------------------------------------------------------------------------
+WOA_ROOT = "/data1/lorraine-20419/ocean_data/WOA23/climatology"
+WOA_MASKS_ROOT = "/data1/lorraine-20419/ocean_data/WOA23/masks"
+HIST_ROOT = "/data1/lorraine-20419/benchmark_cmip6/historical"
+SSP_ROOT = "/data1/lorraine-20419/benchmark_cmip6/ssp245"
+
+MODELS = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+MODEL_INFO = {
+    "CESM2": {"lat_coord": "lat", "lon_coord": "lon", "depth_scale": 0.01},
+    "GFDL-ESM4": {"lat_coord": "lat", "lon_coord": "lon", "depth_scale": 1.0},
+    "MPI-ESM1-2-LR": {"lat_coord": "latitude", "lon_coord": "longitude", "depth_scale": 1.0},
+}
+
+# -----------------------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------------------
+def _depth_name(ds):
+    for n in ["lev", "depth", "deptht", "z", "st_ocean"]:
+        if n in ds.dims or n in ds.coords:
+            return n
+    return None
+
+
+def _get_data_var(ds, name):
+    if name in ds:
+        return ds[name]
+    for v in ds.data_vars:
+        if v.lower() == name.lower():
+            return ds[v]
+    return ds[list(ds.data_vars)[0]]
+
+
+def _depth_values_m(ds, name, default_scale=1.0):
+    da = ds[name]
+    vals = np.asarray(da.values, dtype=float)
+    units = str(da.attrs.get("units", "")).strip().lower()
+    if "cm" in units or "centimeter" in units or "centimetre" in units:
+        vals = vals * 0.01
+    elif units in ("m", "meter", "meters", "metre", "metres") or units.endswith(" m"):
+        pass
+    else:
+        vals = vals * default_scale
+    return vals
+
+
+def _find_model_files(root, model, var, exp=None):
+    d = os.path.join(root, model, var)
+    files = sorted(glob.glob(os.path.join(d, f"{var}_*.nc")))
+    if exp is not None:
+        files_exp = [f for f in files if f"_{exp}_" in os.path.basename(f)]
+        if files_exp:
+            files = files_exp
+    return files
+
+
+def _variant_from_files(files):
+    out = set()
+    for f in files:
+        m = re.search(r"_(r\d+i\d+p\d+f\d+)_", os.path.basename(f))
+        if m:
+            out.add(m.group(1))
+    return sorted(out)
+
+
+def _open_cmip_dataset(root, model, var, exp, time_slice=None,
+                       fallback_root=None, fallback_exp=None):
+    files = _find_model_files(root, model, var, exp)
+    if not files and fallback_root is not None:
+        files = _find_model_files(fallback_root, model, var, fallback_exp or exp)
+    if not files:
+        d = os.path.join(root, model, var)
+        files = sorted(glob.glob(os.path.join(d, f"{var}_*.nc")))
+    if not files:
+        raise FileNotFoundError(f"No files found for {model} {var} under {root}")
+
+    if len(files) == 1:
+        ds = xr.open_dataset(files[0], decode_times=True, use_cftime=True)
+    else:
+        ds = xr.open_mfdataset(files, combine="by_coords", decode_times=True,
+                               use_cftime=True)
+
+    if time_slice is not None and "time" in ds.dims:
+        ds = ds.sel(time=slice(time_slice[0], time_slice[1]))
+    return ds
+
+
+def _build_sss_monthly(ds_so, ds_vol, info):
+    so = _get_data_var(ds_so, "so")
+    dname = _depth_name(ds_so)
+    dep = _depth_values_m(ds_so, dname, info.get("depth_scale", 1.0))
+    lev_idx = np.where((dep >= 0.0) & (dep <= 10.0))[0]
+    if len(lev_idx) == 0:
+        lev_idx = np.array([0])
+
+    so_sel = so.isel({dname: lev_idx})
+
+    vol = _get_data_var(ds_vol, "volcello")
+    dname_v = _depth_name(ds_vol)
+    vol_sel = vol.isel({dname_v: lev_idx})
+    if "time" in vol_sel.dims:
+        vol_sel = vol_sel.isel(time=0, drop=True)
+    if dname_v != dname:
+        vol_sel = vol_sel.rename({dname_v: dname})
+
+    num = (so_sel * vol_sel).sum(dim=dname)
+    den = vol_sel.sum(dim=dname)
+    return num / den
+
+
+def _area_weighted_global_mean(da, area_np):
+    ydim, xdim = da.dims[-2], da.dims[-1]
+    area_np = np.asarray(area_np, dtype=float)
+    area_np = np.where(np.isfinite(area_np) & (area_np > 0), area_np, np.nan)
+    area_da = xr.DataArray(
+        area_np,
+        dims=(ydim, xdim),
+        coords={ydim: da[ydim], xdim: da[xdim]},
+    )
+    mask = np.isfinite(da) & np.isfinite(area_da)
+    num = (da.where(mask) * area_da).sum(dim=(ydim, xdim), skipna=True)
+    den = area_da.where(mask).sum(dim=(ydim, xdim), skipna=True)
+    return num / den
+
+
+def _regrid_to_woa(field, lon2d, lat2d, area2d, woa_lat, woa_lon):
+    f = np.asarray(field, dtype=float)
+    lon = np.asarray(lon2d, dtype=float)
+    lat = np.asarray(lat2d, dtype=float)
+    area = np.asarray(area2d, dtype=float)
+    if f.ndim != 2:
+        raise ValueError("field must be 2-D")
+
+    ny, nx = len(woa_lat), len(woa_lon)
+    mask = (
+        np.isfinite(f) & np.isfinite(lon) & np.isfinite(lat)
+        & np.isfinite(area) & (area > 0)
+    )
+    out_flat = np.full(ny * nx, np.nan, dtype=float)
+    if not np.any(mask):
+        return out_flat.reshape(ny, nx)
+
+    lonm = ((lon[mask] + 180.0) % 360.0) - 180.0
+    latm = lat[mask]
+    i = np.floor(lonm + 180.0).astype(int)
+    j = np.floor(latm + 90.0).astype(int)
+    i = np.clip(i, 0, nx - 1)
+    j = np.clip(j, 0, ny - 1)
+    flat = j * nx + i
+
+    w = area[mask]
+    num = np.bincount(flat, weights=f[mask] * w, minlength=ny * nx)
+    den = np.bincount(flat, weights=w, minlength=ny * nx)
+    good = den > 0
+    out_flat[good] = num[good] / den[good]
+    return out_flat.reshape(ny, nx)
+
+
+def _linear_trend_stats(years, values):
+    years = np.asarray(years, dtype=float)
+    values = np.asarray(values, dtype=float)
+    mask = np.isfinite(years) & np.isfinite(values)
+    x = years[mask]
+    y = values[mask]
+    n = len(x)
+
+    out = dict(
+        n=n,
+        slope_psu_per_decade=np.nan,
+        ci_low_psu_per_decade=np.nan,
+        ci_high_psu_per_decade=np.nan,
+        r2=np.nan,
+        p=np.nan,
+        excludes_zero=False,
+        intercept=np.nan,
+        slope_per_year=np.nan,
+    )
+    if n < 3:
+        return out
+
+    xmean = x.mean()
+    ymean = y.mean()
+    Sxx = ((x - xmean) ** 2).sum()
+    if Sxx <= 0:
+        return out
+
+    Sxy = ((x - xmean) * (y - ymean)).sum()
+    slope = Sxy / Sxx
+    intercept = ymean - slope * xmean
+    resid = y - (intercept + slope * x)
+    SSE = (resid ** 2).sum()
+    SST = ((y - ymean) ** 2).sum()
+    r2 = 1.0 - SSE / SST if SST > 0 else np.nan
+    se = np.sqrt(SSE / (n - 2) / Sxx)
+    tcrit = stats.t.ppf(0.975, n - 2)
+    ci_low = slope - tcrit * se
+    ci_high = slope + tcrit * se
+    p = 2.0 * stats.t.sf(np.abs(slope / se), n - 2) if se > 0 else 1.0
+
+    out.update(dict(
+        slope_psu_per_decade=slope * 10.0,
+        ci_low_psu_per_decade=ci_low * 10.0,
+        ci_high_psu_per_decade=ci_high * 10.0,
+        r2=r2,
+        p=p,
+        excludes_zero=bool(ci_low > 0 or ci_high < 0),
+        intercept=intercept,
+        slope_per_year=slope,
+    ))
+    return out
+
+
+def _trend_map(annual_da):
+    years = annual_da["year"].values.astype(float)
+    y = np.asarray(annual_da.values, dtype=float)
+    mask = np.isfinite(y)
+    x = years[:, None, None]
+
+    x0 = np.where(mask, x, 0.0)
+    y0 = np.where(mask, y, 0.0)
+    count = mask.sum(axis=0).astype(float)
+    count_safe = np.where(count > 0, count, np.nan)
+
+    xmean = x0.sum(axis=0) / count_safe
+    ymean = y0.sum(axis=0) / count_safe
+
+    Sxx = np.where(mask, (x - xmean[None, :, :]) ** 2, 0.0).sum(axis=0)
+    Sxy = np.where(mask, (x - xmean[None, :, :]) * (y - ymean[None, :, :]), 0.0).sum(axis=0)
+    slope = Sxy / Sxx
+    intercept = ymean - slope * xmean
+
+    resid = np.where(mask, y - (intercept[None, :, :] + slope[None, :, :] * x), 0.0)
+    SSE = (resid ** 2).sum(axis=0)
+    SST = np.where(mask, (y - ymean[None, :, :]) ** 2, 0.0).sum(axis=0)
+    r2 = 1.0 - SSE / SST
+
+    se = np.sqrt(SSE / (count - 2.0) / Sxx)
+    tval = slope / se
+    p = 2.0 * stats.t.sf(np.abs(tval), count - 2.0)
+
+    bad = (count < 3) | (Sxx <= 0) | ~np.isfinite(slope)
+    slope = np.where(bad, np.nan, slope)
+    r2 = np.where(bad, np.nan, r2)
+    p = np.where(bad, np.nan, p)
+    return slope * 10.0, p, r2
+
+
+def _weighted_mean_field(field, mask, area):
+    m = mask & np.isfinite(field)
+    if not np.any(m):
+        return np.nan
+    return np.nansum(field[m] * area[m]) / np.nansum(area[m])
+
+
+def _read_msk_numeric(path):
+    """Robustly read WOA .msk files.
+
+    The WOA mask files may contain a variable number of whitespace-separated
+    columns (especially basinmask_01.msk, which stores one value per standard
+    level).  We only need the first three numeric fields: latitude, longitude
+    and the surface value.  Parsing line by line avoids pandas' fixed-column
+    assumptions and ignores trailing level-by-level fields.
+    """
+    rows = []
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#") or s.startswith("!"):
+                continue
+            # strip inline comments
+            s = s.split("#", 1)[0].split("!", 1)[0].strip()
+            if not s:
+                continue
+            parts = re.split(r"[\s,]+", s)
+            parts = [p for p in parts if p]
+            if len(parts) < 3:
+                continue
+            try:
+                lat = float(parts[0])
+                lon = float(parts[1])
+                val = float(parts[2])
+            except ValueError:
+                continue
+            if not (np.isfinite(lat) and np.isfinite(lon) and np.isfinite(val)):
+                continue
+            if lat < -90.0 or lat > 90.0 or lon < -180.0 or lon > 180.0:
+                continue
+            rows.append((lat, lon, val))
+    return pd.DataFrame(rows, columns=[0, 1, 2])
+
+
+def _woa_layer_thickness(depth):
+    z = np.asarray(depth, dtype=float)
+    dz = np.empty_like(z)
+    if len(z) > 1:
+        dz[:-1] = z[1:] - z[:-1]
+        dz[-1] = dz[-2]
+    elif len(z) == 1:
+        dz[0] = 1.0
+    return np.abs(dz)
+
+
+# -----------------------------------------------------------------------------
+# WOA23 salinity, land-sea mask and basin mask
+# -----------------------------------------------------------------------------
+woa_file = os.path.join(
+    WOA_ROOT,
+    "salinity",
+    "1971-2000_climate_normal",
+    "woa23_decav71A0_s00_01.nc",
+)
+woa_ds = xr.open_dataset(woa_file, decode_times=False)
+
+woa_var = None
+for cand in ["s_an", "salinity", "s", "so"]:
+    if cand in woa_ds:
+        woa_var = cand
+        break
+if woa_var is None:
+    for cand in woa_ds.data_vars:
+        if cand.endswith("_an") or "sal" in cand.lower():
+            woa_var = cand
+            break
+if woa_var is None:
+    woa_var = list(woa_ds.data_vars)[0]
+
+woa_da = woa_ds[woa_var]
+if "time" in woa_da.dims:
+    woa_da = woa_da.isel(time=0, drop=True)
+
+woa_depth_name = _depth_name(woa_ds)
+woa_depth = np.asarray(woa_ds[woa_depth_name].values, dtype=float)
+woa_lat = np.asarray(woa_ds["lat"].values, dtype=float)
+woa_lon = np.asarray(woa_ds["lon"].values, dtype=float)
+ny_woa, nx_woa = len(woa_lat), len(woa_lon)
+
+R_EARTH = 6371000.0
+woa_area = (
+    R_EARTH ** 2
+    * np.deg2rad(woa_lat[1] - woa_lat[0])
+    * np.deg2rad(woa_lon[1] - woa_lon[0])
+    * np.cos(np.deg2rad(woa_lat))[:, None]
+    * np.ones((1, nx_woa))
+)
+
+# Land-sea mask: ocean is mask > 1.
+df_land = _read_msk_numeric(os.path.join(WOA_MASKS_ROOT, "landsea_01.msk"))
+lat_land = df_land.iloc[:, 0].values.astype(float)
+lon_land = df_land.iloc[:, 1].values.astype(float)
+val_land = df_land.iloc[:, 2].values.astype(float)
+
+landsea_arr = np.full((ny_woa, nx_woa), np.nan, dtype=float)
+j_land = np.clip(
+    np.round((lat_land - woa_lat[0]) / (woa_lat[1] - woa_lat[0])).astype(int),
+    0, ny_woa - 1,
+)
+i_land = np.mod(
+    np.round((lon_land - woa_lon[0]) / (woa_lon[1] - woa_lon[0])).astype(int),
+    nx_woa,
+)
+landsea_arr[j_land, i_land] = val_land
+woa_ocean = landsea_arr > 1.0
+
+# Basin mask: take the surface basin value from the sparse table.
+df_basin = _read_msk_numeric(os.path.join(WOA_MASKS_ROOT, "basinmask_01.msk"))
+lat_basin = df_basin.iloc[:, 0].values.astype(float)
+lon_basin = df_basin.iloc[:, 1].values.astype(float)
+basin_surface_val = df_basin.iloc[:, 2].values.astype(float)
+
+basin_surface = np.full((ny_woa, nx_woa), np.nan, dtype=float)
+j_basin = np.clip(
+    np.round((lat_basin - woa_lat[0]) / (woa_lat[1] - woa_lat[0])).astype(int),
+    0, ny_woa - 1,
+)
+i_basin = np.mod(
+    np.round((lon_basin - woa_lon[0]) / (woa_lon[1] - woa_lon[0])).astype(int),
+    nx_woa,
+)
+basin_surface[j_basin, i_basin] = basin_surface_val
+
+basin_codes = np.unique(basin_surface[np.isfinite(basin_surface)])
+if basin_codes.size == 0:
+    basin_fold = np.full_like(basin_surface, np.nan)
+elif np.nanmax(basin_codes) <= 5:
+    # Compact WOA13-style coding: 1 Atlantic, 2 Pacific, 3 Indian, 4 Arctic, 5 Southern.
+    basin_fold = np.full_like(basin_surface, np.nan)
+    basin_fold[np.isin(basin_surface, [1])] = 1  # Atlantic
+    basin_fold[np.isin(basin_surface, [2])] = 2  # Pacific
+    basin_fold[np.isin(basin_surface, [3])] = 3  # Indian
+else:
+    # Extended WOA13-style coding with marginal seas.
+    basin_fold = np.full_like(basin_surface, np.nan)
+    basin_fold[np.isin(basin_surface, [1, 4, 5, 6])] = 1  # Atlantic + Mediterranean/Black/Baltic
+    basin_fold[np.isin(basin_surface, [2])] = 2           # Pacific
+    basin_fold[np.isin(basin_surface, [3, 7, 8])] = 3     # Indian + Red Sea/Persian Gulf
+    # 9 Arctic and 10 Southern remain NaN (excluded).
+
+# WOA23 SSS over levels whose depths are in 0-10 m, weighted by full layer volume.
+woa_lev_idx = np.where((woa_depth >= 0.0) & (woa_depth <= 10.0))[0]
+if len(woa_lev_idx) == 0:
+    woa_lev_idx = np.array([0])
+
+woa_dz = _woa_layer_thickness(woa_depth)
+woa_s_sel = np.asarray(
+    woa_da.isel({woa_depth_name: woa_lev_idx}).values, dtype=float
+)
+woa_vol = woa_dz[woa_lev_idx][:, None, None] * woa_area[None, :, :]
+
+valid_woa = np.isfinite(woa_s_sel)
+num_woa = np.nansum(np.where(valid_woa, woa_s_sel * woa_vol, np.nan), axis=0)
+den_woa = np.nansum(np.where(valid_woa, woa_vol, np.nan), axis=0)
+with np.errstate(invalid="ignore", divide="ignore"):
+    woa_sss_np = num_woa / den_woa
+woa_sss_np[~woa_ocean] = np.nan
+
+m_woa_global = woa_ocean & np.isfinite(woa_sss_np)
+woa_sss_global_mean = (
+    np.nansum(woa_sss_np[m_woa_global] * woa_area[m_woa_global])
+    / np.nansum(woa_area[m_woa_global])
+)
+
+# -----------------------------------------------------------------------------
+# CMIP6 processing
+# -----------------------------------------------------------------------------
+sss_global_mean = {}
+sss_global_bias = {}
+rmse_against_woa = {}
+corr_against_woa = {}
+bias_maps = {}
+
+trend_hist_stats = {}
+trend_ssp_stats = {}
+trend_ratio = {}
+trend_ratio_meaning = {}
+trend_maps = {}
+trend_p_maps = {}
+
+delta_sss = {}
+variant_caveats = {}
+variant_hist = {}
+variant_ssp = {}
+global_series = {}
+
+for model in MODELS:
+    info = MODEL_INFO[model]
+
+    hist_so_files = _find_model_files(HIST_ROOT, model, "so", "historical")
+    ssp_so_files = _find_model_files(SSP_ROOT, model, "so", "ssp245")
+    vh = _variant_from_files(hist_so_files)
+    vs = _variant_from_files(ssp_so_files)
+    variant_hist[model] = vh
+    variant_ssp[model] = vs
+
+    if vh and vs and vh != vs:
+        variant_caveats[model] = (
+            f"historical so variant {','.join(vh)} vs ssp245 so variant "
+            f"{','.join(vs)}; the delta mixes different ensemble members."
+        )
+    elif vh and vs:
+        variant_caveats[model] = (
+            f"same so variant {','.join(vh)} in both experiments; no "
+            "ensemble-member mismatch."
+        )
+    else:
+        variant_caveats[model] = (
+            "variant label could not be parsed for one experiment; check filenames."
+        )
+
+    ds_so_hist = _open_cmip_dataset(
+        HIST_ROOT, model, "so", "historical",
+        time_slice=("1950-01-01", "2014-12-31"),
+    )
+    ds_so_ssp = _open_cmip_dataset(
+        SSP_ROOT, model, "so", "ssp245",
+        time_slice=("2071-01-01", "2100-12-31"),
+    )
+
+    ds_vol_hist = _open_cmip_dataset(
+        HIST_ROOT, model, "volcello", "historical",
+    )
+    ds_vol_ssp = _open_cmip_dataset(
+        SSP_ROOT, model, "volcello", "ssp245",
+        fallback_root=HIST_ROOT, fallback_exp="historical",
+    )
+
+    ds_area = _open_cmip_dataset(
+        HIST_ROOT, model, "areacello", "historical",
+        fallback_root=SSP_ROOT, fallback_exp="ssp245",
+    )
+    area_da = _get_data_var(ds_area, "areacello")
+    if "time" in area_da.dims:
+        area_da = area_da.isel(time=0, drop=True)
+    area2d = np.asarray(area_da.values, dtype=float)
+    area2d = np.where(np.isfinite(area2d) & (area2d > 0), area2d, np.nan)
+
+    lon_da = ds_so_hist[info["lon_coord"]]
+    lat_da = ds_so_hist[info["lat_coord"]]
+    if lon_da.ndim == 1 and lat_da.ndim == 1:
+        lon2d, lat2d = np.meshgrid(
+            np.asarray(lon_da.values, dtype=float),
+            np.asarray(lat_da.values, dtype=float),
+        )
+    else:
+        lon2d = np.asarray(lon_da.values, dtype=float)
+        lat2d = np.asarray(lat_da.values, dtype=float)
+
+    sss_hist_monthly = _build_sss_monthly(ds_so_hist, ds_vol_hist, info)
+    sss_ssp_monthly = _build_sss_monthly(ds_so_ssp, ds_vol_ssp, info)
+
+    years_h = np.array([t.year for t in sss_hist_monthly.indexes["time"]])
+    sss_hist_monthly = sss_hist_monthly.assign_coords(year=("time", years_h))
+    annual_hist_sss = sss_hist_monthly.groupby("year").mean("time").compute()
+
+    years_s = np.array([t.year for t in sss_ssp_monthly.indexes["time"]])
+    sss_ssp_monthly = sss_ssp_monthly.assign_coords(year=("time", years_s))
+    annual_ssp_sss = sss_ssp_monthly.groupby("year").mean("time").compute()
+
+    annual_global_hist = _area_weighted_global_mean(
+        annual_hist_sss, area2d
+    ).compute()
+    annual_global_ssp = _area_weighted_global_mean(
+        annual_ssp_sss, area2d
+    ).compute()
+
+    sss_hist_clim = annual_hist_sss.sel(year=slice(1971, 2000)).mean("year")
+    sss_hist_9514 = annual_hist_sss.sel(year=slice(1995, 2014)).mean("year")
+    sss_ssp_mean = annual_ssp_sss.mean("year")
+
+    sss_global_mean[model] = float(
+        annual_global_hist.sel(year=slice(1971, 2000)).mean().values
+    )
+    sss_global_bias[model] = sss_global_mean[model] - woa_sss_global_mean
+
+    model_clim_regrid = _regrid_to_woa(
+        sss_hist_clim.values, lon2d, lat2d, area2d, woa_lat, woa_lon
+    )
+    bias = model_clim_regrid - woa_sss_np
+    bias_maps[model] = bias
+
+    m_cmp = (
+        woa_ocean
+        & np.isfinite(woa_sss_np)
+        & np.isfinite(model_clim_regrid)
+    )
+    rmse_against_woa[model] = float(
+        np.sqrt(np.mean((model_clim_regrid[m_cmp] - woa_sss_np[m_cmp]) ** 2))
+    )
+    corr_against_woa[model] = float(
+        np.corrcoef(model_clim_regrid[m_cmp], woa_sss_np[m_cmp])[0, 1]
+    )
+
+    trend_hist_stats[model] = _linear_trend_stats(
+        annual_global_hist["year"].values, annual_global_hist.values
+    )
+    trend_ssp_stats[model] = _linear_trend_stats(
+        annual_global_ssp["year"].values, annual_global_ssp.values
+    )
+
+    sh = trend_hist_stats[model]["slope_psu_per_decade"]
+    ss = trend_ssp_stats[model]["slope_psu_per_decade"]
+    if np.isfinite(sh) and abs(sh) > 1e-12:
+        trend_ratio[model] = ss / sh
+    else:
+        trend_ratio[model] = np.nan
+
+    if (trend_hist_stats[model]["excludes_zero"]
+            and trend_ssp_stats[model]["excludes_zero"]):
+        trend_ratio_meaning[model] = (
+            "ratio pairs slopes from disjoint periods and different forcings; "
+            "it is not a continuation slope and should be read only as a "
+            "descriptive comparison."
+        )
+    else:
+        trend_ratio_meaning[model] = (
+            "ratio is not meaningful because at least one segment's 95% CI "
+            "includes zero (or the historical slope is near zero), so it is "
+            "numerically unstable."
+        )
+
+    tr_map, p_map, _ = _trend_map(annual_hist_sss)
+    trend_maps[model] = _regrid_to_woa(
+        tr_map, lon2d, lat2d, area2d, woa_lat, woa_lon
+    )
+    trend_p_maps[model] = _regrid_to_woa(
+        p_map, lon2d, lat2d, area2d, woa_lat, woa_lon
+    )
+
+    model_hist9514_regrid = _regrid_to_woa(
+        sss_hist_9514.values, lon2d, lat2d, area2d, woa_lat, woa_lon
+    )
+    model_ssp_regrid = _regrid_to_woa(
+        sss_ssp_mean.values, lon2d, lat2d, area2d, woa_lat, woa_lon
+    )
+    delta_regrid = model_ssp_regrid - model_hist9514_regrid
+
+    delta_sss[model] = {
+        "global": _weighted_mean_field(delta_regrid, woa_ocean, woa_area),
+        "Atlantic": _weighted_mean_field(
+            delta_regrid, woa_ocean & (basin_fold == 1), woa_area
+        ),
+        "Indian": _weighted_mean_field(
+            delta_regrid, woa_ocean & (basin_fold == 3), woa_area
+        ),
+        "Pacific": _weighted_mean_field(
+            delta_regrid, woa_ocean & (basin_fold == 2), woa_area
+        ),
+    }
+
+    hist_years = annual_global_hist["year"].values
+    hist_vals = annual_global_hist.values
+    ssp_years = annual_global_ssp["year"].values
+    ssp_vals = annual_global_ssp.values
+
+    hist_fit = (
+        trend_hist_stats[model]["intercept"]
+        + trend_hist_stats[model]["slope_per_year"] * hist_years
+    )
+    ssp_fit = (
+        trend_ssp_stats[model]["intercept"]
+        + trend_ssp_stats[model]["slope_per_year"] * ssp_years
+    )
+
+    global_series[model] = dict(
+        hist_years=hist_years,
+        hist_sss=hist_vals,
+        ssp_years=ssp_years,
+        ssp_sss=ssp_vals,
+        hist_fit=hist_fit,
+        ssp_fit=ssp_fit,
+    )
+
+# -----------------------------------------------------------------------------
+# Print numerical results
+# -----------------------------------------------------------------------------
+print("WOA23 global mean SSS 1971-2000: {:.2f} psu".format(woa_sss_global_mean))
+print("\nModel mean-state 1971-2000:")
+print(f"{'Model':<15} {'Global mean':>12} {'Bias':>8} {'RMSE':>8} {'Corr':>8}")
+for model in MODELS:
+    print(f"{model:<15} {sss_global_mean[model]:>12.2f} {sss_global_bias[model]:>8.2f} "
+          f"{rmse_against_woa[model]:>8.2f} {corr_against_woa[model]:>8.3f}")
+
+print("\nTrends:")
+for model in MODELS:
+    ht = trend_hist_stats[model]
+    st = trend_ssp_stats[model]
+    print(f"{model}:")
+    print(f"  Historical 1950-2014: {ht['slope_psu_per_decade']:.3g} psu/decade, "
+          f"95% CI [{ht['ci_low_psu_per_decade']:.3g}, {ht['ci_high_psu_per_decade']:.3g}], "
+          f"R2={ht['r2']:.3f}, excludes zero: {ht['excludes_zero']}")
+    print(f"  SSP245 2071-2100:     {st['slope_psu_per_decade']:.3g} psu/decade, "
+          f"95% CI [{st['ci_low_psu_per_decade']:.3g}, {st['ci_high_psu_per_decade']:.3g}], "
+          f"R2={st['r2']:.3f}, excludes zero: {st['excludes_zero']}")
+    ratio = trend_ratio[model]
+    print(f"  Ratio ssp245/historical: {ratio:.1f}")
+    print(f"  Ratio meaning: {trend_ratio_meaning[model]}")
+
+print("\nDelta SSS (ssp245 2071-2100 minus historical 1995-2014):")
+for model in MODELS:
+    d = delta_sss[model]
+    print(f"{model}: Global={d['global']:.2f}, Atlantic={d['Atlantic']:.2f}, "
+          f"Indian={d['Indian']:.2f}, Pacific={d['Pacific']:.2f}")
+    print(f"  Caveat: {variant_caveats[model]}")
+
+# -----------------------------------------------------------------------------
+# Figures
+# -----------------------------------------------------------------------------
+# Figure 1: SSS bias maps
+bias_vals = np.concatenate([
+    bias_maps[m][np.isfinite(bias_maps[m])].ravel() for m in MODELS
+])
+vmax_bias = np.nanmax(np.abs(bias_vals)) if bias_vals.size else 1.0
+if not np.isfinite(vmax_bias) or vmax_bias == 0:
+    vmax_bias = 1e-6
+norm_bias = TwoSlopeNorm(vmin=-vmax_bias, vcenter=0, vmax=vmax_bias)
+
+fig = plt.figure(figsize=(15, 4))
+for i, model in enumerate(MODELS):
+    if HAVE_CARTOPY:
+        ax = fig.add_subplot(1, 3, i + 1, projection=ccrs.PlateCarree())
+        ax.set_global()
+        ax.coastlines(linewidth=0.5)
+    else:
+        ax = fig.add_subplot(1, 3, i + 1)
+        ax.set_xlim(-180, 180)
+        ax.set_ylim(-90, 90)
+        ax.set_aspect("equal")
+    pcm = ax.pcolormesh(
+        woa_lon, woa_lat, bias_maps[model],
+        cmap="RdBu_r", norm=norm_bias, shading="auto"
+    )
+    ax.set_title(model)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+cbar = fig.colorbar(pcm, ax=fig.axes, orientation="horizontal",
+                    fraction=0.05, pad=0.05)
+cbar.set_label("SSS bias (psu)")
+fig.suptitle("Figure 1: SSS bias vs WOA23 (1971-2000)")
+plt.savefig("figure1_sss_bias.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+
+# Figure 2: historical SSS trend maps with significance stippling
+trend_vals = np.concatenate([
+    trend_maps[m][np.isfinite(trend_maps[m])].ravel() for m in MODELS
+])
+vmax_trend = np.nanmax(np.abs(trend_vals)) if trend_vals.size else 1.0
+if not np.isfinite(vmax_trend) or vmax_trend == 0:
+    vmax_trend = 1e-6
+norm_trend = TwoSlopeNorm(vmin=-vmax_trend, vcenter=0, vmax=vmax_trend)
+
+fig = plt.figure(figsize=(15, 4))
+for i, model in enumerate(MODELS):
+    if HAVE_CARTOPY:
+        ax = fig.add_subplot(1, 3, i + 1, projection=ccrs.PlateCarree())
+        ax.set_global()
+        ax.coastlines(linewidth=0.5)
+    else:
+        ax = fig.add_subplot(1, 3, i + 1)
+        ax.set_xlim(-180, 180)
+        ax.set_ylim(-90, 90)
+        ax.set_aspect("equal")
+    pcm = ax.pcolormesh(
+        woa_lon, woa_lat, trend_maps[model],
+        cmap="RdBu_r", norm=norm_trend, shading="auto"
+    )
+    p = trend_p_maps[model]
+    tr = trend_maps[model]
+    sig = (p < 0.05) & np.isfinite(tr)
+    if np.any(sig):
+        lon_mesh, lat_mesh = np.meshgrid(woa_lon, woa_lat)
+        if HAVE_CARTOPY:
+            ax.scatter(lon_mesh[sig], lat_mesh[sig], s=1, color="k",
+                       marker=".", transform=ccrs.PlateCarree(), alpha=0.6)
+        else:
+            ax.scatter(lon_mesh[sig], lat_mesh[sig], s=1, color="k",
+                       marker=".", alpha=0.6)
+    ax.set_title(model)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+cbar = fig.colorbar(pcm, ax=fig.axes, orientation="horizontal",
+                    fraction=0.05, pad=0.05)
+cbar.set_label("SSS trend (psu/decade)")
+fig.suptitle("Figure 2: Historical SSS trend 1950-2014 (stippled p<0.05)")
+plt.savefig("figure2_sss_trend.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+
+# Figure 3: global mean SSS time series
+fig, ax = plt.subplots(figsize=(10, 5))
+colors = plt.cm.tab10(np.linspace(0, 1, len(MODELS)))
+for model, color in zip(MODELS, colors):
+    gs = global_series[model]
+    ax.plot(gs["hist_years"], gs["hist_sss"], "o-", markersize=2,
+            linewidth=1, color=color, label=f"{model} historical")
+    ax.plot(gs["ssp_years"], gs["ssp_sss"], "o-", markersize=2,
+            linewidth=1, color=color, label=f"{model} ssp245")
+    ax.plot(gs["hist_years"], gs["hist_fit"], "--", linewidth=1, color=color)
+    ax.plot(gs["ssp_years"], gs["ssp_fit"], "--", linewidth=1, color=color)
+ax.set_xlabel("Year")
+ax.set_ylabel("Global mean SSS (psu)")
+ax.set_title("Figure 3: Global mean SSS time series")
+ax.legend(fontsize=7, ncol=2)
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("figure3_sss_timeseries.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+</execute>

@@ -1,0 +1,175 @@
+# exchange 3: planning
+# elapsed: 47.9 s
+
+===== SYSTEM =====
+You are an oceanographic data analysis assistant with conversation history support.
+
+
+
+Available tools: none. There are no project functions in this setting; the analysis code opens
+the datasets' raw files itself with numpy, pandas and xarray.
+
+Available datasets:
+{
+  "woa23": {
+    "description": "[climatology] World Ocean Atlas 2023 (NOAA/NCEI) 1.00 degree objectively analysed climatology. Temperature and salinity come on two climate normals, 1971-2000 and 1991-2020; oxygen, apparent oxygen utilization and percent oxygen saturation each provide both a 1971-2000 normal (the default) and a 1965-2022 all-period (all) composite; nutrients provide only the 1965-2022 all-period composite. Variables: apparent_oxygen_utilization, nitrate, oxygen, percent_oxygen_saturation, phosphate, salinity, silicate, temperature."
+  },
+  "glodap": {
+    "description": "[climatology] GLODAPv2 global ocean carbon chemistry mapped climatology (DIVA objective analysis), built from 1972-2013 input data. No time dimension, 33 standard depth levels. Variables: Cant, NO3, OmegaA, OmegaC, PI_TCO2, PO4, TAlk, TCO2, oxygen, pHts25p0, pHtsinsitutp, salinity, silicate, temperature. Climatology period 1972-2013."
+  },
+  "seanoe_mld": {
+    "description": "[climatology] Global ocean mixed layer depth (MLD) monthly climatology from the LOPS laboratory. The criterion is a potential density increase of 0.03 kg/m3 relative to the reference depth. Based on a month-by-month objective analysis of 1970-2021 Argo and WOD profiles. Variables: mask, mld_dr003, n_obs. Climatology period 1970-2021."
+  },
+  "ersst": {
+    "description": "[timeseries] NOAA Extended Reconstructed SST v5 (in situ observations only), monthly mean, 1854 to present. Surface only, no vertical dimension. Variables: sst."
+  },
+  "cpc_indices": {
+    "description": "[index] NOAA monthly climate indices. The four Nino products are CPC ENSO monitoring indices, giving regional mean SST and its anomaly in degC. The PDO product is a NOAA NCEI pattern index and is dimensionless; it is kept here so the monthly indices live together, despite the dataset id naming CPC. Products: ersst5_81-10, ersst5_91-20, oisst, oni, pdo."
+  },
+  "cmip6_historical": {
+    "description": "[timeseries] CMIP6 historical (all-forcing historical simulation) ocean component, Omon monthly frequency plus Ofx fixed fields. Three models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 1850-01 to 2014-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  },
+  "cmip6_ssp245": {
+    "description": "[timeseries] CMIP6 ScenarioMIP ssp245 (SSP2-4.5, concentration-driven). Grid and coordinate definitions are the same as historical; they differ in time range, variant label and variable coverage. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 2015-01 to 2100-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  }
+}
+
+Domain knowledge retrieved for this question (grouped by [fragment-id] (severity)):
+<domain_knowledge>
+[common-comparison-mask] (must)
+- Put all three models and WOA23 on the WOA23 1° grid, build one mask with `build_comparison_mask` and apply `.where(mask)` to every field before bias, RMSE and correlation; the default `ocean_only=True` is right here because WOA23 is the reference.
+- Report `compute_difference_metrics`' `mean_data`/`mean_reference` over that shared sample; each model's own-grid global mean is a different quantity and their difference is not the bias on the shared cells — say so, and give the mask's cell counts.
+
+[omip-native-grid-vs-regridded] (should)
+- Compute each global mean on the model's own grid with its own `areacello`; regrid only for the maps, the RMSE and the pattern correlation on the common mask, using 'conservative' (going to a coarser grid) and stating the method since a regridded RMSE/correlation depends on it.
+
+[omip-weighted-means-and-integrals] (should)
+- Global mean SST is area-weighted over the top level: Σ `tos`·`areacello` / Σ `areacello` over valid ocean cells, with the weights masked to those same cells; a plain `mean()` over (y, x) is wrong.
+- `compute_difference_metrics` weights by area by default; `analyze_correlation` needs `weighting='area'` for the spatial pattern correlation.
+
+[cmip6-grid-labels] (should)
+- GFDL-ESM4 `tos` is `gr`, already remapped to a 180×360 1° grid ('conserve_order1'), so its "native" mean and mask are the regridded ones; CESM2 (gx1v7, 100 km) and MPI-ESM1-2-LR (250 km) are `gn`.
+- Resolution differs about 2.5× between CESM2 and MPI-ESM1-2-LR, so features narrower than the coarse grid are not comparable in amplitude.
+
+[cmip6-tos-bulk-top-cell] (should)
+- `tos` is the bulk temperature of the top model cell, including under sea ice, so a global mean carries near-freezing polar values; top cells differ (CESM2 0–10 m, GFDL-ESM4 0–2 m, MPI-ESM1-2-LR 0–12 m), so "SST" is not the same layer across the models.
+
+[missing-values-and-land-cells] (should)
+- CMIP6 files mark land and below-sea-floor cells with the missing value 1e20; any read path that skips CF masking (raw netCDF4 arrays, scale/offset before masking, float32 overflow) turns those into huge numbers that silently dominate sums and means.
+
+[cmip6-static-grid-fields] (should)
+- Weight each mean by the model's own `areacello` (tracer-cell area, zero or missing over land); on a curvilinear grid it is the only correct area weight.
+- Total ocean area differs between models by about a per cent because each resolves the coastline differently — state the area each mean was taken over rather than rescaling one model to another.
+
+[cmip6-experiments-historical-ssp245] (should)
+- These are coupled, single-member historical runs with their own internal variability: a 1971–2000 climatology is a legitimate statistic, but no match of individual years or event timing with WOA23 should be expected.
+</domain_knowledge>
+
+Data selection rules:
+1. <selected_data> must contain dataset IDs exactly as listed above (e.g. woa23, cmip6_historical).
+   Never put a file path there, and never invent a name. One dataset ID holds many variables, and
+   CMIP6 also holds several models; those are chosen in the next step, not here.
+2. Long-term trends, interannual variability and scenario projections need a timeseries dataset
+   (cmip6_historical, cmip6_ssp245, ersst). Mean state, seasonal cycle and vertical structure need a
+   climatology (woa23, glodap, seanoe_mld). A question about the ENSO monitoring index itself needs
+   cpc_indices.
+3. Select several datasets, comma-separated, when the question compares a model against observations
+   or needs variables that live in different products.
+4. Reading data: there are no loading functions. The code step opens the raw files of the datasets
+   you select and is shown where they live and how they are laid out; plan the reading as part of
+   the steps.
+5. Regional and global means are area- or volume-weighted, never plain averages over lat/lon: plan
+   where the weights come from (for CMIP6, the model's own areacello / volcello fixed fields).
+
+How to write the plan:
+1. Write the plan as numbered steps, each naming the datasets, variables and models it needs.
+   End it with an "Other notes:" section, one line each, holding only the caveats the answer must
+   state.
+2. Add no computational constraint of your own. Every definition, weighting, mask, threshold,
+   interpolation, filter or correction a step applies must come from the question or from what is
+   given above (the dataset descriptions, and any domain knowledge); do not devise one that
+   none of them states (an extra mask, a partial-layer weighting, a screening threshold).
+3. There are no project tools to call: plan every step as an operation the code performs on the raw
+   data with the standard libraries (numpy, pandas, xarray).
+4. Do not round intermediate values: later steps use the unrounded results of earlier ones, and a
+   value is rounded only where it is reported, to the precision the question asks for.
+5. The steps, any notes under them and Other notes all go inside the <plan> tags; nothing outside them
+   is passed on to the later steps.
+
+How to use the domain knowledge:
+1. Priority: definitions and procedures the user states explicitly in the question come first, the
+   dataset descriptions second, the knowledge fragments last. Use the fragments to settle
+   choices the question leaves open and to find the caveats that must be stated. When a fragment
+   conflicts with what the question prescribes, follow the question and record the difference under
+   Other notes so the answer can explain it.
+2. Under the step where a piece of knowledge FIRST matters, add one line "- Note [fragment-id]: ..."
+   carrying what to do (the formula, threshold, unit conversion or check). Each
+   fragment gets exactly ONE such note line in the whole plan, under a step or under Other notes, not
+   both. A later step that also depends on it names "[fragment-id]" inline in its own text, with no
+   further note line and no restatement - the next stage reads the whole plan. Do not copy the
+   knowledge text into the plan.
+3. Other notes also hold the differences between the question's definition and the protocol; a line
+   that comes from a fragment takes the form "- [fragment-id] ...".
+4. Cite every fragment of severity must at least once, in a step or under Other notes. Fragments of
+   severity should or info that end up unused may be left out.
+5. The notes may name functions of this project in backticks (`compute_basic_stat`,
+   `load_regular_data`, ...). None of them exists in this setting: read such a name as the operation
+   it stands for, and plan that operation on the raw data.
+
+Analyze the user's question and select appropriate data. Follow this format strictly:
+<plan>numbered steps: the datasets, variables and models each step needs, with the knowledge notes under each step, then Other notes</plan>
+<selected_data>comma-separated list of dataset IDs you will use</selected_data>
+
+IMPORTANT: Your response MUST contain all required XML tags, and tags must be properly closed.
+
+
+===== USER =====
+User question: Evaluate the 1971-2000 sea surface temperature (SST) climatology of three CMIP6 historical simulations against the World Ocean Atlas 2023 (WOA23) observational climatology, and describe the spatial structure of the bias.
+
+Data to use:
+- CMIP6 historical variable `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, from 1971-01 to 2000-12, each on its own native grid with its own published cell areas (areacello).
+- WOA23 temperature, the 1971-2000 climate normal, annual time slice, objectively analysed field, at 0 m depth, on the 1-degree grid.
+- The WOA23 1-degree land-sea mask (landsea_01), in which a cell is ocean when its value is greater than 1.
+
+Expected numerical results:
+- For each model, the global mean of its 1971-2000 SST climatology over its own native ocean grid, in degrees Celsius to 2 decimal places.
+- The global mean of the WOA23 0 m annual field over the whole 1-degree grid, in degrees Celsius to 2 decimal places.
+- On the WOA23 1-degree grid, over the cells on which the models are compared with WOA23: the mean SST of each model and of WOA23, in degrees Celsius to 2 decimal places.
+- On the same cells, for each model: the mean bias delta_SST (model minus WOA23) in degrees Celsius to 2 decimal places, the RMSE against WOA23 in degrees Celsius to 3 decimal places, and the spatial Pearson correlation with WOA23 to 3 decimal places.
+- The ranking of the three models from smallest to largest absolute delta_SST.
+
+Expected visualizations:
+- Figure 1, a 2-by-2 panel of global maps: the bias fields (model minus WOA23) of CESM2, GFDL-ESM4 and MPI-ESM1-2-LR on the cells of that comparison with one shared diverging colour scale centred on zero, and the WOA23 0 m reference SST on the same cells with a sequential colour scale. Label every panel and give each colour scale a unit label in degrees Celsius.
+- Figure 2, a bar chart of the four global mean SST values of the first two items above, each over its own native ocean grid (CESM2, GFDL-ESM4, MPI-ESM1-2-LR and WOA23), each bar annotated with its value, with the y axis labelled in degrees Celsius.
+
+Now output your reasoning and selections.
+
+===== RESPONSE =====
+<plan>
+1. Open the raw files for WOA23 and CMIP6 historical. From WOA23 take `temperature` for the 1971–2000 climate normal, annual time slice, 0 m depth, on the 1-degree grid, and take `landsea_01`; define WOA ocean cells as `landsea_01 > 1`. From CMIP6 historical take monthly `tos` for 1971-01 to 2000-12 and `areacello` for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR. Decode CF metadata and explicitly replace the missing value 1e20 with NaN before any arithmetic.
+- Note [missing-values-and-land-cells]: CMIP6 land and below-sea-floor cells use 1e20; mask these out before sums/means so they cannot dominate the statistics.
+
+2. For each CMIP6 model, compute the 1971–2000 climatological SST map on its native grid by averaging the monthly `tos` values over the 360 months from 1971-01 to 2000-12. GFDL-ESM4 `tos` is already on its `gr` 180×360 1-degree grid, so its native map/mask are the regridded ones; CESM2 and MPI-ESM1-2-LR are on their native `gn` grids.
+- Note [cmip6-grid-labels]: GFDL-ESM4 `tos` is `gr` already remapped to 180×360 1-degree; CESM2 is gx1v7 (~100 km) and MPI-ESM1-2-LR is ~250 km, so the coarse grid cannot represent narrow features at the same amplitude.
+
+3. Compute each model’s native-grid global mean SST using its own `areacello`, restricted to cells where `tos` is valid: Σ(`tos`×`areacello`)/Σ`areacello`, with weights masked to the same valid cells. Also compute the WOA23 global mean over the full 1-degree WOA ocean domain (`landsea_01 > 1`), not restricted to the later comparison cells, using cos(latitude) cell-area weights. Report each mean in °C to 2 decimal places and state the ocean area each mean was taken over. Keep unrounded values for later ranking.
+- Note [omip-weighted-means-and-integrals]: global mean SST is area-weighted over the surface field, Σ`tos`·`areacello`/Σ`areacello`, with weights masked to valid cells; a plain mean over latitude/longitude is wrong.
+- Note [cmip6-static-grid-fields]: use each model’s own `areacello`; total ocean area differs between models by about a per cent because each resolves the coastline differently, so state the area each mean was taken over rather than rescaling one model to another.
+- Note [cmip6-tos-bulk-top-cell]: `tos` is the bulk temperature of the top model cell, including under sea ice; the top cells differ (CESM2 0–10 m, GFDL-ESM4 0–2 m, MPI-ESM1-2-LR 0–12 m), so “SST” is not exactly the same layer across models.
+
+4. Remap each model’s 1971–2000 SST climatology to the WOA23 1-degree grid using conservative area-weighted remapping. Use the native fields for the model global means in step 3 and the remapped fields only for the comparison metrics and maps. State that conservative remapping was used.
+- Note [omip-native-grid-vs-regridded]: compute each global mean on the model’s own grid with its own `areacello`; regrid only for the maps, RMSE and pattern correlation on the common mask, using conservative remapping.
+
+5. On the WOA23 1-degree grid, build one shared comparison mask: WOA ocean cells (`landsea_01 > 1`) that are also finite in WOA23 SST and in all three remapped model SST fields. Apply `.where(mask)` to WOA23 and to all three model fields before computing bias, RMSE and correlation. Report the number of cells in this mask.
+- Note [common-comparison-mask]: put all three models and WOA23 on the WOA23 1-degree grid, use one mask with `ocean_only=True`, and apply it to every field; report the shared-sample `mean_data`/`mean_reference`, and state that each model’s own-grid global mean is a different quantity whose difference from another global mean is not the shared-cell bias.
+
+6. On the shared mask, using WOA-grid cos(latitude) cell-area weights, compute for each model: the weighted mean model SST, the weighted mean WOA23 SST over the same cells, the mean bias delta_SST = model minus WOA23, the area-weighted RMSE, and the area-weighted spatial Pearson correlation with WOA23. Use the unrounded biases for ranking and round only when reporting: means and biases to 2 decimal places, RMSE and correlation to 3 decimal places. Rank the models from smallest to largest absolute delta_SST.
+
+7. Produce Figure 1 as a 2-by-2 panel of global maps on the shared comparison cells: CESM2 minus WOA23, GFDL-ESM4 minus WOA23, MPI-ESM1-2-LR minus WOA23, and WOA23 SST. Use one shared diverging colour scale centred on zero for the three bias panels, with a symmetric limit set by the largest absolute bias among them; use a sequential colour scale for the WOA23 reference panel. Label every panel and every colour bar in °C.
+
+8. Produce Figure 2 as a bar chart of the four native-domain global mean SST values from steps 3: CESM2, GFDL-ESM4, MPI-ESM1-2-LR and WOA23, each over its own native ocean grid. Annotate each bar with its value and label the y axis in °C.
+
+Other notes:
+- [cmip6-experiments-historical-ssp245] These are coupled single-member historical runs with internal variability; a 1971–2000 climatology is a legitimate statistic, but no match of individual years or event timing with WOA23 should be expected.
+</plan>
+<selected_data>woa23,cmip6_historical</selected_data>

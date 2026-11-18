@@ -1,0 +1,1142 @@
+{
+  "session_id": "T1_deepseek-flash_20261025_072039",
+  "total_turns": 1,
+  "max_turns": 10,
+  "history": [
+    {
+      "session_id": "T1_deepseek-flash_20261025_072039",
+      "user_query": "Assess the ENSO amplitude simulated by three CMIP6 historical runs against ERSSTv5 observations over 1950-01 to 2014-12.\n\nData to use:\n- CMIP6 historical variable `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1950-01 to 2014-12, each on its own native grid with its own published cell areas.\n- ERSSTv5 monthly SST over the same window, on its native 2-degree grid.\n\nExpected numerical results, based on the monthly Nino 3.4 index of each of the four sources over 1950-01 to 2014-12: the SST anomaly over 5S-5N, 170W-120W, each source relative to a 1950-2014 monthly climatology. Standard deviations are population standard deviations (ddof = 0).\n- For each source, the standard deviation of its Nino 3.4 anomaly over all 780 months, in degrees Celsius to 2 decimal places.\n- For each model, the amplitude bias (model minus ERSSTv5 standard deviation) in degrees Celsius to 2 decimal places and the amplitude ratio (model divided by ERSSTv5) to 2 decimal places, and the ranking of the three models from smallest to largest absolute amplitude bias.\n- For each source, the standard deviation of the anomaly for each of the 12 calendar months, in degrees Celsius to 2 decimal places (48 values).\n- For each source, the calendar month of largest standard deviation and its value, the calendar month of smallest standard deviation, and the largest-to-smallest ratio to 2 decimal places; and whether each model reproduces the observed peak month and strength of seasonal phase locking.\n- For each source, the number and the percentage (to 1 decimal place) of months whose Nino 3.4 anomaly strictly exceeds 1.0 degrees Celsius in absolute value.\n\nExpected visualizations:\n- Figure 1, a line plot of the seasonal cycle of amplitude: calendar month (January to December) on the x axis, standard deviation in degrees Celsius on the y axis, four curves on one axis, the observations visually distinct from the three models, and each curve's peak month marked.\n- Figure 2, four stacked panels sharing one time axis over 1950-2014, in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, each showing that source's Nino 3.4 anomaly series on an identical y-axis range that contains every series, with the +1.0 and -1.0 degrees Celsius levels marked and each panel annotated with its standard deviation and exceedance percentage.",
+      "language": "en",
+      "turn_number": 1,
+      "bundle_path": "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T1_deepseek-flash_20261025_072039/turn01",
+      "selected_tools": [],
+      "knowledge": null,
+      "generated_code": "<compute>\nimport os\nimport glob\nimport re\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\n\nHIST_ROOT = '/data1/lorraine-20419/benchmark_cmip6/historical'\nERSST_PATH = '/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc'\n\nSTART_YEAR = 1950\nEND_YEAR = 2014\nN_MONTHS = (END_YEAR - START_YEAR + 1) * 12\nTIME_AXIS = pd.date_range(f'{START_YEAR}-01-01', f'{END_YEAR}-12-01', freq='MS')\n\nMODEL_CFG = {\n    'CESM2': {\n        'y': 'nlat', 'x': 'nlon', 'lat': 'lat', 'lon': 'lon',\n        'apply_sftof': True\n    },\n    'GFDL-ESM4': {\n        'y': 'lat', 'x': 'lon', 'lat': 'lat', 'lon': 'lon',\n        'apply_sftof': False\n    },\n    'MPI-ESM1-2-LR': {\n        'y': 'j', 'x': 'i', 'lat': 'latitude', 'lon': 'longitude',\n        'apply_sftof': False\n    },\n}\nMODELS = ['CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\nSOURCES = ['ERSSTv5'] + MODELS\n\n\ndef _files(root, model, var):\n    return sorted(glob.glob(os.path.join(root, model, var, '*.nc')))\n\n\ndef _variant(path):\n    m = re.search(r'_(r\\d+i\\d+p\\d+f\\d+)_', os.path.basename(path))\n    return m.group(1) if m else None\n\n\ndef _open_cmip_files(files):\n    if not files:\n        raise FileNotFoundError('No CMIP6 files found')\n    if len(files) == 1:\n        return xr.open_dataset(files[0], use_cftime=True, decode_times=True)\n    return xr.open_mfdataset(\n        files, combine='by_coords', use_cftime=True, decode_times=True\n    )\n\n\ndef _select_years(da, y0=START_YEAR, y1=END_YEAR):\n    da = da.sortby('time')\n    yrs = da.time.dt.year\n    good = (yrs >= y0) & (yrs <= y1)\n    return da.isel(time=np.where(good.values)[0])\n\n\ndef _ensure_celsius(da):\n    u = str(da.attrs.get('units', '')).strip().lower()\n    if u in ('k', 'kelvin') or u.startswith('kelvin'):\n        da = da - 273.15\n        da.attrs = dict(da.attrs)\n        da.attrs['units'] = 'degC'\n    return da\n\n\ndef _region_mask(lat2d, lon2d, lat0=-5.0, lat1=5.0, lon0=190.0, lon1=240.0):\n    lonn = ((lon2d % 360.0) + 360.0) % 360.0\n    return (lat2d >= lat0) & (lat2d <= lat1) & (lonn >= lon0) & (lonn <= lon1)\n\n\ndef _stats_from_index(idx):\n    idx = idx.sortby('time')\n\n    clim = idx.groupby('time.month').mean(dim='time')\n    anom = (idx.groupby('time.month') - clim).sortby('time')\n\n    std_all = float(anom.std(dim='time').values)\n\n    seasonal = anom.groupby('time.month').std(dim='time')\n    seasonal = seasonal.reindex({seasonal.dims[0]: np.arange(1, 13)})\n    seasonal_vals = seasonal.values.astype(float)\n\n    peak_month = int(seasonal.idxmax().values.item())\n    peak_std = float(seasonal.max().values)\n    min_month = int(seasonal.idxmin().values.item())\n    min_std = float(seasonal.min().values)\n    peak_min_ratio = peak_std / min_std if min_std != 0 else np.nan\n\n    exceed_count = int((np.abs(anom) > 1.0).sum(dim='time').values)\n    n = int(anom.sizes['time'])\n    exceed_pct = round(100.0 * exceed_count / n, 1) if n else np.nan\n\n    return {\n        'std': std_all,\n        'seasonal_std': seasonal_vals,\n        'peak_month': peak_month,\n        'peak_std': peak_std,\n        'min_month': min_month,\n        'min_std': min_std,\n        'peak_min_ratio': peak_min_ratio,\n        'exceed_count': exceed_count,\n        'exceed_pct': exceed_pct,\n        'anom_values': anom.values.astype(float),\n        'n_months': n,\n    }\n\n\n# ---------------------------------------------------------------------------\n# ERSSTv5\n# ---------------------------------------------------------------------------\nds_obs = xr.open_dataset(ERSST_PATH)\nsst_obs = ds_obs['sst'].sel(\n    time=slice(f'{START_YEAR}-01-01', f'{END_YEAR}-12-31')\n)\n\nlat_o = sst_obs['lat']\nlon_o = sst_obs['lon']\nlonn_o = ((lon_o % 360.0) + 360.0) % 360.0\n\nlat_o_sel = lat_o[(lat_o >= -5.0) & (lat_o <= 5.0)]\nlon_o_sel = lon_o[(lonn_o >= 190.0) & (lonn_o <= 240.0)]\nsub_o = sst_obs.sel(lat=lat_o_sel, lon=lon_o_sel)\n\nw_o = np.cos(np.deg2rad(sub_o['lat']))\nw_o = w_o.broadcast_like(sub_o.isel(time=0, drop=True))\nvalid_o = sub_o.notnull()\nw_o_valid = w_o.where(valid_o)\n\nnum_o = (sub_o * w_o_valid).sum(dim=('lat', 'lon'), skipna=True)\nden_o = w_o_valid.sum(dim=('lat', 'lon'), skipna=True)\nidx_obs = (num_o / den_o).compute()\n\nnino34_index = {'ERSSTv5': idx_obs}\nnino34_stats = {'ERSSTv5': _stats_from_index(idx_obs)}\n\n\n# ---------------------------------------------------------------------------\n# CMIP6 historical tos\n# ---------------------------------------------------------------------------\nfor model in MODELS:\n    cfg = MODEL_CFG[model]\n\n    tos_files = _files(HIST_ROOT, model, 'tos')\n    ds_tos = _open_cmip_files(tos_files)\n    tos = _select_years(ds_tos['tos'])\n    tos = _ensure_celsius(tos)\n\n    area_files = _files(HIST_ROOT, model, 'areacello')\n    if not area_files:\n        raise FileNotFoundError(f'No areacello file for {model}')\n\n    variant = _variant(tos_files[0])\n    if variant is not None:\n        cand = [f for f in area_files if variant in os.path.basename(f)]\n        if cand:\n            area_files = cand\n\n    ds_area = xr.open_dataset(area_files[0])\n    area = ds_area['areacello']\n    if 'time' in area.dims:\n        area = area.isel(time=0)\n    area = area.squeeze()\n\n    if cfg['apply_sftof']:\n        sftof_files = _files(HIST_ROOT, model, 'sftof')\n        if sftof_files:\n            if variant is not None:\n                cand = [f for f in sftof_files if variant in os.path.basename(f)]\n                if cand:\n                    sftof_files = cand\n            ds_sftof = xr.open_dataset(sftof_files[0])\n            sftof = ds_sftof['sftof']\n            if 'time' in sftof.dims:\n                sftof = sftof.isel(time=0)\n            sftof = sftof.squeeze()\n            area = area * sftof\n\n    lat2d = tos[cfg['lat']]\n    lon2d = tos[cfg['lon']]\n    if lat2d.ndim == 1:\n        lat2d, lon2d = xr.broadcast(lat2d, lon2d)\n\n    rmask = _region_mask(lat2d, lon2d)\n    weights = area.where(rmask).fillna(0.0)\n\n    valid = tos.notnull()\n    w = weights.where(valid)\n\n    num = (tos * w).sum(dim=(cfg['y'], cfg['x']), skipna=True)\n    den = w.sum(dim=(cfg['y'], cfg['x']), skipna=True)\n    idx_m = (num / den).compute()\n\n    nino34_index[model] = idx_m\n    nino34_stats[model] = _stats_from_index(idx_m)\n\n\nfor src in SOURCES:\n    assert nino34_stats[src]['n_months'] == N_MONTHS, (\n        src, nino34_stats[src]['n_months'], N_MONTHS\n    )\n\n\n# ---------------------------------------------------------------------------\n# Summaries\n# ---------------------------------------------------------------------------\nnino34_std = {s: nino34_stats[s]['std'] for s in SOURCES}\nnino34_std_2dp = {s: round(nino34_stats[s]['std'], 2) for s in SOURCES}\n\nnino34_seasonal_std = {\n    s: nino34_stats[s]['seasonal_std'] for s in SOURCES\n}\nnino34_seasonal_std_2dp = {\n    s: np.round(nino34_stats[s]['seasonal_std'], 2) for s in SOURCES\n}\n\nnino34_peak_month = {s: nino34_stats[s]['peak_month'] for s in SOURCES}\nnino34_peak_std = {s: nino34_stats[s]['peak_std'] for s in SOURCES}\nnino34_min_month = {s: nino34_stats[s]['min_month'] for s in SOURCES}\nnino34_min_std = {s: nino34_stats[s]['min_std'] for s in SOURCES}\nnino34_peak_min_ratio = {s: nino34_stats[s]['peak_min_ratio'] for s in SOURCES}\n\nnino34_exceed_count = {s: nino34_stats[s]['exceed_count'] for s in SOURCES}\nnino34_exceed_pct = {s: nino34_stats[s]['exceed_pct'] for s in SOURCES}\nnino34_anom_values = {s: nino34_stats[s]['anom_values'] for s in SOURCES}\n\nobs_std = nino34_std['ERSSTv5']\namplitude_bias = {m: nino34_std[m] - obs_std for m in MODELS}\namplitude_ratio = {m: nino34_std[m] / obs_std for m in MODELS}\namplitude_bias_2dp = {m: round(amplitude_bias[m], 2) for m in MODELS}\namplitude_ratio_2dp = {m: round(amplitude_ratio[m], 2) for m in MODELS}\namplitude_bias_ranking = sorted(MODELS, key=lambda m: abs(amplitude_bias[m]))\n\nseasonal_std_df = pd.DataFrame(\n    {s: nino34_stats[s]['seasonal_std'] for s in SOURCES},\n    index=np.arange(1, 13)\n)\nseasonal_std_rounded_df = seasonal_std_df.round(2)\n\nsummary_df = pd.DataFrame({\n    'nino34_std_degC': [nino34_std[s] for s in SOURCES],\n    'nino34_std_degC_2dp': [nino34_std_2dp[s] for s in SOURCES],\n    'exceed_count_abs_gt_1C': [nino34_exceed_count[s] for s in SOURCES],\n    'exceed_pct': [nino34_exceed_pct[s] for s in SOURCES],\n    'amplitude_bias_vs_ERSSTv5_degC': [np.nan] + [\n        amplitude_bias_2dp[m] for m in MODELS\n    ],\n    'amplitude_ratio_vs_ERSSTv5': [np.nan] + [\n        amplitude_ratio_2dp[m] for m in MODELS\n    ],\n}, index=SOURCES)\n\nphase_locking_df = pd.DataFrame({\n    'peak_month': [nino34_peak_month[s] for s in SOURCES],\n    'peak_std_degC': [round(nino34_peak_std[s], 2) for s in SOURCES],\n    'min_month': [nino34_min_month[s] for s in SOURCES],\n    'min_std_degC': [round(nino34_min_std[s], 2) for s in SOURCES],\n    'peak_to_min_ratio': [round(nino34_peak_min_ratio[s], 2) for s in SOURCES],\n}, index=SOURCES)\n\nobs_peak_month = nino34_peak_month['ERSSTv5']\nobs_peak_min_ratio = nino34_peak_min_ratio['ERSSTv5']\n\nphase_locking_assessment = {\n    m: {\n        'model_peak_month': nino34_peak_month[m],\n        'obs_peak_month': obs_peak_month,\n        'peak_month_matches_obs': nino34_peak_month[m] == obs_peak_month,\n        'model_peak_to_min_ratio': round(nino34_peak_min_ratio[m], 2),\n        'obs_peak_to_min_ratio': round(obs_peak_min_ratio, 2),\n        'ratio_difference_model_minus_obs': round(\n            nino34_peak_min_ratio[m] - obs_peak_min_ratio, 2\n        ),\n    }\n    for m in MODELS\n}\n</compute>\n\n<visualize>\nmonths = np.arange(1, 13)\nmonth_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',\n                'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']\n\ncolors = {\n    'ERSSTv5': 'black',\n    'CESM2': 'tab:blue',\n    'GFDL-ESM4': 'tab:orange',\n    'MPI-ESM1-2-LR': 'tab:green',\n}\n\n# Figure 1: seasonal cycle of Nino 3.4 amplitude\nfig1, ax1 = plt.subplots(figsize=(9, 5))\n\nfor src in SOURCES:\n    vals = nino34_stats[src]['seasonal_std']\n\n    if src == 'ERSSTv5':\n        ax1.plot(\n            months, vals, color=colors[src], lw=3.0, marker='o', ms=5,\n            label=src, zorder=10\n        )\n    else:\n        ax1.plot(\n            months, vals, color=colors[src], lw=1.6, marker='o', ms=4,\n            label=src\n        )\n\n    pm = nino34_stats[src]['peak_month']\n    pv = nino34_stats[src]['peak_std']\n    ax1.scatter(\n        pm, pv, color=colors[src],\n        s=150 if src == 'ERSSTv5' else 80,\n        marker='*',\n        edgecolor='black' if src == 'ERSSTv5' else 'none',\n        zorder=11\n    )\n\nax1.set_xticks(months)\nax1.set_xticklabels(month_labels)\nax1.set_xlabel('Calendar month')\nax1.set_ylabel('Nino 3.4 anomaly standard deviation (degC)')\nax1.set_title('Seasonal cycle of Nino 3.4 amplitude, 1950-2014')\nax1.grid(True, alpha=0.3)\nax1.legend(frameon=False)\nfig1.tight_layout()\n\n# Figure 2: four stacked Nino 3.4 anomaly panels\nfig2, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)\n\nall_anoms = np.concatenate([nino34_stats[s]['anom_values'] for s in SOURCES])\nymax = np.nanmax(np.abs(all_anoms)) * 1.05\n\nfor ax, src in zip(axes, SOURCES):\n    vals = nino34_stats[src]['anom_values']\n\n    ax.plot(TIME_AXIS, vals, color=colors[src], lw=1.0)\n    ax.axhline(1.0, color='gray', linestyle='--', linewidth=0.8)\n    ax.axhline(-1.0, color='gray', linestyle='--', linewidth=0.8)\n    ax.axhline(0.0, color='gray', linestyle=':', linewidth=0.5)\n    ax.set_ylim(-ymax, ymax)\n    ax.set_ylabel('Anomaly (degC)')\n\n    ax.text(\n        0.01, 0.95,\n        f\"{src}\\n\"\n        f\"SD = {nino34_stats[src]['std']:.2f} degC\\n\"\n        f\"|anom| > 1 degC: {nino34_stats[src]['exceed_count']} months \"\n        f\"({nino34_stats[src]['exceed_pct']:.1f}%)\",\n        transform=ax.transAxes,\n        va='top',\n        ha='left',\n        fontsize=9,\n        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),\n    )\n\naxes[-1].set_xlabel('Year')\nfig2.suptitle('Nino 3.4 SST anomalies, 1950-2014')\nfig2.tight_layout(rect=[0, 0, 1, 0.97])\n</visualize>",
+      "compute_iterations": [
+        {
+          "iteration": 1,
+          "code": "import os\nimport glob\nimport re\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\n\nHIST_ROOT = '/data1/lorraine-20419/benchmark_cmip6/historical'\nERSST_PATH = '/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc'\n\nSTART_YEAR = 1950\nEND_YEAR = 2014\nN_MONTHS = (END_YEAR - START_YEAR + 1) * 12\nTIME_AXIS = pd.date_range(f'{START_YEAR}-01-01', f'{END_YEAR}-12-01', freq='MS')\n\nMODEL_CFG = {\n    'CESM2': {\n        'y': 'nlat', 'x': 'nlon', 'lat': 'lat', 'lon': 'lon',\n        'apply_sftof': True\n    },\n    'GFDL-ESM4': {\n        'y': 'lat', 'x': 'lon', 'lat': 'lat', 'lon': 'lon',\n        'apply_sftof': False\n    },\n    'MPI-ESM1-2-LR': {\n        'y': 'j', 'x': 'i', 'lat': 'latitude', 'lon': 'longitude',\n        'apply_sftof': False\n    },\n}\nMODELS = ['CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\nSOURCES = ['ERSSTv5'] + MODELS\n\n\ndef _files(root, model, var):\n    return sorted(glob.glob(os.path.join(root, model, var, '*.nc')))\n\n\ndef _variant(path):\n    m = re.search(r'_(r\\d+i\\d+p\\d+f\\d+)_', os.path.basename(path))\n    return m.group(1) if m else None\n\n\ndef _open_cmip_files(files):\n    if not files:\n        raise FileNotFoundError('No CMIP6 files found')\n    if len(files) == 1:\n        return xr.open_dataset(files[0], use_cftime=True, decode_times=True)\n    return xr.open_mfdataset(\n        files, combine='by_coords', use_cftime=True, decode_times=True\n    )\n\n\ndef _select_years(da, y0=START_YEAR, y1=END_YEAR):\n    da = da.sortby('time')\n    yrs = da.time.dt.year\n    good = (yrs >= y0) & (yrs <= y1)\n    return da.isel(time=np.where(good.values)[0])\n\n\ndef _ensure_celsius(da):\n    u = str(da.attrs.get('units', '')).strip().lower()\n    if u in ('k', 'kelvin') or u.startswith('kelvin'):\n        da = da - 273.15\n        da.attrs = dict(da.attrs)\n        da.attrs['units'] = 'degC'\n    return da\n\n\ndef _region_mask(lat2d, lon2d, lat0=-5.0, lat1=5.0, lon0=190.0, lon1=240.0):\n    lonn = ((lon2d % 360.0) + 360.0) % 360.0\n    return (lat2d >= lat0) & (lat2d <= lat1) & (lonn >= lon0) & (lonn <= lon1)\n\n\ndef _stats_from_index(idx):\n    idx = idx.sortby('time')\n\n    clim = idx.groupby('time.month').mean(dim='time')\n    anom = (idx.groupby('time.month') - clim).sortby('time')\n\n    std_all = float(anom.std(dim='time').values)\n\n    seasonal = anom.groupby('time.month').std(dim='time')\n    seasonal = seasonal.reindex({seasonal.dims[0]: np.arange(1, 13)})\n    seasonal_vals = seasonal.values.astype(float)\n\n    peak_month = int(seasonal.idxmax().values.item())\n    peak_std = float(seasonal.max().values)\n    min_month = int(seasonal.idxmin().values.item())\n    min_std = float(seasonal.min().values)\n    peak_min_ratio = peak_std / min_std if min_std != 0 else np.nan\n\n    exceed_count = int((np.abs(anom) > 1.0).sum(dim='time').values)\n    n = int(anom.sizes['time'])\n    exceed_pct = round(100.0 * exceed_count / n, 1) if n else np.nan\n\n    return {\n        'std': std_all,\n        'seasonal_std': seasonal_vals,\n        'peak_month': peak_month,\n        'peak_std': peak_std,\n        'min_month': min_month,\n        'min_std': min_std,\n        'peak_min_ratio': peak_min_ratio,\n        'exceed_count': exceed_count,\n        'exceed_pct': exceed_pct,\n        'anom_values': anom.values.astype(float),\n        'n_months': n,\n    }\n\n\n# ---------------------------------------------------------------------------\n# ERSSTv5\n# ---------------------------------------------------------------------------\nds_obs = xr.open_dataset(ERSST_PATH)\nsst_obs = ds_obs['sst'].sel(\n    time=slice(f'{START_YEAR}-01-01', f'{END_YEAR}-12-31')\n)\n\nlat_o = sst_obs['lat']\nlon_o = sst_obs['lon']\nlonn_o = ((lon_o % 360.0) + 360.0) % 360.0\n\nlat_o_sel = lat_o[(lat_o >= -5.0) & (lat_o <= 5.0)]\nlon_o_sel = lon_o[(lonn_o >= 190.0) & (lonn_o <= 240.0)]\nsub_o = sst_obs.sel(lat=lat_o_sel, lon=lon_o_sel)\n\nw_o = np.cos(np.deg2rad(sub_o['lat']))\nw_o = w_o.broadcast_like(sub_o.isel(time=0, drop=True))\nvalid_o = sub_o.notnull()\nw_o_valid = w_o.where(valid_o)\n\nnum_o = (sub_o * w_o_valid).sum(dim=('lat', 'lon'), skipna=True)\nden_o = w_o_valid.sum(dim=('lat', 'lon'), skipna=True)\nidx_obs = (num_o / den_o).compute()\n\nnino34_index = {'ERSSTv5': idx_obs}\nnino34_stats = {'ERSSTv5': _stats_from_index(idx_obs)}\n\n\n# ---------------------------------------------------------------------------\n# CMIP6 historical tos\n# ---------------------------------------------------------------------------\nfor model in MODELS:\n    cfg = MODEL_CFG[model]\n\n    tos_files = _files(HIST_ROOT, model, 'tos')\n    ds_tos = _open_cmip_files(tos_files)\n    tos = _select_years(ds_tos['tos'])\n    tos = _ensure_celsius(tos)\n\n    area_files = _files(HIST_ROOT, model, 'areacello')\n    if not area_files:\n        raise FileNotFoundError(f'No areacello file for {model}')\n\n    variant = _variant(tos_files[0])\n    if variant is not None:\n        cand = [f for f in area_files if variant in os.path.basename(f)]\n        if cand:\n            area_files = cand\n\n    ds_area = xr.open_dataset(area_files[0])\n    area = ds_area['areacello']\n    if 'time' in area.dims:\n        area = area.isel(time=0)\n    area = area.squeeze()\n\n    if cfg['apply_sftof']:\n        sftof_files = _files(HIST_ROOT, model, 'sftof')\n        if sftof_files:\n            if variant is not None:\n                cand = [f for f in sftof_files if variant in os.path.basename(f)]\n                if cand:\n                    sftof_files = cand\n            ds_sftof = xr.open_dataset(sftof_files[0])\n            sftof = ds_sftof['sftof']\n            if 'time' in sftof.dims:\n                sftof = sftof.isel(time=0)\n            sftof = sftof.squeeze()\n            area = area * sftof\n\n    lat2d = tos[cfg['lat']]\n    lon2d = tos[cfg['lon']]\n    if lat2d.ndim == 1:\n        lat2d, lon2d = xr.broadcast(lat2d, lon2d)\n\n    rmask = _region_mask(lat2d, lon2d)\n    weights = area.where(rmask).fillna(0.0)\n\n    valid = tos.notnull()\n    w = weights.where(valid)\n\n    num = (tos * w).sum(dim=(cfg['y'], cfg['x']), skipna=True)\n    den = w.sum(dim=(cfg['y'], cfg['x']), skipna=True)\n    idx_m = (num / den).compute()\n\n    nino34_index[model] = idx_m\n    nino34_stats[model] = _stats_from_index(idx_m)\n\n\nfor src in SOURCES:\n    assert nino34_stats[src]['n_months'] == N_MONTHS, (\n        src, nino34_stats[src]['n_months'], N_MONTHS\n    )\n\n\n# ---------------------------------------------------------------------------\n# Summaries\n# ---------------------------------------------------------------------------\nnino34_std = {s: nino34_stats[s]['std'] for s in SOURCES}\nnino34_std_2dp = {s: round(nino34_stats[s]['std'], 2) for s in SOURCES}\n\nnino34_seasonal_std = {\n    s: nino34_stats[s]['seasonal_std'] for s in SOURCES\n}\nnino34_seasonal_std_2dp = {\n    s: np.round(nino34_stats[s]['seasonal_std'], 2) for s in SOURCES\n}\n\nnino34_peak_month = {s: nino34_stats[s]['peak_month'] for s in SOURCES}\nnino34_peak_std = {s: nino34_stats[s]['peak_std'] for s in SOURCES}\nnino34_min_month = {s: nino34_stats[s]['min_month'] for s in SOURCES}\nnino34_min_std = {s: nino34_stats[s]['min_std'] for s in SOURCES}\nnino34_peak_min_ratio = {s: nino34_stats[s]['peak_min_ratio'] for s in SOURCES}\n\nnino34_exceed_count = {s: nino34_stats[s]['exceed_count'] for s in SOURCES}\nnino34_exceed_pct = {s: nino34_stats[s]['exceed_pct'] for s in SOURCES}\nnino34_anom_values = {s: nino34_stats[s]['anom_values'] for s in SOURCES}\n\nobs_std = nino34_std['ERSSTv5']\namplitude_bias = {m: nino34_std[m] - obs_std for m in MODELS}\namplitude_ratio = {m: nino34_std[m] / obs_std for m in MODELS}\namplitude_bias_2dp = {m: round(amplitude_bias[m], 2) for m in MODELS}\namplitude_ratio_2dp = {m: round(amplitude_ratio[m], 2) for m in MODELS}\namplitude_bias_ranking = sorted(MODELS, key=lambda m: abs(amplitude_bias[m]))\n\nseasonal_std_df = pd.DataFrame(\n    {s: nino34_stats[s]['seasonal_std'] for s in SOURCES},\n    index=np.arange(1, 13)\n)\nseasonal_std_rounded_df = seasonal_std_df.round(2)\n\nsummary_df = pd.DataFrame({\n    'nino34_std_degC': [nino34_std[s] for s in SOURCES],\n    'nino34_std_degC_2dp': [nino34_std_2dp[s] for s in SOURCES],\n    'exceed_count_abs_gt_1C': [nino34_exceed_count[s] for s in SOURCES],\n    'exceed_pct': [nino34_exceed_pct[s] for s in SOURCES],\n    'amplitude_bias_vs_ERSSTv5_degC': [np.nan] + [\n        amplitude_bias_2dp[m] for m in MODELS\n    ],\n    'amplitude_ratio_vs_ERSSTv5': [np.nan] + [\n        amplitude_ratio_2dp[m] for m in MODELS\n    ],\n}, index=SOURCES)\n\nphase_locking_df = pd.DataFrame({\n    'peak_month': [nino34_peak_month[s] for s in SOURCES],\n    'peak_std_degC': [round(nino34_peak_std[s], 2) for s in SOURCES],\n    'min_month': [nino34_min_month[s] for s in SOURCES],\n    'min_std_degC': [round(nino34_min_std[s], 2) for s in SOURCES],\n    'peak_to_min_ratio': [round(nino34_peak_min_ratio[s], 2) for s in SOURCES],\n}, index=SOURCES)\n\nobs_peak_month = nino34_peak_month['ERSSTv5']\nobs_peak_min_ratio = nino34_peak_min_ratio['ERSSTv5']\n\nphase_locking_assessment = {\n    m: {\n        'model_peak_month': nino34_peak_month[m],\n        'obs_peak_month': obs_peak_month,\n        'peak_month_matches_obs': nino34_peak_month[m] == obs_peak_month,\n        'model_peak_to_min_ratio': round(nino34_peak_min_ratio[m], 2),\n        'obs_peak_to_min_ratio': round(obs_peak_min_ratio, 2),\n        'ratio_difference_model_minus_obs': round(\n            nino34_peak_min_ratio[m] - obs_peak_min_ratio, 2\n        ),\n    }\n    for m in MODELS\n}",
+          "success": true,
+          "materialized_results": {
+            "materialized": 9,
+            "megabytes": 378.2,
+            "seconds": 11.0,
+            "kept_lazy": [
+              "ds_tos (7233 MB)"
+            ]
+          },
+          "output": {
+            "HIST_ROOT": "/data1/lorraine-20419/benchmark_cmip6/historical",
+            "ERSST_PATH": "/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc",
+            "START_YEAR": 1950,
+            "END_YEAR": 2014,
+            "N_MONTHS": 780,
+            "TIME_AXIS": "DatetimeIndex(['1950-01-01', '1950-02-01', '1950-03-01', '1950-04-01',\n               '1950-05-01', '1950-06-01', '1950-07-01', '1950-08-01',\n               '1950-09-01', '1950-10-01',\n               ...\n               '2014-03-01', '2014-04-01', '2014-05-01', '2014-06-01',\n               '2014-07-01', '2014-08-01', '2014-09-01', '2014-10-01',\n               '2014-11-01', '2014-12-01'],\n              dtype='datetime64[ns]', length=780, freq='MS')",
+            "MODEL_CFG": {
+              "CESM2": {
+                "y": "nlat",
+                "x": "nlon",
+                "lat": "lat",
+                "lon": "lon",
+                "apply_sftof": true
+              },
+              "GFDL-ESM4": {
+                "y": "lat",
+                "x": "lon",
+                "lat": "lat",
+                "lon": "lon",
+                "apply_sftof": false
+              },
+              "MPI-ESM1-2-LR": {
+                "y": "j",
+                "x": "i",
+                "lat": "latitude",
+                "lon": "longitude",
+                "apply_sftof": false
+              }
+            },
+            "MODELS": [
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR"
+            ],
+            "SOURCES": [
+              "ERSSTv5",
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR"
+            ],
+            "ds_obs": {
+              "time_bnds": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 2072,
+                  "nbnds": 2
+                },
+                "long_name": "Time Boundaries",
+                "size": 4144,
+                "n_valid": 4144,
+                "min": 9.969209968386869e+36,
+                "max": 9.969209968386869e+36,
+                "mean": 9.969209968386869e+36,
+                "std": 0.0
+              },
+              "sst": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 2072,
+                  "lat": 89,
+                  "lon": 180
+                },
+                "units": "degC",
+                "long_name": "Monthly Means of Sea Surface Temperature",
+                "size": 33193440,
+                "n_valid": 22767136,
+                "min": -1.7999999523162842,
+                "max": 42.326358795166016,
+                "mean": 13.565886497497559,
+                "std": 11.497235298156738
+              }
+            },
+            "sst_obs": {
+              "type": "DataArray",
+              "dims": {
+                "time": 780,
+                "lat": 89,
+                "lon": 180
+              },
+              "units": "degC",
+              "long_name": "Monthly Means of Sea Surface Temperature",
+              "size": 12495600,
+              "n_valid": 8570640,
+              "min": -1.7999999523162842,
+              "max": 34.07516098022461,
+              "mean": 13.684885025024414,
+              "std": 11.519001007080078
+            },
+            "lat_o": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 89
+              },
+              "units": "degrees_north",
+              "long_name": "Latitude",
+              "size": 89,
+              "n_valid": 89,
+              "min": -88.0,
+              "max": 88.0,
+              "mean": 0.0,
+              "std": 51.38093185424805
+            },
+            "lon_o": {
+              "type": "DataArray",
+              "dims": {
+                "lon": 180
+              },
+              "units": "degrees_east",
+              "long_name": "Longitude",
+              "size": 180,
+              "n_valid": 180,
+              "min": 0.0,
+              "max": 358.0,
+              "mean": 179.0,
+              "std": 103.92144775390625
+            },
+            "lonn_o": {
+              "type": "DataArray",
+              "dims": {
+                "lon": 180
+              },
+              "units": "degrees_east",
+              "long_name": "Longitude",
+              "size": 180,
+              "n_valid": 180,
+              "min": 0.0,
+              "max": 358.0,
+              "mean": 179.0,
+              "std": 103.92144775390625
+            },
+            "lat_o_sel": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 5
+              },
+              "units": "degrees_north",
+              "long_name": "Latitude",
+              "size": 5,
+              "n_valid": 5,
+              "min": -4.0,
+              "max": 4.0,
+              "mean": 0.0,
+              "std": 2.8284270763397217,
+              "values": [
+                4.0,
+                2.0,
+                0.0,
+                -2.0,
+                -4.0
+              ]
+            },
+            "lon_o_sel": {
+              "type": "DataArray",
+              "dims": {
+                "lon": 26
+              },
+              "units": "degrees_east",
+              "long_name": "Longitude",
+              "size": 26,
+              "n_valid": 26,
+              "min": 190.0,
+              "max": 240.0,
+              "mean": 215.0,
+              "std": 15.0,
+              "values": [
+                190.0,
+                192.0,
+                194.0,
+                196.0,
+                198.0,
+                200.0,
+                202.0,
+                204.0,
+                206.0,
+                208.0,
+                210.0,
+                212.0,
+                214.0,
+                216.0,
+                218.0,
+                220.0,
+                222.0,
+                224.0,
+                226.0,
+                228.0,
+                230.0,
+                232.0,
+                234.0,
+                236.0,
+                238.0,
+                240.0
+              ]
+            },
+            "sub_o": {
+              "type": "DataArray",
+              "dims": {
+                "time": 780,
+                "lat": 5,
+                "lon": 26
+              },
+              "units": "degC",
+              "long_name": "Monthly Means of Sea Surface Temperature",
+              "size": 101400,
+              "n_valid": 101400,
+              "min": 21.128305435180664,
+              "max": 30.512975692749023,
+              "mean": 26.85946273803711,
+              "std": 1.378936767578125
+            },
+            "w_o": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 5,
+                "lon": 26
+              },
+              "units": "degrees_north",
+              "long_name": "Latitude",
+              "size": 130,
+              "n_valid": 130,
+              "min": 0.9975640773773193,
+              "max": 1.0,
+              "mean": 0.9987819790840149,
+              "std": 0.0010189767926931381
+            },
+            "valid_o": {
+              "type": "DataArray",
+              "dims": {
+                "time": 780,
+                "lat": 5,
+                "lon": 26
+              },
+              "units": "degC",
+              "long_name": "Monthly Means of Sea Surface Temperature",
+              "size": 101400,
+              "values": [
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "True"
+              ]
+            },
+            "w_o_valid": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 5,
+                "lon": 26,
+                "time": 780
+              },
+              "units": "degrees_north",
+              "long_name": "Latitude",
+              "size": 101400,
+              "n_valid": 101400,
+              "min": 0.9975640773773193,
+              "max": 1.0,
+              "mean": 0.9987820386886597,
+              "std": 0.0010189767926931381
+            },
+            "num_o": {
+              "type": "DataArray",
+              "dims": {
+                "time": 780
+              },
+              "units": "degC",
+              "long_name": "Monthly Means of Sea Surface Temperature",
+              "size": 780,
+              "n_valid": 780,
+              "min": 3148.825439453125,
+              "max": 3779.4267578125,
+              "mean": 3487.433349609375,
+              "std": 124.89495849609375
+            },
+            "den_o": {
+              "type": "DataArray",
+              "dims": {
+                "time": 780
+              },
+              "units": "degrees_north",
+              "long_name": "Latitude",
+              "size": 780,
+              "n_valid": 780,
+              "min": 129.84165954589844,
+              "max": 129.84165954589844,
+              "mean": 129.84165954589844,
+              "std": 0.0
+            },
+            "idx_obs": {
+              "type": "DataArray",
+              "dims": {
+                "time": 780
+              },
+              "units": "degC",
+              "long_name": "Monthly Means of Sea Surface Temperature",
+              "size": 780,
+              "n_valid": 780,
+              "min": 24.251272201538086,
+              "max": 29.107967376708984,
+              "mean": 26.8591251373291,
+              "std": 0.9619020223617554
+            },
+            "nino34_index": {
+              "ERSSTv5": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 780
+                },
+                "units": "degC",
+                "long_name": "Monthly Means of Sea Surface Temperature",
+                "size": 780,
+                "n_valid": 780,
+                "min": 24.251272201538086,
+                "max": 29.107967376708984,
+                "mean": 26.8591251373291,
+                "std": 0.9619020223617554
+              },
+              "CESM2": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 780
+                },
+                "units": "degC",
+                "long_name": "Sea Surface Temperature",
+                "size": 780,
+                "n_valid": 780,
+                "min": 23.452348709106445,
+                "max": 30.584609985351562,
+                "mean": 27.438274383544922,
+                "std": 1.4306608438491821
+              },
+              "GFDL-ESM4": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 780
+                },
+                "units": "degC",
+                "long_name": "Sea Surface Temperature",
+                "size": 780,
+                "n_valid": 780,
+                "min": 22.592201232910156,
+                "max": 29.53203773498535,
+                "mean": 26.260501861572266,
+                "std": 1.1968718767166138
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 780
+                },
+                "units": "degC",
+                "long_name": "Sea Surface Temperature",
+                "size": 780,
+                "n_valid": 780,
+                "min": 23.165363311767578,
+                "max": 29.08015251159668,
+                "mean": 25.845653533935547,
+                "std": 1.0818939208984375
+              }
+            },
+            "nino34_stats": {
+              "ERSSTv5": {
+                "std": 0.8489886941818262,
+                "seasonal_std": {
+                  "type": "ndarray",
+                  "shape": [
+                    12
+                  ],
+                  "size": 12,
+                  "n_valid": 12,
+                  "min": 0.5963829157218463,
+                  "max": 1.1202555411215664,
+                  "mean": 0.827112160714066,
+                  "std": 0.1914870137734671,
+                  "values": [
+                    1.081394,
+                    0.88423,
+                    0.670235,
+                    0.596383,
+                    0.608909,
+                    0.613024,
+                    0.675797,
+                    0.762768,
+                    0.849722,
+                    0.987066,
+                    1.075561,
+                    1.120256
+                  ]
+                },
+                "peak_month": 12,
+                "peak_std": 1.1202555411215664,
+                "min_month": 4,
+                "min_std": 0.5963829157218463,
+                "peak_min_ratio": 1.878416553508476,
+                "exceed_count": 170,
+                "exceed_pct": 21.8,
+                "anom_values": {
+                  "type": "ndarray",
+                  "shape": [
+                    780
+                  ],
+                  "size": 780,
+                  "n_valid": 780,
+                  "min": -2.2286930084228516,
+                  "max": 2.628002166748047,
+                  "mean": 5.966577774439103e-07,
+                  "std": 0.8489886941818257
+                },
+                "n_months": 780
+              },
+              "CESM2": {
+                "std": 1.2865464103648578,
+                "seasonal_std": {
+                  "type": "ndarray",
+                  "shape": [
+                    12
+                  ],
+                  "size": 12,
+                  "n_valid": 12,
+                  "min": 0.9422419491042356,
+                  "max": 1.623649632058717,
+                  "mean": 1.263330203025251,
+                  "std": 0.24330734499927753,
+                  "values": [
+                    1.62365,
+                    1.425894,
+                    1.196199,
+                    1.072111,
+                    1.01258,
+                    0.942242,
+                    0.978472,
+                    1.086434,
+                    1.242738,
+                    1.398662,
+                    1.560192,
+                    1.62079
+                  ]
+                },
+                "peak_month": 1,
+                "peak_std": 1.623649632058717,
+                "min_month": 6,
+                "min_std": 0.9422419491042356,
+                "peak_min_ratio": 1.7231769755127944,
+                "exceed_count": 360,
+                "exceed_pct": 46.2,
+                "anom_values": {
+                  "type": "ndarray",
+                  "shape": [
+                    780
+                  ],
+                  "size": 780,
+                  "n_valid": 780,
+                  "min": -3.3769397735595703,
+                  "max": 3.341421127319336,
+                  "mean": 2.102974133613782e-07,
+                  "std": 1.2865464103648576
+                },
+                "n_months": 780
+              },
+              "GFDL-ESM4": {
+                "std": 0.9990544672589744,
+                "seasonal_std": {
+                  "type": "ndarray",
+                  "shape": [
+                    12
+                  ],
+                  "size": 12,
+                  "n_valid": 12,
+                  "min": 0.7465125919060059,
+                  "max": 1.2484130087485668,
+                  "mean": 0.9862431160134316,
+                  "std": 0.15948148689107283,
+                  "values": [
+                    1.126868,
+                    1.059687,
+                    0.964063,
+                    0.912426,
+                    0.840661,
+                    0.780579,
+                    0.746513,
+                    0.853557,
+                    0.978319,
+                    1.11184,
+                    1.211994,
+                    1.248413
+                  ]
+                },
+                "peak_month": 12,
+                "peak_std": 1.2484130087485668,
+                "min_month": 7,
+                "min_std": 0.7465125919060059,
+                "peak_min_ratio": 1.672326792989656,
+                "exceed_count": 237,
+                "exceed_pct": 30.4,
+                "anom_values": {
+                  "type": "ndarray",
+                  "shape": [
+                    780
+                  ],
+                  "size": 780,
+                  "n_valid": 780,
+                  "min": -3.139993667602539,
+                  "max": 3.271371841430664,
+                  "mean": 1.4598552997295672e-06,
+                  "std": 0.9990544672589744
+                },
+                "n_months": 780
+              },
+              "MPI-ESM1-2-LR": {
+                "std": 0.8541293807196937,
+                "seasonal_std": {
+                  "type": "ndarray",
+                  "shape": [
+                    12
+                  ],
+                  "size": 12,
+                  "n_valid": 12,
+                  "min": 0.7114612347715752,
+                  "max": 1.0311863395041638,
+                  "mean": 0.8487684253042413,
+                  "std": 0.09554663369389658,
+                  "values": [
+                    0.956197,
+                    0.906989,
+                    0.78066,
+                    0.824846,
+                    0.855594,
+                    0.779461,
+                    0.711461,
+                    0.740754,
+                    0.767668,
+                    0.863445,
+                    0.966959,
+                    1.031186
+                  ]
+                },
+                "peak_month": 12,
+                "peak_std": 1.0311863395041638,
+                "min_month": 7,
+                "min_std": 0.7114612347715752,
+                "peak_min_ratio": 1.449392165175719,
+                "exceed_count": 199,
+                "exceed_pct": 25.5,
+                "anom_values": {
+                  "type": "ndarray",
+                  "shape": [
+                    780
+                  ],
+                  "size": 780,
+                  "n_valid": 780,
+                  "min": -2.170867919921875,
+                  "max": 2.6837158203125,
+                  "mean": 7.825020032051282e-07,
+                  "std": 0.8541293807196941
+                },
+                "n_months": 780
+              }
+            },
+            "nino34_std": {
+              "ERSSTv5": 0.8489886941818262,
+              "CESM2": 1.2865464103648578,
+              "GFDL-ESM4": 0.9990544672589744,
+              "MPI-ESM1-2-LR": 0.8541293807196937
+            },
+            "nino34_std_2dp": {
+              "ERSSTv5": 0.85,
+              "CESM2": 1.29,
+              "GFDL-ESM4": 1.0,
+              "MPI-ESM1-2-LR": 0.85
+            },
+            "nino34_seasonal_std": {
+              "ERSSTv5": {
+                "type": "ndarray",
+                "shape": [
+                  12
+                ],
+                "size": 12,
+                "n_valid": 12,
+                "min": 0.5963829157218463,
+                "max": 1.1202555411215664,
+                "mean": 0.827112160714066,
+                "std": 0.1914870137734671,
+                "values": [
+                  1.081394,
+                  0.88423,
+                  0.670235,
+                  0.596383,
+                  0.608909,
+                  0.613024,
+                  0.675797,
+                  0.762768,
+                  0.849722,
+                  0.987066,
+                  1.075561,
+                  1.120256
+                ]
+              },
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  12
+                ],
+                "size": 12,
+                "n_valid": 12,
+                "min": 0.9422419491042356,
+                "max": 1.623649632058717,
+                "mean": 1.263330203025251,
+                "std": 0.24330734499927753,
+                "values": [
+                  1.62365,
+                  1.425894,
+                  1.196199,
+                  1.072111,
+                  1.01258,
+                  0.942242,
+                  0.978472,
+                  1.086434,
+                  1.242738,
+                  1.398662,
+                  1.560192,
+                  1.62079
+                ]
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  12
+                ],
+                "size": 12,
+                "n_valid": 12,
+                "min": 0.7465125919060059,
+                "max": 1.2484130087485668,
+                "mean": 0.9862431160134316,
+                "std": 0.15948148689107283,
+                "values": [
+                  1.126868,
+                  1.059687,
+                  0.964063,
+                  0.912426,
+                  0.840661,
+                  0.780579,
+                  0.746513,
+                  0.853557,
+                  0.978319,
+                  1.11184,
+                  1.211994,
+                  1.248413
+                ]
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  12
+                ],
+                "size": 12,
+                "n_valid": 12,
+                "min": 0.7114612347715752,
+                "max": 1.0311863395041638,
+                "mean": 0.8487684253042413,
+                "std": 0.09554663369389658,
+                "values": [
+                  0.956197,
+                  0.906989,
+                  0.78066,
+                  0.824846,
+                  0.855594,
+                  0.779461,
+                  0.711461,
+                  0.740754,
+                  0.767668,
+                  0.863445,
+                  0.966959,
+                  1.031186
+                ]
+              }
+            },
+            "nino34_seasonal_std_2dp": {
+              "ERSSTv5": {
+                "type": "ndarray",
+                "shape": [
+                  12
+                ],
+                "size": 12,
+                "n_valid": 12,
+                "min": 0.6,
+                "max": 1.12,
+                "mean": 0.8275,
+                "std": 0.19153437463459835,
+                "values": [
+                  1.08,
+                  0.88,
+                  0.67,
+                  0.6,
+                  0.61,
+                  0.61,
+                  0.68,
+                  0.76,
+                  0.85,
+                  0.99,
+                  1.08,
+                  1.12
+                ]
+              },
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  12
+                ],
+                "size": 12,
+                "n_valid": 12,
+                "min": 0.94,
+                "max": 1.62,
+                "mean": 1.2633333333333334,
+                "std": 0.24321915129272936,
+                "values": [
+                  1.62,
+                  1.43,
+                  1.2,
+                  1.07,
+                  1.01,
+                  0.94,
+                  0.98,
+                  1.09,
+                  1.24,
+                  1.4,
+                  1.56,
+                  1.62
+                ]
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  12
+                ],
+                "size": 12,
+                "n_valid": 12,
+                "min": 0.75,
+                "max": 1.25,
+                "mean": 0.9858333333333335,
+                "std": 0.15965892465572423,
+                "values": [
+                  1.13,
+                  1.06,
+                  0.96,
+                  0.91,
+                  0.84,
+                  0.78,
+                  0.75,
+                  0.85,
+                  0.98,
+                  1.11,
+                  1.21,
+                  1.25
+                ]
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  12
+                ],
+                "size": 12,
+                "n_valid": 12,
+                "min": 0.71,
+                "max": 1.03,
+                "mean": 0.8491666666666666,
+                "std": 0.09638968939789268,
+                "values": [
+                  0.96,
+                  0.91,
+                  0.78,
+                  0.82,
+                  0.86,
+                  0.78,
+                  0.71,
+                  0.74,
+                  0.77,
+                  0.86,
+                  0.97,
+                  1.03
+                ]
+              }
+            },
+            "nino34_peak_month": {
+              "ERSSTv5": 12,
+              "CESM2": 1,
+              "GFDL-ESM4": 12,
+              "MPI-ESM1-2-LR": 12
+            },
+            "nino34_peak_std": {
+              "ERSSTv5": 1.1202555411215664,
+              "CESM2": 1.623649632058717,
+              "GFDL-ESM4": 1.2484130087485668,
+              "MPI-ESM1-2-LR": 1.0311863395041638
+            },
+            "nino34_min_month": {
+              "ERSSTv5": 4,
+              "CESM2": 6,
+              "GFDL-ESM4": 7,
+              "MPI-ESM1-2-LR": 7
+            },
+            "nino34_min_std": {
+              "ERSSTv5": 0.5963829157218463,
+              "CESM2": 0.9422419491042356,
+              "GFDL-ESM4": 0.7465125919060059,
+              "MPI-ESM1-2-LR": 0.7114612347715752
+            },
+            "nino34_peak_min_ratio": {
+              "ERSSTv5": 1.878416553508476,
+              "CESM2": 1.7231769755127944,
+              "GFDL-ESM4": 1.672326792989656,
+              "MPI-ESM1-2-LR": 1.449392165175719
+            },
+            "nino34_exceed_count": {
+              "ERSSTv5": 170,
+              "CESM2": 360,
+              "GFDL-ESM4": 237,
+              "MPI-ESM1-2-LR": 199
+            },
+            "nino34_exceed_pct": {
+              "ERSSTv5": 21.8,
+              "CESM2": 46.2,
+              "GFDL-ESM4": 30.4,
+              "MPI-ESM1-2-LR": 25.5
+            },
+            "nino34_anom_values": {
+              "ERSSTv5": {
+                "type": "ndarray",
+                "shape": [
+                  780
+                ],
+                "size": 780,
+                "n_valid": 780,
+                "min": -2.2286930084228516,
+                "max": 2.628002166748047,
+                "mean": 5.966577774439103e-07,
+                "std": 0.8489886941818257
+              },
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  780
+                ],
+                "size": 780,
+                "n_valid": 780,
+                "min": -3.3769397735595703,
+                "max": 3.341421127319336,
+                "mean": 2.102974133613782e-07,
+                "std": 1.2865464103648576
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  780
+                ],
+                "size": 780,
+                "n_valid": 780,
+                "min": -3.139993667602539,
+                "max": 3.271371841430664,
+                "mean": 1.4598552997295672e-06,
+                "std": 0.9990544672589744
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  780
+                ],
+                "size": 780,
+                "n_valid": 780,
+                "min": -2.170867919921875,
+                "max": 2.6837158203125,
+                "mean": 7.825020032051282e-07,
+                "std": 0.8541293807196941
+              }
+            },
+            "obs_std": 0.8489886941818262,
+            "amplitude_bias": {
+              "CESM2": 0.43755771618303163,
+              "GFDL-ESM4": 0.1500657730771482,
+              "MPI-ESM1-2-LR": 0.005140686537867478
+            },
+            "amplitude_ratio": {
+              "CESM2": 1.5153869765070402,
+              "GFDL-ESM4": 1.176758270287412,
+              "MPI-ESM1-2-LR": 1.0060550706659546
+            },
+            "amplitude_bias_2dp": {
+              "CESM2": 0.44,
+              "GFDL-ESM4": 0.15,
+              "MPI-ESM1-2-LR": 0.01
+            },
+            "amplitude_ratio_2dp": {
+              "CESM2": 1.52,
+              "GFDL-ESM4": 1.18,
+              "MPI-ESM1-2-LR": 1.01
+            },
+            "amplitude_bias_ranking": [
+              "MPI-ESM1-2-LR",
+              "GFDL-ESM4",
+              "CESM2"
+            ],
+            "seasonal_std_df": "     ERSSTv5     CESM2  GFDL-ESM4  MPI-ESM1-2-LR\n1   1.081394  1.623650   1.126868       0.956197\n2   0.884230  1.425894   1.059687       0.906989\n3   0.670235  1.196199   0.964063       0.780660\n4   0.596383  1.072111   0.912426       0.824846\n5   0.608909  1.012580   0.840661       0.855594\n6   0.613024  0.942242   0.780579       0.779461\n7   0.675797  0.978472   0.746513       0.711461\n8   0.762768  1.086434   0.853557       0.740754\n9   0.849722  1.242738   0.978319       0.767668\n10  0.987066  1.398662   1.111840       0.863445\n11  1.075561  1.560192   1.211994       0.966959\n12  1.120256  1.620790   1.248413       1.031186",
+            "seasonal_std_rounded_df": "    ERSSTv5  CESM2  GFDL-ESM4  MPI-ESM1-2-LR\n1      1.08   1.62       1.13           0.96\n2      0.88   1.43       1.06           0.91\n3      0.67   1.20       0.96           0.78\n4      0.60   1.07       0.91           0.82\n5      0.61   1.01       0.84           0.86\n6      0.61   0.94       0.78           0.78\n7      0.68   0.98       0.75           0.71\n8      0.76   1.09       0.85           0.74\n9      0.85   1.24       0.98           0.77\n10     0.99   1.40       1.11           0.86\n11     1.08   1.56       1.21           0.97\n12     1.12   1.62       1.25           1.03",
+            "summary_df": "               nino34_std_degC  ...  amplitude_ratio_vs_ERSSTv5\nERSSTv5               0.848989  ...                         NaN\nCESM2                 1.286546  ...                        1.52\nGFDL-ESM4             0.999054  ...                        1.18\nMPI-ESM1-2-LR         0.854129  ...                        1.01\n\n[4 rows x 6 columns]",
+            "phase_locking_df": "               peak_month  peak_std_degC  ...  min_std_degC  peak_to_min_ratio\nERSSTv5                12           1.12  ...          0.60               1.88\nCESM2                   1           1.62  ...          0.94               1.72\nGFDL-ESM4              12           1.25  ...          0.75               1.67\nMPI-ESM1-2-LR          12           1.03  ...          0.71               1.45\n\n[4 rows x 5 columns]",
+            "obs_peak_month": 12,
+            "obs_peak_min_ratio": 1.878416553508476,
+            "phase_locking_assessment": {
+              "CESM2": {
+                "model_peak_month": 1,
+                "obs_peak_month": 12,
+                "peak_month_matches_obs": false,
+                "model_peak_to_min_ratio": 1.72,
+                "obs_peak_to_min_ratio": 1.88,
+                "ratio_difference_model_minus_obs": -0.16
+              },
+              "GFDL-ESM4": {
+                "model_peak_month": 12,
+                "obs_peak_month": 12,
+                "peak_month_matches_obs": true,
+                "model_peak_to_min_ratio": 1.67,
+                "obs_peak_to_min_ratio": 1.88,
+                "ratio_difference_model_minus_obs": -0.21
+              },
+              "MPI-ESM1-2-LR": {
+                "model_peak_month": 12,
+                "obs_peak_month": 12,
+                "peak_month_matches_obs": true,
+                "model_peak_to_min_ratio": 1.45,
+                "obs_peak_to_min_ratio": 1.88,
+                "ratio_difference_model_minus_obs": -0.43
+              }
+            }
+          },
+          "omitted_loop_variables": [
+            "area",
+            "area_files",
+            "cand",
+            "cfg",
+            "den",
+            "ds_area",
+            "ds_sftof",
+            "ds_tos",
+            "idx_m",
+            "lat2d",
+            "lon2d",
+            "model",
+            "num",
+            "rmask",
+            "sftof",
+            "sftof_files",
+            "src",
+            "tos",
+            "tos_files",
+            "valid",
+            "variant",
+            "w",
+            "weights"
+          ]
+        }
+      ],
+      "visualization_iterations": [
+        {
+          "iteration": 1,
+          "code": "months = np.arange(1, 13)\nmonth_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',\n                'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']\n\ncolors = {\n    'ERSSTv5': 'black',\n    'CESM2': 'tab:blue',\n    'GFDL-ESM4': 'tab:orange',\n    'MPI-ESM1-2-LR': 'tab:green',\n}\n\n# Figure 1: seasonal cycle of Nino 3.4 amplitude\nfig1, ax1 = plt.subplots(figsize=(9, 5))\n\nfor src in SOURCES:\n    vals = nino34_stats[src]['seasonal_std']\n\n    if src == 'ERSSTv5':\n        ax1.plot(\n            months, vals, color=colors[src], lw=3.0, marker='o', ms=5,\n            label=src, zorder=10\n        )\n    else:\n        ax1.plot(\n            months, vals, color=colors[src], lw=1.6, marker='o', ms=4,\n            label=src\n        )\n\n    pm = nino34_stats[src]['peak_month']\n    pv = nino34_stats[src]['peak_std']\n    ax1.scatter(\n        pm, pv, color=colors[src],\n        s=150 if src == 'ERSSTv5' else 80,\n        marker='*',\n        edgecolor='black' if src == 'ERSSTv5' else 'none',\n        zorder=11\n    )\n\nax1.set_xticks(months)\nax1.set_xticklabels(month_labels)\nax1.set_xlabel('Calendar month')\nax1.set_ylabel('Nino 3.4 anomaly standard deviation (degC)')\nax1.set_title('Seasonal cycle of Nino 3.4 amplitude, 1950-2014')\nax1.grid(True, alpha=0.3)\nax1.legend(frameon=False)\nfig1.tight_layout()\n\n# Figure 2: four stacked Nino 3.4 anomaly panels\nfig2, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)\n\nall_anoms = np.concatenate([nino34_stats[s]['anom_values'] for s in SOURCES])\nymax = np.nanmax(np.abs(all_anoms)) * 1.05\n\nfor ax, src in zip(axes, SOURCES):\n    vals = nino34_stats[src]['anom_values']\n\n    ax.plot(TIME_AXIS, vals, color=colors[src], lw=1.0)\n    ax.axhline(1.0, color='gray', linestyle='--', linewidth=0.8)\n    ax.axhline(-1.0, color='gray', linestyle='--', linewidth=0.8)\n    ax.axhline(0.0, color='gray', linestyle=':', linewidth=0.5)\n    ax.set_ylim(-ymax, ymax)\n    ax.set_ylabel('Anomaly (degC)')\n\n    ax.text(\n        0.01, 0.95,\n        f\"{src}\\n\"\n        f\"SD = {nino34_stats[src]['std']:.2f} degC\\n\"\n        f\"|anom| > 1 degC: {nino34_stats[src]['exceed_count']} months \"\n        f\"({nino34_stats[src]['exceed_pct']:.1f}%)\",\n        transform=ax.transAxes,\n        va='top',\n        ha='left',\n        fontsize=9,\n        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),\n    )\n\naxes[-1].set_xlabel('Year')\nfig2.suptitle('Nino 3.4 SST anomalies, 1950-2014')\nfig2.tight_layout(rect=[0, 0, 1, 0.97])",
+          "success": true,
+          "output": {
+            "months": {
+              "type": "ndarray",
+              "shape": [
+                12
+              ],
+              "size": 12,
+              "n_valid": 12,
+              "min": 1.0,
+              "max": 12.0,
+              "mean": 6.5,
+              "std": 3.452052529534663,
+              "values": [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12
+              ]
+            },
+            "month_labels": [
+              "Jan",
+              "Feb",
+              "Mar",
+              "Apr",
+              "May",
+              "Jun",
+              "Jul",
+              "Aug",
+              "Sep",
+              "Oct",
+              "Nov",
+              "Dec"
+            ],
+            "colors": {
+              "ERSSTv5": "black",
+              "CESM2": "tab:blue",
+              "GFDL-ESM4": "tab:orange",
+              "MPI-ESM1-2-LR": "tab:green"
+            },
+            "fig1": "Figure(900x500)",
+            "ax1": "Axes(0.0737809,0.116556;0.909552x0.812778)",
+            "fig2": "Figure(1200x1000)",
+            "axes": {
+              "type": "ndarray",
+              "shape": [
+                4
+              ],
+              "size": 4,
+              "values": [
+                "Axes(0.0483565,0.723215;0.939144x0.201785)",
+                "Axes(0.0483565,0.501569;0.939144x0.201785)",
+                "Axes(0.0483565,0.279924;0.939144x0.201785)",
+                "Axes(0.0483565,0.0582778;0.939144x0.201785)"
+              ]
+            },
+            "all_anoms": {
+              "type": "ndarray",
+              "shape": [
+                3120
+              ],
+              "size": 3120,
+              "n_valid": 3120,
+              "min": -3.3769397735595703,
+              "max": 3.341421127319336,
+              "mean": 7.62328123434996e-07,
+              "std": 1.0128709562958653
+            },
+            "ymax": 3.545786762237549
+          },
+          "omitted_loop_variables": [
+            "ax",
+            "pm",
+            "pv",
+            "vals"
+          ]
+        }
+      ],
+      "visualization_paths": [
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T1_deepseek-flash_20261025_072039/turn01/figures/visualization_T1_deepseek-flash_20261025_072039_turn1_1.png",
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T1_deepseek-flash_20261025_072039/turn01/figures/visualization_T1_deepseek-flash_20261025_072039_turn1_2.png"
+      ],
+      "selected_data": {
+        "name": [
+          "ersst",
+          "cmip6_historical"
+        ],
+        "path": [
+          "/data1/lorraine-20419/ocean_data/ERSSTv5",
+          "/data1/lorraine-20419/benchmark_cmip6/historical"
+        ],
+        "how": "inferred from the root directories the executed code names"
+      },
+      "observation": "[\n  {\n    \"type\": \"computation\",\n    \"status\": \"success\",\n    \"results\": {\n      \"HIST_ROOT\": \"/data1/lorraine-20419/benchmark_cmip6/historical\",\n      \"ERSST_PATH\": \"/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc\",\n      \"START_YEAR\": 1950,\n      \"END_YEAR\": 2014,\n      \"N_MONTHS\": 780,\n      \"TIME_AXIS\": \"DatetimeIndex(['1950-01-01', '1950-02-01', '1950-03-01', '1950-04-01',\\n               '1950-05-01', '1950-06-01', '1950-07-01', '1950-08-01',\\n               '1950-09-01', '1950-10-01',\\n               ...\\n               '2014-03-01', '2014-04-01', '2014-05-01', '2014-06-01',\\n               '2014-07-01', '2014-08-01', '2014-09-01', '2014-10-01',\\n               '2014-11-01', '2014-12-01'],\\n              dtype='datetime64[ns]', length=780, freq='MS')\",\n      \"MODEL_CFG\": {\n        \"CESM2\": {\n          \"y\": \"nlat\",\n          \"x\": \"nlon\",\n          \"lat\": \"lat\",\n          \"lon\": \"lon\",\n          \"apply_sftof\": true\n        },\n        \"GFDL-ESM4\": {\n          \"y\": \"lat\",\n          \"x\": \"lon\",\n          \"lat\": \"lat\",\n          \"lon\": \"lon\",\n          \"apply_sftof\": false\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"y\": \"j\",\n          \"x\": \"i\",\n          \"lat\": \"latitude\",\n          \"lon\": \"longitude\",\n          \"apply_sftof\": false\n        }\n      },\n      \"MODELS\": [\n        \"CESM2\",\n        \"GFDL-ESM4\",\n        \"MPI-ESM1-2-LR\"\n      ],\n      \"SOURCES\": [\n        \"ERSSTv5\",\n        \"CESM2\",\n        \"GFDL-ESM4\",\n        \"MPI-ESM1-2-LR\"\n      ],\n      \"ds_obs\": {\n        \"time_bnds\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 2072,\n            \"nbnds\": 2\n          },\n          \"long_name\": \"Time Boundaries\",\n          \"size\": 4144,\n          \"n_valid\": 4144,\n          \"min\": 9.969209968386869e+36,\n          \"max\": 9.969209968386869e+36,\n          \"mean\": 9.969209968386869e+36,\n          \"std\": 0.0\n        },\n        \"sst\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 2072,\n            \"lat\": 89,\n            \"lon\": 180\n          },\n          \"units\": \"degC\",\n          \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n          \"size\": 33193440,\n          \"n_valid\": 22767136,\n          \"min\": -1.7999999523162842,\n          \"max\": 42.326358795166016,\n          \"mean\": 13.565886497497559,\n          \"std\": 11.497235298156738\n        }\n      },\n      \"sst_obs\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 780,\n          \"lat\": 89,\n          \"lon\": 180\n        },\n        \"units\": \"degC\",\n        \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n        \"size\": 12495600,\n        \"n_valid\": 8570640,\n        \"min\": -1.7999999523162842,\n        \"max\": 34.07516098022461,\n        \"mean\": 13.684885025024414,\n        \"std\": 11.519001007080078\n      },\n      \"lat_o\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"lat\": 89\n        },\n        \"units\": \"degrees_north\",\n        \"long_name\": \"Latitude\",\n        \"size\": 89,\n        \"n_valid\": 89,\n        \"min\": -88.0,\n        \"max\": 88.0,\n        \"mean\": 0.0,\n        \"std\": 51.38093185424805\n      },\n      \"lon_o\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"lon\": 180\n        },\n        \"units\": \"degrees_east\",\n        \"long_name\": \"Longitude\",\n        \"size\": 180,\n        \"n_valid\": 180,\n        \"min\": 0.0,\n        \"max\": 358.0,\n        \"mean\": 179.0,\n        \"std\": 103.92144775390625\n      },\n      \"lonn_o\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"lon\": 180\n        },\n        \"units\": \"degrees_east\",\n        \"long_name\": \"Longitude\",\n        \"size\": 180,\n        \"n_valid\": 180,\n        \"min\": 0.0,\n        \"max\": 358.0,\n        \"mean\": 179.0,\n        \"std\": 103.92144775390625\n      },\n      \"lat_o_sel\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"lat\": 5\n        },\n        \"units\": \"degrees_north\",\n        \"long_name\": \"Latitude\",\n        \"size\": 5,\n        \"n_valid\": 5,\n        \"min\": -4.0,\n        \"max\": 4.0,\n        \"mean\": 0.0,\n        \"std\": 2.8284270763397217,\n        \"values\": [\n          4.0,\n          2.0,\n          0.0,\n          -2.0,\n          -4.0\n        ]\n      },\n      \"lon_o_sel\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"lon\": 26\n        },\n        \"units\": \"degrees_east\",\n        \"long_name\": \"Longitude\",\n        \"size\": 26,\n        \"n_valid\": 26,\n        \"min\": 190.0,\n        \"max\": 240.0,\n        \"mean\": 215.0,\n        \"std\": 15.0,\n        \"values\": [\n          190.0,\n          192.0,\n          194.0,\n          196.0,\n          198.0,\n          200.0,\n          202.0,\n          204.0,\n          206.0,\n          208.0,\n          210.0,\n          212.0,\n          214.0,\n          216.0,\n          218.0,\n          220.0,\n          222.0,\n          224.0,\n          226.0,\n          228.0,\n          230.0,\n          232.0,\n          234.0,\n          236.0,\n          238.0,\n          240.0\n        ]\n      },\n      \"sub_o\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 780,\n          \"lat\": 5,\n          \"lon\": 26\n        },\n        \"units\": \"degC\",\n        \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n        \"size\": 101400,\n        \"n_valid\": 101400,\n        \"min\": 21.128305435180664,\n        \"max\": 30.512975692749023,\n        \"mean\": 26.85946273803711,\n        \"std\": 1.378936767578125\n      },\n      \"w_o\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"lat\": 5,\n          \"lon\": 26\n        },\n        \"units\": \"degrees_north\",\n        \"long_name\": \"Latitude\",\n        \"size\": 130,\n        \"n_valid\": 130,\n        \"min\": 0.9975640773773193,\n        \"max\": 1.0,\n        \"mean\": 0.9987819790840149,\n        \"std\": 0.0010189767926931381\n      },\n      \"valid_o\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 780,\n          \"lat\": 5,\n          \"lon\": 26\n        },\n        \"units\": \"degC\",\n        \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n        \"size\": 101400,\n        \"values\": [\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\"\n        ]\n      },\n      \"w_o_valid\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"lat\": 5,\n          \"lon\": 26,\n          \"time\": 780\n        },\n        \"units\": \"degrees_north\",\n        \"long_name\": \"Latitude\",\n        \"size\": 101400,\n        \"n_valid\": 101400,\n        \"min\": 0.9975640773773193,\n        \"max\": 1.0,\n        \"mean\": 0.9987820386886597,\n        \"std\": 0.0010189767926931381\n      },\n      \"num_o\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 780\n        },\n        \"units\": \"degC\",\n        \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n        \"size\": 780,\n        \"n_valid\": 780,\n        \"min\": 3148.825439453125,\n        \"max\": 3779.4267578125,\n        \"mean\": 3487.433349609375,\n        \"std\": 124.89495849609375\n      },\n      \"den_o\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 780\n        },\n        \"units\": \"degrees_north\",\n        \"long_name\": \"Latitude\",\n        \"size\": 780,\n        \"n_valid\": 780,\n        \"min\": 129.84165954589844,\n        \"max\": 129.84165954589844,\n        \"mean\": 129.84165954589844,\n        \"std\": 0.0\n      },\n      \"idx_obs\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 780\n        },\n        \"units\": \"degC\",\n        \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n        \"size\": 780,\n        \"n_valid\": 780,\n        \"min\": 24.251272201538086,\n        \"max\": 29.107967376708984,\n        \"mean\": 26.8591251373291,\n        \"std\": 0.9619020223617554\n      },\n      \"nino34_index\": {\n        \"ERSSTv5\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 780\n          },\n          \"units\": \"degC\",\n          \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n          \"size\": 780,\n          \"n_valid\": 780,\n          \"min\": 24.251272201538086,\n          \"max\": 29.107967376708984,\n          \"mean\": 26.8591251373291,\n          \"std\": 0.9619020223617554\n        },\n        \"CESM2\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 780\n          },\n          \"units\": \"degC\",\n          \"long_name\": \"Sea Surface Temperature\",\n          \"size\": 780,\n          \"n_valid\": 780,\n          \"min\": 23.452348709106445,\n          \"max\": 30.584609985351562,\n          \"mean\": 27.438274383544922,\n          \"std\": 1.4306608438491821\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 780\n          },\n          \"units\": \"degC\",\n          \"long_name\": \"Sea Surface Temperature\",\n          \"size\": 780,\n          \"n_valid\": 780,\n          \"min\": 22.592201232910156,\n          \"max\": 29.53203773498535,\n          \"mean\": 26.260501861572266,\n          \"std\": 1.1968718767166138\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 780\n          },\n          \"units\": \"degC\",\n          \"long_name\": \"Sea Surface Temperature\",\n          \"size\": 780,\n          \"n_valid\": 780,\n          \"min\": 23.165363311767578,\n          \"max\": 29.08015251159668,\n          \"mean\": 25.845653533935547,\n          \"std\": 1.0818939208984375\n        }\n      },\n      \"nino34_stats\": {\n        \"ERSSTv5\": {\n          \"std\": 0.8489886941818262,\n          \"seasonal_std\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              12\n            ],\n            \"size\": 12,\n            \"n_valid\": 12,\n            \"min\": 0.5963829157218463,\n            \"max\": 1.1202555411215664,\n            \"mean\": 0.827112160714066,\n            \"std\": 0.1914870137734671,\n            \"values\": [\n              1.081394,\n              0.88423,\n              0.670235,\n              0.596383,\n              0.608909,\n              0.613024,\n              0.675797,\n              0.762768,\n              0.849722,\n              0.987066,\n              1.075561,\n              1.120256\n            ]\n          },\n          \"peak_month\": 12,\n          \"peak_std\": 1.1202555411215664,\n          \"min_month\": 4,\n          \"min_std\": 0.5963829157218463,\n          \"peak_min_ratio\": 1.878416553508476,\n          \"exceed_count\": 170,\n          \"exceed_pct\": 21.8,\n          \"anom_values\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              780\n            ],\n            \"size\": 780,\n            \"n_valid\": 780,\n            \"min\": -2.2286930084228516,\n            \"max\": 2.628002166748047,\n            \"mean\": 5.966577774439103e-07,\n            \"std\": 0.8489886941818257\n          },\n          \"n_months\": 780\n        },\n        \"CESM2\": {\n          \"std\": 1.2865464103648578,\n          \"seasonal_std\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              12\n            ],\n            \"size\": 12,\n            \"n_valid\": 12,\n            \"min\": 0.9422419491042356,\n            \"max\": 1.623649632058717,\n            \"mean\": 1.263330203025251,\n            \"std\": 0.24330734499927753,\n            \"values\": [\n              1.62365,\n              1.425894,\n              1.196199,\n              1.072111,\n              1.01258,\n              0.942242,\n              0.978472,\n              1.086434,\n              1.242738,\n              1.398662,\n              1.560192,\n              1.62079\n            ]\n          },\n          \"peak_month\": 1,\n          \"peak_std\": 1.623649632058717,\n          \"min_month\": 6,\n          \"min_std\": 0.9422419491042356,\n          \"peak_min_ratio\": 1.7231769755127944,\n          \"exceed_count\": 360,\n          \"exceed_pct\": 46.2,\n          \"anom_values\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              780\n            ],\n            \"size\": 780,\n            \"n_valid\": 780,\n            \"min\": -3.3769397735595703,\n            \"max\": 3.341421127319336,\n            \"mean\": 2.102974133613782e-07,\n            \"std\": 1.2865464103648576\n          },\n          \"n_months\": 780\n        },\n        \"GFDL-ESM4\": {\n          \"std\": 0.9990544672589744,\n          \"seasonal_std\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              12\n            ],\n            \"size\": 12,\n            \"n_valid\": 12,\n            \"min\": 0.7465125919060059,\n            \"max\": 1.2484130087485668,\n            \"mean\": 0.9862431160134316,\n            \"std\": 0.15948148689107283,\n            \"values\": [\n              1.126868,\n              1.059687,\n              0.964063,\n              0.912426,\n              0.840661,\n              0.780579,\n              0.746513,\n              0.853557,\n              0.978319,\n              1.11184,\n              1.211994,\n              1.248413\n            ]\n          },\n          \"peak_month\": 12,\n          \"peak_std\": 1.2484130087485668,\n          \"min_month\": 7,\n          \"min_std\": 0.7465125919060059,\n          \"peak_min_ratio\": 1.672326792989656,\n          \"exceed_count\": 237,\n          \"exceed_pct\": 30.4,\n          \"anom_values\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              780\n            ],\n            \"size\": 780,\n            \"n_valid\": 780,\n            \"min\": -3.139993667602539,\n            \"max\": 3.271371841430664,\n            \"mean\": 1.4598552997295672e-06,\n            \"std\": 0.9990544672589744\n          },\n          \"n_months\": 780\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"std\": 0.8541293807196937,\n          \"seasonal_std\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              12\n            ],\n            \"size\": 12,\n            \"n_valid\": 12,\n            \"min\": 0.7114612347715752,\n            \"max\": 1.0311863395041638,\n            \"mean\": 0.8487684253042413,\n            \"std\": 0.09554663369389658,\n            \"values\": [\n              0.956197,\n              0.906989,\n              0.78066,\n              0.824846,\n              0.855594,\n              0.779461,\n              0.711461,\n              0.740754,\n              0.767668,\n              0.863445,\n              0.966959,\n              1.031186\n            ]\n          },\n          \"peak_month\": 12,\n          \"peak_std\": 1.0311863395041638,\n          \"min_month\": 7,\n          \"min_std\": 0.7114612347715752,\n          \"peak_min_ratio\": 1.449392165175719,\n          \"exceed_count\": 199,\n          \"exceed_pct\": 25.5,\n          \"anom_values\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              780\n            ],\n            \"size\": 780,\n            \"n_valid\": 780,\n            \"min\": -2.170867919921875,\n            \"max\": 2.6837158203125,\n            \"mean\": 7.825020032051282e-07,\n            \"std\": 0.8541293807196941\n          },\n          \"n_months\": 780\n        }\n      },\n      \"nino34_std\": {\n        \"ERSSTv5\": 0.8489886941818262,\n        \"CESM2\": 1.2865464103648578,\n        \"GFDL-ESM4\": 0.9990544672589744,\n        \"MPI-ESM1-2-LR\": 0.8541293807196937\n      },\n      \"nino34_std_2dp\": {\n        \"ERSSTv5\": 0.85,\n        \"CESM2\": 1.29,\n        \"GFDL-ESM4\": 1.0,\n        \"MPI-ESM1-2-LR\": 0.85\n      },\n      \"nino34_seasonal_std\": {\n        \"ERSSTv5\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            12\n          ],\n          \"size\": 12,\n          \"n_valid\": 12,\n          \"min\": 0.5963829157218463,\n          \"max\": 1.1202555411215664,\n          \"mean\": 0.827112160714066,\n          \"std\": 0.1914870137734671,\n          \"values\": [\n            1.081394,\n            0.88423,\n            0.670235,\n            0.596383,\n            0.608909,\n            0.613024,\n            0.675797,\n            0.762768,\n            0.849722,\n            0.987066,\n            1.075561,\n            1.120256\n          ]\n        },\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            12\n          ],\n          \"size\": 12,\n          \"n_valid\": 12,\n          \"min\": 0.9422419491042356,\n          \"max\": 1.623649632058717,\n          \"mean\": 1.263330203025251,\n          \"std\": 0.24330734499927753,\n          \"values\": [\n            1.62365,\n            1.425894,\n            1.196199,\n            1.072111,\n            1.01258,\n            0.942242,\n            0.978472,\n            1.086434,\n            1.242738,\n            1.398662,\n            1.560192,\n            1.62079\n          ]\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            12\n          ],\n          \"size\": 12,\n          \"n_valid\": 12,\n          \"min\": 0.7465125919060059,\n          \"max\": 1.2484130087485668,\n          \"mean\": 0.9862431160134316,\n          \"std\": 0.15948148689107283,\n          \"values\": [\n            1.126868,\n            1.059687,\n            0.964063,\n            0.912426,\n            0.840661,\n            0.780579,\n            0.746513,\n            0.853557,\n            0.978319,\n            1.11184,\n            1.211994,\n            1.248413\n          ]\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            12\n          ],\n          \"size\": 12,\n          \"n_valid\": 12,\n          \"min\": 0.7114612347715752,\n          \"max\": 1.0311863395041638,\n          \"mean\": 0.8487684253042413,\n          \"std\": 0.09554663369389658,\n          \"values\": [\n            0.956197,\n            0.906989,\n            0.78066,\n            0.824846,\n            0.855594,\n            0.779461,\n            0.711461,\n            0.740754,\n            0.767668,\n            0.863445,\n            0.966959,\n            1.031186\n          ]\n        }\n      },\n      \"nino34_seasonal_std_2dp\": {\n        \"ERSSTv5\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            12\n          ],\n          \"size\": 12,\n          \"n_valid\": 12,\n          \"min\": 0.6,\n          \"max\": 1.12,\n          \"mean\": 0.8275,\n          \"std\": 0.19153437463459835,\n          \"values\": [\n            1.08,\n            0.88,\n            0.67,\n            0.6,\n            0.61,\n            0.61,\n            0.68,\n            0.76,\n            0.85,\n            0.99,\n            1.08,\n            1.12\n          ]\n        },\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            12\n          ],\n          \"size\": 12,\n          \"n_valid\": 12,\n          \"min\": 0.94,\n          \"max\": 1.62,\n          \"mean\": 1.2633333333333334,\n          \"std\": 0.24321915129272936,\n          \"values\": [\n            1.62,\n            1.43,\n            1.2,\n            1.07,\n            1.01,\n            0.94,\n            0.98,\n            1.09,\n            1.24,\n            1.4,\n            1.56,\n            1.62\n          ]\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            12\n          ],\n          \"size\": 12,\n          \"n_valid\": 12,\n          \"min\": 0.75,\n          \"max\": 1.25,\n          \"mean\": 0.9858333333333335,\n          \"std\": 0.15965892465572423,\n          \"values\": [\n            1.13,\n            1.06,\n            0.96,\n            0.91,\n            0.84,\n            0.78,\n            0.75,\n            0.85,\n            0.98,\n            1.11,\n            1.21,\n            1.25\n          ]\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            12\n          ],\n          \"size\": 12,\n          \"n_valid\": 12,\n          \"min\": 0.71,\n          \"max\": 1.03,\n          \"mean\": 0.8491666666666666,\n          \"std\": 0.09638968939789268,\n          \"values\": [\n            0.96,\n            0.91,\n            0.78,\n            0.82,\n            0.86,\n            0.78,\n            0.71,\n            0.74,\n            0.77,\n            0.86,\n            0.97,\n            1.03\n          ]\n        }\n      },\n      \"nino34_peak_month\": {\n        \"ERSSTv5\": 12,\n        \"CESM2\": 1,\n        \"GFDL-ESM4\": 12,\n        \"MPI-ESM1-2-LR\": 12\n      },\n      \"nino34_peak_std\": {\n        \"ERSSTv5\": 1.1202555411215664,\n        \"CESM2\": 1.623649632058717,\n        \"GFDL-ESM4\": 1.2484130087485668,\n        \"MPI-ESM1-2-LR\": 1.0311863395041638\n      },\n      \"nino34_min_month\": {\n        \"ERSSTv5\": 4,\n        \"CESM2\": 6,\n        \"GFDL-ESM4\": 7,\n        \"MPI-ESM1-2-LR\": 7\n      },\n      \"nino34_min_std\": {\n        \"ERSSTv5\": 0.5963829157218463,\n        \"CESM2\": 0.9422419491042356,\n        \"GFDL-ESM4\": 0.7465125919060059,\n        \"MPI-ESM1-2-LR\": 0.7114612347715752\n      },\n      \"nino34_peak_min_ratio\": {\n        \"ERSSTv5\": 1.878416553508476,\n        \"CESM2\": 1.7231769755127944,\n        \"GFDL-ESM4\": 1.672326792989656,\n        \"MPI-ESM1-2-LR\": 1.449392165175719\n      },\n      \"nino34_exceed_count\": {\n        \"ERSSTv5\": 170,\n        \"CESM2\": 360,\n        \"GFDL-ESM4\": 237,\n        \"MPI-ESM1-2-LR\": 199\n      },\n      \"nino34_exceed_pct\": {\n        \"ERSSTv5\": 21.8,\n        \"CESM2\": 46.2,\n        \"GFDL-ESM4\": 30.4,\n        \"MPI-ESM1-2-LR\": 25.5\n      },\n      \"nino34_anom_values\": {\n        \"ERSSTv5\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            780\n          ],\n          \"size\": 780,\n          \"n_valid\": 780,\n          \"min\": -2.2286930084228516,\n          \"max\": 2.628002166748047,\n          \"mean\": 5.966577774439103e-07,\n          \"std\": 0.8489886941818257\n        },\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            780\n          ],\n          \"size\": 780,\n          \"n_valid\": 780,\n          \"min\": -3.3769397735595703,\n          \"max\": 3.341421127319336,\n          \"mean\": 2.102974133613782e-07,\n          \"std\": 1.2865464103648576\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            780\n          ],\n          \"size\": 780,\n          \"n_valid\": 780,\n          \"min\": -3.139993667602539,\n          \"max\": 3.271371841430664,\n          \"mean\": 1.4598552997295672e-06,\n          \"std\": 0.9990544672589744\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            780\n          ],\n          \"size\": 780,\n          \"n_valid\": 780,\n          \"min\": -2.170867919921875,\n          \"max\": 2.6837158203125,\n          \"mean\": 7.825020032051282e-07,\n          \"std\": 0.8541293807196941\n        }\n      },\n      \"obs_std\": 0.8489886941818262,\n      \"amplitude_bias\": {\n        \"CESM2\": 0.43755771618303163,\n        \"GFDL-ESM4\": 0.1500657730771482,\n        \"MPI-ESM1-2-LR\": 0.005140686537867478\n      },\n      \"amplitude_ratio\": {\n        \"CESM2\": 1.5153869765070402,\n        \"GFDL-ESM4\": 1.176758270287412,\n        \"MPI-ESM1-2-LR\": 1.0060550706659546\n      },\n      \"amplitude_bias_2dp\": {\n        \"CESM2\": 0.44,\n        \"GFDL-ESM4\": 0.15,\n        \"MPI-ESM1-2-LR\": 0.01\n      },\n      \"amplitude_ratio_2dp\": {\n        \"CESM2\": 1.52,\n        \"GFDL-ESM4\": 1.18,\n        \"MPI-ESM1-2-LR\": 1.01\n      },\n      \"amplitude_bias_ranking\": [\n        \"MPI-ESM1-2-LR\",\n        \"GFDL-ESM4\",\n        \"CESM2\"\n      ],\n      \"seasonal_std_df\": \"     ERSSTv5     CESM2  GFDL-ESM4  MPI-ESM1-2-LR\\n1   1.081394  1.623650   1.126868       0.956197\\n2   0.884230  1.425894   1.059687       0.906989\\n3   0.670235  1.196199   0.964063       0.780660\\n4   0.596383  1.072111   0.912426       0.824846\\n5   0.608909  1.012580   0.840661       0.855594\\n6   0.613024  0.942242   0.780579       0.779461\\n7   0.675797  0.978472   0.746513       0.711461\\n8   0.762768  1.086434   0.853557       0.740754\\n9   0.849722  1.242738   0.978319       0.767668\\n10  0.987066  1.398662   1.111840       0.863445\\n11  1.075561  1.560192   1.211994       0.966959\\n12  1.120256  1.620790   1.248413       1.031186\",\n      \"seasonal_std_rounded_df\": \"    ERSSTv5  CESM2  GFDL-ESM4  MPI-ESM1-2-LR\\n1      1.08   1.62       1.13           0.96\\n2      0.88   1.43       1.06           0.91\\n3      0.67   1.20       0.96           0.78\\n4      0.60   1.07       0.91           0.82\\n5      0.61   1.01       0.84           0.86\\n6      0.61   0.94       0.78           0.78\\n7      0.68   0.98       0.75           0.71\\n8      0.76   1.09       0.85           0.74\\n9      0.85   1.24       0.98           0.77\\n10     0.99   1.40       1.11           0.86\\n11     1.08   1.56       1.21           0.97\\n12     1.12   1.62       1.25           1.03\",\n      \"summary_df\": \"               nino34_std_degC  ...  amplitude_ratio_vs_ERSSTv5\\nERSSTv5               0.848989  ...                         NaN\\nCESM2                 1.286546  ...                        1.52\\nGFDL-ESM4             0.999054  ...                        1.18\\nMPI-ESM1-2-LR         0.854129  ...                        1.01\\n\\n[4 rows x 6 columns]\",\n      \"phase_locking_df\": \"               peak_month  peak_std_degC  ...  min_std_degC  peak_to_min_ratio\\nERSSTv5                12           1.12  ...          0.60               1.88\\nCESM2                   1           1.62  ...          0.94               1.72\\nGFDL-ESM4              12           1.25  ...          0.75               1.67\\nMPI-ESM1-2-LR          12           1.03  ...          0.71               1.45\\n\\n[4 rows x 5 columns]\",\n      \"obs_peak_month\": 12,\n      \"obs_peak_min_ratio\": 1.878416553508476,\n      \"phase_locking_assessment\": {\n        \"CESM2\": {\n          \"model_peak_month\": 1,\n          \"obs_peak_month\": 12,\n          \"peak_month_matches_obs\": false,\n          \"model_peak_to_min_ratio\": 1.72,\n          \"obs_peak_to_min_ratio\": 1.88,\n          \"ratio_difference_model_minus_obs\": -0.16\n        },\n        \"GFDL-ESM4\": {\n          \"model_peak_month\": 12,\n          \"obs_peak_month\": 12,\n          \"peak_month_matches_obs\": true,\n          \"model_peak_to_min_ratio\": 1.67,\n          \"obs_peak_to_min_ratio\": 1.88,\n          \"ratio_difference_model_minus_obs\": -0.21\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"model_peak_month\": 12,\n          \"obs_peak_month\": 12,\n          \"peak_month_matches_obs\": true,\n          \"model_peak_to_min_ratio\": 1.45,\n          \"obs_peak_to_min_ratio\": 1.88,\n          \"ratio_difference_model_minus_obs\": -0.43\n        }\n      }\n    }\n  },\n  {\n    \"type\": \"visualization\",\n    \"status\": \"success\",\n    \"paths\": [\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T1_deepseek-flash_20261025_072039/turn01/figures/visualization_T1_deepseek-flash_20261025_072039_turn1_1.png\",\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T1_deepseek-flash_20261025_072039/turn01/figures/visualization_T1_deepseek-flash_20261025_072039_turn1_2.png\"\n    ]\n  }\n]",
+      "solution": "<solution>\n\nThe Nino 3.4 index was defined as the area-weighted SST anomaly over 5°S–5°N, 170°W–120°W, relative to the 1950–2014 monthly climatology of each source. Standard deviations use the population definition (ddof = 0) over all 780 months.\n\n## Overall ENSO amplitude and exceedance\n\n| Source | Nino 3.4 SD (°C) | Months with \\|anomaly\\| > 1.0°C | Percentage |\n|---|---:|---:|---:|\n| ERSSTv5 | 0.85 | 170 | 21.8% |\n| CESM2 | 1.29 | 360 | 46.2% |\n| GFDL-ESM4 | 1.00 | 237 | 30.4% |\n| MPI-ESM1-2-LR | 0.85 | 199 | 25.5% |\n\n## Model amplitude bias and ratio against ERSSTv5\n\nBias = model SD minus ERSSTv5 SD; ratio = model SD divided by ERSSTv5 SD.\n\n| Model | SD (°C) | Bias (°C) | Ratio | Absolute-bias rank |\n|---|---:|---:|---:|---:|\n| MPI-ESM1-2-LR | 0.85 | 0.01 | 1.01 | 1 |\n| GFDL-ESM4 | 1.00 | 0.15 | 1.18 | 2 |\n| CESM2 | 1.29 | 0.44 | 1.52 | 3 |\n\nRanking from smallest to largest absolute amplitude bias: **MPI-ESM1-2-LR < GFDL-ESM4 < CESM2**. MPI-ESM1-2-LR reproduces the observed overall amplitude almost exactly; GFDL-ESM4 is moderately stronger; CESM2 is substantially too strong, with about 1.52× the observed Nino 3.4 SD.\n\n## Seasonal-cycle amplitude by calendar month\n\nStandard deviation of the Nino 3.4 anomaly for each calendar month (°C, 2 decimal places).\n\n| Month | ERSSTv5 | CESM2 | GFDL-ESM4 | MPI-ESM1-2-LR |\n|---|---:|---:|---:|---:|\n| Jan | 1.08 | 1.62 | 1.13 | 0.96 |\n| Feb | 0.88 | 1.43 | 1.06 | 0.91 |\n| Mar | 0.67 | 1.20 | 0.96 | 0.78 |\n| Apr | 0.60 | 1.07 | 0.91 | 0.82 |\n| May | 0.61 | 1.01 | 0.84 | 0.86 |\n| Jun | 0.61 | 0.94 | 0.78 | 0.78 |\n| Jul | 0.68 | 0.98 | 0.75 | 0.71 |\n| Aug | 0.76 | 1.09 | 0.85 | 0.74 |\n| Sep | 0.85 | 1.24 | 0.98 | 0.77 |\n| Oct | 0.99 | 1.40 | 1.11 | 0.86 |\n| Nov | 1.08 | 1.56 | 1.21 | 0.97 |\n| Dec | 1.12 | 1.62 | 1.25 | 1.03 |\n\n## Peak/minimum seasonal amplitude and phase locking\n\n| Source | Peak month | Peak SD (°C) | Minimum month | Minimum SD (°C) | Peak/min ratio |\n|---|---|---:|---|---:|---:|\n| ERSSTv5 | Dec | 1.12 | Apr | 0.60 | 1.88 |\n| CESM2 | Jan | 1.62 | Jun | 0.94 | 1.72 |\n| GFDL-ESM4 | Dec | 1.25 | Jul | 0.75 | 1.67 |\n| MPI-ESM1-2-LR | Dec | 1.03 | Jul | 0.71 | 1.45 |\n\nThe observed seasonal phase locking peaks in **December** with a peak-to-minimum amplitude ratio of **1.88**.\n\n- **CESM2:** Does **not** reproduce the observed peak month; its maximum occurs in **January** rather than December. Its peak-to-minimum ratio is **1.72**, weaker than the observed **1.88** by 0.16.\n- **GFDL-ESM4:** Reproduces the observed peak month, **December**, but has weaker seasonal phase locking, with a ratio of **1.67** versus the observed **1.88** (weaker by 0.21).\n- **MPI-ESM1-2-LR:** Also reproduces the observed peak month, **December**, but its seasonal phase locking is substantially weaker, with a ratio of **1.45** versus **1.88** (weaker by 0.43).\n\nOverall, MPI-ESM1-2-LR has the closest total ENSO amplitude to ERSSTv5, followed by GFDL-ESM4, while CESM2 strongly overestimates ENSO amplitude. However, all three models somewhat underrepresent the observed seasonal peak-to-minimum amplitude contrast; only GFDL-ESM4 and MPI-ESM1-2-LR place the maximum in the observed December, whereas CESM2 peaks in January.\n\nFigure 1 shows the seasonal cycle of Nino 3.4 amplitude with the peak month marked for each source. Figure 2 shows the four stacked Nino 3.4 anomaly time series over 1950–2014 with common y-axis limits, ±1.0°C reference lines, and annotations of each series’ standard deviation and exceedance percentage.\n\n</solution>",
+      "timestamp": "2026-10-25T07:24:34.079958"
+    }
+  ]
+}

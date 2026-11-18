@@ -1,0 +1,298 @@
+# exchange 2: knowledge_condensing
+# elapsed: 5.7 s
+
+===== SYSTEM =====
+You condense knowledge fragments into short notes for the planning step of a data analysis. The
+planner sees only your notes, not the fragments.
+
+Fragments selected for this question (each headed by its [fragment-id]):
+<fragments>
+### [anomaly-baselines-and-climate-indices] Anomalies and climate indices: which climatology to remove, which baseline, which season convention
+(type: method; severity: must)
+#### Key points
+- CPC changed the base period of its Oceanic Niño Index because, with a warming
+  trend in the Niño-3.4 region since 1950, episodes defined against a fixed base
+  period "are increasingly incorporating longer-term trends that do not reflect
+  interannual ENSO variability". The ONI now uses centred 30-year base periods,
+  each applied to successive 5-year spans of the record. [CPC ONI change]
+  The same index therefore exists on several baselines; `configs/datasets.yaml`
+  lists the local CPC products and the baseline of each.
+- The WOA23 seasonal climatologies are calendar quarters: winter January–March,
+  spring April–June, summer July–September, autumn October–December. [WOA23
+  documentation]
+#### Implications for this project
+- Which climatology is removed decides what an anomaly means.
+  - Against the field's **own** climatology (`compute_anomaly_vs_own_climatology`,
+    and `compute_enso_nino_index` on model output) whatever bias the field
+    carries cancels. This is what an index, a trend, a composite or a comparison
+    between two products needs.
+  - Against the **observed** climatology (`compute_anomaly_vs_woa23`) the
+    field's bias against observations stays inside the anomaly. This answers
+    "how far is this field from the observed ocean". An observed climatology
+    forced on a model index puts the model's mean-state bias into the index
+    (see `cmip6-tos-bulk-top-cell`).
+- The baseline is part of the answer. An anomaly is defined only relative to
+  the period its climatology came from, and two series built on different
+  baselines differ by an offset (one constant per calendar month) even when
+  their variability is identical. Compute an index on the baseline of any
+  published series it is compared with (`base_period`), and state the
+  climatology and baseline used; the tools record both in the result's attrs.
+  The CPC products in the registry differ in baseline and are not
+  interchangeable.
+- Niño 3.4 is the standard region for ENSO monitoring. A monthly index is
+  matched against the climatology of its own calendar month, which removes the
+  seasonal cycle.
+- Seasons: DJF/MAM/JJA/SON is the usual (meteorological) climate definition,
+  while the WOA23 seasonal fields are the calendar quarters JFM/AMJ/JAS/OND.
+  The two are offset by a month and must not be mixed in one comparison
+  (`season_convention` of `temporal_aggregate`; `freq='season'` of
+  `compute_anomaly_vs_woa23` uses the WOA23 quarters).
+- Events are defined operationally by persistence, not by eye: a warm or cold
+  phase of a climate index, a marine heatwave or a hypoxic spell counts only
+  when the series stays beyond the threshold for a minimum number of
+  consecutive steps. A single step beyond the threshold is noise;
+  `min_duration` of `detect_threshold_events` is what separates an event from
+  a wobble.
+- Scan a time series for outliers on its anomalies, not on its raw values. A
+  raw ocean series is dominated by its seasonal cycle, so every summer maximum
+  sits in the tail of the distribution and the "outliers" returned are simply
+  the warm season.
+#### Common mistakes
+- Reading the offset between a reconstructed index and a published one built on
+  another baseline as an error of the reconstruction.
+- Comparing seasonal means built on the DJF and the JFM conventions.
+
+### [common-comparison-mask] One comparison sample: a shared mask for model–observation and multi-model metrics
+(type: method; severity: must)
+#### Key points
+- Regridding model output to a spherical grid "generally involves a land–sea
+  mask distinct from the model native mask". [OMIP-phys A3] After remapping,
+  each source covers its own set of cells, and coastal cells differ most.
+- The GLODAPv2 mapped climatology is a global 1° × 1° product on 33 standard
+  depth surfaces, mapped from the GLODAPv2 bottle data. [Lauvset et al. 2016]
+  It shares the horizontal geometry of the WOA 1° grid, but not WOA's data
+  coverage or its land-sea mask.
+#### Checked in the local files
+- GLODAPv2.2016b surface `TCO2` has 41320 valid cells on its 1° grid, and
+  WOA23 `landsea_01` calls 1459 of them land: 442 north of 60°N, 179 south of
+  60°S, the rest coastal cells at all latitudes. `build_comparison_mask` on the
+  GLODAP field keeps 39861 cells with `ocean_only=True` and all 41320 with
+  `ocean_only=False` (checked 2026-10-20).
+#### Implications for this project
+- A model is comparable with an observation, or with another model, only where
+  both have data, and several models can be ranked against each other on a
+  cell-by-cell score (a bias, an RMSE or the pattern correlation of one field)
+  only where all of them do. Left to itself each pair covers a different set of
+  cells, so such a score from one pair describes a different piece of ocean
+  from the next, and a ranking between them means nothing. Put the fields on
+  one grid, build one mask over all of them with `build_comparison_mask`, and
+  apply it with `.where(mask)` to every field before any metric is taken.
+- Where the shared mask does not apply: a pattern that is itself the result of
+  an analysis on each source's own domain, such as the regression pattern of a
+  variability mode (see `eof-modes-and-pdo-index`). Each mode was computed on
+  its own source's cells, so masking the patterns afterwards to the other
+  sources' coverage does not make them comparable. Correlate each with the
+  reference pattern over the cells the two share (`analyze_correlation` leaves
+  out the cells either one lacks), and compare the models on those
+  correlations. Nor does a mask built on one level carry to another: coverage
+  shrinks with depth, so a statistic at several depths takes its cells from the
+  fields at each depth, not from the surface mask.
+- The numbers of one cell-by-cell comparison come from one sample. Report the
+  means that `compute_difference_metrics` returns over the shared sample
+  (`mean_data`, `mean_reference`) together with the bias, not means computed
+  separately over different cells. A global or regional mean of each source
+  over its own ocean, with its own weights, is a different quantity (see
+  `omip-native-grid-vs-regridded`): when the difference of such means is asked
+  for, take each mean on its own grid and say that the difference is not the
+  bias on the shared mask.
+- `ocean_only=True`, the default of `build_comparison_mask`, is right only when
+  WOA23 is part of the comparison. The check is made on the grid, so a
+  GLODAP-against-models comparison on the shared 1° geometry silently inherits
+  WOA23's coastline and drops cells where GLODAP has data and WOA23 says land.
+  Those are among the hardest cells for a model to match, so dropping them
+  flatters every model. Pass `ocean_only=False` when the reference is not WOA23.
+- Report the cell counts the mask records alongside the metrics. A mask much
+  smaller than the individual fields means the products disagree about where
+  the ocean is, not that the models are poor.
+#### Common mistakes
+- Scoring each model on its own pairwise mask in a cell-by-cell comparison of
+  one field, and then ranking the models on those scores.
+- Applying the WOA23 land-sea mask to a comparison against GLODAP.
+
+### [serial-correlation-and-significance] Autocorrelated ocean data: significance of trends and correlations, and validation of fitted relations
+(type: method; severity: should)
+#### Key points
+- Serially correlated observations carry fewer independent samples than they
+  have time steps. For red noise with lag-one autocorrelation r, the effective
+  sample size for the sample mean (order 1) is T(1 − r)/(1 + r). For the
+  correlation between two series with lag-one autocorrelations r_X and r_Y it
+  is T(1 − r_X r_Y)/(1 + r_X r_Y) (Eq. 31). [Bretherton et al. 1999, §5]
+- In practice the autocorrelation has to be estimated from the one series at
+  hand, so the effective sample size is itself uncertain, the more so when the
+  series has substantial power at periods near its length. [Bretherton et al.
+  1999, §5]
+#### Implications for this project
+- A monthly ocean series is strongly autocorrelated, so its number of steps
+  overstates the independent information by a large factor. Uncorrected, a test
+  uses far too many degrees of freedom: weak correlations come out highly
+  significant, and a monthly trend map is significant almost everywhere, which
+  says more about the persistence of the ocean than about any trend.
+  `fit_1D_trend`, `fit_trend_map` and `analyze_correlation` apply an effective
+  sample size along time by default and return the unadjusted values alongside;
+  quote the corrected ones.
+- For the question "is this quantity changing, and how fast", fit a straight
+  line explicitly: `method='linear'` (the standard choice) or
+  `method='theil_sen'` (the same question, resistant to outliers and non-normal
+  residuals). Automatic model selection answers "which curve describes this
+  series", not "what is the trend": a seasonal series will legitimately select
+  the sinusoid. Quote the slope with its confidence interval, and call it
+  significant only if the interval excludes zero.
+- A trend map is a straight-line fit at every cell, so every cell is estimated
+  the same way and read as a rate. Over whole years the raw field can be
+  fitted, but its seasonal cycle inflates the lag-1 autocorrelation and makes
+  the test conservative; removing the seasonal cycle first gives a sharper test
+  and the same trend. Draw the slope everywhere and stipple the significant
+  cells, rather than blanking the insignificant ones: a coherent pattern that
+  misses significance is still worth seeing. A low R² with a significant slope
+  is normal for a noisy field, a real drift buried in variability.
+- Correlations along time: when both series contain a long-term trend, detrend
+  them first (`detrend=True`), because two independently rising series
+  correlate through their trends alone. That is for asking whether two
+  different quantities are related. When two estimates of the same quantity are
+  compared, such as an index rebuilt from a gridded field against the
+  published index, or one series against its counterpart in another product,
+  correlate them as they are: their shared trend is part of the agreement being
+  checked, not a spurious link. When the effective sample size is much
+  smaller than the number of pairs, the correlation rests on that many
+  independent observations; a correlation from a handful of points is unstable.
+- Across space no such correction exists for a pattern correlation: read its
+  coefficient, not its p-value.
+- Fitted relations between fields (`fit_multivariate_relation`): neighbouring
+  ocean cells are near-duplicates, so a random train/test split scores a model
+  against its own neighbours and reports a skill it does not have. Hold out
+  whole spatial blocks larger than the field's correlation length scale; a
+  random split suits only data with no spatial structure. Ocean tracers are
+  often strongly collinear, which makes individual coefficients unreliable even
+  when the fit is good; the variance inflation factors show when that happens.
+#### Common mistakes
+- Quoting a trend's p-value or interval from the naive sample size of a monthly
+  series.
+- Letting automatic model selection answer a trend question.
+
+### [cmip6-tos-bulk-top-cell] CMIP6 tos is the bulk temperature of the top model cell, including under sea ice
+(type: concept; severity: should)
+#### Key points
+- `tos` is the "temperature of upper boundary of the liquid ocean, including
+  temperatures below sea-ice and floating ice shelves" (CMOR). Under sea ice it
+  is the water temperature just below the ice, not the ice-surface temperature.
+  [CMOR Omon; OMIP-phys H13]
+- Model surface tracers are **bulk values averaged over the top grid cell**,
+  which is generally at least a metre thick. They are not skin values. [OMIP-phys H13]
+- "In nearly all ocean climate models, the surface temperature is given by the
+  prognostic temperature in the upper-most ocean grid cell." [OMIP-phys H13]
+- `tos` is surface potential temperature, which equals surface in-situ
+  temperature and differs from surface Conservative Temperature. [OMIP-phys H13]
+- Top-cell thickness of the three native ocean grids, according to the CMIP6 source
+  registry [CVs source_id]:
+
+  | model | ocean component | top grid cell |
+  |---|---|---|
+  | CESM2 | POP2, 60 levels | 0–10 m |
+  | GFDL-ESM4 | GFDL-OM4p5 (MOM6), 75 levels | 0–2 m |
+  | MPI-ESM1-2-LR | MPIOM1.63, 40 levels | 0–12 m |
+
+  The CESM2 paper itself evaluates SST as "0‐ to 10‐m average in the ocean"
+  against ERSSTv5. [CESM2 §7]
+#### Implications for this project
+- Using the first level of `thetao` as a substitute for `tos` (needed for
+  ssp245, where `tos` is missing; see `configs/datasets.yaml`) reproduces the
+  model's own SST definition, because tos is the top-cell prognostic
+  temperature. Minor differences are possible where the archived vertical grid
+  differs from the native grid. GFDL-ESM4's archived `thetao` has been
+  regridded to 35 z levels, the first centred at 2.5 m. Checked on GFDL-ESM4,
+  1990–1999: a Niño3.4 index from the top level of `thetao` matches the one
+  from `tos` to an RMS of 0.005 °C. A 0–10 m thickness-weighted average
+  (two levels) departs by 0.031 °C. `compute_enso_nino_index` and
+  `compute_pdo_index` therefore take the top level by default
+  (`depth_level=None`), the like-for-like substitute where `tos` is missing.
+  A `depth_level` of 10 m instead averages two levels in GFDL-ESM4 but one in
+  CESM2 and MPI-ESM1-2-LR, so it is not the same quantity across models.
+- A model's first level stands for its surface. A value asked for at 0 m,
+  above every model's shallowest level centre, is that shallowest level's value
+  (`regrid_vertical` with `fill_surface=True`).
+- An ENSO index from a model is its anomaly from its **own** climatology.
+  Subtracting an observed climatology puts the model's mean-state bias into
+  the index, which is then not an ENSO index (`compute_enso_nino_index` with
+  `climatology='woa23'` on model output does exactly that).
+- Sea-ice-covered cells carry the under-ice water temperature (near freezing).
+  They are not missing. A global-mean SST therefore includes polar values near
+  −1.8 °C. Observational products that also report under-ice SST near freezing
+  are comparable. If a product masks sea ice, the ocean masks must be made
+  consistent before comparing.
+</fragments>
+
+Rules:
+1. For each fragment keep only what changes how THIS question is computed or how its result must be
+   stated. Write at most 2 notes per fragment, one line each, the most important first.
+2. Each note is actionable: the formula, threshold, unit conversion, weighting, tool argument or check
+   to apply, or the caveat the answer must state. Leave out background, the source's reasoning, and
+   points about variables, models or steps this question does not involve.
+3. Invent nothing; the notes must follow the fragment text. Every note must be backed by what the
+   fragment says: add no number, tool argument, rule or exception the fragment does not contain, and
+   never state the opposite of what it says. Copy numbers, formulas, variable names and tool names
+   exactly as the fragment writes them, and put variable and tool names in backticks. You may refer
+   to quantities the question itself defines (its thresholds, periods, regions).
+4. Only where the question's text actually states a definition or procedure that differs from the
+   fragment, write a note saying so, quoting the question's words: the question's version is
+   followed and the difference is stated in the answer. Where the question is silent, follow the
+   fragment, and never claim the question prescribes something it does not say.
+5. If, having read it, a fragment does not apply to this question, write
+   "[fragment-id] not applicable: <reason>" and no notes for it.
+6. Keep the whole answer under about 3600 characters.
+
+Follow this format strictly:
+<knowledge_notes>
+[fragment-id]
+- note
+- note
+[fragment-id] not applicable: reason
+</knowledge_notes>
+
+
+===== USER =====
+User question: Rebuild the Nino 3.4 index from the raw ERSSTv5 sea surface temperature field and check it against the series NOAA/CPC publishes, then use the same code to reproduce the offset between CPC's two baseline periods.
+
+Data to use:
+- ERSSTv5 monthly SST, 1950-01 to 2023-12, on its native 2-degree grid.
+- The CPC monthly Nino index on the 1991-2020 baseline (`ersst5_91-20`), Nino 3.4 anomaly column: the main reference.
+- The CPC monthly Nino index on the 1981-2010 baseline (`ersst5_81-10`), Nino 3.4 anomaly column: the control.
+- The CPC ONI series (`oni`), the official 3-month running index.
+
+Expected numerical results:
+- RECON_9120, the monthly Nino 3.4 index reconstructed from ERSSTv5 as the SST anomaly over 5S-5N, 170W-120W relative to a 1991-2020 monthly climatology, 1950-01 to 2023-12. Against the CPC 1991-2020 Nino 3.4 anomaly over that window, report the Pearson correlation to 6 decimal places, the RMSE in degrees Celsius to 4 decimal places, and the largest absolute deviation in degrees Celsius to 4 decimal places with the year and month at which it occurs.
+- The number of El Nino events in RECON_9120 over 1950-2023 under the operational ONI criterion (at least 5 consecutive overlapping 3-month seasons, i.e. values of the 3-month centred running mean, at or above +0.5 degrees Celsius), and the three events with the highest peak values, each with the year and month of its peak and its peak value in degrees Celsius to 2 decimal places.
+- The same count and the same three largest peaks for the CPC ONI series under the identical criterion, with an explanation of why the two counts differ.
+- The mean baseline offset of the reconstruction, RECON_8110 (the same index relative to the 1981-2010 baseline) minus RECON_9120, as the unweighted mean over the months of 1950-01 to 2020-12, in degrees Celsius to 3 decimal places.
+- The mean published baseline offset, CPC 1981-2010 minus CPC 1991-2020 Nino 3.4 anomaly, as the unweighted mean over the same months, in degrees Celsius to 3 decimal places, and how closely it agrees with the reconstructed offset.
+
+Expected visualizations:
+- Figure 1, a two-row figure sharing a time axis over 1950-2023. The upper row overlays the RECON_9120 and CPC 1991-2020 monthly anomalies, the 3-month running mean, the +0.5 and -0.5 degrees Celsius thresholds, and shading between the threshold and the running-mean curve, warm during detected El Nino events and cool during detected La Nina events (at least 5 consecutive seasons at or below -0.5 degrees Celsius). The lower row shows RECON_9120 minus CPC on its own vertical scale. Label both vertical axes in degrees Celsius.
+- Figure 2, a square scatter plot of RECON_9120 (y) against the CPC 1991-2020 series (x), one point per month, with identical axis ranges and ticks, a 1:1 reference line, and the correlation and RMSE annotated.
+
+Now write the notes.
+
+===== RESPONSE =====
+<knowledge_notes>
+[anomaly-baselines-and-climate-indices]
+- Build RECON_9120 and RECON_8110 from ERSSTv5's own climatology, each on its stated baseline (`base_period` 1991-2020 and 1981-2010), with each calendar month matched to its own climatology (`compute_enso_nino_index`). State the climatology and baseline used. The CPC products differ in baseline and are not interchangeable, so compare RECON_9120 with `ersst5_91-20` and RECON_8110 with `ersst5_81-10`.
+- The offset between baselines is one constant per calendar month. Do not read it as a reconstruction error, and note that the reconstructed and published offsets should agree. Count events only if the series stays beyond ±0.5 °C for at least 5 consecutive seasons (`min_duration` of `detect_threshold_events`). The question's "at least 5 consecutive overlapping 3-month seasons" fits this. The CPC ONI changed to centred 30-year base periods applied to successive 5-year spans, so its event count can differ from RECON_9120, which uses one fixed baseline. State this in the explanation.
+
+[common-comparison-mask]
+- Mostly not applicable: this is a single-field index comparison and no model ranking is involved. Only where both series are defined should they be compared; use the same months for the correlation, RMSE and maximum deviation, and report the offsets over the shared 1950-01 to 2020-12 months.
+
+[serial-correlation-and-significance]
+- Correlate the reconstruction with the published index as they are, without detrending (`detrend=False`). These are two estimates of the same quantity, so their shared trend is part of the agreement being checked. Do not quote a p-value from the naive monthly sample size; the effective sample size is much smaller than the number of months.
+- The rest of this fragment (trend fits, spatial blocks, pattern correlation) is not applicable: no trend or fitted relation is asked for.
+
+[cmip6-tos-bulk-top-cell] not applicable: it concerns CMIP6 model `tos` and top-cell definitions, while this question uses observational ERSSTv5 and no model output.
+</knowledge_notes>

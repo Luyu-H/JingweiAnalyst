@@ -1,0 +1,669 @@
+# exchange 4: code_generation
+# elapsed: 105.5 s
+
+===== SYSTEM =====
+Here are the full specifications for the tools you have selected:
+
+{
+  "load_regular_data": {
+    "description": "Load a rectangular subset of a time series dataset.\nThis is the entry point for any question about change over time \u2014 trends, variability, scenario projections \u2014 and for the published index series (cpc_indices), which have a time axis but no grid. Give the window you need: reading a global field and slicing it afterwards is slower and, on a curvilinear model grid, wrong, because index dimensions cannot be sliced by latitude and longitude. A window crossing the dateline is handled, and comes back on a continuous longitude axis.\nThe result stays lazy, so a large request is cheap until it is reduced.",
+    "args": {
+      "dataset": "str, required. The dataset id, from the registry of available datasets.",
+      "variable": "str, required. The variable's short name in that dataset. For an index dataset it names the region the series is published for, e.g. 'NINO3.4'; leave it out for an index that is defined on its own domain rather than on a region box.",
+      "model": "str, required for multi-model datasets. Which model to read.",
+      "product": "str, required for a dataset that publishes several series of the same quantity. Which one to read; the registry lists each product with its baseline period. Default is the dataset's operational series.",
+      "field": "str, optional, default 'anomaly' where it applies. Which published field to read: 'anomaly' for the departure from the baseline climatology, or 'total' for the absolute value.",
+      "time_range": "list[str, str], optional. Continuous window as ['start', 'end'] in ISO 8601, e.g. ['1990-01', '2014-12']. Default is the whole record.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward. Levels are selected by their centre. Default is every level.",
+      "lat_range": "list[float, float], optional. [min, max] in degrees North.",
+      "lon_range": "list[float, float], optional. [min, max] in degrees East, in either the 0-360 or the -180-180 convention; a window crossing the dateline is handled.",
+      "chunk_time": "int, optional, default 12. Chunk size along time for lazy reading."
+    },
+    "returns": "xr.DataArray on the dataset's own grid, with units and the provenance attributes that let the weighting and derived-quantity tools find the right cell areas, volumes and layer thicknesses. On a regular grid the dimensions are (time, depth, lat, lon); on a curvilinear model grid they are the model's index dimensions with 2-D latitude and longitude coordinates, trimmed to the requested box. An index dataset comes back with 'time' alone and no spatial dimensions."
+  },
+  "load_climatology_data": {
+    "description": "Load a subset of an observational climatology.\nThis is the entry point for a mean state, a seasonal cycle or a vertical structure, and for the reference field a model is evaluated against. A climatology is already an average over many years, so it has no time axis to take a trend along.",
+    "args": {
+      "dataset": "str, required. The climatology's dataset id.",
+      "variable": "str, required for most datasets. The variable name that dataset uses; common aliases are accepted.",
+      "time_slice": "str, optional, default 'annual'. 'annual' for a single all-year field, which reaches the deepest levels; 'monthly' for twelve fields, adding a 'month' dimension; 'seasonal' for four, adding a 'season' dimension. The monthly and seasonal fields are shallower than the annual one.",
+      "months": "list[int], optional. Select particular months from a monthly climatology, e.g. [1, 2, 12].",
+      "period": "str, optional. Which climate normal to read, where the variable offers more than one.",
+      "field": "str, optional. Which statistical field to read, where the product publishes several (the objectively analysed value, the raw mean, the standard deviation, the number of observations). Default is the analysed value.",
+      "version": "str, optional. Product version, where more than one exists.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward.",
+      "lat_range": "list[float, float], optional. [min, max] in degrees North.",
+      "lon_range": "list[float, float], optional. [min, max] in degrees East, either convention; a window crossing the dateline is handled."
+    },
+    "returns": "xr.DataArray with dimensions (depth, lat, lon), plus 'month' or 'season' for the corresponding slices, carrying units and the provenance attributes the weighting tools need."
+  },
+  "load_volumes_for_cmip6": {
+    "description": "Load the volume of each grid cell of a model in cubic metres.\nYou usually do NOT need this to take a volume-weighted average, which assembles the right volumes itself. Reach for it to report the volume of a region, to turn a per-cubic-metre quantity into a total, or to weight something by hand.\nA model's own published cell volumes are used where they exist; otherwise volumes are rebuilt from cell areas and layer thicknesses.",
+    "args": {
+      "dataset": "str, required. The experiment's dataset id.",
+      "model": "str, required. Which model's grid to describe.",
+      "time_range": "list[str, str], optional. ['start', 'end'] in ISO 8601. Only accepted for a model that publishes a time-varying cell volume; for a fixed field it is an error.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward.",
+      "lat_range": "list[float, float], optional. [min, max] in degrees North.",
+      "lon_range": "list[float, float], optional. [min, max] in degrees East, either convention.",
+      "variable": "str, optional, default 'thetao'. Only consulted when the volumes have to be rebuilt: it says which variable's vertical grid to use."
+    },
+    "returns": "xr.DataArray of cell volumes in m3, masked to ocean, on the model's own grid and matching what the loaders return for it. Where a model publishes its cell volume monthly the result keeps a time axis; reduce over time, or pass a time_range, before using it as a static weight. attrs['volume_source'] records whether the volumes are the model's own or were rebuilt."
+  },
+  "load_depth_levels": {
+    "description": "Load a dataset's depth levels and the boundaries of each layer, in metres.\nYou usually do NOT need this to average or integrate over depth, which applies the correct layer thicknesses itself. Reach for it when you want the level definitions themselves \u2014 to report which depths a dataset resolves, to check whether two products share a vertical grid, or to weight something by hand.\nVertical grids are not shared between products, and within a product they can differ by variable and by time slice, so say which you mean.",
+    "args": {
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward. Levels are selected by their CENTRE and their layers returned whole, so the column covered reaches past the range asked for; check the returned bounds and report those.",
+      "dataset": "str, optional, default the shared observational climatology grid. Which dataset's vertical grid to read.",
+      "model": "str, required when the dataset has several models.",
+      "variable": "str, optional. Which variable's vertical grid to read, since levels can differ by variable within a product.",
+      "time_slice": "str, optional, default 'annual'. Which time slice's vertical axis to read, for climatologies whose monthly and seasonal fields are shallower than the annual one.",
+      "period": "str, optional. Which climate normal to read the axis from."
+    },
+    "returns": "tuple (levels, bounds): the level centres in metres, and the upper and lower boundary of each layer as an (n, 2) array. Layer thickness is the difference between the two."
+  },
+  "load_basin_mask": {
+    "description": "Load the ocean basin each 1-degree cell belongs to, as numeric codes.\nCodes are given separately at each standard depth level, because a marginal sea's label stops at its sill and below that the water belongs to the open ocean. Use it to separate basins in a calculation by hand; to mask a field to a named basin, select_basin does this and carries the mask onto the field's own grid.",
+    "args": {
+      "depth_levels": "str or list[str], optional. Depth level(s) to select, written as the depth with an 'm' suffix, e.g. '0m', '100m'. Must be exact standard levels. If None, the full 3-D mask is returned."
+    },
+    "returns": "xr.DataArray of basin codes on the 1-degree grid, 2-D (lat, lon) for a single level and 3-D (depth, lat, lon) otherwise. Land and below-sea-floor cells are missing. Use attrs['basin_names'] to decode the numbers; the codes distinguish each marginal sea from the ocean it opens onto, so an ocean taken as its main code alone excludes them."
+  },
+  "load_landsea_mask": {
+    "description": "Load the land/sea mask on the 1-degree grid, which doubles as a bathymetry index.\nThe value counts how deep the ocean reaches at each cell, so it can exclude land before averaging or restrict a calculation to cells deep enough for the levels being analysed.",
+    "args": {},
+    "returns": "xr.DataArray of integer bottom level numbers with dims (lat, lon) on the 1-degree grid, aligned with the observational climatologies.\nThis is NOT a 0/1 field: a value of 1 means land, and ocean is (mask > 1). The value is offset by one from the depth axis, so (mask - 1) is the number of levels of ocean, i.e. the 1-based index of the deepest level holding data. Values beyond the climatology's own axis index deeper standard levels in the trenches; clip them before using the mask as an index."
+  },
+  "temporal_aggregate": {
+    "description": "Aggregate a time series in time: a DAY-WEIGHTED long-term mean, or annual, seasonal or climatological-monthly values, or a running window.\nThis is the only tool that weights by month length; compute_basic_stat does not weight in time. Means are weighted by the number of days in each month in the dataset's own calendar, with each cell's weights masked to the months it has data, so a cell missing at every step stays missing. Model time axes are stamped on Gregorian month starts, but the model's own calendar is recorded on the time coordinate ('source_calendar') and is the one used: a 365-day model's February counts 28 days in every year. Weighting applies to op='mean' only; a median, minimum, maximum or standard deviation is taken over the steps as they are.\nOnly a field with a real time axis can be aggregated; a climatology has none.",
+    "args": {
+      "data": "xr.DataArray, required. A field with a 'time' dimension.",
+      "freq": "str, optional, default 'year'. What to aggregate to:\n- 'mean': ONE field for the whole window, the time dimension removed: the mean state of the period. compute_basic_stat(op='mean', dim='time') instead gives every step the same weight.\n- 'year': one value per calendar year.\n- 'season': one value per seasonal period (see season_convention).\n- 'climatology': one value per calendar month, across all years.\n- 'rolling': a running window that SMOOTHS the series instead of collapsing it \u2014 the time axis keeps every step, and each value is the statistic over the `window` steps around it.",
+      "op": "str, optional, default 'mean'. 'mean' (day-weighted), 'median', 'min', 'max' or 'std'.",
+      "season_convention": "str, optional, default 'meteorological'. Which three months each season covers: 'meteorological' gives DJF/MAM/JJA/SON; 'woa' gives the calendar quarters JFM/AMJ/JAS/OND, on which the WOA23 seasonal fields are built.",
+      "window": "int, required for freq='rolling', ignored otherwise. Number of time steps in the window, in the units of the time axis. An odd window is centred exactly; an even one leans one step towards the past.",
+      "center": "bool, optional, default True, freq='rolling' only. Place each window's value at its middle step, keeping the smoothed series in phase with the original. False places it at the last step, which is what an index computed from data already in hand does, and shifts every feature later by half a window."
+    },
+    "returns": "xr.DataArray, aggregated in time.\n- 'mean': the 'time' dimension is gone and a single field is left, carrying the window it covers in attrs['time_mean_period'] and the number of steps it averaged. attrs ['incomplete_periods'] lists any year the window does not cover in full, which tilts a long-term mean towards the seasons those years contribute.\n- 'year': the time axis becomes an integer 'year' coordinate. attrs['incomplete_periods'] lists any year not covered by a full 12 months, which biases a trend if left in.\n- 'season': one entry per seasonal period, with 'season' and 'year' coordinates attached; a December-starting season is labelled by the year holding its January.\n- 'climatology': a 'month' coordinate (1-12) with month names attached.\n- 'rolling': the time axis is unchanged in length and labels, with the ends left missing where no complete window covers them. The running mean is unweighted, because a running window is a filter over a fixed number of steps rather than a time average."
+  },
+  "compute_ratio": {
+    "description": "Compute the element-wise ratio of two fields, for stoichiometric quantities such as N:P.\nTwo concentrations on different molar bases are refused rather than divided; convert one of them first. Two concentrations on the same basis but with different prefixes are rescaled so the ratio is dimensionless.",
+    "args": {
+      "data1": "xr.DataArray, required. The numerator.",
+      "data2": "xr.DataArray, required. The denominator. Cells where it is zero come back missing rather than infinite."
+    },
+    "returns": "xr.DataArray of the ratio at every cell; averaging it gives the mean of the ratio, while the ratio of the means is the weighted mean of each field, divided. attrs record the units of both inputs and whether the result is a true molar ratio."
+  },
+  "compute_basic_stat": {
+    "description": "Reduce a field along chosen dimensions with one basic statistic, weighted in space but never in time.\nOver a time axis every step counts the same, whatever its length; temporal_aggregate is the tool that weights by month length.\nThe weighted operators take their weights from the grid the data came from, so the field must still be on its original grid and levels \u2014 subsetting is fine, regridding or averaging over depth beforehand is not.",
+    "args": {
+      "data": "xr.DataArray, required. Input field.",
+      "op": "str, required. The statistic to apply:\n- 'mean', 'median', 'min', 'max', 'sum', 'count' (non-missing elements), 'std' (standard deviation about the mean, ddof=0). These are unweighted.\n- 'area_weighted_mean' for a horizontal average, weighting each cell by its area.\n- 'volume_weighted_mean' for an average over dimensions that include depth, weighting each cell by its volume.\n- 'argmax'/'argmin' return WHERE the extreme falls rather than what it is: the coordinate label at which it occurs, one per remaining column. They reduce a single dimension. For the one extreme of a whole field, use locate_extreme.",
+      "dim": "str or list of str, optional. Dimension(s) to reduce. If None, every dimension is reduced. A weighted mean must include the dimensions its weights vary along: the horizontal pair for 'area_weighted_mean', and 'depth' for 'volume_weighted_mean'. On a curvilinear grid you may write ['lat', 'lon'] and they are mapped to the model's index dimensions."
+    },
+    "returns": "xr.DataArray with the reduced dimension(s) removed. For 'argmax'/'argmin' the values are coordinate labels rather than data values. A weighted result records in attrs which weights were used."
+  },
+  "compute_exceedance_fraction": {
+    "description": "Measure what proportion of a domain lies beyond a threshold, by area, by volume or by count.\nMissing data are left out of the numerator and the denominator, and each cell is weighted by its area or volume on the grid the field is on.\nEvery comparison is applied to the deviation from `reference`, which is zero unless set. Writing d = x - reference, the four are: 'greater' d > threshold, 'less' d < threshold, 'abs_greater' |d| > threshold, 'abs_less' |d| < threshold. So 'abs_less' with reference=16 and threshold=2 is the band 14 < x < 18, while 'abs_greater' with the same numbers is everything outside it. The inequalities are STRICT, and the test actually used is returned in 'criterion'.\nIt answers a different question from its neighbours: detect_outliers asks whether a value is unusual against a distribution, detect_threshold_events asks whether a threshold was held long enough to count as an episode, and this asks how much of the domain is beyond it.",
+    "args": {
+      "data": "xr.DataArray, required. The field to test \u2014 a difference, an anomaly, a concentration, an index. It must still carry the attrs its loader set if the weights are to be found.",
+      "threshold": "float, required. The distance from the reference that counts, in the field's own units. It must not be negative; for a one-sided test below a value use comparison='less'.",
+      "comparison": "str, optional, default 'abs_greater'. Which side counts, applied to x - reference as above. 'abs_greater' for a discrepancy, where an error of either sign matters; 'abs_less' for the share that agrees to within a tolerance, or that falls inside a band; 'greater' and 'less' for a one-sided physical criterion.",
+      "dim": "str or list[str], optional. Dimension(s) the proportion is taken over. Default None, every dimension, giving one number. Pass the horizontal pair for an area fraction at each time step, or 'time' for the fraction of the record at each cell.",
+      "weighting": "str, optional, default 'auto'. 'auto' weights by cell area when the horizontal dimensions are reduced, by cell volume when depth is among them too, and counts elements equally otherwise \u2014 which is what a fraction of time steps wants. 'area', 'volume' and 'none' force the choice.",
+      "reference": "float, optional, default 0.0. The value the comparison is taken against, in the field's own units, so the threshold measures a departure from it. Use it for a band around a physical constant; leave it at zero when the field is already a difference or an anomaly."
+    },
+    "returns": "dict:\n'fraction_percent' and 'fraction': the answer, in percent and as a proportion. A float when everything is reduced, otherwise a DataArray on the dimensions left over.\n'exceeding_amount', 'total_amount': the weighted amounts behind the fraction \u2014 square metres for area weighting, cubic metres for volume, a count of elements when unweighted.\n'n_exceeding', 'n_valid': element counts, with missing data already excluded.\n'mask': the test as a field of 1 where the criterion is met, 0 where it is not and NaN where there is no data \u2014 ready to stipple over a map.\n'weighting', 'criterion': what the weights were, and the exact test with its numbers filled in."
+  },
+  "select_basin": {
+    "description": "Keep the part of a field that lies in one ocean basin and blank the rest.\nThis is what a per-basin number needs \u2014 an Atlantic mean, a Pacific bias, an Indian Ocean RMSE. It masks a field you already have, so a difference, a trend map or any other computed quantity can be split by basin, which a loader that cuts a region while reading cannot do.\nMarginal seas each carry their own code in the mask. By default they are folded into the ocean they open onto; the codes used are recorded in the result.\nThe mask is defined on a 1-degree grid but is carried onto whatever grid the field is on by nearest cell, so a curvilinear model can be split on its own grid and weighted with its own cell areas, with no regridding.",
+    "args": {
+      "data": "xr.DataArray, required. Any field with horizontal dimensions \u2014 loaded, derived or differenced. It must still carry the attrs its loader set, which is how its grid is identified.",
+      "basin": "str or int or list[int], required. 'Atlantic', 'Pacific', 'Indian', 'Southern' or 'Arctic' for a whole ocean; the name of a single sea in the mask, such as 'Mediterranean Sea', for that basin alone; or raw mask codes for full control.",
+      "include_marginal_seas": "bool, optional, default True. Fold each ocean's marginal seas and sub-basins into it. Ignored when a single named sea or explicit codes are requested. The Southern and Arctic Oceans are always separate basins, never folded into their neighbours.",
+      "depth_dependent": "bool, optional, default False. The mask labels every standard level separately: a marginal sea's label stops at its sill, and below that depth the water carries the open ocean's code. False applies the surface labels through the whole water column; True applies each level's own labels, and the field must then have a 'depth' dimension."
+    },
+    "returns": "xr.DataArray with the same dimensions, coordinates and grid as the input, and everything outside the basin set to NaN. Because the grid is untouched, a later area-weighted mean uses the same cell areas as the global field and masks them to the basin automatically. attrs record 'basin', 'basin_codes' and 'basin_definition'."
+  },
+  "regrid_horizontal": {
+    "description": "Put a field on another horizontal grid so two products can be compared cell by cell.\nRegrid the GLOBAL field and subset afterwards. 'conservative' reads the source grid's geometry from the dataset's own file, which describes the whole grid, so a curvilinear field already cut to a box can no longer be located on it and is refused; 'bilinear' works from the field's own 2-D coordinates and does accept one.\nHorizontal vector components (uo, vo, umo, vmo) of CESM2 and MPI-ESM1-2-LR are refused.\nThe result carries the target grid's identity, so later weighting uses the target's cell areas.",
+    "args": {
+      "data": "xr.DataArray, required. The field to move, on a regular or a curvilinear grid. Other dimensions (time, depth) pass through untouched. It must still carry the attrs its loader set, which is how its own grid is identified.",
+      "target": "str or xr.DataArray, optional, default 'woa23'. The grid to move onto: a registered observational grid by name ('woa23', '1deg', 'glodap', 'seanoe_mld', 'ersst'), or a DataArray on a regular grid to use as a template. The target must be rectilinear.",
+      "method": "str, optional, default 'conservative'. 'conservative' area-averages the source cells that overlap each target cell, conserving the field's area integral; it needs the source grid's corner mesh. 'bilinear' interpolates between cell centres and needs no corner mesh. 'nearest_s2d' copies the nearest source cell. 'patch' is a higher-order smooth interpolation.",
+      "skipna": "bool, optional, default True. Ignore missing cells instead of letting them spread. Land is missing in every ocean field, so with skipna=False every coastal target cell comes back empty.",
+      "na_thres": "float, optional, default 0.5. How much of a target cell may be missing before the cell itself is set to NaN, from 0 (any missing source data empties it) to 1 (keep it if any valid data contributes)."
+    },
+    "returns": "xr.DataArray on the target grid, with ('lat', 'lon') in place of the source's horizontal dimensions and everything else unchanged. Missing data stays missing. attrs record the method and the source grid, and carry the TARGET grid's identity so later weighting uses the target's areas."
+  },
+  "build_comparison_mask": {
+    "description": "Build the one set of cells on which several fields can be scored against each other.\nIt returns a single mask, True where every field given has data, to apply to each field before the metrics are taken.\nGive it the fields already on a common grid: regrid first, because cells can only be intersected once they are the same cells. Curvilinear index dimensions (nlat/nlon, j/i) are refused for that reason.\nIt is for fields on DIFFERENT grids. Two fields already sharing one grid - an operator diagnostic against its own model's published field - need no intersection: use `a.notnull() & b.notnull()`, or require every time step valid with `.mean(dim, skipna=False)`. Reaching for this tool there only imports a grid check that cannot pass on a curvilinear model.\nWith ocean_only (the default) it also drops the cells the WOA23 land-sea mask calls land, reading that mask the right way: it is NOT a 0/1 field, 1 means land and ocean is (value > 1). The check is made on the grid: it is applied whenever the fields share the WOA23 1-degree geometry, which GLODAP and any other 1-degree product also do.",
+    "args": {
+      "fields": "list[xr.DataArray], required. Two or more fields, all on the same rectilinear grid, usually a model climatology regridded onto an observational grid together with the observational field itself. A cell survives only where every one of them has data.",
+      "ocean_only": "bool, optional, default True. Also require the cell to be ocean in the WOA23 1-degree land-sea mask. The check is on the GRID, so it applies to the fields of any 1-degree product, whether or not WOA23 is among them; it is skipped, with a note in attrs, only on a grid that is not 1-degree.",
+      "extra_mask": "xr.DataArray, optional. A further boolean condition to intersect, on the same grid \u2014 a basin, a latitude band, a depth-sufficiency test. False or NaN cells are dropped.",
+      "reduce_other_dims": "str, optional, default 'all'. What to do when a field carries time or depth as well. 'all' keeps a cell only where the field is valid at every step and level, which is what a metric taken over the whole field needs. 'any' keeps it where the field is valid somewhere. Pass a field already reduced to a map to avoid the question."
+    },
+    "returns": "xr.DataArray of booleans with dims (lat, lon) on the shared grid, True on the cells every field covers. Apply it with .where(mask) to each field before measuring.\nattrs record how many cells each field contributed, how many survived and what was intersected."
+  },
+  "transform_unit": {
+    "description": "Convert a field from one unit to another within the same physical category.\nBetween the two molar bases, per unit MASS (umol kg-1) and per unit VOLUME (mol m-3), the conversion goes through seawater density: a constant (the default) or a density field, applied cell by cell.\nPass a density field EXACTLY as compute_potential_density_anomaly returned it. Do not add 1000 to make it absolute first: whether the array is an anomaly or an absolute density is read from its own long_name BEFORE its magnitude, so a pre-converted field still labelled 'anomaly' has 1000 added a second time and every converted value comes out about half its true size.",
+    "args": {
+      "data": "xr.DataArray, required. The field to convert.",
+      "from_unit": "str, required, case-insensitive. The unit the data is in; passing the array's own 'units' attribute works, including the variant spellings different products use. Recognised categories: temperature ('degC', 'K'), concentration per mass ('umol/kg', 'mmol/kg'), concentration per volume ('mol m-3', 'mmol/m3', 'umol/L'), dimensionless ('1', 'psu', ''), length ('m', 'cm'), velocity ('m/s', 'cm/s', 'mm/s').",
+      "to_unit": "str, required. The target unit, in any of the same spellings. It must belong to the same category as from_unit.",
+      "density": "float or xr.DataArray, optional, default 1.025. Seawater density, used only between the mass and volume bases. A float is read as kg/L. A DataArray is aligned cell by cell, so each cell converts at its own density; both an absolute density and a density anomaly (sigma) are understood, decided from the array's metadata and magnitude and reported back in the result."
+    },
+    "returns": "xr.DataArray with converted values and its 'units' attribute updated. attrs record 'original_units' and, for a mass/volume conversion, 'density_assumption' \u2014 whether a constant or a field was used, and how it was interpreted."
+  },
+  "fit_multivariate_relation": {
+    "description": "Fit a statistical model predicting one variable from one or more others, and report the coefficients with diagnostics.\nUse it for a relationship between variables rather than a change over time: the stoichiometric slope between two nutrients, the dependence of a tracer on temperature and salinity, an empirical predictor built from several fields. With a single predictor it is an ordinary regression, returning the slope, the intercept and R2.\nValidation holds out whole spatial blocks by default (validation='blocked'). The diagnostics include a variance inflation factor for each predictor.",
+    "args": {
+      "target": "xr.DataArray, required. The variable to be predicted.",
+      "predictors": "list[xr.DataArray], required. One or more predictor fields, on the same coordinates as the target.",
+      "method": "str, optional. 'linear', 'ridge', 'lasso', 'polynomial' or 'random_forest'. If None, several are fitted and the best by validation score is returned.",
+      "alpha": "float, optional, default 1.0. Regularisation strength for ridge and lasso.",
+      "poly_degree": "int, optional, default 2. Polynomial degree for method='polynomial'.",
+      "test_size": "float, optional, default 0.2. Fraction of the data held out for validation.",
+      "standardize": "bool, optional. Whether to standardise predictors. Defaults to True for ridge and lasso, whose penalties are scale-dependent.",
+      "validation": "str, optional, default 'blocked'. 'blocked' holds out whole spatial regions; 'random' splits cells at random.",
+      "block_degrees": "float, optional, default 10.0. Size of the held-out blocks in degrees."
+    },
+    "returns": "dict:\n'coefficients': the fitted coefficients, including the intercept, for the linear family; None for tree-based models. They come from a fit to ALL valid samples; the held-out split is used only for the validation score. These are the raw coefficients and are NOT comparable between predictors.\n'metrics': {rmse, mae, r2, adj_r2, train_r2, test_r2}. rmse, mae and r2 are for the full-sample fit; train_r2 and test_r2 are the validation scores on the held-out split.\n'diagnostics': residual statistics; 'vif' per predictor with a warning when collinearity is severe; how the held-out set was chosen; and, for method='linear', coefficient standard errors, p-values and the F test.\n'feature_importance': comparable importance per predictor (standardised coefficients for the linear family, impurity importances for a forest).\n'fitted_data': predictions on the target's coordinates.\n'equation', 'method_used', and 'all_methods_scores' when the model was selected automatically."
+  },
+  "compute_difference_metrics": {
+    "description": "Measure how far one field is from another: bias, RMSE, the largest single departure and where it happens.\nEvery metric is computed in one pass over the elements the two fields share, so all of them describe the same sample.\nOver the horizontal the metrics are area-weighted by default; along time they are unweighted. The weights come from the grid the fields are on, so two fields on different grids must be put on a common one first.\nThe correlation is not included: use analyze_correlation.",
+    "args": {
+      "data": "xr.DataArray, required. The field being assessed. The sign of the bias follows it: bias = mean(data - reference).",
+      "reference": "xr.DataArray, required. What it is measured against. The two are intersected first, so a longer series or a wider region is trimmed to the overlap rather than broadcast.",
+      "dim": "str or list[str], optional. Dimension(s) to reduce. Default None, every shared dimension, giving one number per metric. Pass the horizontal pair for a per-time-step RMSE, or 'time' for a per-cell map.",
+      "weighting": "str, optional, default 'auto'. 'auto' weights by cell area when the horizontal dimensions are among those reduced and leaves everything else unweighted; 'area' insists on it and fails if the grid cannot be identified; 'none' weights every element equally."
+    },
+    "returns": "dict. Scalars come back as floats, a partial reduction as xr.DataArray on the dimensions left over.\n'bias': mean(data - reference), the systematic offset.\n'mae', 'rmse': mean absolute error and root mean square error.\n'centered_rmse': RMSE with the bias removed, i.e. the disagreement in pattern alone. rmse^2 = bias^2 + centered_rmse^2, so the two together say whether a field is merely offset or actually shaped differently.\n'max_abs_error' and 'max_abs_error_at': the largest single departure and the coordinates where it occurs; the location is None when the reduction leaves dimensions behind.\n'std_data', 'std_reference', 'std_ratio': the two spreads over the same sample and their ratio \u2014 above 1 the field varies too much, below 1 too little.\n'mean_data', 'mean_reference': the weighted means over the shared sample, the two numbers the bias came from.\n'n_valid', 'weighting': the sample size and what the weights were.\n'difference': the field data - reference itself, on the shared sample and carrying the grid identity, ready to map or to pass to compute_exceedance_fraction."
+  },
+  "load_data_with_geolocator": {
+    "description": "Load data for a NAMED geographic region instead of a coordinate box, using Natural Earth boundaries.\nUse it when the question names a sea, a bay or an ocean: the outline is more faithful than any box, and no coordinates have to be guessed. For a region that is not in the supported list, fall back to a loader with explicit ranges. To split a field you already have by ocean basin, use select_basin instead \u2014 this tool masks while reading, so it only works on a stored variable.",
+    "args": {
+      "dataset": "str, required. The dataset id to read from.",
+      "variable": "str, required for most datasets. The variable name that dataset uses.",
+      "model": "str, required for multi-model datasets.",
+      "geofeature": "str, optional, default 'water_body'. Which kind of boundary to use: 'water_body', 'country', 'state' or 'continent'. Ocean analysis almost always wants 'water_body'.",
+      "loc_name": "str or list[str], required. Name(s) of the region, case-sensitive, from the supported list below. Pass a list to merge several regions into one field for a single calculation; make separate calls when they are to be compared.\nSupported water bodies: ['Arctic Ocean', 'SOUTHERN OCEAN', 'North Atlantic Ocean', 'North Pacific Ocean', 'South Pacific Ocean', 'INDIAN OCEAN', 'South Atlantic Ocean', 'Black Sea', 'Philippine Sea', 'Great Barrier Reef', 'Tasman Sea', 'Bay of Bengal', 'South China Sea', 'Arabian Sea', 'Beaufort Sea', 'Caribbean Sea', 'Gulf of Mexico', 'Labrador Sea', 'Hudson Bay', 'Caspian Sea', 'Baffin Bay', 'Gulf of Alaska', 'Red Sea', 'Sea of Okhotsk', 'Weddell Sea', 'Persian Gulf', 'Celebes Sea', 'Sulu Sea', 'Norwegian Sea', 'Greenland Sea', 'Banda Sea', 'Luzon Strait', 'Bay of Biscay', 'Mozambique Channel', 'Gulf of Guinea', 'Scotia Sea', 'Baltic Sea', 'Barents Sea', 'North Sea', 'Bristol Channel', 'Inner Seas', 'Irish Sea', 'Java Sea', 'Andaman Sea', 'Yellow Sea', 'East China Sea', 'Chukchi Sea', 'Bah\u00eda de Campeche', 'Arafura Sea', 'Timor Sea', 'Gulf of Thailand', 'Laccadive Sea', 'Bellingshausen Sea', 'Amundsen Sea', 'Davis Strait', 'Kara Sea', 'Laptev Sea', 'Drake Passage', 'Great Australian Bight', 'Gulf of Aden', 'Gulf of Oman', 'Tyrrhenian Sea', 'White Sea', 'Sea of Azov', 'James Bay', 'Gulf of Carpentaria', 'Golfo de California', 'Hudson Strait', 'Gulf of Finland', 'English Channel', 'Gulf of Honduras', 'Golfe du Lion', 'Gulf of Bothnia', 'Adriatic Sea', 'Straits of Florida', 'Bay of Plenty', 'The North Western Passages', 'Queen Charlotte Sound', 'Ionian Sea', 'Gulf of Saint Lawrence', 'Molucca Sea', 'Bismarck Sea', 'Solomon Sea', 'Gulf of Tonkin', 'Bay of Fundy', 'R\u00edo de la Plata', 'Strait of Malacca', 'Strait of Singapore', 'Makassar Strait', 'Ceram Sea', 'Inner Sea', 'Taiwan Strait', 'Cook Inlet', 'Bristol Bay', 'Melville Bay', 'Gulf of Maine', 'Chesapeake Bay', 'Strait of Gibraltar', 'Golfo San Jorge', 'Balearic Sea', 'Aegean Sea', 'Gulf of Mannar', 'Shelikhova Gulf', 'Bo Hai', 'Gulf of Kutch', 'Golfo de Panam\u00e1', 'Amundsen Gulf', 'Viscount Melville Sound', 'Ungava Bay', 'Yucatan Channel', 'Bering Sea', 'East Siberian Sea', 'Lincoln Sea', 'Bass Strait', 'Franklin Bay', 'Dixon Entrance', \"M'Clure Strait\", 'Boca Grande', 'Ba\u00eda de Maraj\u00f3', 'Golfo San Mat\u00edas', 'Golfo Corcovado', 'Wrigley Gulf', 'Sulzberger Bay', 'Ronne Entrance', 'Bransfield Strait', 'McMurdo Sound', 'Ba\u00eda de S\u00e3o Marcos', 'Cumberland Sound', 'Frobisher Bay', 'Disko Bay', 'Hamilton Inlet', 'Storfjorden', 'Vestfjorden', 'Skagerrak', 'Karskiye Strait', \"Vil'kitskogo Strait\", 'Sognefjorden', 'Trondheimsfjorden', 'Kattegat', 'Gulf of Khambh\u00e4t', 'Palk Strait', 'Kronotskiy Gulf', 'Uda Bay', 'Uchiura Bay', 'Tsugaru Strait', 'Tatar Strait', 'Shark Bay', 'Gulf of Gab\u00e8s', 'Mackenzie Bay', 'Norton Sound', 'Kotzebue Sound', 'Gulf of Boothia', 'Kane Basin', 'Foxe Basin', 'Golfo de Tehuantepec', 'Golfo de Guayaquil', 'Gulf of Masira', 'Gulf of Yana', 'Dmitriy Laptev Strait', 'La P\u00e9rouse Strait', 'East Korea Bay', 'Qiongzhou Strait', 'Cook Strait', 'Torres Strait', 'Geographe Bay', 'Gulf of Papua', 'Gulf of Olen\u2018k', 'Gulf of Riga', 'Waddenzee', 'Gulf of Sidra', 'Sea of Crete', 'Ligurian Sea', 'Alboran Sea', 'Bight of Benin', 'Bight of Biafra', 'Strait of Belle Isle', 'Prince William Sound', 'Estrecho de Magellanes', 'Bah\u00eda Blanca', 'Golfo de Penas', 'Bah\u00eda Grande', 'Marguerite Bay', 'Prydz Bay', 'Vincennes Bay', 'Porpoise Bay', 'Davis Sea', 'L\u00fctzow-Holm Bay', 'Antongila Bay', 'Hangzhou Bay', 'Karaginskiy Gulf', 'Gulf of Kamchatka', 'Bosporus', 'Bab el Mandeb', 'Gulf St. Vincent', 'Golfo de Urab\u00e1', 'Baia de Maputo', 'St. Helena Bay', 'Boknafjorden', 'Joseph Bonaparte Gulf', 'Gulf of Martaban', 'Gulf of Sakhalin', 'Kangertittivaq', 'Saint Lawrence River', 'Chaun Bay', 'Khatanga Gulf', 'Garabogaz Bay', 'Gulf of Suez', 'Gulf of Ob', 'Yenisey Gulf', 'Dardanelles', 'Sea of Marmara', 'Gulf of Aqaba', 'Lago de Maracaibo', 'Denmark Strait', 'Massachusetts Bay', 'Delaware Bay', 'Long Island Sound', 'Albemarle Sound', 'Pamlico Sound', 'Smith Sound', 'Queen Charlotte Strait', 'Baird Inlet', 'Husky Lakes', 'Lake Pontchartrain', 'Stettiner Haff', 'Darnley Bay', 'Prince of Wales Strait', 'Minto Inlet', 'Richard Collinson Inlet', 'Prince ALbert Sound', 'Liddon Gulf', 'Wynniatt Bay', 'Hadley Bay', 'Bathurst Inlet', 'Goldsmith Channel', 'Sherman Basin', 'Wager Bay', 'Fury and Hecla Strait', 'Jones Sound', 'Eclipse Sound', 'Hall Basin', 'Uummannaq Fjord', 'Peacock Sound', 'George VI Sound', 'Seno de Skyring', 'Seno Otway', 'Bay In\u00fatil', 'Lagoa dos Patos', 'Amazon River', \"Bras d'Or Lake\", 'Kaliningrad', 'Matochkin Shar Strait', 'Ozero Mogotoyevo', 'Guba Gusinaya', 'Bali Sea', 'Davao Gulf', 'Halmahera Sea', 'Selat Bali', 'Gulf of Tomini', 'Flores Sea', 'Sibuyan Sea', 'Selat Dampier', 'Gulf of Buli', 'Gulf of Kau', 'Bohol Sea', 'Surigao Strait', 'Ragay Gulf', 'Samar Sea', 'Tayabas Bay', 'Leyte Gulf', 'Visayan Sea', 'Savu Sea', 'Hecate Strait', 'Cordova Bay', 'Murchison Sound', 'Robeson Channel', 'Kennedy Channel', 'Canal Perigoso', 'Canal do Sul', 'Canal do Norte', '\u00d8resund', 'Mecklenburger Bucht', 'Sargasso Sea', 'San Francisco Bay', 'Monterey Bay', 'Yangtze River', 'Columbia River', 'Salish Sea', \"Gulf of Anadyr'\", 'Mediterranean Sea', 'Ross Sea', 'Coral Sea', 'Sea of Japan', 'Korea Strait']",
+      "time_range": "list[str, str], optional. Time series datasets only: ['start', 'end'] in ISO 8601.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward.",
+      "time_slice": "str, optional, default 'annual'. Climatologies only: 'annual', 'monthly' or 'seasonal'.",
+      "months": "list[int], optional. Select particular months from a monthly climatology.",
+      "period": "str, optional. Which climate normal to read.",
+      "field": "str, optional. Which statistical field to read.",
+      "version": "str, optional. Product version, where more than one exists."
+    },
+    "returns": "xr.DataArray with the dimensions the dataset would otherwise return and cells outside the region set to NaN. A regular grid keeps its full coordinates; a curvilinear grid keeps its index dimensions and is trimmed to the region's bounding block. Average it with an area-weighted mean, which picks the right cell areas for the grid on its own."
+  }
+}
+
+Here are the full entries for the datasets selected in the previous step (variables, models, time
+span, climatology period):
+
+{
+  "woa23": {
+    "description": "[climatology] World Ocean Atlas 2023 (NOAA/NCEI) 1.00 degree objectively analysed climatology. Temperature and salinity come on two climate normals, 1971-2000 and 1991-2020; oxygen, apparent oxygen utilization and percent oxygen saturation each provide both a 1971-2000 normal (the default) and a 1965-2022 all-period (all) composite; nutrients provide only the 1965-2022 all-period composite. Variables: apparent_oxygen_utilization, nitrate, oxygen, percent_oxygen_saturation, phosphate, salinity, silicate, temperature."
+  },
+  "cmip6_historical": {
+    "description": "[timeseries] CMIP6 historical (all-forcing historical simulation) ocean component, Omon monthly frequency plus Ofx fixed fields. Three models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 1850-01 to 2014-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  }
+}
+
+Cross-dataset conventions (every opener already enforces these; use them to judge what can be
+compared directly):
+
+{
+  "longitude": "CMIP6 and ERSSTv5 are natively 0-360, WOA23 and SEANOE -180-180, GLODAP 20.5-379.5; the opener always outputs -180-180.",
+  "depth": "CESM2 is natively in centimetres, the rest in metres; the opener always outputs metres, positive down, ascending.",
+  "grid": "CESM2 and MPI-ESM1-2-LR are curvilinear and cannot be sel'd by lat/lon directly; use a 2-D mask. Area weighting uses areacello, not load_areas.",
+  "time": "WOA23 needs decode_times=False; SEANOE's time carries no CF units; CMIP6 uses three different calendars, all converted to month-start datetime64.",
+  "units": "CMIP6 uses mol m-3 (per volume), WOA23 and GLODAP use umol kg-1 (per mass); converting between them needs in situ density, mol m-3 = umol kg-1 * rho / 1000. The opener does not convert automatically, it only records this in attrs.",
+  "climatology_period": "WOA23 temperature/salinity 1971-2000 or 1991-2020, oxygen/AOU/percent-saturation 1971-2000 or 1965-2022, nutrients (nitrate/phosphate/silicate) 1965-2022 ONLY; GLODAP 1972-2013; ERSSTv5 internal climatology 1971-2000; CPC uses 1991-2020 from 2021-01 onward."
+}
+
+Plan from the previous step:
+1. Load the data.
+   - Use `load_regular_data` for cmip6_historical `no3` and `po4`, for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR. Period is 1971-01 to 2000-12, monthly, all depth levels from 200 to 1000 m.
+   - Load each model's own `volcello` with `load_volumes_for_cmip6`.
+   - Use `load_depth_levels` to get the levels and layer boundaries for the 200-1000 m layer.
+   - Use `load_climatology_data` for woa23 `nitrate` and `phosphate` (all-period annual composite).
+   - Use `load_basin_mask` for the WOA23 basin mask (basinmask_01), and `load_landsea_mask` if needed.
+   - Note [cmip6-static-grid-fields]: take layer thickness and volume weights from each model's own volcello, not from lev_bnds differences. Record and report `attrs['volume_source']`.
+   - Note [cmip6-grid-labels]: GFDL-ESM4 is `gr` (1° archive grid, 35 levels, regridded land-sea mask). CESM2 and MPI are `gn`. State this when comparing the sources.
+
+2. Build the model climatologies.
+   - Use `temporal_aggregate` for the day-weighted long-term mean over 1971-2000 of model no3 and po4. This gives a 1971-2000 climatology per model.
+   - Restrict all four sources to the 200-1000 m layer on their original levels. Integrate or average on the original levels, with no interpolation and no nearest-level selection.
+   - Note [omip-native-grid-vs-regridded]: compute the means, volume shares and basin means on each source's native grid with its own weights. Regrid only for the maps and the common-mask regression and scatter. State which grid each number comes from.
+
+3. Compute N:P and the per-source statistics on native grids.
+   - Use `compute_ratio` (NO3/PO4) cell by cell for each source. Native fields are fine because N:P is scale-invariant. The mean of this cell-by-cell N:P is the headline value.
+   - Use `compute_basic_stat` with `op='volume_weighted_mean'` for mean NO3 and mean PO4 over 200-1000 m. Use each model's own volcello and, for WOA23, volumes from its depth levels and areas. Divide the means to get the ratio of means, and label it as the secondary value.
+   - Use `compute_basic_stat` volume-weighted mean on the cell-by-cell N:P field for the headline mean.
+   - Note [omip-weighted-means-and-integrals]: use NaN-aware weights restricted to valid cells. Label the two means clearly, with the cell-by-cell mean as the headline. Use `compute_exceedance_fraction` by volume, with missing cells out of the denominator. Report the volume in m3 next to each percentage. The regression weights each cell equally, so it differs from the volume-weighted statistics; state this.
+
+4. Compute the volume shares.
+   - Use `compute_exceedance_fraction` (by volume) for N:P strictly between 14 and 18, globally for each source.
+   - Use the same tool for N:P below 12, globally and within the Pacific and Indian basins (via step 5 masking).
+
+5. Compute the basin means.
+   - Use `select_basin` with the WOA23 basin mask to pick the Pacific, Atlantic and Indian basins. Marginal seas are folded into their parent ocean. Southern and Arctic are excluded.
+   - Compute the volume-weighted mean of the cell-by-cell N:P per basin for each source.
+   - Note [basin-and-region-definitions]: use `include_marginal_seas=True` and `depth_dependent=False` (surface labels over the whole layer). State both settings.
+
+6. Regrid and build the common mask.
+   - Use `regrid_horizontal` to put all four sources on one common 1° grid (WOA23 grid). Use the 'conservative' method before any area-weighted step.
+   - Use `build_comparison_mask` with the default `ocean_only=True`. Build it from the 200-1000 m layer fields of all four sources, and apply it with `.where(mask)` before any metric. Report the cell counts.
+   - Note [common-comparison-mask]: use this shared sample for the regression and the scatter and map comparisons. State that global means over each source's own ocean differ from the shared-sample means.
+
+7. Convert units and run the regression.
+   - Note [cmip6-bgc-units-per-volume]: convert model no3 and po4 from mol m-3 to µmol kg-1 with mmol m-3 × 1000 / 1025 (ρ = 1025 kg m-3), and state that density. WOA23 is already in µmol kg-1. N:P, slope and R² are unaffected by the scaling; the intercept b needs the conversion.
+   - Use `fit_multivariate_relation` for NO3 = a·PO4 + b on the shared-mask cells, each cell weighted equally. Do this for each of the four sources. Report a (2 dp), b in µmol kg-1 (2 dp) and R² (3 dp).
+
+8. Compare against Redfield and observations.
+   - Judge each source's N:P as at, above or below 16 using the headline mean.
+   - Judge whether each model reproduces the WOA23 low-N:P (<12) volume and its Pacific and Indian distribution. Use `compute_difference_metrics` against WOA23 on the shared mask for supporting bias and RMSE of N:P.
+
+9. Figures.
+   - Figure 1: a 4-panel scatter of NO3 (y) against PO4 (x) in µmol kg-1 over 200-1000 m. Panels in the order WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, with identical axis ranges and ticks. Each panel has its own fitted line and the Redfield 16:1 line through the origin, in distinct styles, annotated with a, b and R².
+   - Figure 2: a 2×2 geographic map of the 200-1000 m mean N:P minus 16 on the common lon-lat frame. Use the regridded fields (display only) and one shared diverging colour scale centred on zero.
+
+Other notes:
+- Headline N:P is the mean of the cell-by-cell ratio. The ratio of means is reported separately and labelled.
+- Native-grid statistics (means, volume shares, basin means) use each source's own volume weights. The regression and scatter use equal-weight cells on the shared mask, so they are not directly comparable to the volume-weighted values.
+- Model concentrations are converted at constant ρ = 1025 kg m-3 for the regression, scatter and axes only.
+- GFDL-ESM4 is on the 1° `gr` archive grid, so its "native" numbers are on that grid.
+- The models cover 1971-2000 monthly means, while WOA23 is an all-period composite, so the periods are not identical.
+- [cmip6-bgc-units-per-volume] Model no3 and po4 are per volume while WOA23 is per mass; only the intercept depends on the conversion.
+- [common-comparison-mask] Shared-sample means differ from each source's own-ocean means.
+
+Generate TWO separate code blocks to solve: "Assess the nitrate-to-phosphate stoichiometry of intermediate water, 200 to 1000 m, in three CMIP6 models against the WOA23 observed climatology, and test whether the models reproduce the low-N:P signal left by denitrification.
+
+Data to use:
+- CMIP6 historical `no3` and `po4` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12, with each model's own volcello.
+- WOA23 nitrate and phosphate, the annual objectively analysed climatology.
+- The WOA23 basin mask (basinmask_01).
+
+Expected numerical results, for the 200-1000 m layer of each of the four sources (the three models' 1971-2000 climatologies and WOA23):
+- The mean N:P, to 2 decimal places, reported two ways and clearly labelled: the mean of the cell-by-cell N:P ratio (the headline value), and the ratio of the mean nitrate to the mean phosphate.
+- The ordinary least-squares regression NO3 = a * PO4 + b over all valid cells, each cell weighted equally, with model concentrations expressed in micromoles per kilogram at a constant density of 1025 kg/m3: the slope a to 2 decimal places, the intercept b in micromoles per kilogram to 2 decimal places, and the R-squared to 3 decimal places.
+- The percentage of water volume with N:P strictly between 14 and 18, to 1 decimal place.
+- For each of the four sources, the headline mean N:P in the Pacific, Atlantic and Indian Oceans (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded), to 2 decimal places.
+- The percentage of water volume with N:P below 12, globally and within the Pacific and the Indian Ocean, to 1 decimal place.
+- Whether each source's stoichiometry sits at, above or below Redfield, and whether each model reproduces the observed low-N:P volume and its basin distribution.
+
+Expected visualizations:
+- Figure 1, a 4-panel scatter of nitrate (y) against phosphate (x) in micromoles per kilogram over 200-1000 m, one panel per source in the order WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, with identical axis ranges and ticks, each panel showing its own fitted regression line and the Redfield 16:1 line through the origin, distinguishable from one another, and annotated with a, b and R-squared.
+- Figure 2, a 2-by-2 panel of global maps of the 200-1000 m mean N:P minus 16 for the four sources, drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only), on one shared diverging colour scale centred on zero."
+
+Context variables and available libraries:
+1. `selected_datasets` = ["woa23", "cmip6_historical"] — the IDs of the datasets above. Pass an ID string
+   straight to a loader's dataset argument (e.g. load_climatology_data(dataset="woa23", ...)); never
+   pass a file path. Take variable and model names from the dataset entries above.
+2. Available libraries (already injected, no import needed): numpy as np, pandas as pd,
+   xarray as xr, matplotlib.pyplot as plt
+
+Generate code in this format:
+
+<compute>
+# Computation code only
+# Call a loading tool to read the data, then process it according to the user's question
+# Perform calculations and store results in variables (e.g. result, mean_value, trend, etc.)
+</compute>
+
+<visualize>
+# Visualization code only (this section is optional)
+# Use results from computation (they will be available as variables)
+# Create matplotlib plots with proper labels and titles
+# Use plt.figure(), plt.plot(), plt.xlabel(), etc.
+# DO NOT use plt.savefig()
+</visualize>
+
+Important:
+- Computation code MUST be complete and standalone
+- Let failures raise. Do NOT wrap a step in try/except to record the error and carry on: the run
+  then exits cleanly with part of the answer silently missing, and the repair pass never sees the
+  problem. If one model or one variable cannot be processed the way you wrote it, the right
+  response is to fix the call, not to catch the exception. Only catch one when the question itself
+  asks you to tolerate a missing input, and then still leave the failure in a variable the answer
+  can report.
+- The loaders return LAZY (dask-backed) xr.DataArray objects. Every quantity you want reported must
+  be materialised explicitly with .compute() (or float()) into its own small variable, otherwise the
+  downstream step sees a dask placeholder and no numbers at all. Large intermediates can stay lazy.
+- For regional or global means use compute_basic_stat with its weighted operators
+  (area_weighted_mean / volume_weighted_mean). Do not average over lat/lon with a plain .mean(), and
+  do not fetch areacello by hand.
+- CESM2 and MPI-ESM1-2-LR are on curvilinear grids: their index dimensions (nlat/nlon, j/i) are NOT
+  geographic and cannot be sliced by value with .sel(). Subset them through the loader's lat_range /
+  lon_range arguments instead.
+- CMIP6 concentrations are in mol m-3 (volume basis) while WOA23 and GLODAP are in umol kg-1 (mass
+  basis); convert with transform_unit before comparing them.
+- For a region that crosses the dateline (the equatorial Pacific, 120E-280E), just pass lon_range to
+  the loading tool: it returns a continuous longitude axis that the weighted statistics and
+  derived-quantity tools accept as it is. Do not assemble such a region by hand with %360, by
+  concatenating two sel windows, or by sortby — an array rebuilt that way has left the dataset's own
+  grid, and weighting it fails with "these lon values have no cell on the dataset's own grid".
+- Arrays from the loaders carry provenance attributes (source_dataset, grid_type, ...) that the
+  weighted statistics and derived-quantity tools use to find the right grid. The execution
+  environment runs with keep_attrs enabled, so ordinary xarray operations preserve them; but when a
+  step changes the physical quantity (a ratio, a difference of unlike things), set the new units
+  yourself with .assign_attrs(units=...), or the reported units will be wrong.
+- Visualization code can reference variables from computation
+- Colour limits on a shared scale: take them from a robust percentile of the pooled data, e.g.
+  `vmax = float(np.nanpercentile(np.abs(np.concatenate([...])), 98))`, and never from the maximum
+  absolute value. A single coastal or marginal-sea cell is routinely an order of magnitude larger
+  than the signal, and `vmax = nanmax(abs(...))` then hands the whole scale to that one cell so
+  every panel renders as uniform white. Use a diverging map centred on zero for a difference or
+  anomaly and a sequential map for a magnitude. When values are clipped, pass `extend='both'` (or
+  'max'/'min') so the colourbar shows arrows, and say how they were clipped in the figure title.
+- Keep a colourbar label to the quantity and its units, e.g. "SSS bias (psu)", under about 40
+  characters. A vertical colourbar label longer than the bar is cut off at both ends in the saved
+  image. Notes such as the clipping percentile, "shared scale" or the data source go in the figure
+  or panel title, never in the colourbar label.
+- Do NOT call tight_layout() after attaching a colorbar to several axes (`fig.colorbar(..., ax=axes)`)
+  — it does not know about that colorbar and will lay the panels over it. Either build the figure
+  with `plt.subplots(..., constrained_layout=True)` and add no tight_layout at all, or call
+  tight_layout BEFORE adding the colorbar.
+- Keep annotation off the data: `loc="best"` for a legend, or place it outside the axes. A legend
+  pinned to a corner where a curve peaks hides the very feature the panel is there to show.
+- A field on a curvilinear grid has 2-D coordinates that are NOT called lat/lon. Read the names off
+  the array with `da.attrs.get("lat_coord", "lat")` / `da.attrs.get("lon_coord", "lon")` rather than
+  indexing `da.coords["lat"]`, which raises KeyError on CESM2 and MPI-ESM1-2-LR.
+- To map a field on a curvilinear grid (CESM2 or MPI-ESM1-2-LR native output), first put it on a
+  regular grid with `regrid_horizontal(field, target="woa23")` (for display only; every reported
+  number stays on the native grid) and draw it with `pcolormesh` on the 1-D lon/lat. Do not hand its
+  2-D coordinates to `pcolormesh`/`contourf`: the model longitude wraps and jumps at the grid seam,
+  which smears the field into horizontal bands and puts it in the wrong place.
+- To map a region that crosses the dateline (the North Pacific 110E-100W, the equatorial Pacific
+  120E-280E), use a continuous 0-360 longitude axis: for the plot only, on a copy of the regular-grid
+  field, `p = da.assign_coords(lon=da.lon % 360).sortby("lon")`, then set the x limits to the region.
+  On a -180..180 axis the region is split into two strips at the panel's edges with empty space
+  between them.
+- Provide a <visualize> block whenever the result still has something to show — a time series, a
+  seasonal cycle, a depth profile, a spatial map, or several groups to compare — even when the
+  question does not ask for a figure in so many words. Leave it empty only when the answer is a
+  single number or a short table with nothing to plot.
+
+
+===== USER =====
+Generate the two code blocks now.
+
+===== RESPONSE =====
+<compute>
+models = ['CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']
+sources = ['WOA23'] + models
+trange = ['1971-01', '2000-12']
+drange = [200, 1000]
+RHO = 1025.0                       # kg m-3, used only for the regression/scatter conversion
+hdims = ['depth', 'lat', 'lon']    # curvilinear index dims are mapped by compute_basic_stat
+basins = ['Pacific', 'Atlantic', 'Indian']
+
+# ---------------------------------------------------------------- 1. load
+native = {}        # per source: time-mean no3, po4 on the native grid and levels
+weights = {}       # per source: volume (models) or layer thickness (WOA23)
+vol_source = {}
+layer_info = {}
+
+for m in models:
+    no3 = load_regular_data(dataset='cmip6_historical', variable='no3', model=m,
+                            time_range=trange, depth_range=drange)
+    po4 = load_regular_data(dataset='cmip6_historical', variable='po4', model=m,
+                            time_range=trange, depth_range=drange)
+    # day-weighted 1971-2000 climatology on the native grid
+    no3c = temporal_aggregate(no3, freq='mean').compute()
+    po4c = temporal_aggregate(po4, freq='mean').compute()
+    # one common valid sample for NO3 and PO4 (PO4 > 0 so the ratio is defined)
+    po4c = po4c.where(po4c > 0)
+    po4c = po4c.where(no3c.notnull())
+    no3c = no3c.where(po4c.notnull())
+    native[m] = dict(no3=no3c, po4=po4c)
+
+    vol = load_volumes_for_cmip6(dataset='cmip6_historical', model=m,
+                                 depth_range=drange, variable='no3')
+    vol_source[m] = vol.attrs.get('volume_source')
+    if 'time' in vol.dims:
+        vol = vol.mean('time')
+    weights[m] = vol.compute()
+
+    lv, bd = load_depth_levels(dataset='cmip6_historical', model=m, variable='no3',
+                               depth_range=drange)
+    layer_info[m] = dict(n_levels=len(lv), top=float(np.min(bd)), bottom=float(np.max(bd)))
+
+no3w = load_climatology_data(dataset='woa23', variable='nitrate', depth_range=drange).compute()
+po4w = load_climatology_data(dataset='woa23', variable='phosphate', depth_range=drange).compute()
+po4w = po4w.where(po4w > 0)
+po4w = po4w.where(no3w.notnull())
+no3w = no3w.where(po4w.notnull())
+native['WOA23'] = dict(no3=no3w, po4=po4w)
+
+lv, bd = load_depth_levels(dataset='woa23', variable='nitrate', depth_range=drange)
+bd = np.asarray(bd)
+assert len(lv) == no3w.sizes['depth']
+dz = xr.DataArray(bd[:, 1] - bd[:, 0], dims='depth', coords={'depth': no3w['depth'].values})
+weights['WOA23'] = dz
+vol_source['WOA23'] = 'layer thickness from WOA23 depth-level bounds x 1-degree cell areas'
+layer_info['WOA23'] = dict(n_levels=len(lv), top=float(bd.min()), bottom=float(bd.max()))
+
+
+def column_mean(field, w):
+    """Thickness/volume-weighted mean over the depth dimension only, NaN-aware."""
+    if w.ndim > 1:
+        w, field = xr.align(w, field, join='override')
+    ww = w.where(field.notnull())
+    s = ww.sum('depth')
+    out = (field * ww).sum('depth') / s
+    return out.where(s > 0)
+
+
+# ---------------------------------------------------------------- 2-5. native-grid statistics
+stats = {}
+colmaps = {}      # native column-mean fields (for later regridding)
+ratio3d = {}
+for s in sources:
+    no3n, po4n = native[s]['no3'], native[s]['po4']
+    ratio = compute_ratio(no3n, po4n).assign_attrs(units='1')
+    ratio3d[s] = ratio
+
+    mean_no3 = float(compute_basic_stat(no3n, 'volume_weighted_mean', dim=hdims).compute())
+    mean_po4 = float(compute_basic_stat(po4n, 'volume_weighted_mean', dim=hdims).compute())
+    headline = float(compute_basic_stat(ratio, 'volume_weighted_mean', dim=hdims).compute())
+
+    ex1418 = compute_exceedance_fraction(ratio, threshold=2.0, comparison='abs_less', reference=16.0)
+    exlow = compute_exceedance_fraction(ratio, threshold=12.0, comparison='less')
+
+    d = dict(
+        mean_no3_native_units=mean_no3,
+        mean_po4_native_units=mean_po4,
+        np_headline_cell_by_cell=headline,
+        np_ratio_of_means=mean_no3 / mean_po4,
+        pct_14_18=float(ex1418['fraction_percent']),
+        vol_14_18_m3=float(ex1418['exceeding_amount']),
+        total_volume_m3=float(exlow['total_amount']),
+        pct_below12_global=float(exlow['fraction_percent']),
+        vol_below12_global_m3=float(exlow['exceeding_amount']),
+        basin_mean={}, basin_pct_below12={}, basin_vol_below12_m3={},
+    )
+    for b in basins:
+        rb = select_basin(ratio, b, include_marginal_seas=True, depth_dependent=False)
+        d['basin_mean'][b] = float(compute_basic_stat(rb, 'volume_weighted_mean', dim=hdims).compute())
+        if b in ('Pacific', 'Indian'):
+            exb = compute_exceedance_fraction(rb, threshold=12.0, comparison='less')
+            d['basin_pct_below12'][b] = float(exb['fraction_percent'])
+            d['basin_vol_below12_m3'][b] = float(exb['exceeding_amount'])
+    stats[s] = d
+
+    colmaps[s] = dict(
+        ratio=column_mean(ratio, weights[s]).assign_attrs(units='1').compute(),
+    )
+
+# ---------------------------------------------------------------- 6. regrid and common mask
+ref_lat, ref_lon = native['WOA23']['no3']['lat'], native['WOA23']['no3']['lon']
+
+
+def snap(x):
+    return x.assign_coords(lat=ref_lat.values, lon=ref_lon.values)
+
+
+reg = {}
+for s in sources:
+    if s == 'WOA23':
+        reg[s] = dict(no3=native[s]['no3'], po4=native[s]['po4'], colratio=colmaps[s]['ratio'])
+    else:
+        reg[s] = dict(
+            no3=snap(regrid_horizontal(native[s]['no3'], target='woa23', method='conservative')).compute(),
+            po4=snap(regrid_horizontal(native[s]['po4'], target='woa23', method='conservative')).compute(),
+            colratio=snap(regrid_horizontal(colmaps[s]['ratio'], target='woa23', method='conservative')).compute(),
+        )
+    # keep only 3-D cells where both nutrients are present
+    ok = reg[s]['no3'].notnull() & reg[s]['po4'].notnull()
+    reg[s]['no3'] = reg[s]['no3'].where(ok)
+    reg[s]['po4'] = reg[s]['po4'].where(ok)
+
+valid_maps = []
+for s in sources:
+    v = (reg[s]['no3'].notnull() & reg[s]['po4'].notnull()).any('depth')
+    v = v.astype(float).where(v)
+    v.attrs.update(reg[s]['no3'].attrs)
+    valid_maps.append(v)
+
+mask = build_comparison_mask(valid_maps, ocean_only=True)
+mask_info = dict(attrs=dict(mask.attrs), n_cells_shared=int(mask.sum()),
+                 n_cells_each={s: int(v.notnull().sum()) for s, v in zip(sources, valid_maps)})
+
+# ---------------------------------------------------------------- 7. unit conversion and regression
+fits = {}
+scatter = {}
+rng = np.random.default_rng(0)
+for s in sources:
+    no3r, po4r = reg[s]['no3'], reg[s]['po4']
+    if s != 'WOA23':
+        no3r = transform_unit(no3r, from_unit='mol m-3', to_unit='umol/kg', density=RHO / 1000.0)
+        po4r = transform_unit(po4r, from_unit='mol m-3', to_unit='umol/kg', density=RHO / 1000.0)
+    no3m = no3r.where(mask)
+    po4m = po4r.where(mask)
+    pair_ok = no3m.notnull() & po4m.notnull()
+    no3m = no3m.where(pair_ok)
+    po4m = po4m.where(pair_ok)
+
+    fit = fit_multivariate_relation(target=no3m, predictors=[po4m], method='linear')
+
+    x = np.asarray(po4m.values).ravel()
+    y = np.asarray(no3m.values).ravel()
+    good = np.isfinite(x) & np.isfinite(y)
+    x, y = x[good], y[good]
+    np_slope, np_int = np.polyfit(x, y, 1)
+    np_r2 = float(np.corrcoef(x, y)[0, 1] ** 2)
+
+    slope = intercept = None
+    co = fit.get('coefficients')
+    if isinstance(co, dict):
+        for k, v in co.items():
+            val = float(np.asarray(v).squeeze())
+            if 'intercept' in str(k).lower():
+                intercept = val
+            elif slope is None:
+                slope = val
+    coef_source = 'fit_multivariate_relation'
+    if slope is None or intercept is None:
+        slope, intercept, coef_source = float(np_slope), float(np_int), 'numpy polyfit (tool coefficients not parsable)'
+    r2 = float(fit['metrics']['r2'])
+
+    fits[s] = dict(a=slope, b_umol_kg=intercept, r2=r2, n_cells=int(len(x)),
+                   np_check=dict(a=float(np_slope), b=float(np_int), r2=np_r2),
+                   coef_source=coef_source, vif=fit['diagnostics'].get('vif') if isinstance(fit.get('diagnostics'), dict) else None)
+    idx = rng.choice(len(x), size=min(8000, len(x)), replace=False)
+    scatter[s] = dict(x=x[idx], y=y[idx], x_p995=float(np.percentile(x, 99.5)),
+                      y_p995=float(np.percentile(y, 99.5)))
+
+# ---------------------------------------------------------------- 8. Redfield and comparison with WOA23
+col_masked = {s: reg[s]['colratio'].where(mask) for s in sources}
+diff_metrics = {}
+for m in models:
+    dm = compute_difference_metrics(col_masked[m], col_masked['WOA23'])
+    diff_metrics[m] = dict(bias=float(dm['bias']), rmse=float(dm['rmse']),
+                           centered_rmse=float(dm['centered_rmse']), n_valid=int(dm['n_valid']))
+
+tol = 0.5
+redfield = {}
+for s in sources:
+    h = stats[s]['np_headline_cell_by_cell']
+    redfield[s] = 'above 16' if h > 16 + tol else ('below 16' if h < 16 - tol else 'at 16 (within +/-0.5)')
+
+low_np = {}
+w_glob = stats['WOA23']['pct_below12_global']
+for m in models:
+    rg = stats[m]['pct_below12_global'] / w_glob if w_glob > 0 else np.nan
+    rp = stats[m]['basin_pct_below12']['Pacific'] / max(stats['WOA23']['basin_pct_below12']['Pacific'], 1e-9)
+    ri = stats[m]['basin_pct_below12']['Indian'] / max(stats['WOA23']['basin_pct_below12']['Indian'], 1e-9)
+    low_np[m] = dict(global_ratio_to_woa=rg, pacific_ratio_to_woa=rp, indian_ratio_to_woa=ri,
+                     reproduces_volume=bool(0.5 <= rg <= 2.0),
+                     reproduces_basins=bool(0.5 <= rp <= 2.0 and 0.5 <= ri <= 2.0))
+
+for s in sources:
+    d = stats[s]
+    print(f"{s}: headline N:P={d['np_headline_cell_by_cell']:.2f}, ratio of means={d['np_ratio_of_means']:.2f}, "
+          f"14<N:P<18: {d['pct_14_18']:.1f}%, N:P<12: {d['pct_below12_global']:.1f}% "
+          f"({d['vol_below12_global_m3']:.3e} m3), basins {({k: round(v, 2) for k, v in d['basin_mean'].items()})}, "
+          f"<12 Pac/Ind: {d['basin_pct_below12']}, Redfield: {redfield[s]}")
+    f = fits[s]
+    print(f"   fit a={f['a']:.2f}, b={f['b_umol_kg']:.2f} umol/kg, R2={f['r2']:.3f}, n={f['n_cells']}")
+print('volume sources:', vol_source)
+print('layers:', layer_info)
+print('mask:', mask_info['n_cells_shared'], mask_info['n_cells_each'])
+print('diff vs WOA23:', diff_metrics)
+print('low N:P:', low_np)
+
+map_data = {s: dict(field=np.asarray(col_masked[s].values) - 16.0,
+                    lon=np.asarray(col_masked[s]['lon'].values),
+                    lat=np.asarray(col_masked[s]['lat'].values)) for s in sources}
+</compute>
+
+<visualize>
+fig, axes = plt.subplots(2, 2, figsize=(11, 9), sharex=True, sharey=True, constrained_layout=True)
+xmax = float(np.ceil(max(scatter[s]['x_p995'] for s in sources) * 1.1 * 2) / 2)
+ymax = float(np.ceil(max(scatter[s]['y_p995'] for s in sources) * 1.1 / 5) * 5)
+xx = np.linspace(0, xmax, 50)
+for ax, s in zip(axes.ravel(), sources):
+    sc = scatter[s]
+    f = fits[s]
+    ax.scatter(sc['x'], sc['y'], s=3, alpha=0.2, color='tab:blue', rasterized=True)
+    ax.plot(xx, f['a'] * xx + f['b_umol_kg'], color='tab:red', lw=2, ls='-', label='OLS fit')
+    ax.plot(xx, 16 * xx, color='k', lw=1.8, ls='--', label='Redfield 16:1')
+    ax.text(0.03, 0.97, f"a = {f['a']:.2f}\nb = {f['b_umol_kg']:.2f} µmol/kg\nR² = {f['r2']:.3f}",
+            transform=ax.transAxes, va='top', ha='left', fontsize=10,
+            bbox=dict(boxstyle='round', fc='white', ec='gray', alpha=0.85))
+    ax.set_xlim(0, xmax)
+    ax.set_ylim(0, ymax)
+    ax.set_title(s)
+    ax.legend(loc='lower right', fontsize=9)
+    ax.grid(alpha=0.3)
+for ax in axes[1, :]:
+    ax.set_xlabel('PO4 (µmol/kg)')
+for ax in axes[:, 0]:
+    ax.set_ylabel('NO3 (µmol/kg)')
+fig.suptitle('NO3 vs PO4, 200-1000 m, shared 1° mask (models at ρ = 1025 kg/m³)')
+
+pooled = np.concatenate([map_data[s]['field'].ravel() for s in sources])
+pooled = pooled[np.isfinite(pooled)]
+vmax = float(np.nanpercentile(np.abs(pooled), 98))
+fig2, axes2 = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
+for ax, s in zip(axes2.ravel(), sources):
+    md = map_data[s]
+    pm = ax.pcolormesh(md['lon'], md['lat'], md['field'], cmap='RdBu_r', vmin=-vmax, vmax=vmax, shading='auto')
+    ax.set_facecolor('lightgray')
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-90, 90)
+    ax.set_aspect('equal')
+    ax.set_title(f"{s}  (headline N:P = {stats[s]['np_headline_cell_by_cell']:.2f})")
+    ax.set_xlabel('Longitude (°E)')
+    ax.set_ylabel('Latitude (°N)')
+    ax.grid(alpha=0.3, lw=0.5)
+cb = fig2.colorbar(pm, ax=axes2, orientation='vertical', shrink=0.8, extend='both')
+cb.set_label('N:P − 16')
+fig2.suptitle(f'200-1000 m mean N:P minus 16, regridded to 1° for display; scale clipped at 98th percentile (±{vmax:.1f})')
+plt.show()
+</visualize>

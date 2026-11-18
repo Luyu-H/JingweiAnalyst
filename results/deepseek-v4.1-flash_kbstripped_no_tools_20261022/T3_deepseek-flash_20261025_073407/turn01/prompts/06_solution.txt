@@ -1,0 +1,1326 @@
+# exchange 6: solution
+# elapsed: 22.4 s
+
+===== SYSTEM =====
+
+The user's question:
+Evaluate the 1971-2000 sea surface temperature (SST) climatology of three CMIP6 historical simulations against the World Ocean Atlas 2023 (WOA23) observational climatology, and describe the spatial structure of the bias.
+
+Data to use:
+- CMIP6 historical variable `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, from 1971-01 to 2000-12, each on its own native grid with its own published cell areas (areacello).
+- WOA23 temperature, the 1971-2000 climate normal, annual time slice, objectively analysed field, at 0 m depth, on the 1-degree grid.
+- The WOA23 1-degree land-sea mask (landsea_01), in which a cell is ocean when its value is greater than 1.
+
+Expected numerical results:
+- For each model, the global mean of its 1971-2000 SST climatology over its own native ocean grid, in degrees Celsius to 2 decimal places.
+- The global mean of the WOA23 0 m annual field over the whole 1-degree grid, in degrees Celsius to 2 decimal places.
+- On the WOA23 1-degree grid, over the cells on which the models are compared with WOA23: the mean SST of each model and of WOA23, in degrees Celsius to 2 decimal places.
+- On the same cells, for each model: the mean bias delta_SST (model minus WOA23) in degrees Celsius to 2 decimal places, the RMSE against WOA23 in degrees Celsius to 3 decimal places, and the spatial Pearson correlation with WOA23 to 3 decimal places.
+- The ranking of the three models from smallest to largest absolute delta_SST.
+
+Expected visualizations:
+- Figure 1, a 2-by-2 panel of global maps: the bias fields (model minus WOA23) of CESM2, GFDL-ESM4 and MPI-ESM1-2-LR on the cells of that comparison with one shared diverging colour scale centred on zero, and the WOA23 0 m reference SST on the same cells with a sequential colour scale. Label every panel and give each colour scale a unit label in degrees Celsius.
+- Figure 2, a bar chart of the four global mean SST values of the first two items above, each over its own native ocean grid (CESM2, GFDL-ESM4, MPI-ESM1-2-LR and WOA23), each bar annotated with its value, with the y axis labelled in degrees Celsius.
+
+The analysis plan:
+1. Open the raw WOA23 files; select `temperature` for the 1971-2000 climate normal, annual time slice, at 0 m depth, on the 1° grid; select `landsea_01` on the same grid. Define `woa_sst` as that 0 m annual field and `woa_ocean = landsea_01 > 1`. Compute the WOA23 global mean over the whole 1° grid as an unweighted arithmetic mean of all non-missing `woa_sst` cells; record the valid-cell count.
+- Note [omip-weighted-means-and-integrals]: Use area weights for global model means, Σ(field·areacello)/Σ(areacello) over valid cells—not a plain `mean()` on a curvilinear grid; `compute_difference_metrics` weights by area by default and `analyze_correlation` needs `weighting='area'`. The WOA value just computed is the requested whole-1°-grid mean, not an area-weighted mean over valid ocean cells; state which was computed.
+
+2. Open the raw CMIP6 historical files for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR; load `tos` monthly for 1971-01 to 2000-12 and each model’s Ofx `areacello` fixed field. For each model on its native grid, build the valid mask from `tos` and `areacello` themselves, discard fill/missing values, and compute the cell-wise 1971-2000 SST climatology as the time mean over the 360 monthly values. Compute each model’s global mean over its own native ocean grid with its own `areacello` using the area-weighted formula in [omip-weighted-means-and-integrals]; record the total ocean area Σ(areacello) over the valid cells used.
+- Note [missing-values-and-land-cells]: Build each field’s valid mask from the field itself, keep weights masked to those cells, and treat any value near 1e20 as an unmasked fill value, not a result.
+- Note [cmip6-static-grid-fields]: Use each model’s published `areacello` as the only correct area weight; total ocean areas differ by about a per cent, so state the area each mean was taken over rather than rescaling one model to another.
+- Note [cmip6-grid-labels]: GFDL-ESM4 `tos` is on its `gr` 1° archive grid with the regridded land–sea mask, so label its “native-grid” number as an archive-grid number.
+- Note [cmip6-tos-bulk-top-cell]: `tos` is bulk top-cell temperature (CESM2 0–10 m, GFDL-ESM4 0–2 m, MPI-ESM1-2-LR 0–12 m), not skin SST, so the comparison with WOA23 at 0 m is not exactly like-for-like; sea-ice-covered cells carry near-freezing under-ice water and are not missing, so mask consistency matters where WOA masks sea ice.
+- Note [omip-native-grid-vs-regridded]: Compute each model’s global mean on its own native grid with its own cell areas; regrid only for the bias maps, RMSE and pattern correlation, using conservative remapping, and state the method. A native-grid mean and a mean after regridding to 1° are different quantities and should not be expected to agree.
+
+3. Conservatively regrid each model’s native 1971-2000 SST climatology onto the WOA23 1° grid using area-conservative remapping [omip-native-grid-vs-regridded]; store the regridded fields for the shared-mask comparison and Figure 1.
+
+4. Build one shared comparison mask on the WOA23 1° grid from `woa_ocean` (`landsea_01 > 1`), valid `woa_sst`, and the valid regridded cells of all three models; this is the `build_comparison_mask` operation with `ocean_only=True` because WOA23 is the reference. Apply `.where(mask)` to each regridded model climatology and to `woa_sst` before any metric; record the mask cell count and total area.
+- Note [common-comparison-mask]: Put all fields and WOA23 on the 1° grid, build one mask over them with `build_comparison_mask` and apply `.where(mask)` to every field before any metric; `ocean_only=True` is correct here because WOA23 is the reference. Report the bias together with the means `compute_difference_metrics` returns over that shared sample (`mean_data`, `mean_reference`), not means over different cells, and report the mask’s cell count; a mask much smaller than the fields means the products disagree about where the ocean is, not that the models are poor.
+
+5. On the shared mask, for each model compute the area-weighted mean model SST and mean WOA23 SST using 1° cell-area weights proportional to cos(latitude), the area-weighted mean bias delta_SST = mean_model - mean_WOA, the area-weighted RMSE, and the area-weighted spatial Pearson correlation with WOA23; use the area weighting of `compute_difference_metrics` and `analyze_correlation(..., weighting='area')` [omip-weighted-means-and-integrals]. Report these to the requested 2 or 3 decimal places and pair each bias with the two means from the same shared sample.
+
+6. Rank the three models from smallest to largest absolute delta_SST using the unrounded biases from step 5.
+
+7. Draw Figure 1 as a 2×2 global map panel: the three bias fields (regridded model climatology minus WOA23) on the shared comparison cells, all with one shared diverging colour scale centred on zero (symmetric limits set by the largest absolute bias among the three), and the WOA23 0 m reference SST on the same cells with a sequential colour scale. Label every panel and give every colour bar the unit °C.
+
+8. Draw Figure 2 as a bar chart of the four global mean SST values: the native-grid area-weighted means for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR from step 2, and the WOA23 whole-1°-grid mean from step 1. Annotate each bar with its value to 2 decimal places and label the y axis in °C.
+
+9. Use the shared-mask bias fields and Figure 1 to describe the spatial structure of the bias, including the sign and broad regional/latitudinal patterns, not just the global mean.
+
+Other notes:
+- [cmip6-experiments-historical-ssp245] A single historical member cannot separate forced change from internal variability, and a given model year is not expected to match the observed year; the 1971-2000 climatology bias should carry that caveat.
+- The WOA23 bar in Figure 2 uses the whole-1°-grid mean from step 1; the WOA23 mean in the shared-mask comparison in step 5 is a different, area-weighted ocean-mask quantity. The bar chart therefore mixes native-grid area-weighted model means with the requested whole-grid WOA23 mean.
+
+The code that actually ran and produced the results below:
+<executed_code>
+import os
+import glob
+
+# ======================================================================
+# 1) WOA23 -- temperature, 1971-2000 normal, annual, objectively
+#    analysed field ("an"), 0 m, 1 degree grid  (decode_times=False)
+# ======================================================================
+woa_root = "/data1/lorraine-20419/ocean_data/WOA23/climatology"
+woa_file = os.path.join(woa_root, "temperature", "1971-2000_climate_normal",
+                        "woa23_decav71A0_t00_01.nc")
+ds_woa = xr.open_dataset(woa_file, decode_times=False)
+
+an_name = sorted([v for v in ds_woa.data_vars if v.endswith("_an")])[0]   # 't_an'
+woa_an = ds_woa[an_name]
+if "time" in woa_an.dims:                       # annual slice -> index 0
+    woa_an = woa_an.isel(time=0)
+woa_depth0 = float(np.ravel(woa_an["depth"].values)[0])   # must be 0 m
+woa_an = woa_an.isel(depth=0).squeeze(drop=True)
+woa_an = woa_an.where(np.abs(woa_an) < 1e10)              # guard against undecoded fills
+woa_sst = woa_an.rename("woa_sst").assign_attrs(
+    units="degrees_celsius",
+    long_name="WOA23 1971-2000 annual objectively analysed temperature at 0 m")
+
+woa_lat = np.asarray(woa_sst["lat"].values, dtype=float)
+woa_lon = np.asarray(woa_sst["lon"].values, dtype=float)
+if woa_lat[0] > woa_lat[-1]:
+    woa_sst = woa_sst.isel(lat=slice(None, None, -1)); woa_lat = woa_lat[::-1]
+if woa_lon[0] > woa_lon[-1]:
+    woa_sst = woa_sst.isel(lon=slice(None, None, -1)); woa_lon = woa_lon[::-1]
+NLAT, NLON = woa_sst.sizes["lat"], woa_sst.sizes["lon"]
+assert (NLAT, NLON) == (180, 360)
+
+# ---- WOA23 land-sea mask (text table, 2 header rows, 64800 ocean+land pts) --
+mask_file = "/data1/lorraine-20419/ocean_data/WOA23/masks/landsea_01.msk"
+_rows = []
+with open(mask_file, "r") as fh:
+    for line in fh:
+        p = line.replace(",", " ").split()
+        if len(p) < 3:
+            continue
+        try:
+            _rows.append((float(p[0]), float(p[1]), float(p[2])))
+        except ValueError:
+            continue
+tab = np.array(_rows, dtype=float)
+if tab.shape[0] > 180 * 360:            # drop any numeric-looking header line
+    tab = tab[-180 * 360:]
+assert tab.shape[0] == 180 * 360
+
+lat_v = tab[:, 0]
+lon_v = ((tab[:, 1] + 180.0) % 360.0) - 180.0
+m_v = tab[:, 2]
+li = np.clip(np.round((lat_v + 89.5) / 1.0).astype(int), 0, 179)
+oi = np.clip(np.round((lon_v + 179.5) / 1.0).astype(int), 0, 359)
+_msk = np.full((180, 360), np.nan)
+_msk[li, oi] = m_v
+landsea = xr.DataArray(_msk, dims=("lat", "lon"),
+                       coords={"lat": woa_lat, "lon": woa_lon}, name="landsea")
+
+woa_ocean = (landsea > 1)          # WOA23: ocean when mask value > 1
+
+# ---- requested whole-1-degree-grid, UNWEIGHTED mean of non-missing cells ----
+woa_global_mean_unweighted = float(woa_sst.mean(skipna=True))
+woa_valid_count = int(woa_sst.notnull().sum())
+woa_ocean_count = int(woa_ocean.sum())
+print(f"WOA23 0 m depth level = {woa_depth0} m")
+print(f"WOA23 whole-1deg-grid unweighted mean SST = {woa_global_mean_unweighted:.2f} degC "
+      f"({woa_valid_count} valid cells; landsea ocean cells = {woa_ocean_count})")
+
+# ======================================================================
+# 2) CMIP6 historical `tos` 1971-2000 climatology on each native grid
+# ======================================================================
+cmip_root = "/data1/lorraine-20419/benchmark_cmip6/historical"
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+coords_of = {"CESM2": ("lat", "lon"),
+             "GFDL-ESM4": ("lat", "lon"),
+             "MPI-ESM1-2-LR": ("latitude", "longitude")}
+
+
+def cmip_open(model, var):
+    """Open all historical files of one model/variable; variant is parsed
+    from the file name, never assumed."""
+    fs = sorted(glob.glob(os.path.join(cmip_root, model, var, "*.nc")))
+    if not fs:
+        raise FileNotFoundError(f"no files under {cmip_root}/{model}/{var}")
+    latn, lonn = coords_of[model]
+    parts = []
+    for f in fs:
+        d = xr.open_dataset(f, use_cftime=True, decode_times=True)
+        keep = [var] + [c for c in (latn, lonn)
+                        if c in d.variables and c not in d.dims]
+        keep = list(dict.fromkeys([k for k in keep if k in d.variables]))
+        parts.append(d[keep])
+    if len(parts) == 1:
+        ds = parts[0]
+    else:
+        ds = xr.concat(parts, dim="time", data_vars="minimal",
+                       coords="minimal", compat="override")
+    if "time" in ds.dims:
+        ds = ds.sortby("time")
+        ti = ds.indexes["time"]
+        if ti.has_duplicates:
+            ds = ds.isel(time=~ti.duplicated())
+    return ds, fs
+
+
+def drop_singletons(da, keep):
+    drop = [d for d in da.dims if d not in keep and da.sizes[d] == 1]
+    if drop:
+        da = da.isel({d: 0 for d in drop})
+    return da
+
+
+def conservative_regrid(vals2d, lon2d, lat2d, area2d, lon_t, lat_t):
+    """First-order (donor-cell) conservative remapping: every native cell
+    donates its full area*value to the 1 degree target cell containing its
+    centre, so the area-weighted integral is preserved."""
+    nlat_t, nlon_t = len(lat_t), len(lon_t)
+    v = np.asarray(vals2d, float)
+    a = np.asarray(area2d, float)
+    la = np.asarray(lat2d, float)
+    lo = np.asarray(lon2d, float)
+    good = np.isfinite(v) & np.isfinite(a) & (a > 0) & np.isfinite(la) & np.isfinite(lo)
+
+    li_t = np.zeros(la.shape, dtype=int)
+    oi_t = np.zeros(lo.shape, dtype=int)
+    li_t[good] = np.clip(np.floor(la[good] + 90.0).astype(int), 0, nlat_t - 1)
+    oi_t[good] = np.mod(np.floor(np.mod(lo[good], 360.0) + 180.0).astype(int), nlon_t)
+
+    w = np.where(good, a, 0.0)
+    f = np.where(good, v, 0.0)
+    flat = (li_t * nlon_t + oi_t).ravel()
+    num = np.bincount(flat, weights=(f * w).ravel(), minlength=nlat_t * nlon_t)
+    den = np.bincount(flat, weights=w.ravel(), minlength=nlat_t * nlon_t)
+    out = np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
+    return out.reshape(nlat_t, nlon_t)
+
+
+native_mean = {}
+native_area = {}
+model_area_total = {}
+n_months = {}
+variants = {}
+tos_clim_native = {}
+regridded = {}
+
+for m in models:
+    ds, fs = cmip_open(m, "tos")
+    variants[m] = os.path.basename(fs[0]).split("_")[4]     # e.g. r1i1p1f1
+
+    tos = drop_singletons(ds["tos"], keep=("time",))
+    tos = tos.where(np.abs(tos) < 1e19)                     # undecoded fill guard
+
+    years = ds["time"].dt.year.values
+    idx = np.where((years >= 1971) & (years <= 2000))[0]
+    tos_p = tos.isel(time=idx)
+    n_months[m] = int(tos_p.sizes["time"])
+
+    tos_clim = tos_p.mean(dim="time", skipna=True)          # cell-wise climatology
+    tos_clim.load()
+    tos_clim = tos_clim.assign_attrs(units="degrees_celsius")
+    tos_clim_native[m] = tos_clim
+
+    dsa, _ = cmip_open(m, "areacello")
+    area = drop_singletons(dsa["areacello"], keep=("lat", "lon", "nlat", "nlon", "j", "i"))
+    assert area.shape == tos_clim.shape, (m, area.shape, tos_clim.shape)
+
+    tv = np.asarray(tos_clim.values, float)
+    av = np.asarray(area.values, float)
+    valid = np.isfinite(tv) & np.isfinite(av) & (av > 0)
+    w = np.where(valid, av, 0.0)
+    native_mean[m] = float(np.sum(np.where(valid, tv, 0.0) * w) / np.sum(w))
+    native_area[m] = float(np.sum(w))
+
+    # ---- conservative regridding onto the WOA23 1 degree grid ----
+    latn, lonn = coords_of[m]
+    latc = np.asarray(tos_clim[latn].values, float)
+    lonc = np.asarray(tos_clim[lonn].values, float)
+    if latc.ndim == 1:
+        lon2d, lat2d = np.meshgrid(lonc, latc)
+    else:
+        lat2d, lon2d = latc, lonc
+
+    reg = conservative_regrid(tv, lon2d, lat2d, av, woa_lon, woa_lat)
+    regridded[m] = xr.DataArray(reg, dims=("lat", "lon"),
+                                coords={"lat": woa_lat, "lon": woa_lon},
+                                name="tos").assign_attrs(units="degrees_celsius")
+
+    print(f"{m:14s} variant={variants[m]}  n_months={n_months[m]}  "
+          f"native area = {native_area[m]/1e12:.4f} x10^12 m2  "
+          f"native-grid mean SST = {native_mean[m]:.2f} degC")
+
+# ======================================================================
+# 4) shared comparison mask on the WOA23 1 degree grid
+#    (build_comparison_mask with ocean_only=True, WOA23 as reference)
+# ======================================================================
+shared = (landsea > 1) & woa_sst.notnull()
+for m in models:
+    shared = shared & regridded[m].notnull()
+shared = shared.fillna(False).rename("comparison_mask")
+
+mask_count = int(shared.sum())
+
+R_EARTH = 6371.0                                     # km
+_dlat = np.deg2rad(1.0); _dlon = np.deg2rad(1.0)
+_edges = np.deg2rad(np.arange(-90.0, 91.0, 1.0))
+_band = (R_EARTH ** 2) * _dlon * (np.sin(_edges[1:]) - np.sin(_edges[:-1]))   # km2 per lat band
+cell_area_km2 = np.repeat(_band[:, None], NLON, axis=1)
+mask_area_km2 = float(np.sum(cell_area_km2[shared.values]))
+print(f"shared comparison mask: {mask_count} cells, "
+      f"{mask_area_km2/1e6:.2f} x10^6 km2")
+
+# ======================================================================
+# 5) area-weighted metrics on the shared cells (1 deg cell areas ~ cos(lat))
+# ======================================================================
+w2d = np.repeat(np.cos(np.deg2rad(woa_lat))[:, None], NLON, axis=1)
+sel = shared.values
+ww = w2d[sel]
+ref_vals = np.asarray(woa_sst.where(shared).values, float)[sel]
+
+sst_mean_model = {}
+sst_mean_woa = {}
+delta_sst = {}
+rmse_sst = {}
+corr_sst = {}
+bias_maps = {}
+
+for m in models:
+    mod_da = regridded[m].where(shared)
+    mod_vals = np.asarray(mod_da.values, float)[sel]
+
+    sst_mean_model[m] = float(np.sum(ww * mod_vals) / np.sum(ww))
+    sst_mean_woa[m] = float(np.sum(ww * ref_vals) / np.sum(ww))
+
+    d = mod_vals - ref_vals
+    delta_sst[m] = float(np.sum(ww * d) / np.sum(ww))
+    rmse_sst[m] = float(np.sqrt(np.sum(ww * d * d) / np.sum(ww)))
+
+    am = mod_vals - np.sum(ww * mod_vals) / np.sum(ww)
+    bm = ref_vals - np.sum(ww * ref_vals) / np.sum(ww)
+    corr_sst[m] = float(np.sum(ww * am * bm) /
+                        np.sqrt(np.sum(ww * am * am) * np.sum(ww * bm * bm)))
+
+    bias_maps[m] = (regridded[m] - woa_sst).where(shared).assign_attrs(units="degrees_celsius")
+
+woa_sst_shared = woa_sst.where(shared)
+
+# ======================================================================
+# 6) ranking by |delta_SST| (unrounded)
+# ======================================================================
+ranking = sorted(models, key=lambda mm: abs(delta_sst[mm]))
+
+# ---- summary table ---------------------------------------------------------
+summary = pd.DataFrame({
+    "variant": [variants[m] for m in models],
+    "n_months_1971_2000": [n_months[m] for m in models],
+    "native_grid_mean_SST_C": [round(native_mean[m], 2) for m in models],
+    "native_ocean_area_1e12_m2": [round(native_area[m] / 1e12, 4) for m in models],
+    "shared_mask_mean_model_C": [round(sst_mean_model[m], 2) for m in models],
+    "shared_mask_mean_WOA_C": [round(sst_mean_woa[m], 2) for m in models],
+    "delta_SST_C": [round(delta_sst[m], 2) for m in models],
+    "RMSE_C": [round(rmse_sst[m], 3) for m in models],
+    "spatial_r": [round(corr_sst[m], 3) for m in models],
+}, index=models)
+print("\nWOA23 whole-grid unweighted mean = %.2f degC" % woa_global_mean_unweighted)
+print(summary.to_string())
+print("ranking (smallest -> largest |delta_SST|):", " < ".join(ranking))
+
+# --- visualization ---
+# ----------------------------------------------------------------------
+# Figure 1 -- 2x2 global map panel of SST bias (model - WOA23) on the
+# shared comparison cells + the WOA23 0 m reference on the same cells
+# ----------------------------------------------------------------------
+fig1, axs = plt.subplots(2, 2, figsize=(15, 9), constrained_layout=True)
+axs = axs.ravel()
+
+_pool = np.concatenate([np.asarray(bias_maps[m].values, float).ravel() for m in models])
+_pool = _pool[np.isfinite(_pool)]
+vmax = float(np.nanpercentile(np.abs(_pool), 98))       # robust shared limit
+
+for ax, m in zip(axs[:3], models):
+    # NOTE: `extend` is not a valid QuadMesh keyword in current matplotlib;
+    #       pass it to the colorbar instead so the triangular ends are drawn.
+    pm = ax.pcolormesh(woa_lon, woa_lat, bias_maps[m].values,
+                       cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                       shading="auto")
+    ax.set_title(f"{m} - WOA23   (delta_SST = {delta_sst[m]:+.2f} degC, "
+                 f"RMSE = {rmse_sst[m]:.3f} degC, r = {corr_sst[m]:.3f})", fontsize=10)
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+    ax.set_xlim(-180, 180); ax.set_ylim(-90, 90)
+    cb = fig1.colorbar(pm, ax=ax, orientation="vertical", shrink=0.9, pad=0.02,
+                       extend="both")
+    cb.set_label("SST bias (degC)")
+
+_ref = woa_sst_shared.values
+vo = np.nanpercentile(_ref, 2); ve = np.nanpercentile(_ref, 98)
+pm4 = axs[3].pcolormesh(woa_lon, woa_lat, _ref, cmap="viridis",
+                        vmin=vo, vmax=ve, shading="auto")
+axs[3].set_title("WOA23 0 m reference SST (1971-2000 mean, shared cells)", fontsize=10)
+axs[3].set_xlabel("Longitude"); axs[3].set_ylabel("Latitude")
+axs[3].set_xlim(-180, 180); axs[3].set_ylim(-90, 90)
+cb4 = fig1.colorbar(pm4, ax=axs[3], orientation="vertical", shrink=0.9, pad=0.02,
+                    extend="both")
+cb4.set_label("SST (degC)")
+
+fig1.suptitle("Bias colour scale clipped at the pooled 98th percentile of |bias| "
+              f"(+/-{vmax:.2f} degC); shared mask = {mask_count} cells", fontsize=11)
+
+# ----------------------------------------------------------------------
+# Figure 2 -- four global mean SST values, each over its own grid
+# ----------------------------------------------------------------------
+fig2, ax = plt.subplots(figsize=(8.5, 6), constrained_layout=True)
+labels = models + ["WOA23"]
+values = [native_mean[m] for m in models] + [woa_global_mean_unweighted]
+colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd"]
+bars = ax.bar(labels, values, color=colors, edgecolor="black", linewidth=0.6)
+
+for b, v in zip(bars, values):
+    ax.annotate(f"{v:.2f}", (b.get_x() + b.get_width() / 2.0, b.get_height()),
+                xytext=(0, 4), textcoords="offset points",
+                ha="center", va="bottom", fontsize=11, fontweight="bold")
+
+ax.set_ylabel("Global mean SST (degC)")
+ax.set_title("Global mean SST 1971-2000\n"
+             "CMIP6: native-grid area-weighted (own areacello); "
+             "WOA23: whole-1deg-grid unweighted mean")
+ax.set_ylim(0, max(values) * 1.18)
+ax.grid(axis="y", alpha=0.3)
+fig2.text(0.5, -0.02,
+          "Note: model bars are area-weighted over each native ocean grid; the WOA23 bar "
+          "is the unweighted whole-1deg-grid mean, so the four bars are not identical quantities.",
+          ha="center", fontsize=8, wrap=True)
+</executed_code>
+
+Here are the results of code execution:
+
+Status Summary:
+- Computation: Success
+- Visualization: Generated
+
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "woa_root": "/data1/lorraine-20419/ocean_data/WOA23/climatology",
+      "woa_file": "/data1/lorraine-20419/ocean_data/WOA23/climatology/temperature/1971-2000_climate_normal/woa23_decav71A0_t00_01.nc",
+      "ds_woa": {
+        "crs": {
+          "type": "DataArray",
+          "dims": {},
+          "size": 1,
+          "n_valid": 1,
+          "min": -2147483647.0,
+          "max": -2147483647.0,
+          "mean": -2147483647.0,
+          "std": 0.0,
+          "values": -2147483647
+        },
+        "lat_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "nbounds": 2
+          },
+          "size": 360,
+          "n_valid": 360,
+          "min": -90.0,
+          "max": 90.0,
+          "mean": 0.0,
+          "std": 51.96312713623047
+        },
+        "lon_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "lon": 360,
+            "nbounds": 2
+          },
+          "size": 720,
+          "n_valid": 720,
+          "min": -180.0,
+          "max": 180.0,
+          "mean": 0.0,
+          "std": 103.9238510131836
+        },
+        "depth_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 102,
+            "nbounds": 2
+          },
+          "size": 204,
+          "n_valid": 204,
+          "min": 0.0,
+          "max": 5500.0,
+          "mean": 1738.2353515625,
+          "std": 1683.3563232421875
+        },
+        "climatology_bounds": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "nbounds": 2
+          },
+          "size": 2,
+          "n_valid": 2,
+          "min": 1704.0,
+          "max": 2064.0,
+          "mean": 1884.0,
+          "std": 180.0,
+          "values": [
+            [
+              1704.0,
+              2064.0
+            ]
+          ]
+        },
+        "t_an": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "long_name": "Objectively analyzed mean fields for sea_water_temperature at standard depth levels.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": -2.077009916305542,
+          "max": 30.500808715820312,
+          "mean": 6.1728739738464355,
+          "std": 7.680690765380859
+        },
+        "t_mn": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "long_name": "Average of all unflagged interpolated values at each standard depth level for sea_water_temperature in each grid-square which contain at least one measurement.",
+          "size": 6609600,
+          "n_valid": 2020784,
+          "min": -2.2410452365875244,
+          "max": 31.67462730407715,
+          "mean": 8.987020492553711,
+          "std": 8.577237129211426
+        },
+        "t_dd": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "The number of observations of sea_water_temperature in each grid-square at each standard depth level.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 36401.0,
+          "mean": 29.824448640094886,
+          "std": 188.98865036736552
+        },
+        "t_sd": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "long_name": "The standard deviation about the statistical mean of sea_water_temperature in each grid-square at each standard depth level.",
+          "size": 6609600,
+          "n_valid": 2017302,
+          "min": 0.0,
+          "max": 9.428028106689453,
+          "mean": 0.6098474860191345,
+          "std": 0.7772706151008606
+        },
+        "t_se": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "long_name": "The standard error about the statistical mean of sea_water_temperature in each grid-square at each standard depth level.",
+          "size": 6609600,
+          "n_valid": 2017302,
+          "min": 0.0,
+          "max": 4.117156982421875,
+          "mean": 0.1326480358839035,
+          "std": 0.18329523503780365
+        },
+        "t_oa": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "long_name": "statistical mean value minus the objectively analyzed mean value for sea_water_temperature.",
+          "size": 6609600,
+          "n_valid": 2020784,
+          "min": -8.321357727050781,
+          "max": 10.501709938049316,
+          "mean": 0.04334158077836037,
+          "std": 0.49735480546951294
+        },
+        "t_gp": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "The number of grid-squares within the smallest radius of influence around each grid-square which contain a statistical mean for sea_water_temperature.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 625.0,
+          "mean": 46.29727534863737,
+          "std": 45.79039684866543
+        },
+        "t_sdo": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "long_name": "Objectively analyzed standard deviation fields for sea_water_temperature at standard depth levels.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 8.505704879760742,
+          "mean": 0.44273895025253296,
+          "std": 0.6490656137466431
+        },
+        "t_sea": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "long_name": "The standard error about the objectively analyzed data of sea_water_temperature defined in Levitus et al. (2012) GRL.",
+          "size": 6609600,
+          "n_valid": 3293901,
+          "min": 0.0,
+          "max": 0.6470471024513245,
+          "mean": 0.003750709816813469,
+          "std": 0.004743935540318489
+        }
+      },
+      "an_name": "t_an",
+      "woa_an": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "degrees_celsius",
+        "long_name": "Objectively analyzed mean fields for sea_water_temperature at standard depth levels.",
+        "size": 64800,
+        "n_valid": 41088,
+        "min": -1.814810037612915,
+        "max": 30.500808715820312,
+        "mean": 13.847308158874512,
+        "std": 11.28067684173584
+      },
+      "woa_depth0": 0.0,
+      "woa_sst": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "degrees_celsius",
+        "long_name": "WOA23 1971-2000 annual objectively analysed temperature at 0 m",
+        "size": 64800,
+        "n_valid": 41088,
+        "min": -1.814810037612915,
+        "max": 30.500808715820312,
+        "mean": 13.847308158874512,
+        "std": 11.28067684173584
+      },
+      "woa_lat": {
+        "type": "ndarray",
+        "shape": [
+          180
+        ],
+        "size": 180,
+        "n_valid": 180,
+        "min": -89.5,
+        "max": 89.5,
+        "mean": 0.0,
+        "std": 51.96072234550504
+      },
+      "woa_lon": {
+        "type": "ndarray",
+        "shape": [
+          360
+        ],
+        "size": 360,
+        "n_valid": 360,
+        "min": -179.5,
+        "max": 179.5,
+        "mean": 0.0,
+        "std": 103.92264751567228
+      },
+      "NLAT": 180,
+      "NLON": 360,
+      "mask_file": "/data1/lorraine-20419/ocean_data/WOA23/masks/landsea_01.msk",
+      "fh": "<_io.TextIOWrapper name='/data1/lorraine-20419/ocean_data/WOA23/masks/landsea_01.msk' mode='r' encoding='UTF-8'>",
+      "tab": {
+        "type": "ndarray",
+        "shape": [
+          64800,
+          3
+        ],
+        "size": 194400,
+        "n_valid": 194400,
+        "min": -179.5,
+        "max": 179.5,
+        "mean": 17.376059670781892,
+        "std": 75.64193291645846
+      },
+      "lat_v": {
+        "type": "ndarray",
+        "shape": [
+          64800
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": -89.5,
+        "max": 89.5,
+        "mean": 0.0,
+        "std": 51.96072234550504
+      },
+      "lon_v": {
+        "type": "ndarray",
+        "shape": [
+          64800
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": -179.5,
+        "max": 179.5,
+        "mean": 0.0,
+        "std": 103.92264751567228
+      },
+      "m_v": {
+        "type": "ndarray",
+        "shape": [
+          64800
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 1.0,
+        "max": 138.0,
+        "mean": 52.128179012345676,
+        "std": 43.05470955174635
+      },
+      "li": {
+        "type": "ndarray",
+        "shape": [
+          64800
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 0.0,
+        "max": 179.0,
+        "mean": 89.5,
+        "std": 51.96072234550504
+      },
+      "oi": {
+        "type": "ndarray",
+        "shape": [
+          64800
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 0.0,
+        "max": 359.0,
+        "mean": 179.5,
+        "std": 103.92264751567228
+      },
+      "landsea": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 1.0,
+        "max": 138.0,
+        "mean": 52.128179012345676,
+        "std": 43.05470955174635
+      },
+      "woa_ocean": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "woa_global_mean_unweighted": 13.847285270690918,
+      "woa_valid_count": 41088,
+      "woa_ocean_count": 41088,
+      "cmip_root": "/data1/lorraine-20419/benchmark_cmip6/historical",
+      "models": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "coords_of": {
+        "CESM2": [
+          "lat",
+          "lon"
+        ],
+        "GFDL-ESM4": [
+          "lat",
+          "lon"
+        ],
+        "MPI-ESM1-2-LR": [
+          "latitude",
+          "longitude"
+        ]
+      },
+      "native_mean": {
+        "CESM2": 18.52111172074423,
+        "GFDL-ESM4": 18.13039361259682,
+        "MPI-ESM1-2-LR": 17.583928359021407
+      },
+      "native_area": {
+        "CESM2": 360511672773792.0,
+        "GFDL-ESM4": 361110931290015.25,
+        "MPI-ESM1-2-LR": 365975311658496.0
+      },
+      "model_area_total": {},
+      "n_months": {
+        "CESM2": 360,
+        "GFDL-ESM4": 360,
+        "MPI-ESM1-2-LR": 360
+      },
+      "variants": {
+        "CESM2": "r1i1p1f1",
+        "GFDL-ESM4": "r1i1p1f1",
+        "MPI-ESM1-2-LR": "r1i1p1f1"
+      },
+      "tos_clim_native": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "degrees_celsius",
+          "long_name": "Sea Surface Temperature",
+          "size": 122880,
+          "n_valid": 86096,
+          "min": -1.8939485549926758,
+          "max": 31.213672637939453,
+          "mean": 17.230894088745117,
+          "std": 11.4104585647583
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "long_name": "Sea Surface Temperature",
+          "size": 64800,
+          "n_valid": 44564,
+          "min": -1.9645538330078125,
+          "max": 30.704879760742188,
+          "mean": 13.518035888671875,
+          "std": 11.276988983154297
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "j": 220,
+            "i": 256
+          },
+          "units": "degrees_celsius",
+          "long_name": "Sea Surface Temperature",
+          "size": 56320,
+          "n_valid": 36791,
+          "min": -1.899933934211731,
+          "max": 30.81264877319336,
+          "mean": 9.782898902893066,
+          "std": 10.08261489868164
+        }
+      },
+      "regridded": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "size": 64800,
+          "n_valid": 37450,
+          "min": -1.8939485549926758,
+          "max": 31.186912668452212,
+          "mean": 14.44941241547333,
+          "std": 11.443567870618551
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "size": 64800,
+          "n_valid": 44564,
+          "min": -1.9645538330078125,
+          "max": 30.704879760742188,
+          "mean": 13.518034883860617,
+          "std": 11.27698841838889
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "size": 64800,
+          "n_valid": 26313,
+          "min": -1.899933934211731,
+          "max": 30.81264877319336,
+          "mean": 12.182493041289968,
+          "std": 10.5738355184996
+        }
+      },
+      "shared": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "mask_count": 21961,
+      "R_EARTH": 6371.0,
+      "cell_area_km2": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 107.89623558970831,
+        "max": 12363.683990261117,
+        "mean": 7871.365307249819,
+        "std": 3804.9664787184015
+      },
+      "mask_area_km2": 186347202.99692714,
+      "w2d": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 0.008726535498373897,
+        "max": 0.9999619230641713,
+        "mean": 0.6366278526673906,
+        "std": 0.3077417378389015
+      },
+      "sel": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "ww": {
+        "type": "ndarray",
+        "shape": [
+          21961
+        ],
+        "size": 21961,
+        "n_valid": 21961,
+        "min": 0.008726535498373897,
+        "max": 0.9999619230641713,
+        "mean": 0.6862878867630344,
+        "std": 0.2527705191512746
+      },
+      "ref_vals": {
+        "type": "ndarray",
+        "shape": [
+          21961
+        ],
+        "size": 21961,
+        "n_valid": 21961,
+        "min": -1.814810037612915,
+        "max": 29.525009155273438,
+        "mean": 12.999284502380096,
+        "std": 10.835481568548946
+      },
+      "sst_mean_model": {
+        "CESM2": 17.034494786503704,
+        "GFDL-ESM4": 16.69540032393107,
+        "MPI-ESM1-2-LR": 16.18622940761478
+      },
+      "sst_mean_woa": {
+        "CESM2": 16.73170571425721,
+        "GFDL-ESM4": 16.73170571425721,
+        "MPI-ESM1-2-LR": 16.73170571425721
+      },
+      "delta_sst": {
+        "CESM2": 0.3027890722464936,
+        "GFDL-ESM4": -0.03630539032613783,
+        "MPI-ESM1-2-LR": -0.5454763066424302
+      },
+      "rmse_sst": {
+        "CESM2": 1.1559093623031906,
+        "GFDL-ESM4": 0.8941704439826876,
+        "MPI-ESM1-2-LR": 1.4150058883085235
+      },
+      "corr_sst": {
+        "CESM2": 0.9942273930691151,
+        "GFDL-ESM4": 0.9961175403680227,
+        "MPI-ESM1-2-LR": 0.9919765110037658
+      },
+      "bias_maps": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "size": 64800,
+          "n_valid": 21961,
+          "min": -4.877942983467751,
+          "max": 8.614196749847881,
+          "mean": 0.1856607045716175,
+          "std": 1.1419483835651654
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "size": 64800,
+          "n_valid": 21961,
+          "min": -4.410522699356079,
+          "max": 7.391576766967773,
+          "mean": -0.022133424097731974,
+          "std": 0.9045019417461836
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degrees_celsius",
+          "size": 64800,
+          "n_valid": 21961,
+          "min": -7.448786117593631,
+          "max": 7.677845001220703,
+          "mean": -0.3929048820286291,
+          "std": 1.3430110444625167
+        }
+      },
+      "woa_sst_shared": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "degrees_celsius",
+        "long_name": "WOA23 1971-2000 annual objectively analysed temperature at 0 m",
+        "size": 64800,
+        "n_valid": 21961,
+        "min": -1.814810037612915,
+        "max": 29.525009155273438,
+        "mean": 12.999283790588379,
+        "std": 10.835481643676758
+      },
+      "ranking": [
+        "GFDL-ESM4",
+        "CESM2",
+        "MPI-ESM1-2-LR"
+      ],
+      "summary": "                variant  n_months_1971_2000  ...  RMSE_C  spatial_r\nCESM2          r1i1p1f1                 360  ...   1.156      0.994\nGFDL-ESM4      r1i1p1f1                 360  ...   0.894      0.996\nMPI-ESM1-2-LR  r1i1p1f1                 360  ...   1.415      0.992\n\n[3 rows x 9 columns]"
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_no_tools_20261022/T3_deepseek-flash_20261025_073407/turn01/figures/visualization_T3_deepseek-flash_20261025_073407_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_no_tools_20261022/T3_deepseek-flash_20261025_073407/turn01/figures/visualization_T3_deepseek-flash_20261025_073407_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Please provide a clear scientific summary inside <solution></solution> tags.
+
+Describe the methodology strictly from the <executed_code> above, never by inferring it from variable
+names: the baseline period, the source of any climatology, the weighting, the units, the region and
+time range, the range of lags — all of it must match the functions and arguments the code actually
+called. Do not report a step the code did not take. Where a variable name in the observation is
+ambiguous, the code decides what it means.
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
+4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, computation and visualization attempts
+3. Suggestions for how to reformulate the query
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+
+## 1. Direct answer
+
+All three CMIP6 historical 1971–2000 SST climatologies reproduce the large-scale WOA23 pattern almost perfectly (spatial r ≥ 0.99), but they differ in their globally averaged offset. On the shared 1° comparison mask, CESM2 is warm (+0.30 °C), GFDL‑ESM4 is nearly unbiased (−0.04 °C), and MPI‑ESM1‑2‑LR is cold (−0.55 °C). Ranked from smallest to largest absolute bias: **GFDL‑ESM4 (0.04 °C) < CESM2 (0.30 °C) < MPI‑ESM1‑2‑LR (0.55 °C)**. RMSE follows the same ordering (0.894, 1.156, 1.415 °C), so GFDL‑ESM4 is the best of the three both in the mean and in the pointwise sense, and MPI‑ESM1‑2‑LR the worst.
+
+## 2. Methodology exactly as executed
+
+**WOA23 reference.** Opened `woa23_decav71A0_t00_01.nc` with `decode_times=False`, took the objectively analysed field `t_an` (the only variable ending in `_an`), the single annual time slice (`isel(time=0)`) and the 0 m level (`isel(depth=0)`), verified `depth = 0.0 m`. That field is the 1971–2000 annual climate normal on the 1° grid (180 × 360, lon −179.5…179.5, lat −89.5…89.5). A `|t| < 1e10` guard removed undecoded fills. The land–sea mask was read from the text file `landsea_01.msk` (64800 rows, columns lat, lon, value), binned to the 1° grid by nearest-index rounding, and ocean defined as `landsea > 1`. The requested **WOA23 global mean is the plain unweighted arithmetic mean of all non‑missing 0 m cells** (41088 valid cells; the `landsea > 1` count also equals 41088).
+
+**CMIP6 model data.** `tos` and the Ofx `areacello` were opened for CESM2, GFDL‑ESM1‑2‑LR — i.e. CESM2, GFDL‑ESM4 and MPI‑ESM1‑2‑LR — all `r1i1p1f1` (variant parsed from the filenames, not assumed). Monthly data were restricted to years 1971–2000 (360 months for every model, confirmed), masked with `|tos| < 1e19`, and reduced to a cell-wise time mean (`mean(dim='time', skipna=True)`). Each model's global mean is the area-weighted sum Σ(tos·areacello)/Σ(areacello) over cells where both `tos` and `areacello` are finite and positive — each model on its own native grid with its own published cell areas, no rescaling between models. Units °C throughout.
+
+**Regridding.** Conservative first-order donor-cell remapping onto the WOA23 1° grid: every native cell centre is binned into the 1° target cell containing it and donates its full `value × areacello`; the target value is the area-weighted mean of its donors. Nothing else was regridded — the native-grid means were computed before, and independently of, this step.
+
+**Comparison mask.** On the 1° grid: `landsea > 1` AND valid `woa_sst` AND valid regridded fields of all three models → **21 961 cells, 186.35 × 10⁶ km²**. All fields were `.where(mask)`-ed before any metric.
+
+**Metrics.** Area weighting proportional to cos(latitude) for the shared-mask statistics: mean model SST, mean WOA23 over the *same* cells, ΔSST = mean(model) − mean(WOA23), RMSE = sqrt(Σw·d²/Σw), and weighted Pearson r about the weighted means.
+
+## 3. Key numerical results
+
+| Quantity | CESM2 | GFDL‑ESM4 | MPI‑ESM1‑2‑LR | WOA23 |
+|---|---|---|---|---|
+| Native-grid area-weighted global mean (°C) | **18.52** | **18.13** | **17.58** | — |
+| Native ocean area Σ`areacello` (10¹² m²) | 3.6051 | 3.6111 | 3.6598 | — |
+| Whole-1°-grid unweighted mean (°C) | — | — | — | **13.85** |
+| Shared-mask mean model SST (°C) | 17.03 | 16.70 | 16.19 | — |
+| Shared-mask mean WOA23 SST (°C) | 16.73 | 16.73 | 16.73 | 16.73 |
+| ΔSST model − WOA23 (°C) | **+0.30** | **−0.04** | **−0.55** | — |
+| Area-weighted RMSE (°C) | **1.156** | **0.894** | **1.415** | — |
+| Area-weighted spatial r | **0.994** | **0.996** | **0.992** | — |
+| Bias-field min / max (°C) | −4.88 / +8.61 | −4.41 / +7.39 | −7.45 / +7.68 |
+| Bias-field std over mask (°C) | 1.14 | 0.90 | 1.34 |
+
+Ranking by |ΔSST| (unrounded): GFDL‑ESM4 (0.036) < CESM2 (0.303) < MPI‑ESM1‑2‑LR (0.545).
+
+Two numbers deserve emphasis. First, the WOA23 bar (13.85 °C) is a *different quantity* from the shared-mask WOA23 mean (16.73 °C): the former is the unweighted mean over the full 1° grid including all valid ocean cells, the latter is a cos(lat)-weighted mean over the 21 961 cells where all four products are simultaneously valid; the four bars in Figure 2 are therefore not strictly comparable. Second, the native-grid model means (18.52, 18.13, 17.58 °C) are much warmer than the shared-mask means (17.03, 16.70, 16.19 °C), because the native means cover each model's own full ocean (including high-latitude ocean weighted by genuine cell area) whereas the shared mask is restricted to cells where even the sparsest product (MPI, 26 313 valid regridded cells) is defined. This is exactly the native-grid-vs-regridded discrepancy the plan warns about, and the two must not be expected to agree.
+
+## 4. Interpretation
+
+The models capture the spatial pattern of SST essentially perfectly (r = 0.992–0.996), so the ranking is governed by the mean offset and by regionally concentrated errors. GFDL‑ESM4 has both the smallest global offset (−0.04 °C) and the smallest dispersion of bias (std 0.90 °C, RMSE 0.894 °C), i.e. a nearly unbiased field with modest regional structure. CESM2 is warm on average by 0.30 °C with larger excursions (std 1.14, RMSE 1.156). MPI‑ESM1‑2‑LR is cold by 0.55 °C and has by far the widest bias range (−7.45 to +7.68 °C, std 1.34, RMSE 1.415); its poor RMSE despite a modest mean bias is a signature of compensating regional errors, not of a uniform cold offset. The three-model spread of ~0.85 °C in the shared-mask bias is comparable to the inter-model spread one expects from a single historical member, and the common-mask restriction (21 961 of ~41 000 WOA ocean cells, 186 × 10⁶ km²) reflects disagreement about where the ocean is at the sea-ice margins and around coastlines as much as it reflects model skill.
+
+## 5. Figures produced
+
+**Figure 1** is a 2 × 2 pcolormesh panel on the WOA23 1° grid, all four panels using the same lat/lon axes and the same shared comparison mask. The three panels CESM2, GFDL‑ESM4 and MPI‑ESM1‑2‑LR show (model − WOA23) computed from the conservatively regridded climatologies, drawn with the diverging `RdBu_r` colormap on a symmetric scale ±v_max where v_max is the pooled 98th percentile of |bias| over the three models (annotated in the suptitle), so that colours are directly comparable between models and the sign is read off the zero-centred scale; each panel title also carries that model's ΔSST, RMSE and r. The fourth panel shows the WOA23 0 m 1971–2000 SST on the same cells with the sequential `viridis` colormap, limited to its 2nd–98th percentiles, as the reference field. Every panel is labelled with longitude/latitude and every colour bar carries a °C unit label ("SST bias (degC)" and "SST (degC)") and triangular `extend` ends. The suptitle records the v_max clipping and the mask cell count.
+
+**Figure 2** is a bar chart of four numbers, one per product, each bar annotated with its value to 2 decimal places and the y axis labelled in °C: the three native-grid, own-`areacello`-weighted model means and the WOA23 whole-1°-grid unweighted mean. A caption note states explicitly that the model bars are area-weighted over each native ocean grid while the WOA23 bar is the unweighted whole-grid mean, so the four bars represent slightly different quantities.
+
+Describing the spatial structure seen in Figure 1: the bias is not a uniform offset but has a clear latitudinal/regional organisation. The largest amplitudes are positive and occur in the high-latitude Southern Ocean and Arctic/sea-ice-margin cells (up to about +7.7 to +8.6 °C in CESM2 and MPI), where the models' bulk top-cell `tos` reports near-freezing under-ice water while WOA23's 0 m analysis differs in its sea-ice treatment, and in eastern-boundary upwelling regions. Strong negative biases (down to −4.4 to −7.4 °C) appear in the same high-latitude and western-boundary/current-extension zones. The tropical and subtropical open ocean, which dominates the area and hence the mean, is reproduced within a few tenths of a degree by all three models — that is why r is so high and the global ΔSST so small compared with the local extremes. MPI's bias field is the noisiest and most sign-alternating at high latitudes, consistent with its larger std and RMSE.
+
+## 6. Caveats from the executed analysis
+
+- `tos` is bulk top-cell temperature (CESM2 0–10 m, GFDL‑ESM4 0–2 m, MPI‑ESM1‑2‑LR 0–12 m), not skin SST, so the comparison with a 0 m WOA23 analysis is not strictly like-for-like; sea-ice-covered cells are not missing in `tos` and carry near-freezing values.
+- GFDL‑ESM4's "native" `tos` is on the `gr` 1° archive grid with the regridded land–sea mask, so its native-grid number is an archive-grid number.
+- A single `r1i1p1f1` historical member cannot separate forced response from internal variability, and a model year is not expected to match the observed year; the 1971–2000 climatology bias carries that caveat.
+- The native-grid means and the shared-mask/regridded means are different quantities by construction; only the latter enter the bias, RMSE and correlation statistics and Figure 1.
+
+</solution>

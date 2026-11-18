@@ -1,0 +1,1408 @@
+{
+  "session_id": "T8_deepseek-flash_20261022_175254",
+  "total_turns": 1,
+  "max_turns": 10,
+  "history": [
+    {
+      "session_id": "T8_deepseek-flash_20261022_175254",
+      "user_query": "Evaluate the ocean carbon system of three CMIP6 models against the GLODAPv2.2016b mapped climatology: dissolved inorganic carbon, total alkalinity and pH.\n\nData to use:\n- CMIP6 historical `dissic`, `talk`, `ph`, `thetao` and `so` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, for the calendar year 2002, plus `dissic`, `thetao` and `so` for 1971-2000.\n- Each model's own areacello and volcello.\n- GLODAPv2.2016b mapped climatology: TCO2, TAlk and pH.\n\nExpected numerical results, with the models taken as their 2002 annual mean unless stated otherwise, and model DIC and alkalinity compared in micromoles per kilogram:\n- The global mean over 0-50 m of DIC and of total alkalinity for each model and for GLODAP (for every source one mean over all its 0-50 m cells), in micromoles per kilogram to the nearest whole unit, and each model's difference from GLODAP.\n- The same 0-50 m mean for pH on the total scale, to 3 decimal places, and each model's difference from GLODAP.\n- For the map of 0-50 m mean DIC (each cell's mean over its own 0-50 m levels), compared on the GLODAP 1-degree grid: each model's mean bias and RMSE in micromoles per kilogram to the nearest whole unit, and the spatial correlation to 3 decimal places.\n- For each model, the global mean DIC bias (model minus GLODAP) at 0, 100, 500, 1000 and 2000 m, compared on the GLODAP 1-degree grid and averaged, at each depth, over every cell where that model and GLODAP are both defined at that depth, in micromoles per kilogram to the nearest whole unit.\n- For each model, the period change of the global 0-50 m mean DIC, 2002 minus the 1971-2000 average, in micromoles per kilogram to the nearest whole unit, and its ratio to that model's 0-50 m DIC difference from GLODAP as defined in the first item to 2 decimal places, with what that implies for reading the bias as a model error.\n- Which model reproduces the observed carbon system best, and whether the three models' errors in DIC, alkalinity and pH are consistent in sign.\n\nExpected visualizations:\n- Figure 1, three global maps in one row, one per model, of the 0-50 m DIC bias against GLODAP on the cells of the map comparison, with one diverging colour scale centred on zero shared by all three panels and labelled in micromoles per kilogram.\n- Figure 2, a single panel of the vertical profile of the global mean DIC bias: depth on the vertical axis increasing downward, bias in micromoles per kilogram on the horizontal axis, one line per model, a vertical zero reference line, and the five sampled depths marked.",
+      "language": "en",
+      "turn_number": 1,
+      "bundle_path": "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T8_deepseek-flash_20261022_175254/turn01",
+      "selected_tools": [],
+      "knowledge": null,
+      "generated_code": "<compute>\nimport os\nimport glob\nimport warnings\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\nfrom scipy.spatial import cKDTree\n\nwarnings.filterwarnings(\"ignore\")\n\nHIST_ROOT = \"/data1/lorraine-20419/benchmark_cmip6/historical\"\nGLODAP_ROOT = \"/data1/lorraine-20419/ocean_data/GLODAPv2.2016b_MappedClimatologies\"\n\nMODELS = {\n    \"CESM2\": dict(\n        y_dim=\"nlat\", x_dim=\"nlon\", lat=\"lat\", lon=\"lon\",\n        depth_dim=\"lev\", depth_scale=0.01, grid=\"curvilinear\",\n    ),\n    \"GFDL-ESM4\": dict(\n        y_dim=\"lat\", x_dim=\"lon\", lat=\"lat\", lon=\"lon\",\n        depth_dim=\"lev\", depth_scale=1.0, grid=\"regular\",\n    ),\n    \"MPI-ESM1-2-LR\": dict(\n        y_dim=\"j\", x_dim=\"i\", lat=\"latitude\", lon=\"longitude\",\n        depth_dim=\"lev\", depth_scale=1.0, grid=\"curvilinear\",\n    ),\n}\n\nprofile_depths = [0, 100, 500, 1000, 2000]\n\n\n# ---------------------------------------------------------------------------\n# small helpers\n# ---------------------------------------------------------------------------\n\ndef _find_nc_files(model, var, root=HIST_ROOT):\n    files = sorted(glob.glob(os.path.join(root, model, var, \"*.nc\")))\n    if not files:\n        files = sorted(glob.glob(os.path.join(root, model, \"**\", f\"{var}*.nc\"), recursive=True))\n    if not files:\n        raise FileNotFoundError(f\"No files for {model} / {var}\")\n    return files\n\n\ndef open_cmip(model, var, root=HIST_ROOT):\n    files = _find_nc_files(model, var, root=root)\n    with xr.open_dataset(files[0], use_cftime=True, decode_times=True) as tmp:\n        has_time = \"time\" in tmp.dims\n    chunks = {\"time\": 12} if has_time else {}\n    if len(files) == 1:\n        return xr.open_dataset(\n            files[0], use_cftime=True, decode_times=True, chunks=chunks\n        )\n    return xr.open_mfdataset(\n        files, combine=\"by_coords\", use_cftime=True, decode_times=True,\n        chunks=chunks,\n    )\n\n\ndef _select_time(da, year=None, period=None):\n    if \"time\" not in da.dims:\n        return da\n    yrs = np.asarray(da.time.dt.year.values)\n    if year is not None:\n        idx = np.where(yrs == year)[0]\n    elif period is not None:\n        idx = np.where((yrs >= period[0]) & (yrs <= period[1]))[0]\n    else:\n        return da\n    return da.isel(time=idx)\n\n\ndef mean_field(da, year=None, period=None):\n    if \"time\" in da.dims:\n        da = _select_time(da, year=year, period=period)\n        da = da.mean(\"time\")\n    return da\n\n\ndef to_numpy_3d(da, depth_dim):\n    dims = list(da.dims)\n    if depth_dim not in dims:\n        raise ValueError(f\"Depth dimension {depth_dim!r} not in {dims}\")\n    other = [d for d in dims if d != depth_dim]\n    da = da.transpose(depth_dim, *other)\n    return np.asarray(da.values, dtype=float)\n\n\ndef get_depth_m(ds, cfg):\n    lev = ds[cfg[\"depth_dim\"]]\n    vals = np.asarray(lev.values, dtype=float)\n    units = str(lev.attrs.get(\"units\", \"\")).lower()\n    scale = cfg[\"depth_scale\"]\n    if \"cm\" in units:\n        scale = 0.01\n    elif units in (\"m\", \"meter\", \"meters\", \"metre\", \"metres\"):\n        scale = 1.0\n    return vals * scale\n\n\ndef get_lat_lon_2d(ds, cfg):\n    lat = ds[cfg[\"lat\"]]\n    lon = ds[cfg[\"lon\"]]\n    if lat.ndim == 2:\n        lat2d = np.asarray(lat.values, dtype=float)\n        lon2d = np.asarray(lon.values, dtype=float)\n    else:\n        lat2d, lon2d = np.meshgrid(\n            np.asarray(lat.values, dtype=float),\n            np.asarray(lon.values, dtype=float),\n            indexing=\"ij\",\n        )\n    return lat2d, lon2d % 360.0\n\n\ndef get_area(model, cfg):\n    ds = open_cmip(model, \"areacello\")\n    da = ds[\"areacello\"]\n    if \"time\" in da.dims:\n        da = da.mean(\"time\")\n    y, x = cfg[\"y_dim\"], cfg[\"x_dim\"]\n    if y in da.dims and x in da.dims:\n        da = da.transpose(y, x)\n    else:\n        da = da.transpose(da.dims[-2], da.dims[-1])\n    area = np.asarray(da.values, dtype=float)\n    ds.close()\n    return area\n\n\ndef get_volcello(model, cfg, year=None, period=None):\n    ds = open_cmip(model, \"volcello\")\n    da = ds[\"volcello\"]\n    if \"time\" in da.dims:\n        if year is not None:\n            da = _select_time(da, year=year)\n        elif period is not None:\n            da = _select_time(da, period=period)\n        da = da.mean(\"time\")\n    out = to_numpy_3d(da, cfg[\"depth_dim\"])\n    ds.close()\n    return out\n\n\n# ---------------------------------------------------------------------------\n# EOS-80 in-situ density, pressure in bars\n# ---------------------------------------------------------------------------\n\ndef rho_eos80(temp, salt, depth_m):\n    T = np.asarray(temp, dtype=float) * 1.00024\n    S = np.asarray(salt, dtype=float)\n    p = np.asarray(depth_m, dtype=float)\n    if p.ndim == 1:\n        p = p.reshape((-1,) + (1,) * (T.ndim - 1))\n    p = p / 10.0  # m -> dbar -> bar\n\n    rho_w = (\n        999.842594\n        + 6.793952e-2 * T\n        - 9.095290e-3 * T**2\n        + 1.001685e-4 * T**3\n        - 1.120083e-6 * T**4\n        + 6.536332e-9 * T**5\n    )\n    A = (\n        0.824493\n        - 4.0899e-3 * T\n        + 7.6438e-5 * T**2\n        - 8.2467e-7 * T**3\n        + 5.3875e-9 * T**4\n    )\n    B = -5.72466e-3 + 1.0227e-4 * T - 1.6546e-6 * T**2\n    C = 4.8314e-4\n    rho0 = rho_w + A * S + B * S**1.5 + C * S**2\n\n    Kw = (\n        19652.21\n        + 148.4206 * T\n        - 2.327105 * T**2\n        + 1.360477e-2 * T**3\n        - 5.155288e-5 * T**4\n    )\n    K0 = (\n        Kw\n        + S * (54.6746 - 0.603459 * T + 1.09987e-2 * T**2 - 6.1670e-5 * T**3)\n        + S**1.5 * (7.944e-2 + 1.6483e-2 * T - 5.3009e-4 * T**2)\n    )\n    K = (\n        K0\n        + p * (3.239908 + 1.43713e-3 * T + 1.16092e-4 * T**2 - 5.77905e-7 * T**3)\n        + p * S * (2.209460e-3 - 2.205960e-3 * T - 2.181160e-3 * T**2)\n        + p * S**1.5 * (-3.01700e-4 + 3.58170e-5 * T)\n        + p**2 * (8.50935e-5 - 6.12293e-6 * T + 5.2787e-8 * T**2)\n        + p**2 * S * (-9.9348e-7 + 2.0816e-8 * T + 9.1697e-10 * T**2)\n    )\n    return rho0 / (1.0 - p / K)\n\n\ndef carbon_to_umolkg(carbon, temp, salt, depth_m, units):\n    c = np.asarray(carbon, dtype=float)\n    u = str(units).lower().replace(\" \", \"\")\n    if \"umol\" in u or \"micromol\" in u:\n        return c\n    if \"molkg-1\" in u and \"m-3\" not in u:\n        return c * 1e6\n    # CMIP6 standard: mol m-3 -> umol kg-1\n    rho = rho_eos80(temp, salt, depth_m)\n    return c * 1e6 / rho\n\n\n# ---------------------------------------------------------------------------\n# weighting / averaging / regridding\n# ---------------------------------------------------------------------------\n\ndef weighted_cell_mean(field, weights):\n    field = np.asarray(field, dtype=float)\n    weights = np.broadcast_to(np.asarray(weights, dtype=float), field.shape)\n    valid = np.isfinite(field) & np.isfinite(weights) & (weights > 0)\n    num = np.nansum(np.where(valid, field * weights, 0.0), axis=0)\n    den = np.nansum(np.where(valid, weights, 0.0), axis=0)\n    out = np.full(num.shape, np.nan)\n    good = den > 0\n    out[good] = num[good] / den[good]\n    return out\n\n\ndef volume_global_mean(field, weights):\n    field = np.asarray(field, dtype=float)\n    weights = np.broadcast_to(np.asarray(weights, dtype=float), field.shape)\n    valid = np.isfinite(field) & np.isfinite(weights) & (weights > 0)\n    if not np.any(valid):\n        return np.nan\n    return np.nansum(field[valid] * weights[valid]) / np.nansum(weights[valid])\n\n\ndef area_weighted_mean(field2d, area2d):\n    field2d = np.asarray(field2d, dtype=float)\n    area2d = np.asarray(area2d, dtype=float)\n    valid = np.isfinite(field2d) & np.isfinite(area2d)\n    if not np.any(valid):\n        return np.nan\n    return np.nansum(field2d[valid] * area2d[valid]) / np.nansum(area2d[valid])\n\n\ndef layer_thickness(depth, max_depth=50.0):\n    d = np.asarray(depth, dtype=float)\n    order = np.argsort(d)\n    ds = d[order]\n    n = len(ds)\n    bounds = np.empty(n + 1, dtype=float)\n    if n == 1:\n        bounds[:] = [0.0, ds[0]]\n    else:\n        bounds[0] = max(0.0, ds[0] - 0.5 * (ds[1] - ds[0]))\n        bounds[1:-1] = 0.5 * (ds[:-1] + ds[1:])\n        bounds[-1] = ds[-1] + 0.5 * (ds[-1] - ds[-2])\n    upper = np.maximum(bounds[:-1], 0.0)\n    lower = np.minimum(bounds[1:], max_depth)\n    thick = np.maximum(0.0, lower - upper)\n    out = np.empty(n, dtype=float)\n    out[order] = thick\n    return out\n\n\ndef _latlon_xyz(lat, lon):\n    lat = np.deg2rad(np.asarray(lat, dtype=float))\n    lon = np.deg2rad(np.asarray(lon, dtype=float) % 360.0)\n    return np.stack(\n        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)],\n        axis=-1,\n    )\n\n\ndef regrid_nearest(src_field, src_lat, src_lon, tgt_lat, tgt_lon, tgt_valid=None):\n    src_field = np.asarray(src_field, dtype=float)\n    src_lat = np.asarray(src_lat, dtype=float)\n    src_lon = np.asarray(src_lon, dtype=float)\n    valid_src = (\n        np.isfinite(src_field)\n        & np.isfinite(src_lat)\n        & np.isfinite(src_lon)\n    )\n    src_vals = src_field[valid_src]\n    out = np.full(np.asarray(tgt_lat).shape, np.nan)\n\n    if src_vals.size == 0:\n        return out\n\n    src_xyz = _latlon_xyz(src_lat[valid_src], src_lon[valid_src])\n    tree = cKDTree(src_xyz)\n\n    tgt_lat = np.asarray(tgt_lat, dtype=float)\n    tgt_lon = np.asarray(tgt_lon, dtype=float)\n    if tgt_valid is None:\n        use = np.ones(tgt_lat.shape, dtype=bool)\n    else:\n        use = np.asarray(tgt_valid, dtype=bool)\n    use = use & np.isfinite(tgt_lat) & np.isfinite(tgt_lon)\n\n    q = _latlon_xyz(tgt_lat[use], tgt_lon[use])\n    _, idx = tree.query(q, k=1)\n    out[use] = src_vals[idx]\n    return out\n\n\ndef interp_to_depth(field3d, depth, target_depth):\n    field3d = np.asarray(field3d, dtype=float)\n    depth = np.asarray(depth, dtype=float)\n    order = np.argsort(depth)\n    depth = depth[order]\n    field3d = field3d[order]\n\n    out = np.full(field3d.shape[1:], np.nan)\n    if target_depth <= depth[0]:\n        return field3d[0].copy()\n    if target_depth > depth[-1]:\n        return out\n\n    i = np.searchsorted(depth, target_depth) - 1\n    i = int(np.clip(i, 0, len(depth) - 2))\n    d0, d1 = depth[i], depth[i + 1]\n    w = (target_depth - d0) / (d1 - d0)\n    return field3d[i] * (1.0 - w) + field3d[i + 1] * w\n\n\n# ---------------------------------------------------------------------------\n# GLODAP reader\n# ---------------------------------------------------------------------------\n\ndef _find_dim(ds, candidates):\n    for name in candidates:\n        if name in ds.dims or name in ds.coords:\n            return name\n    for d in list(ds.dims):\n        if any(c in d.lower() for c in candidates):\n            return d\n    return None\n\n\ndef open_glodap(varfile, varname):\n    path = os.path.join(GLODAP_ROOT, f\"GLODAPv2.2016b.{varfile}.nc\")\n    ds = xr.open_dataset(path)\n    da = ds[varname]\n\n    lat_name = _find_dim(ds, [\"lat\", \"latitude\"])\n    lon_name = _find_dim(ds, [\"lon\", \"longitude\"])\n    depth_name = _find_dim(ds, [\"depth_surface\", \"depth\"])\n\n    if depth_name is None:\n        depth_name = [d for d in da.dims if \"depth\" in d.lower()][0]\n    if lat_name is None:\n        lat_name = [d for d in da.dims if \"lat\" in d.lower()][0]\n    if lon_name is None:\n        lon_name = [d for d in da.dims if \"lon\" in d.lower()][0]\n\n    if \"Depth\" in ds:\n        depth = np.asarray(ds[\"Depth\"].values, dtype=float)\n    else:\n        depth = np.asarray(ds[depth_name].values, dtype=float)\n    lat = np.asarray(ds[lat_name].values, dtype=float)\n    lon = np.asarray(ds[lon_name].values, dtype=float) % 360.0\n\n    rename = {}\n    if depth_name in da.dims and depth_name != \"depth\":\n        rename[depth_name] = \"depth\"\n    if lat_name in da.dims and lat_name != \"lat\":\n        rename[lat_name] = \"lat\"\n    if lon_name in da.dims and lon_name != \"lon\":\n        rename[lon_name] = \"lon\"\n    if rename:\n        da = da.rename(rename)\n\n    da = da.assign_coords(\n        depth=(\"depth\", depth),\n        lat=(\"lat\", lat),\n        lon=(\"lon\", lon),\n    )\n    da = da.sortby(\"depth\").sortby(\"lat\").sortby(\"lon\")\n    da = da.transpose(\"depth\", \"lat\", \"lon\")\n    ds.close()\n    return da\n\n\nglodap_dic_da = open_glodap(\"TCO2\", \"TCO2\")\nglodap_talk_da = open_glodap(\"TAlk\", \"TAlk\")\nglodap_ph_da = open_glodap(\"pHtsinsitutp\", \"pHtsinsitutp\")\n\nglodap_depth = np.asarray(glodap_dic_da[\"depth\"].values, dtype=float)\nglodap_lat = np.asarray(glodap_dic_da[\"lat\"].values, dtype=float)\nglodap_lon = np.asarray(glodap_dic_da[\"lon\"].values, dtype=float)\n\nglodap_dic = np.asarray(glodap_dic_da.values, dtype=float)\nglodap_talk = np.asarray(glodap_talk_da.reindex_like(glodap_dic_da).values, dtype=float)\nglodap_ph = np.asarray(glodap_ph_da.reindex_like(glodap_dic_da).values, dtype=float)\n\nglodap_thick_full = layer_thickness(glodap_depth, max_depth=50.0)\nlev_g50 = glodap_depth <= 50.0\n\nglodap_dic_50 = glodap_dic[lev_g50]\nglodap_talk_50 = glodap_talk[lev_g50]\nglodap_ph_50 = glodap_ph[lev_g50]\nglodap_thick_50 = glodap_thick_full[lev_g50]\n\nglodap_dic_map = weighted_cell_mean(glodap_dic_50, glodap_thick_50[:, None, None])\nglodap_talk_map = weighted_cell_mean(glodap_talk_50, glodap_thick_50[:, None, None])\nglodap_ph_map = weighted_cell_mean(glodap_ph_50, glodap_thick_50[:, None, None])\n\nglodap_area = (\n    np.cos(np.deg2rad(glodap_lat))[:, None]\n    * np.ones((1, len(glodap_lon)), dtype=float)\n)\nglodap_vol_50 = glodap_area[None, :, :] * glodap_thick_50[:, None, None]\n\nglodap_dic_global = volume_global_mean(glodap_dic_50, glodap_vol_50)\nglodap_talk_global = volume_global_mean(glodap_talk_50, glodap_vol_50)\nglodap_ph_global = volume_global_mean(glodap_ph_50, glodap_vol_50)\n\nglodap_lat2d, glodap_lon2d = np.meshgrid(\n    glodap_lat, glodap_lon, indexing=\"ij\"\n)\nglodap_valid_map = np.isfinite(glodap_dic_map)\n\n\n# ---------------------------------------------------------------------------\n# process each CMIP6 model\n# ---------------------------------------------------------------------------\n\ndef process_model(model):\n    cfg = MODELS[model]\n\n    ds_d = open_cmip(model, \"dissic\")\n    ds_t = open_cmip(model, \"talk\")\n    ds_p = open_cmip(model, \"ph\")\n    ds_th = open_cmip(model, \"thetao\")\n    ds_s = open_cmip(model, \"so\")\n\n    depth_m_raw = get_depth_m(ds_d, cfg)\n    order = np.argsort(depth_m_raw)\n    depth_m = depth_m_raw[order]\n\n    lat2d, lon2d = get_lat_lon_2d(ds_d, cfg)\n    area = get_area(model, cfg)\n    if area.shape != lat2d.shape:\n        area = area.T\n\n    def get_3d(da, year=None, period=None):\n        return to_numpy_3d(\n            mean_field(da, year=year, period=period),\n            cfg[\"depth_dim\"],\n        )[order]\n\n    dissic_2002 = get_3d(ds_d[\"dissic\"], year=2002)\n    talk_2002 = get_3d(ds_t[\"talk\"], year=2002)\n    ph_2002 = get_3d(ds_p[\"ph\"], year=2002)\n    theta_2002 = get_3d(ds_th[\"thetao\"], year=2002)\n    so_2002 = get_3d(ds_s[\"so\"], year=2002)\n\n    dissic_period = get_3d(ds_d[\"dissic\"], period=(1971, 2000))\n    theta_period = get_3d(ds_th[\"thetao\"], period=(1971, 2000))\n    so_period = get_3d(ds_s[\"so\"], period=(1971, 2000))\n\n    dic_units = ds_d[\"dissic\"].attrs.get(\"units\", \"\")\n    talk_units = ds_t[\"talk\"].attrs.get(\"units\", \"\")\n\n    dic_2002_umol = carbon_to_umolkg(\n        dissic_2002, theta_2002, so_2002, depth_m[:, None, None], dic_units\n    )\n    talk_2002_umol = carbon_to_umolkg(\n        talk_2002, theta_2002, so_2002, depth_m[:, None, None], talk_units\n    )\n    dic_period_umol = carbon_to_umolkg(\n        dissic_period, theta_period, so_period, depth_m[:, None, None], dic_units\n    )\n\n    vol_2002 = get_volcello(model, cfg, year=2002)[order]\n    vol_period = get_volcello(model, cfg, period=(1971, 2000))[order]\n\n    lev50 = depth_m <= 50.0\n\n    dic_map = weighted_cell_mean(dic_2002_umol[lev50], vol_2002[lev50])\n    talk_map = weighted_cell_mean(talk_2002_umol[lev50], vol_2002[lev50])\n    ph_map = weighted_cell_mean(ph_2002[lev50], vol_2002[lev50])\n\n    dic_global = volume_global_mean(dic_2002_umol[lev50], vol_2002[lev50])\n    talk_global = volume_global_mean(talk_2002_umol[lev50], vol_2002[lev50])\n    ph_global = volume_global_mean(ph_2002[lev50], vol_2002[lev50])\n\n    dic_global_map = area_weighted_mean(dic_map, area)\n    talk_global_map = area_weighted_mean(talk_map, area)\n    ph_global_map = area_weighted_mean(ph_map, area)\n\n    dic_period_global = volume_global_mean(\n        dic_period_umol[lev50], vol_period[lev50]\n    )\n    dic_period_map = weighted_cell_mean(\n        dic_period_umol[lev50], vol_period[lev50]\n    )\n    dic_period_global_map = area_weighted_mean(dic_period_map, area)\n\n    for ds in (ds_d, ds_t, ds_p, ds_th, ds_s):\n        ds.close()\n\n    return dict(\n        depth_m=depth_m,\n        lat2d=lat2d,\n        lon2d=lon2d,\n        area=area,\n        dic_2002_umol=dic_2002_umol,\n        talk_2002_umol=talk_2002_umol,\n        ph_2002=ph_2002,\n        dic_period_umol=dic_period_umol,\n        vol_2002=vol_2002,\n        vol_period=vol_period,\n        dic_map=dic_map,\n        talk_map=talk_map,\n        ph_map=ph_map,\n        dic_global=dic_global,\n        talk_global=talk_global,\n        ph_global=ph_global,\n        dic_global_map=dic_global_map,\n        talk_global_map=talk_global_map,\n        ph_global_map=ph_global_map,\n        dic_period_global=dic_period_global,\n        dic_period_global_map=dic_period_global_map,\n    )\n\n\nmodel_results = {m: process_model(m) for m in MODELS}\n\nfor m in MODELS:\n    model_results[m][\"dic_bias_global\"] = (\n        model_results[m][\"dic_global\"] - glodap_dic_global\n    )\n    model_results[m][\"talk_bias_global\"] = (\n        model_results[m][\"talk_global\"] - glodap_talk_global\n    )\n    model_results[m][\"ph_bias_global\"] = (\n        model_results[m][\"ph_global\"] - glodap_ph_global\n    )\n\n\n# ---------------------------------------------------------------------------\n# map metrics and bias maps on the GLODAP 1-degree grid\n# ---------------------------------------------------------------------------\n\nmap_metrics = {}\ndic_bias_maps = {}\n\nfor m in MODELS:\n    src = model_results[m]\n    model_on_glodap = regrid_nearest(\n        src[\"dic_map\"],\n        src[\"lat2d\"],\n        src[\"lon2d\"],\n        glodap_lat2d,\n        glodap_lon2d,\n        glodap_valid_map,\n    )\n    valid = glodap_valid_map & np.isfinite(model_on_glodap)\n    diff = model_on_glodap - glodap_dic_map\n\n    bias_map = np.full(glodap_dic_map.shape, np.nan)\n    bias_map[valid] = diff[valid]\n    dic_bias_maps[m] = bias_map\n\n    map_metrics[m] = dict(\n        mean_bias=float(np.mean(diff[valid])),\n        rmse=float(np.sqrt(np.mean(diff[valid] ** 2))),\n        corr=float(np.corrcoef(model_on_glodap[valid], glodap_dic_map[valid])[0, 1])\n        if np.sum(valid) > 1 else np.nan,\n    )\n\n\n# ---------------------------------------------------------------------------\n# vertical profile of DIC bias at selected GLODAP depths\n# ---------------------------------------------------------------------------\n\nvertical_bias = {}\n\nfor m in MODELS:\n    src = model_results[m]\n    vals = {}\n    for d in profile_depths:\n        idx = int(np.argmin(np.abs(glodap_depth - d)))\n        gl_slice = glodap_dic[idx]\n        tgt_valid = np.isfinite(gl_slice)\n\n        model_slice = interp_to_depth(src[\"dic_2002_umol\"], src[\"depth_m\"], d)\n        model_on_glodap = regrid_nearest(\n            model_slice,\n            src[\"lat2d\"],\n            src[\"lon2d\"],\n            glodap_lat2d,\n            glodap_lon2d,\n            tgt_valid,\n        )\n        valid = tgt_valid & np.isfinite(model_on_glodap)\n        vals[d] = (\n            float(np.mean(model_on_glodap[valid] - gl_slice[valid]))\n            if np.any(valid) else np.nan\n        )\n    vertical_bias[m] = vals\n\n\n# ---------------------------------------------------------------------------\n# period change and ratio to the 2002 model-minus-GLODAP bias\n# ---------------------------------------------------------------------------\n\nperiod_table = {}\nfor m in MODELS:\n    change = (\n        model_results[m][\"dic_global\"]\n        - model_results[m][\"dic_period_global\"]\n    )\n    bias = model_results[m][\"dic_bias_global\"]\n    ratio = float(change / bias) if abs(bias) > 1e-12 else np.nan\n    period_table[m] = dict(\n        dic_2002=float(model_results[m][\"dic_global\"]),\n        dic_1971_2000=float(model_results[m][\"dic_period_global\"]),\n        change=float(change),\n        dic_bias_vs_glodap=float(bias),\n        ratio=ratio,\n    )\n\n\n# ---------------------------------------------------------------------------\n# tidy result tables\n# ---------------------------------------------------------------------------\n\nsource_rows = []\nfor m in MODELS:\n    source_rows.append(\n        dict(\n            source=m,\n            DIC=model_results[m][\"dic_global\"],\n            TAlk=model_results[m][\"talk_global\"],\n            pH=model_results[m][\"ph_global\"],\n        )\n    )\nsource_rows.append(\n    dict(source=\"GLODAP\", DIC=glodap_dic_global, TAlk=glodap_talk_global, pH=glodap_ph_global)\n)\nglobal_mean_df = pd.DataFrame(source_rows).set_index(\"source\")\n\nglobal_bias_df = pd.DataFrame(\n    {\n        m: {\n            \"DIC\": model_results[m][\"dic_bias_global\"],\n            \"TAlk\": model_results[m][\"talk_bias_global\"],\n            \"pH\": model_results[m][\"ph_bias_global\"],\n        }\n        for m in MODELS\n    }\n).T\n\nglobal_mean_rounded = global_mean_df.copy()\nglobal_mean_rounded[[\"DIC\", \"TAlk\"]] = global_mean_rounded[[\"DIC\", \"TAlk\"]].round(0)\nglobal_mean_rounded[\"pH\"] = global_mean_rounded[\"pH\"].round(3)\n\nglobal_bias_rounded = global_bias_df.copy()\nglobal_bias_rounded[[\"DIC\", \"TAlk\"]] = global_bias_rounded[[\"DIC\", \"TAlk\"]].round(0)\nglobal_bias_rounded[\"pH\"] = global_bias_rounded[\"pH\"].round(3)\n\nmap_metrics_df = pd.DataFrame.from_dict(map_metrics, orient=\"index\")\nmap_metrics_rounded = map_metrics_df.copy()\nmap_metrics_rounded[[\"mean_bias\", \"rmse\"]] = map_metrics_rounded[[\"mean_bias\", \"rmse\"]].round(0)\nmap_metrics_rounded[\"corr\"] = map_metrics_rounded[\"corr\"].round(3)\n\nvertical_bias_df = pd.DataFrame.from_dict(vertical_bias, orient=\"index\")\nvertical_bias_df = vertical_bias_df[profile_depths]\nvertical_bias_rounded = vertical_bias_df.round(0)\n\nperiod_df = pd.DataFrame.from_dict(period_table, orient=\"index\")\nperiod_rounded = period_df.copy()\nfor c in [\"dic_2002\", \"dic_1971_2000\", \"change\", \"dic_bias_vs_glodap\"]:\n    period_rounded[c] = period_rounded[c].round(0)\nperiod_rounded[\"ratio\"] = period_rounded[\"ratio\"].round(2)\n\nsign_df = np.sign(global_bias_df[[\"DIC\", \"TAlk\", \"pH\"]]).astype(int)\n\n# aggregate error score: DIC/TAlk in umol kg-1, pH scaled by 1000\nmodel_scores = pd.Series(\n    {\n        m: (\n            abs(global_bias_df.loc[m, \"DIC\"])\n            + abs(global_bias_df.loc[m, \"TAlk\"])\n            + 1000.0 * abs(global_bias_df.loc[m, \"pH\"])\n            + map_metrics_df.loc[m, \"rmse\"]\n        )\n        for m in MODELS\n    }\n)\nbest_model = model_scores.idxmin()\n\n# sign-consistency statements\nsame_sign_across_models = {\n    c: bool(sign_df[c].nunique() == 1) for c in sign_df.columns\n}\nwithin_model_consistency = {}\nfor m in MODELS:\n    s = sign_df.loc[m]\n    within_model_consistency[m] = bool(\n        (s[\"DIC\"] == s[\"TAlk\"]) and (s[\"pH\"] == -s[\"DIC\"])\n    )\n\nperiod_implication = (\n    \"The 2002-minus-1971-2000 DIC change is of the same order as the \"\n    \"model-minus-GLODAP DIC offset for at least some models. Because GLODAP \"\n    \"is a 1972-2013 climatology while the model fields are for 2002, the \"\n    \"offset cannot be interpreted as a pure model carbon-system error; it \"\n    \"also contains a time-mismatch contribution.\"\n)\n</compute>\n\n<visualize>\nimport matplotlib.pyplot as plt\n\n# ---------------------------------------------------------------------------\n# Figure 1: 0-50 m DIC bias maps, shared diverging scale\n# ---------------------------------------------------------------------------\nall_abs = np.concatenate(\n    [np.abs(dic_bias_maps[m][np.isfinite(dic_bias_maps[m])]).ravel() for m in MODELS]\n)\nvmax = np.nanpercentile(all_abs, 98) if all_abs.size else 50.0\nvmax = max(vmax, 1.0)\n\nfig, axes = plt.subplots(1, 3, figsize=(15, 4.2), sharey=True)\nfor ax, m in zip(axes, MODELS):\n    pm = ax.pcolormesh(\n        glodap_lon,\n        glodap_lat,\n        dic_bias_maps[m],\n        cmap=\"RdBu_r\",\n        vmin=-vmax,\n        vmax=vmax,\n        shading=\"auto\",\n    )\n    ax.set_title(m)\n    ax.set_xlabel(\"Longitude\")\n    ax.set_ylabel(\"Latitude\")\n    ax.set_xlim(0, 360)\n    ax.set_ylim(-90, 90)\n\ncbar = fig.colorbar(\n    pm, ax=axes, orientation=\"horizontal\", fraction=0.05, pad=0.08, shrink=0.85\n)\ncbar.set_label(r\"DIC bias (model $-$ GLODAP), $\\mu$mol kg$^{-1}$\")\nfig.suptitle(\"0-50 m mean DIC bias against GLODAPv2.2016b\", y=1.02)\n\n\n# ---------------------------------------------------------------------------\n# Figure 2: vertical profile of global mean DIC bias\n# ---------------------------------------------------------------------------\nfig2, ax2 = plt.subplots(figsize=(5.5, 5.5))\nfor m in MODELS:\n    ax2.plot(\n        vertical_bias_df.loc[m].values,\n        profile_depths,\n        marker=\"o\",\n        label=m,\n    )\nax2.axvline(0.0, color=\"k\", linewidth=0.8)\nax2.invert_yaxis()\nax2.set_xlabel(r\"DIC bias (model $-$ GLODAP), $\\mu$mol kg$^{-1}$\")\nax2.set_ylabel(\"Depth (m)\")\nax2.set_title(\"Global mean DIC bias profile\")\nfor d in profile_depths:\n    ax2.axhline(d, color=\"0.7\", linewidth=0.4, linestyle=\":\")\nax2.legend(frameon=False)\n</visualize>",
+      "compute_iterations": [
+        {
+          "iteration": 1,
+          "code": "import os\nimport glob\nimport warnings\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\nfrom scipy.spatial import cKDTree\n\nwarnings.filterwarnings(\"ignore\")\n\nHIST_ROOT = \"/data1/lorraine-20419/benchmark_cmip6/historical\"\nGLODAP_ROOT = \"/data1/lorraine-20419/ocean_data/GLODAPv2.2016b_MappedClimatologies\"\n\nMODELS = {\n    \"CESM2\": dict(\n        y_dim=\"nlat\", x_dim=\"nlon\", lat=\"lat\", lon=\"lon\",\n        depth_dim=\"lev\", depth_scale=0.01, grid=\"curvilinear\",\n    ),\n    \"GFDL-ESM4\": dict(\n        y_dim=\"lat\", x_dim=\"lon\", lat=\"lat\", lon=\"lon\",\n        depth_dim=\"lev\", depth_scale=1.0, grid=\"regular\",\n    ),\n    \"MPI-ESM1-2-LR\": dict(\n        y_dim=\"j\", x_dim=\"i\", lat=\"latitude\", lon=\"longitude\",\n        depth_dim=\"lev\", depth_scale=1.0, grid=\"curvilinear\",\n    ),\n}\n\nprofile_depths = [0, 100, 500, 1000, 2000]\n\n\n# ---------------------------------------------------------------------------\n# small helpers\n# ---------------------------------------------------------------------------\n\ndef _find_nc_files(model, var, root=HIST_ROOT):\n    files = sorted(glob.glob(os.path.join(root, model, var, \"*.nc\")))\n    if not files:\n        files = sorted(glob.glob(os.path.join(root, model, \"**\", f\"{var}*.nc\"), recursive=True))\n    if not files:\n        raise FileNotFoundError(f\"No files for {model} / {var}\")\n    return files\n\n\ndef open_cmip(model, var, root=HIST_ROOT):\n    files = _find_nc_files(model, var, root=root)\n    with xr.open_dataset(files[0], use_cftime=True, decode_times=True) as tmp:\n        has_time = \"time\" in tmp.dims\n    chunks = {\"time\": 12} if has_time else {}\n    if len(files) == 1:\n        return xr.open_dataset(\n            files[0], use_cftime=True, decode_times=True, chunks=chunks\n        )\n    return xr.open_mfdataset(\n        files, combine=\"by_coords\", use_cftime=True, decode_times=True,\n        chunks=chunks,\n    )\n\n\ndef _select_time(da, year=None, period=None):\n    if \"time\" not in da.dims:\n        return da\n    yrs = np.asarray(da.time.dt.year.values)\n    if year is not None:\n        idx = np.where(yrs == year)[0]\n    elif period is not None:\n        idx = np.where((yrs >= period[0]) & (yrs <= period[1]))[0]\n    else:\n        return da\n    return da.isel(time=idx)\n\n\ndef mean_field(da, year=None, period=None):\n    if \"time\" in da.dims:\n        da = _select_time(da, year=year, period=period)\n        da = da.mean(\"time\")\n    return da\n\n\ndef to_numpy_3d(da, depth_dim):\n    dims = list(da.dims)\n    if depth_dim not in dims:\n        raise ValueError(f\"Depth dimension {depth_dim!r} not in {dims}\")\n    other = [d for d in dims if d != depth_dim]\n    da = da.transpose(depth_dim, *other)\n    return np.asarray(da.values, dtype=float)\n\n\ndef get_depth_m(ds, cfg):\n    lev = ds[cfg[\"depth_dim\"]]\n    vals = np.asarray(lev.values, dtype=float)\n    units = str(lev.attrs.get(\"units\", \"\")).lower()\n    scale = cfg[\"depth_scale\"]\n    if \"cm\" in units:\n        scale = 0.01\n    elif units in (\"m\", \"meter\", \"meters\", \"metre\", \"metres\"):\n        scale = 1.0\n    return vals * scale\n\n\ndef get_lat_lon_2d(ds, cfg):\n    lat = ds[cfg[\"lat\"]]\n    lon = ds[cfg[\"lon\"]]\n    if lat.ndim == 2:\n        lat2d = np.asarray(lat.values, dtype=float)\n        lon2d = np.asarray(lon.values, dtype=float)\n    else:\n        lat2d, lon2d = np.meshgrid(\n            np.asarray(lat.values, dtype=float),\n            np.asarray(lon.values, dtype=float),\n            indexing=\"ij\",\n        )\n    return lat2d, lon2d % 360.0\n\n\ndef get_area(model, cfg):\n    ds = open_cmip(model, \"areacello\")\n    da = ds[\"areacello\"]\n    if \"time\" in da.dims:\n        da = da.mean(\"time\")\n    y, x = cfg[\"y_dim\"], cfg[\"x_dim\"]\n    if y in da.dims and x in da.dims:\n        da = da.transpose(y, x)\n    else:\n        da = da.transpose(da.dims[-2], da.dims[-1])\n    area = np.asarray(da.values, dtype=float)\n    ds.close()\n    return area\n\n\ndef get_volcello(model, cfg, year=None, period=None):\n    ds = open_cmip(model, \"volcello\")\n    da = ds[\"volcello\"]\n    if \"time\" in da.dims:\n        if year is not None:\n            da = _select_time(da, year=year)\n        elif period is not None:\n            da = _select_time(da, period=period)\n        da = da.mean(\"time\")\n    out = to_numpy_3d(da, cfg[\"depth_dim\"])\n    ds.close()\n    return out\n\n\n# ---------------------------------------------------------------------------\n# EOS-80 in-situ density, pressure in bars\n# ---------------------------------------------------------------------------\n\ndef rho_eos80(temp, salt, depth_m):\n    T = np.asarray(temp, dtype=float) * 1.00024\n    S = np.asarray(salt, dtype=float)\n    p = np.asarray(depth_m, dtype=float)\n    if p.ndim == 1:\n        p = p.reshape((-1,) + (1,) * (T.ndim - 1))\n    p = p / 10.0  # m -> dbar -> bar\n\n    rho_w = (\n        999.842594\n        + 6.793952e-2 * T\n        - 9.095290e-3 * T**2\n        + 1.001685e-4 * T**3\n        - 1.120083e-6 * T**4\n        + 6.536332e-9 * T**5\n    )\n    A = (\n        0.824493\n        - 4.0899e-3 * T\n        + 7.6438e-5 * T**2\n        - 8.2467e-7 * T**3\n        + 5.3875e-9 * T**4\n    )\n    B = -5.72466e-3 + 1.0227e-4 * T - 1.6546e-6 * T**2\n    C = 4.8314e-4\n    rho0 = rho_w + A * S + B * S**1.5 + C * S**2\n\n    Kw = (\n        19652.21\n        + 148.4206 * T\n        - 2.327105 * T**2\n        + 1.360477e-2 * T**3\n        - 5.155288e-5 * T**4\n    )\n    K0 = (\n        Kw\n        + S * (54.6746 - 0.603459 * T + 1.09987e-2 * T**2 - 6.1670e-5 * T**3)\n        + S**1.5 * (7.944e-2 + 1.6483e-2 * T - 5.3009e-4 * T**2)\n    )\n    K = (\n        K0\n        + p * (3.239908 + 1.43713e-3 * T + 1.16092e-4 * T**2 - 5.77905e-7 * T**3)\n        + p * S * (2.209460e-3 - 2.205960e-3 * T - 2.181160e-3 * T**2)\n        + p * S**1.5 * (-3.01700e-4 + 3.58170e-5 * T)\n        + p**2 * (8.50935e-5 - 6.12293e-6 * T + 5.2787e-8 * T**2)\n        + p**2 * S * (-9.9348e-7 + 2.0816e-8 * T + 9.1697e-10 * T**2)\n    )\n    return rho0 / (1.0 - p / K)\n\n\ndef carbon_to_umolkg(carbon, temp, salt, depth_m, units):\n    c = np.asarray(carbon, dtype=float)\n    u = str(units).lower().replace(\" \", \"\")\n    if \"umol\" in u or \"micromol\" in u:\n        return c\n    if \"molkg-1\" in u and \"m-3\" not in u:\n        return c * 1e6\n    # CMIP6 standard: mol m-3 -> umol kg-1\n    rho = rho_eos80(temp, salt, depth_m)\n    return c * 1e6 / rho\n\n\n# ---------------------------------------------------------------------------\n# weighting / averaging / regridding\n# ---------------------------------------------------------------------------\n\ndef weighted_cell_mean(field, weights):\n    field = np.asarray(field, dtype=float)\n    weights = np.broadcast_to(np.asarray(weights, dtype=float), field.shape)\n    valid = np.isfinite(field) & np.isfinite(weights) & (weights > 0)\n    num = np.nansum(np.where(valid, field * weights, 0.0), axis=0)\n    den = np.nansum(np.where(valid, weights, 0.0), axis=0)\n    out = np.full(num.shape, np.nan)\n    good = den > 0\n    out[good] = num[good] / den[good]\n    return out\n\n\ndef volume_global_mean(field, weights):\n    field = np.asarray(field, dtype=float)\n    weights = np.broadcast_to(np.asarray(weights, dtype=float), field.shape)\n    valid = np.isfinite(field) & np.isfinite(weights) & (weights > 0)\n    if not np.any(valid):\n        return np.nan\n    return np.nansum(field[valid] * weights[valid]) / np.nansum(weights[valid])\n\n\ndef area_weighted_mean(field2d, area2d):\n    field2d = np.asarray(field2d, dtype=float)\n    area2d = np.asarray(area2d, dtype=float)\n    valid = np.isfinite(field2d) & np.isfinite(area2d)\n    if not np.any(valid):\n        return np.nan\n    return np.nansum(field2d[valid] * area2d[valid]) / np.nansum(area2d[valid])\n\n\ndef layer_thickness(depth, max_depth=50.0):\n    d = np.asarray(depth, dtype=float)\n    order = np.argsort(d)\n    ds = d[order]\n    n = len(ds)\n    bounds = np.empty(n + 1, dtype=float)\n    if n == 1:\n        bounds[:] = [0.0, ds[0]]\n    else:\n        bounds[0] = max(0.0, ds[0] - 0.5 * (ds[1] - ds[0]))\n        bounds[1:-1] = 0.5 * (ds[:-1] + ds[1:])\n        bounds[-1] = ds[-1] + 0.5 * (ds[-1] - ds[-2])\n    upper = np.maximum(bounds[:-1], 0.0)\n    lower = np.minimum(bounds[1:], max_depth)\n    thick = np.maximum(0.0, lower - upper)\n    out = np.empty(n, dtype=float)\n    out[order] = thick\n    return out\n\n\ndef _latlon_xyz(lat, lon):\n    lat = np.deg2rad(np.asarray(lat, dtype=float))\n    lon = np.deg2rad(np.asarray(lon, dtype=float) % 360.0)\n    return np.stack(\n        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)],\n        axis=-1,\n    )\n\n\ndef regrid_nearest(src_field, src_lat, src_lon, tgt_lat, tgt_lon, tgt_valid=None):\n    src_field = np.asarray(src_field, dtype=float)\n    src_lat = np.asarray(src_lat, dtype=float)\n    src_lon = np.asarray(src_lon, dtype=float)\n    valid_src = (\n        np.isfinite(src_field)\n        & np.isfinite(src_lat)\n        & np.isfinite(src_lon)\n    )\n    src_vals = src_field[valid_src]\n    out = np.full(np.asarray(tgt_lat).shape, np.nan)\n\n    if src_vals.size == 0:\n        return out\n\n    src_xyz = _latlon_xyz(src_lat[valid_src], src_lon[valid_src])\n    tree = cKDTree(src_xyz)\n\n    tgt_lat = np.asarray(tgt_lat, dtype=float)\n    tgt_lon = np.asarray(tgt_lon, dtype=float)\n    if tgt_valid is None:\n        use = np.ones(tgt_lat.shape, dtype=bool)\n    else:\n        use = np.asarray(tgt_valid, dtype=bool)\n    use = use & np.isfinite(tgt_lat) & np.isfinite(tgt_lon)\n\n    q = _latlon_xyz(tgt_lat[use], tgt_lon[use])\n    _, idx = tree.query(q, k=1)\n    out[use] = src_vals[idx]\n    return out\n\n\ndef interp_to_depth(field3d, depth, target_depth):\n    field3d = np.asarray(field3d, dtype=float)\n    depth = np.asarray(depth, dtype=float)\n    order = np.argsort(depth)\n    depth = depth[order]\n    field3d = field3d[order]\n\n    out = np.full(field3d.shape[1:], np.nan)\n    if target_depth <= depth[0]:\n        return field3d[0].copy()\n    if target_depth > depth[-1]:\n        return out\n\n    i = np.searchsorted(depth, target_depth) - 1\n    i = int(np.clip(i, 0, len(depth) - 2))\n    d0, d1 = depth[i], depth[i + 1]\n    w = (target_depth - d0) / (d1 - d0)\n    return field3d[i] * (1.0 - w) + field3d[i + 1] * w\n\n\n# ---------------------------------------------------------------------------\n# GLODAP reader\n# ---------------------------------------------------------------------------\n\ndef _find_dim(ds, candidates):\n    for name in candidates:\n        if name in ds.dims or name in ds.coords:\n            return name\n    for d in list(ds.dims):\n        if any(c in d.lower() for c in candidates):\n            return d\n    return None\n\n\ndef open_glodap(varfile, varname):\n    path = os.path.join(GLODAP_ROOT, f\"GLODAPv2.2016b.{varfile}.nc\")\n    ds = xr.open_dataset(path)\n    da = ds[varname]\n\n    lat_name = _find_dim(ds, [\"lat\", \"latitude\"])\n    lon_name = _find_dim(ds, [\"lon\", \"longitude\"])\n    depth_name = _find_dim(ds, [\"depth_surface\", \"depth\"])\n\n    if depth_name is None:\n        depth_name = [d for d in da.dims if \"depth\" in d.lower()][0]\n    if lat_name is None:\n        lat_name = [d for d in da.dims if \"lat\" in d.lower()][0]\n    if lon_name is None:\n        lon_name = [d for d in da.dims if \"lon\" in d.lower()][0]\n\n    if \"Depth\" in ds:\n        depth = np.asarray(ds[\"Depth\"].values, dtype=float)\n    else:\n        depth = np.asarray(ds[depth_name].values, dtype=float)\n    lat = np.asarray(ds[lat_name].values, dtype=float)\n    lon = np.asarray(ds[lon_name].values, dtype=float) % 360.0\n\n    rename = {}\n    if depth_name in da.dims and depth_name != \"depth\":\n        rename[depth_name] = \"depth\"\n    if lat_name in da.dims and lat_name != \"lat\":\n        rename[lat_name] = \"lat\"\n    if lon_name in da.dims and lon_name != \"lon\":\n        rename[lon_name] = \"lon\"\n    if rename:\n        da = da.rename(rename)\n\n    da = da.assign_coords(\n        depth=(\"depth\", depth),\n        lat=(\"lat\", lat),\n        lon=(\"lon\", lon),\n    )\n    da = da.sortby(\"depth\").sortby(\"lat\").sortby(\"lon\")\n    da = da.transpose(\"depth\", \"lat\", \"lon\")\n    ds.close()\n    return da\n\n\nglodap_dic_da = open_glodap(\"TCO2\", \"TCO2\")\nglodap_talk_da = open_glodap(\"TAlk\", \"TAlk\")\nglodap_ph_da = open_glodap(\"pHtsinsitutp\", \"pHtsinsitutp\")\n\nglodap_depth = np.asarray(glodap_dic_da[\"depth\"].values, dtype=float)\nglodap_lat = np.asarray(glodap_dic_da[\"lat\"].values, dtype=float)\nglodap_lon = np.asarray(glodap_dic_da[\"lon\"].values, dtype=float)\n\nglodap_dic = np.asarray(glodap_dic_da.values, dtype=float)\nglodap_talk = np.asarray(glodap_talk_da.reindex_like(glodap_dic_da).values, dtype=float)\nglodap_ph = np.asarray(glodap_ph_da.reindex_like(glodap_dic_da).values, dtype=float)\n\nglodap_thick_full = layer_thickness(glodap_depth, max_depth=50.0)\nlev_g50 = glodap_depth <= 50.0\n\nglodap_dic_50 = glodap_dic[lev_g50]\nglodap_talk_50 = glodap_talk[lev_g50]\nglodap_ph_50 = glodap_ph[lev_g50]\nglodap_thick_50 = glodap_thick_full[lev_g50]\n\nglodap_dic_map = weighted_cell_mean(glodap_dic_50, glodap_thick_50[:, None, None])\nglodap_talk_map = weighted_cell_mean(glodap_talk_50, glodap_thick_50[:, None, None])\nglodap_ph_map = weighted_cell_mean(glodap_ph_50, glodap_thick_50[:, None, None])\n\nglodap_area = (\n    np.cos(np.deg2rad(glodap_lat))[:, None]\n    * np.ones((1, len(glodap_lon)), dtype=float)\n)\nglodap_vol_50 = glodap_area[None, :, :] * glodap_thick_50[:, None, None]\n\nglodap_dic_global = volume_global_mean(glodap_dic_50, glodap_vol_50)\nglodap_talk_global = volume_global_mean(glodap_talk_50, glodap_vol_50)\nglodap_ph_global = volume_global_mean(glodap_ph_50, glodap_vol_50)\n\nglodap_lat2d, glodap_lon2d = np.meshgrid(\n    glodap_lat, glodap_lon, indexing=\"ij\"\n)\nglodap_valid_map = np.isfinite(glodap_dic_map)\n\n\n# ---------------------------------------------------------------------------\n# process each CMIP6 model\n# ---------------------------------------------------------------------------\n\ndef process_model(model):\n    cfg = MODELS[model]\n\n    ds_d = open_cmip(model, \"dissic\")\n    ds_t = open_cmip(model, \"talk\")\n    ds_p = open_cmip(model, \"ph\")\n    ds_th = open_cmip(model, \"thetao\")\n    ds_s = open_cmip(model, \"so\")\n\n    depth_m_raw = get_depth_m(ds_d, cfg)\n    order = np.argsort(depth_m_raw)\n    depth_m = depth_m_raw[order]\n\n    lat2d, lon2d = get_lat_lon_2d(ds_d, cfg)\n    area = get_area(model, cfg)\n    if area.shape != lat2d.shape:\n        area = area.T\n\n    def get_3d(da, year=None, period=None):\n        return to_numpy_3d(\n            mean_field(da, year=year, period=period),\n            cfg[\"depth_dim\"],\n        )[order]\n\n    dissic_2002 = get_3d(ds_d[\"dissic\"], year=2002)\n    talk_2002 = get_3d(ds_t[\"talk\"], year=2002)\n    ph_2002 = get_3d(ds_p[\"ph\"], year=2002)\n    theta_2002 = get_3d(ds_th[\"thetao\"], year=2002)\n    so_2002 = get_3d(ds_s[\"so\"], year=2002)\n\n    dissic_period = get_3d(ds_d[\"dissic\"], period=(1971, 2000))\n    theta_period = get_3d(ds_th[\"thetao\"], period=(1971, 2000))\n    so_period = get_3d(ds_s[\"so\"], period=(1971, 2000))\n\n    dic_units = ds_d[\"dissic\"].attrs.get(\"units\", \"\")\n    talk_units = ds_t[\"talk\"].attrs.get(\"units\", \"\")\n\n    dic_2002_umol = carbon_to_umolkg(\n        dissic_2002, theta_2002, so_2002, depth_m[:, None, None], dic_units\n    )\n    talk_2002_umol = carbon_to_umolkg(\n        talk_2002, theta_2002, so_2002, depth_m[:, None, None], talk_units\n    )\n    dic_period_umol = carbon_to_umolkg(\n        dissic_period, theta_period, so_period, depth_m[:, None, None], dic_units\n    )\n\n    vol_2002 = get_volcello(model, cfg, year=2002)[order]\n    vol_period = get_volcello(model, cfg, period=(1971, 2000))[order]\n\n    lev50 = depth_m <= 50.0\n\n    dic_map = weighted_cell_mean(dic_2002_umol[lev50], vol_2002[lev50])\n    talk_map = weighted_cell_mean(talk_2002_umol[lev50], vol_2002[lev50])\n    ph_map = weighted_cell_mean(ph_2002[lev50], vol_2002[lev50])\n\n    dic_global = volume_global_mean(dic_2002_umol[lev50], vol_2002[lev50])\n    talk_global = volume_global_mean(talk_2002_umol[lev50], vol_2002[lev50])\n    ph_global = volume_global_mean(ph_2002[lev50], vol_2002[lev50])\n\n    dic_global_map = area_weighted_mean(dic_map, area)\n    talk_global_map = area_weighted_mean(talk_map, area)\n    ph_global_map = area_weighted_mean(ph_map, area)\n\n    dic_period_global = volume_global_mean(\n        dic_period_umol[lev50], vol_period[lev50]\n    )\n    dic_period_map = weighted_cell_mean(\n        dic_period_umol[lev50], vol_period[lev50]\n    )\n    dic_period_global_map = area_weighted_mean(dic_period_map, area)\n\n    for ds in (ds_d, ds_t, ds_p, ds_th, ds_s):\n        ds.close()\n\n    return dict(\n        depth_m=depth_m,\n        lat2d=lat2d,\n        lon2d=lon2d,\n        area=area,\n        dic_2002_umol=dic_2002_umol,\n        talk_2002_umol=talk_2002_umol,\n        ph_2002=ph_2002,\n        dic_period_umol=dic_period_umol,\n        vol_2002=vol_2002,\n        vol_period=vol_period,\n        dic_map=dic_map,\n        talk_map=talk_map,\n        ph_map=ph_map,\n        dic_global=dic_global,\n        talk_global=talk_global,\n        ph_global=ph_global,\n        dic_global_map=dic_global_map,\n        talk_global_map=talk_global_map,\n        ph_global_map=ph_global_map,\n        dic_period_global=dic_period_global,\n        dic_period_global_map=dic_period_global_map,\n    )\n\n\nmodel_results = {m: process_model(m) for m in MODELS}\n\nfor m in MODELS:\n    model_results[m][\"dic_bias_global\"] = (\n        model_results[m][\"dic_global\"] - glodap_dic_global\n    )\n    model_results[m][\"talk_bias_global\"] = (\n        model_results[m][\"talk_global\"] - glodap_talk_global\n    )\n    model_results[m][\"ph_bias_global\"] = (\n        model_results[m][\"ph_global\"] - glodap_ph_global\n    )\n\n\n# ---------------------------------------------------------------------------\n# map metrics and bias maps on the GLODAP 1-degree grid\n# ---------------------------------------------------------------------------\n\nmap_metrics = {}\ndic_bias_maps = {}\n\nfor m in MODELS:\n    src = model_results[m]\n    model_on_glodap = regrid_nearest(\n        src[\"dic_map\"],\n        src[\"lat2d\"],\n        src[\"lon2d\"],\n        glodap_lat2d,\n        glodap_lon2d,\n        glodap_valid_map,\n    )\n    valid = glodap_valid_map & np.isfinite(model_on_glodap)\n    diff = model_on_glodap - glodap_dic_map\n\n    bias_map = np.full(glodap_dic_map.shape, np.nan)\n    bias_map[valid] = diff[valid]\n    dic_bias_maps[m] = bias_map\n\n    map_metrics[m] = dict(\n        mean_bias=float(np.mean(diff[valid])),\n        rmse=float(np.sqrt(np.mean(diff[valid] ** 2))),\n        corr=float(np.corrcoef(model_on_glodap[valid], glodap_dic_map[valid])[0, 1])\n        if np.sum(valid) > 1 else np.nan,\n    )\n\n\n# ---------------------------------------------------------------------------\n# vertical profile of DIC bias at selected GLODAP depths\n# ---------------------------------------------------------------------------\n\nvertical_bias = {}\n\nfor m in MODELS:\n    src = model_results[m]\n    vals = {}\n    for d in profile_depths:\n        idx = int(np.argmin(np.abs(glodap_depth - d)))\n        gl_slice = glodap_dic[idx]\n        tgt_valid = np.isfinite(gl_slice)\n\n        model_slice = interp_to_depth(src[\"dic_2002_umol\"], src[\"depth_m\"], d)\n        model_on_glodap = regrid_nearest(\n            model_slice,\n            src[\"lat2d\"],\n            src[\"lon2d\"],\n            glodap_lat2d,\n            glodap_lon2d,\n            tgt_valid,\n        )\n        valid = tgt_valid & np.isfinite(model_on_glodap)\n        vals[d] = (\n            float(np.mean(model_on_glodap[valid] - gl_slice[valid]))\n            if np.any(valid) else np.nan\n        )\n    vertical_bias[m] = vals\n\n\n# ---------------------------------------------------------------------------\n# period change and ratio to the 2002 model-minus-GLODAP bias\n# ---------------------------------------------------------------------------\n\nperiod_table = {}\nfor m in MODELS:\n    change = (\n        model_results[m][\"dic_global\"]\n        - model_results[m][\"dic_period_global\"]\n    )\n    bias = model_results[m][\"dic_bias_global\"]\n    ratio = float(change / bias) if abs(bias) > 1e-12 else np.nan\n    period_table[m] = dict(\n        dic_2002=float(model_results[m][\"dic_global\"]),\n        dic_1971_2000=float(model_results[m][\"dic_period_global\"]),\n        change=float(change),\n        dic_bias_vs_glodap=float(bias),\n        ratio=ratio,\n    )\n\n\n# ---------------------------------------------------------------------------\n# tidy result tables\n# ---------------------------------------------------------------------------\n\nsource_rows = []\nfor m in MODELS:\n    source_rows.append(\n        dict(\n            source=m,\n            DIC=model_results[m][\"dic_global\"],\n            TAlk=model_results[m][\"talk_global\"],\n            pH=model_results[m][\"ph_global\"],\n        )\n    )\nsource_rows.append(\n    dict(source=\"GLODAP\", DIC=glodap_dic_global, TAlk=glodap_talk_global, pH=glodap_ph_global)\n)\nglobal_mean_df = pd.DataFrame(source_rows).set_index(\"source\")\n\nglobal_bias_df = pd.DataFrame(\n    {\n        m: {\n            \"DIC\": model_results[m][\"dic_bias_global\"],\n            \"TAlk\": model_results[m][\"talk_bias_global\"],\n            \"pH\": model_results[m][\"ph_bias_global\"],\n        }\n        for m in MODELS\n    }\n).T\n\nglobal_mean_rounded = global_mean_df.copy()\nglobal_mean_rounded[[\"DIC\", \"TAlk\"]] = global_mean_rounded[[\"DIC\", \"TAlk\"]].round(0)\nglobal_mean_rounded[\"pH\"] = global_mean_rounded[\"pH\"].round(3)\n\nglobal_bias_rounded = global_bias_df.copy()\nglobal_bias_rounded[[\"DIC\", \"TAlk\"]] = global_bias_rounded[[\"DIC\", \"TAlk\"]].round(0)\nglobal_bias_rounded[\"pH\"] = global_bias_rounded[\"pH\"].round(3)\n\nmap_metrics_df = pd.DataFrame.from_dict(map_metrics, orient=\"index\")\nmap_metrics_rounded = map_metrics_df.copy()\nmap_metrics_rounded[[\"mean_bias\", \"rmse\"]] = map_metrics_rounded[[\"mean_bias\", \"rmse\"]].round(0)\nmap_metrics_rounded[\"corr\"] = map_metrics_rounded[\"corr\"].round(3)\n\nvertical_bias_df = pd.DataFrame.from_dict(vertical_bias, orient=\"index\")\nvertical_bias_df = vertical_bias_df[profile_depths]\nvertical_bias_rounded = vertical_bias_df.round(0)\n\nperiod_df = pd.DataFrame.from_dict(period_table, orient=\"index\")\nperiod_rounded = period_df.copy()\nfor c in [\"dic_2002\", \"dic_1971_2000\", \"change\", \"dic_bias_vs_glodap\"]:\n    period_rounded[c] = period_rounded[c].round(0)\nperiod_rounded[\"ratio\"] = period_rounded[\"ratio\"].round(2)\n\nsign_df = np.sign(global_bias_df[[\"DIC\", \"TAlk\", \"pH\"]]).astype(int)\n\n# aggregate error score: DIC/TAlk in umol kg-1, pH scaled by 1000\nmodel_scores = pd.Series(\n    {\n        m: (\n            abs(global_bias_df.loc[m, \"DIC\"])\n            + abs(global_bias_df.loc[m, \"TAlk\"])\n            + 1000.0 * abs(global_bias_df.loc[m, \"pH\"])\n            + map_metrics_df.loc[m, \"rmse\"]\n        )\n        for m in MODELS\n    }\n)\nbest_model = model_scores.idxmin()\n\n# sign-consistency statements\nsame_sign_across_models = {\n    c: bool(sign_df[c].nunique() == 1) for c in sign_df.columns\n}\nwithin_model_consistency = {}\nfor m in MODELS:\n    s = sign_df.loc[m]\n    within_model_consistency[m] = bool(\n        (s[\"DIC\"] == s[\"TAlk\"]) and (s[\"pH\"] == -s[\"DIC\"])\n    )\n\nperiod_implication = (\n    \"The 2002-minus-1971-2000 DIC change is of the same order as the \"\n    \"model-minus-GLODAP DIC offset for at least some models. Because GLODAP \"\n    \"is a 1972-2013 climatology while the model fields are for 2002, the \"\n    \"offset cannot be interpreted as a pure model carbon-system error; it \"\n    \"also contains a time-mismatch contribution.\"\n)",
+          "success": true,
+          "materialized_results": {
+            "materialized": 0
+          },
+          "output": {
+            "HIST_ROOT": "/data1/lorraine-20419/benchmark_cmip6/historical",
+            "GLODAP_ROOT": "/data1/lorraine-20419/ocean_data/GLODAPv2.2016b_MappedClimatologies",
+            "MODELS": {
+              "CESM2": {
+                "y_dim": "nlat",
+                "x_dim": "nlon",
+                "lat": "lat",
+                "lon": "lon",
+                "depth_dim": "lev",
+                "depth_scale": 0.01,
+                "grid": "curvilinear"
+              },
+              "GFDL-ESM4": {
+                "y_dim": "lat",
+                "x_dim": "lon",
+                "lat": "lat",
+                "lon": "lon",
+                "depth_dim": "lev",
+                "depth_scale": 1.0,
+                "grid": "regular"
+              },
+              "MPI-ESM1-2-LR": {
+                "y_dim": "j",
+                "x_dim": "i",
+                "lat": "latitude",
+                "lon": "longitude",
+                "depth_dim": "lev",
+                "depth_scale": 1.0,
+                "grid": "curvilinear"
+              }
+            },
+            "profile_depths": [
+              0,
+              100,
+              500,
+              1000,
+              2000
+            ],
+            "glodap_dic_da": {
+              "type": "DataArray",
+              "dims": {
+                "depth": 33,
+                "lat": 180,
+                "lon": 360
+              },
+              "units": "micro-mol kg-1",
+              "long_name": "moles of dissolved inorganic carbon per unit mass in seawater",
+              "size": 2138400,
+              "n_valid": 1103356,
+              "min": 1019.1619873046875,
+              "max": 2402.477294921875,
+              "mean": 2181.71025090623,
+              "std": 105.46550860707693
+            },
+            "glodap_talk_da": {
+              "type": "DataArray",
+              "dims": {
+                "depth": 33,
+                "lat": 180,
+                "lon": 360
+              },
+              "units": "micro-mol kg-1",
+              "long_name": "seawater alkalinity expressed as mole equivalent per unit mass",
+              "size": 2138400,
+              "n_valid": 1101785,
+              "min": 1069.45556640625,
+              "max": 2659.830810546875,
+              "mean": 2324.9228543747763,
+              "std": 53.49204578692571
+            },
+            "glodap_ph_da": {
+              "type": "DataArray",
+              "dims": {
+                "depth": 33,
+                "lat": 180,
+                "lon": 360
+              },
+              "units": "",
+              "long_name": "seawater ph reported on total scale at in situ temperature and pressure",
+              "size": 2138400,
+              "n_valid": 1101821,
+              "min": 7.426542282104492,
+              "max": 8.522977828979492,
+              "mean": 7.930877682557368,
+              "std": 0.14905358069576602
+            },
+            "glodap_depth": {
+              "type": "ndarray",
+              "shape": [
+                33
+              ],
+              "size": 33,
+              "n_valid": 33,
+              "min": 0.0,
+              "max": 5500.0,
+              "mean": 1347.2727272727273,
+              "std": 1544.0296015518354,
+              "values": [
+                0.0,
+                10.0,
+                20.0,
+                30.0,
+                50.0,
+                75.0,
+                100.0,
+                125.0,
+                150.0,
+                200.0,
+                250.0,
+                300.0,
+                400.0,
+                500.0,
+                600.0,
+                700.0,
+                800.0,
+                900.0,
+                1000.0,
+                1100.0,
+                1200.0,
+                1300.0,
+                1400.0,
+                1500.0,
+                1750.0,
+                2000.0,
+                2500.0,
+                3000.0,
+                3500.0,
+                4000.0,
+                4500.0,
+                5000.0,
+                5500.0
+              ]
+            },
+            "glodap_lat": {
+              "type": "ndarray",
+              "shape": [
+                180
+              ],
+              "size": 180,
+              "n_valid": 180,
+              "min": -89.5,
+              "max": 89.5,
+              "mean": 0.0,
+              "std": 51.96072234550504
+            },
+            "glodap_lon": {
+              "type": "ndarray",
+              "shape": [
+                360
+              ],
+              "size": 360,
+              "n_valid": 360,
+              "min": 0.5,
+              "max": 359.5,
+              "mean": 180.0,
+              "std": 103.92264751567228
+            },
+            "glodap_dic": {
+              "type": "ndarray",
+              "shape": [
+                33,
+                180,
+                360
+              ],
+              "size": 2138400,
+              "n_valid": 1103356,
+              "min": 1019.1619873046875,
+              "max": 2402.477294921875,
+              "mean": 2181.71025090623,
+              "std": 105.46550860707693
+            },
+            "glodap_talk": {
+              "type": "ndarray",
+              "shape": [
+                33,
+                180,
+                360
+              ],
+              "size": 2138400,
+              "n_valid": 1101785,
+              "min": 1069.45556640625,
+              "max": 2659.830810546875,
+              "mean": 2324.9228543747763,
+              "std": 53.49204578692571
+            },
+            "glodap_ph": {
+              "type": "ndarray",
+              "shape": [
+                33,
+                180,
+                360
+              ],
+              "size": 2138400,
+              "n_valid": 1101821,
+              "min": 7.426542282104492,
+              "max": 8.522977828979492,
+              "mean": 7.930877682557368,
+              "std": 0.14905358069576602
+            },
+            "glodap_thick_full": {
+              "type": "ndarray",
+              "shape": [
+                33
+              ],
+              "size": 33,
+              "n_valid": 33,
+              "min": 0.0,
+              "max": 15.0,
+              "mean": 1.5151515151515151,
+              "std": 3.790907879756607,
+              "values": [
+                5.0,
+                10.0,
+                10.0,
+                15.0,
+                10.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "lev_g50": {
+              "type": "ndarray",
+              "shape": [
+                33
+              ],
+              "size": 33,
+              "values": [
+                "True",
+                "True",
+                "True",
+                "True",
+                "True",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            },
+            "glodap_dic_50": {
+              "type": "ndarray",
+              "shape": [
+                5,
+                180,
+                360
+              ],
+              "size": 324000,
+              "n_valid": 203515,
+              "min": 1019.1619873046875,
+              "max": 2348.09130859375,
+              "mean": 2048.965751090991,
+              "std": 78.44239992401275
+            },
+            "glodap_talk_50": {
+              "type": "ndarray",
+              "shape": [
+                5,
+                180,
+                360
+              ],
+              "size": 324000,
+              "n_valid": 203242,
+              "min": 1069.45556640625,
+              "max": 2659.830810546875,
+              "mean": 2290.0619428459972,
+              "std": 70.73093874375982
+            },
+            "glodap_ph_50": {
+              "type": "ndarray",
+              "shape": [
+                5,
+                180,
+                360
+              ],
+              "size": 324000,
+              "n_valid": 202609,
+              "min": 7.426542282104492,
+              "max": 8.522977828979492,
+              "mean": 8.090291732884042,
+              "std": 0.04999398214545646
+            },
+            "glodap_thick_50": {
+              "type": "ndarray",
+              "shape": [
+                5
+              ],
+              "size": 5,
+              "n_valid": 5,
+              "min": 5.0,
+              "max": 15.0,
+              "mean": 10.0,
+              "std": 3.1622776601683795,
+              "values": [
+                5.0,
+                10.0,
+                10.0,
+                15.0,
+                10.0
+              ]
+            },
+            "glodap_dic_map": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 41977,
+              "min": 1019.1619873046875,
+              "max": 2313.45703125,
+              "mean": 2048.5587845105897,
+              "std": 78.49971077017891
+            },
+            "glodap_talk_map": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 41952,
+              "min": 1071.3240559895833,
+              "max": 2627.9599609375,
+              "mean": 2287.2936559169134,
+              "std": 76.00204530780078
+            },
+            "glodap_ph_map": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 41944,
+              "min": 7.662694931030273,
+              "max": 8.522977828979492,
+              "mean": 8.08946898324973,
+              "std": 0.04386619416972416
+            },
+            "glodap_area": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 64800,
+              "min": 0.008726535498373897,
+              "max": 0.9999619230641713,
+              "mean": 0.6366278526673906,
+              "std": 0.3077417378389015
+            },
+            "glodap_vol_50": {
+              "type": "ndarray",
+              "shape": [
+                5,
+                180,
+                360
+              ],
+              "size": 324000,
+              "n_valid": 324000,
+              "min": 0.043632677491869484,
+              "max": 14.99942884596257,
+              "mean": 6.366278526673907,
+              "std": 3.804010741416317
+            },
+            "glodap_dic_global": 2032.371322805601,
+            "glodap_talk_global": 2303.335285407343,
+            "glodap_ph_global": 8.082068862230763,
+            "glodap_lat2d": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 64800,
+              "min": -89.5,
+              "max": 89.5,
+              "mean": 0.0,
+              "std": 51.96072234550504
+            },
+            "glodap_lon2d": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 64800,
+              "min": 0.5,
+              "max": 359.5,
+              "mean": 180.0,
+              "std": 103.92264751567228
+            },
+            "glodap_valid_map": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            },
+            "model_results": {
+              "CESM2": {
+                "depth_m": {
+                  "type": "ndarray",
+                  "shape": [
+                    60
+                  ],
+                  "size": 60,
+                  "n_valid": 60,
+                  "min": 5.0,
+                  "max": 5375.0,
+                  "mean": 1216.5627050781252,
+                  "std": 1543.0631914862215
+                },
+                "lat2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 122880,
+                  "min": -79.2205226074621,
+                  "max": 89.70640964187461,
+                  "mean": 2.791601116953018,
+                  "std": 43.44720217375342
+                },
+                "lon2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 122880,
+                  "min": 0.014731101635748343,
+                  "max": 359.99602043021787,
+                  "mean": 185.76465359587667,
+                  "std": 106.55290281820834
+                },
+                "area": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 122880,
+                  "min": 334119264.0,
+                  "max": 7288963072.0,
+                  "mean": 4109057742.753646,
+                  "std": 1421303047.3540154
+                },
+                "dic_2002_umol": {
+                  "type": "ndarray",
+                  "shape": [
+                    60,
+                    384,
+                    320
+                  ],
+                  "size": 7372800,
+                  "n_valid": 4247539,
+                  "min": 1114.1800649895756,
+                  "max": 3386.488821113909,
+                  "mean": 2152.765047190302,
+                  "std": 131.53869933645396
+                },
+                "talk_2002_umol": {
+                  "type": "ndarray",
+                  "shape": [
+                    60,
+                    384,
+                    320
+                  ],
+                  "size": 7372800,
+                  "n_valid": 4247539,
+                  "min": 1231.347724994614,
+                  "max": 4538.65005290439,
+                  "mean": 2297.378457967762,
+                  "std": 74.09568898045299
+                },
+                "ph_2002": {
+                  "type": "ndarray",
+                  "shape": [
+                    60,
+                    384,
+                    320
+                  ],
+                  "size": 7372800,
+                  "n_valid": 4247539,
+                  "min": 7.086112976074219,
+                  "max": 8.945194244384766,
+                  "mean": 7.8990640119389,
+                  "std": 0.20404151975094537
+                },
+                "dic_period_umol": {
+                  "type": "ndarray",
+                  "shape": [
+                    60,
+                    384,
+                    320
+                  ],
+                  "size": 7372800,
+                  "n_valid": 4247539,
+                  "min": 1093.2767186831218,
+                  "max": 3403.7828588529746,
+                  "mean": 2146.6851110806215,
+                  "std": 135.19039713005944
+                },
+                "vol_2002": {
+                  "type": "ndarray",
+                  "shape": [
+                    60,
+                    384,
+                    320
+                  ],
+                  "size": 7372800,
+                  "n_valid": 7372800,
+                  "min": 3341192448.0,
+                  "max": 1822102913024.0,
+                  "mean": 376662966104.7352,
+                  "std": 444155523327.8274
+                },
+                "vol_period": {
+                  "type": "ndarray",
+                  "shape": [
+                    60,
+                    384,
+                    320
+                  ],
+                  "size": 7372800,
+                  "n_valid": 7372800,
+                  "min": 3341192448.0,
+                  "max": 1822102913024.0,
+                  "mean": 376662966104.7352,
+                  "std": 444155523327.8274
+                },
+                "dic_map": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 86096,
+                  "min": 1242.7390248079078,
+                  "max": 3094.6260071650036,
+                  "mean": 1998.420056898587,
+                  "std": 89.23277708872166
+                },
+                "talk_map": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 86096,
+                  "min": 1238.0837671883874,
+                  "max": 3397.2938656239085,
+                  "mean": 2255.3632325178837,
+                  "std": 91.44246278256666
+                },
+                "ph_map": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 86096,
+                  "min": 7.845910167694091,
+                  "max": 8.318596522013346,
+                  "mean": 8.079826187570358,
+                  "std": 0.02848070489921855
+                },
+                "dic_global": 1996.6512436991818,
+                "talk_global": 2264.0109274754473,
+                "ph_global": 8.079533407300165,
+                "dic_global_map": 1995.9011375406403,
+                "talk_global_map": 2263.0129921205894,
+                "ph_global_map": 8.079643267286501,
+                "dic_period_global": 1987.4336999344596,
+                "dic_period_global_map": 1986.6634172378017,
+                "dic_bias_global": -35.720079106419234,
+                "talk_bias_global": -39.32435793189552,
+                "ph_bias_global": -0.0025354549305980356
+              },
+              "GFDL-ESM4": {
+                "depth_m": {
+                  "type": "ndarray",
+                  "shape": [
+                    35
+                  ],
+                  "size": 35,
+                  "n_valid": 35,
+                  "min": 2.5,
+                  "max": 6500.0,
+                  "mean": 1631.0,
+                  "std": 1882.9664049427056,
+                  "values": [
+                    2.5,
+                    10.0,
+                    20.0,
+                    32.5,
+                    51.25,
+                    75.0,
+                    100.0,
+                    125.0,
+                    156.25,
+                    200.0,
+                    250.0,
+                    312.5,
+                    400.0,
+                    500.0,
+                    600.0,
+                    700.0,
+                    800.0,
+                    900.0,
+                    1000.0,
+                    1100.0,
+                    1200.0,
+                    1300.0,
+                    1400.0,
+                    1537.5,
+                    1750.0,
+                    2062.5,
+                    2500.0,
+                    3000.0,
+                    3500.0,
+                    4000.0,
+                    4500.0,
+                    5000.0,
+                    5500.0,
+                    6000.0,
+                    6500.0
+                  ]
+                },
+                "lat2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 64800,
+                  "min": -89.5,
+                  "max": 89.5,
+                  "mean": 0.0,
+                  "std": 51.96072234550504
+                },
+                "lon2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 64800,
+                  "min": 0.5,
+                  "max": 359.50000000000006,
+                  "mean": 180.0,
+                  "std": 103.92264751567228
+                },
+                "area": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 64800,
+                  "min": 0.0,
+                  "max": 12390983680.0,
+                  "mean": 5572699556.94468,
+                  "std": 4892158005.51933
+                },
+                "dic_2002_umol": {
+                  "type": "ndarray",
+                  "shape": [
+                    35,
+                    180,
+                    360
+                  ],
+                  "size": 2268000,
+                  "n_valid": 1212999,
+                  "min": 346.95333859284045,
+                  "max": 3157.2334585409503,
+                  "mean": 2184.4535673077226,
+                  "std": 104.47217545301342
+                },
+                "talk_2002_umol": {
+                  "type": "ndarray",
+                  "shape": [
+                    35,
+                    180,
+                    360
+                  ],
+                  "size": 2268000,
+                  "n_valid": 1212999,
+                  "min": 384.0311756186881,
+                  "max": 4227.131856293257,
+                  "mean": 2336.7675985478704,
+                  "std": 73.04290287442284
+                },
+                "ph_2002": {
+                  "type": "ndarray",
+                  "shape": [
+                    35,
+                    180,
+                    360
+                  ],
+                  "size": 2268000,
+                  "n_valid": 1212999,
+                  "min": 7.27360725402832,
+                  "max": 9.926178932189941,
+                  "mean": 7.944673191347803,
+                  "std": 0.15632633299589122
+                },
+                "dic_period_umol": {
+                  "type": "ndarray",
+                  "shape": [
+                    35,
+                    180,
+                    360
+                  ],
+                  "size": 2268000,
+                  "n_valid": 1212999,
+                  "min": 344.7516825490957,
+                  "max": 3130.1433563106802,
+                  "mean": 2178.603929928764,
+                  "std": 108.04477111019976
+                },
+                "vol_2002": {
+                  "type": "ndarray",
+                  "shape": [
+                    35,
+                    180,
+                    360
+                  ],
+                  "size": 2268000,
+                  "n_valid": 1212999,
+                  "min": 324.1607971191406,
+                  "max": 6196805238784.0,
+                  "mean": 1100421518958.6997,
+                  "std": 1469116169810.9407
+                },
+                "vol_period": {
+                  "type": "ndarray",
+                  "shape": [
+                    35,
+                    180,
+                    360
+                  ],
+                  "size": 2268000,
+                  "n_valid": 1212999,
+                  "min": 324.15374755859375,
+                  "max": 6196801044480.0,
+                  "mean": 1100420923230.5413,
+                  "std": 1469115452693.025
+                },
+                "dic_map": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 44564,
+                  "min": 347.01310512653214,
+                  "max": 3154.5089271228235,
+                  "mean": 2062.375355672535,
+                  "std": 131.93629857859904
+                },
+                "talk_map": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 44564,
+                  "min": 384.12171483171267,
+                  "max": 4222.132695782923,
+                  "mean": 2304.503361395767,
+                  "std": 158.2552869635374
+                },
+                "ph_map": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 44564,
+                  "min": 7.650740975481393,
+                  "max": 9.925735774780906,
+                  "mean": 8.098480371728915,
+                  "std": 0.052885862004676536
+                },
+                "dic_global": 2059.1846292721375,
+                "talk_global": 2335.6812602335776,
+                "ph_global": 8.088340151903468,
+                "dic_global_map": 2056.9400025244704,
+                "talk_global_map": 2332.843564597131,
+                "ph_global_map": 8.088047094789747,
+                "dic_period_global": 2046.7063800166045,
+                "dic_period_global_map": 2044.440857936349,
+                "dic_bias_global": 26.81330646653646,
+                "talk_bias_global": 32.34597482623485,
+                "ph_bias_global": 0.006271289672705294
+              },
+              "MPI-ESM1-2-LR": {
+                "depth_m": {
+                  "type": "ndarray",
+                  "shape": [
+                    40
+                  ],
+                  "size": 40,
+                  "n_valid": 40,
+                  "min": 6.0,
+                  "max": 5720.0,
+                  "mean": 1378.925,
+                  "std": 1571.0682136288672,
+                  "values": [
+                    6.0,
+                    17.0,
+                    27.0,
+                    37.0,
+                    47.0,
+                    57.0,
+                    68.5,
+                    82.5,
+                    100.0,
+                    122.5,
+                    150.0,
+                    182.5,
+                    220.0,
+                    262.5,
+                    310.0,
+                    362.5,
+                    420.0,
+                    485.0,
+                    560.0,
+                    645.0,
+                    740.0,
+                    845.0,
+                    960.0,
+                    1085.0,
+                    1220.0,
+                    1365.0,
+                    1525.0,
+                    1700.0,
+                    1885.0,
+                    2080.0,
+                    2290.0,
+                    2525.0,
+                    2785.0,
+                    3070.0,
+                    3395.0,
+                    3770.0,
+                    4195.0,
+                    4670.0,
+                    5170.0,
+                    5720.0
+                  ]
+                },
+                "lat2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 56320,
+                  "min": -83.96550988220439,
+                  "max": 89.72660369238089,
+                  "mean": 11.336055347692735,
+                  "std": 55.357212731498535
+                },
+                "lon2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 56320,
+                  "min": 0.0071753680209129525,
+                  "max": 359.99604092487033,
+                  "mean": 210.8956971346869,
+                  "std": 115.14908977381505
+                },
+                "area": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 36791,
+                  "min": 181538016.0,
+                  "max": 33998391296.0,
+                  "mean": 9947414086.556387,
+                  "std": 9163450614.786087
+                },
+                "dic_2002_umol": {
+                  "type": "ndarray",
+                  "shape": [
+                    40,
+                    220,
+                    256
+                  ],
+                  "size": 2252800,
+                  "n_valid": 1089671,
+                  "min": 311.3290378910861,
+                  "max": 2770.152166138101,
+                  "mean": 2088.976959145064,
+                  "std": 105.44561267856001
+                },
+                "talk_2002_umol": {
+                  "type": "ndarray",
+                  "shape": [
+                    40,
+                    220,
+                    256
+                  ],
+                  "size": 2252800,
+                  "n_valid": 1089671,
+                  "min": 293.49294542845394,
+                  "max": 3187.3751404431405,
+                  "mean": 2239.3253993754292,
+                  "std": 77.48926123755676
+                },
+                "ph_2002": {
+                  "type": "ndarray",
+                  "shape": [
+                    40,
+                    220,
+                    256
+                  ],
+                  "size": 2252800,
+                  "n_valid": 1089671,
+                  "min": 6.8458991050720215,
+                  "max": 8.229844093322754,
+                  "mean": 7.976607591723793,
+                  "std": 0.1528200897641408
+                },
+                "dic_period_umol": {
+                  "type": "ndarray",
+                  "shape": [
+                    40,
+                    220,
+                    256
+                  ],
+                  "size": 2252800,
+                  "n_valid": 1089671,
+                  "min": 353.0713219555558,
+                  "max": 2769.812889447149,
+                  "mean": 2083.750691251375,
+                  "std": 107.42558840163622
+                },
+                "vol_2002": {
+                  "type": "ndarray",
+                  "shape": [
+                    40,
+                    220,
+                    256
+                  ],
+                  "size": 2252800,
+                  "n_valid": 1089671,
+                  "min": 1136050432.0,
+                  "max": 26849056915456.0,
+                  "mean": 1247278821033.7039,
+                  "std": 2034768928121.9226
+                },
+                "vol_period": {
+                  "type": "ndarray",
+                  "shape": [
+                    40,
+                    220,
+                    256
+                  ],
+                  "size": 2252800,
+                  "n_valid": 1089671,
+                  "min": 1136050432.0,
+                  "max": 26849056915456.0,
+                  "mean": 1247278821033.7039,
+                  "std": 2034768928121.9226
+                },
+                "dic_map": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 36791,
+                  "min": 318.39740021055235,
+                  "max": 2734.6871769828676,
+                  "mean": 2001.2187581659384,
+                  "std": 101.44859061565866
+                },
+                "talk_map": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 36791,
+                  "min": 299.6164857758201,
+                  "max": 3186.860802912093,
+                  "mean": 2192.0141659680526,
+                  "std": 124.39288356704299
+                },
+                "ph_map": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 36791,
+                  "min": 7.255028700988532,
+                  "max": 8.206424015804071,
+                  "mean": 8.070316490889613,
+                  "std": 0.046576058863725685
+                },
+                "dic_global": 1974.0581253985138,
+                "talk_global": 2217.4802817136774,
+                "ph_global": 8.058560033463909,
+                "dic_global_map": 1972.68473805854,
+                "talk_global_map": 2215.709790008345,
+                "ph_global_map": 8.058190343417397,
+                "dic_period_global": 1963.220690507908,
+                "dic_period_global_map": 1961.8058041673573,
+                "dic_bias_global": -58.31319740708727,
+                "talk_bias_global": -85.85500369366537,
+                "ph_bias_global": -0.023508828766853895
+              }
+            },
+            "map_metrics": {
+              "CESM2": {
+                "mean_bias": -34.77620617061979,
+                "rmse": 65.87314368946282,
+                "corr": 0.7699836333872702
+              },
+              "GFDL-ESM4": {
+                "mean_bias": 20.6069114769911,
+                "rmse": 83.2441290531715,
+                "corr": 0.6373626719949481
+              },
+              "MPI-ESM1-2-LR": {
+                "mean_bias": -67.6765104247207,
+                "rmse": 100.84665072075308,
+                "corr": 0.6597498222128831
+              }
+            },
+            "dic_bias_maps": {
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41977,
+                "min": -884.4836419904764,
+                "max": 870.9361645261242,
+                "mean": -34.77620617061979,
+                "std": 55.94538894235307
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41977,
+                "min": -1803.1752398234717,
+                "max": 723.482701366351,
+                "mean": 20.6069114769911,
+                "std": 80.65320961499627
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41977,
+                "min": -1744.8954568648353,
+                "max": 683.2788660414349,
+                "mean": -67.6765104247207,
+                "std": 74.76588057614408
+              }
+            },
+            "vertical_bias": {
+              "CESM2": {
+                "0": -28.036937391175016,
+                "100": -49.43364811119501,
+                "500": -18.34772473329869,
+                "1000": -8.341923284598574,
+                "2000": -12.435741357483183
+              },
+              "GFDL-ESM4": {
+                "0": 24.522476271033288,
+                "100": 14.745886059338586,
+                "500": -6.467760056282574,
+                "1000": -0.08906648705256906,
+                "2000": -11.580595293753387
+              },
+              "MPI-ESM1-2-LR": {
+                "0": -68.14169466536966,
+                "100": -68.00802067684866,
+                "500": -86.5218857877121,
+                "1000": -81.31145515755803,
+                "2000": -77.286948116889
+              }
+            },
+            "period_table": {
+              "CESM2": {
+                "dic_2002": 1996.6512436991818,
+                "dic_1971_2000": 1987.4336999344596,
+                "change": 9.217543764722222,
+                "dic_bias_vs_glodap": -35.720079106419234,
+                "ratio": -0.2580493659395548
+              },
+              "GFDL-ESM4": {
+                "dic_2002": 2059.1846292721375,
+                "dic_1971_2000": 2046.7063800166045,
+                "change": 12.478249255533001,
+                "dic_bias_vs_glodap": 26.81330646653646,
+                "ratio": 0.46537525206397445
+              },
+              "MPI-ESM1-2-LR": {
+                "dic_2002": 1974.0581253985138,
+                "dic_1971_2000": 1963.220690507908,
+                "change": 10.837434890605664,
+                "dic_bias_vs_glodap": -58.31319740708727,
+                "ratio": -0.18584875075446478
+              }
+            },
+            "source_rows": [
+              {
+                "source": "CESM2",
+                "DIC": 1996.6512436991818,
+                "TAlk": 2264.0109274754473,
+                "pH": 8.079533407300165
+              },
+              {
+                "source": "GFDL-ESM4",
+                "DIC": 2059.1846292721375,
+                "TAlk": 2335.6812602335776,
+                "pH": 8.088340151903468
+              },
+              {
+                "source": "MPI-ESM1-2-LR",
+                "DIC": 1974.0581253985138,
+                "TAlk": 2217.4802817136774,
+                "pH": 8.058560033463909
+              },
+              {
+                "source": "GLODAP",
+                "DIC": 2032.371322805601,
+                "TAlk": 2303.335285407343,
+                "pH": 8.082068862230763
+              }
+            ],
+            "global_mean_df": "                       DIC         TAlk        pH\nsource                                           \nCESM2          1996.651244  2264.010927  8.079533\nGFDL-ESM4      2059.184629  2335.681260  8.088340\nMPI-ESM1-2-LR  1974.058125  2217.480282  8.058560\nGLODAP         2032.371323  2303.335285  8.082069",
+            "global_bias_df": "                     DIC       TAlk        pH\nCESM2         -35.720079 -39.324358 -0.002535\nGFDL-ESM4      26.813306  32.345975  0.006271\nMPI-ESM1-2-LR -58.313197 -85.855004 -0.023509",
+            "global_mean_rounded": "                  DIC    TAlk     pH\nsource                              \nCESM2          1997.0  2264.0  8.080\nGFDL-ESM4      2059.0  2336.0  8.088\nMPI-ESM1-2-LR  1974.0  2217.0  8.059\nGLODAP         2032.0  2303.0  8.082",
+            "global_bias_rounded": "                DIC  TAlk     pH\nCESM2         -36.0 -39.0 -0.003\nGFDL-ESM4      27.0  32.0  0.006\nMPI-ESM1-2-LR -58.0 -86.0 -0.024",
+            "map_metrics_df": "               mean_bias        rmse      corr\nCESM2         -34.776206   65.873144  0.769984\nGFDL-ESM4      20.606911   83.244129  0.637363\nMPI-ESM1-2-LR -67.676510  100.846651  0.659750",
+            "map_metrics_rounded": "               mean_bias   rmse   corr\nCESM2              -35.0   66.0  0.770\nGFDL-ESM4           21.0   83.0  0.637\nMPI-ESM1-2-LR      -68.0  101.0  0.660",
+            "vertical_bias_df": "                    0          100        500        1000       2000\nCESM2         -28.036937 -49.433648 -18.347725  -8.341923 -12.435741\nGFDL-ESM4      24.522476  14.745886  -6.467760  -0.089066 -11.580595\nMPI-ESM1-2-LR -68.141695 -68.008021 -86.521886 -81.311455 -77.286948",
+            "vertical_bias_rounded": "               0     100   500   1000  2000\nCESM2         -28.0 -49.0 -18.0  -8.0 -12.0\nGFDL-ESM4      25.0  15.0  -6.0  -0.0 -12.0\nMPI-ESM1-2-LR -68.0 -68.0 -87.0 -81.0 -77.0",
+            "period_df": "                  dic_2002  dic_1971_2000  ...  dic_bias_vs_glodap     ratio\nCESM2          1996.651244    1987.433700  ...          -35.720079 -0.258049\nGFDL-ESM4      2059.184629    2046.706380  ...           26.813306  0.465375\nMPI-ESM1-2-LR  1974.058125    1963.220691  ...          -58.313197 -0.185849\n\n[3 rows x 5 columns]",
+            "period_rounded": "               dic_2002  dic_1971_2000  change  dic_bias_vs_glodap  ratio\nCESM2            1997.0         1987.0     9.0               -36.0  -0.26\nGFDL-ESM4        2059.0         2047.0    12.0                27.0   0.47\nMPI-ESM1-2-LR    1974.0         1963.0    11.0               -58.0  -0.19",
+            "sign_df": "               DIC  TAlk  pH\nCESM2           -1    -1  -1\nGFDL-ESM4        1     1   1\nMPI-ESM1-2-LR   -1    -1  -1",
+            "model_scores": "CESM2            143.453036\nGFDL-ESM4        148.674700\nMPI-ESM1-2-LR    268.523681\ndtype: float64",
+            "best_model": "CESM2",
+            "same_sign_across_models": {
+              "DIC": false,
+              "TAlk": false,
+              "pH": false
+            },
+            "within_model_consistency": {
+              "CESM2": false,
+              "GFDL-ESM4": false,
+              "MPI-ESM1-2-LR": false
+            },
+            "period_implication": "The 2002-minus-1971-2000 DIC change is of the same order as the model-minus-GLODAP DIC offset for at least some models. Because GLODAP is a 1972-2013 climatology while the model fields are for 2002, the offset cannot be interpreted as a pure model carbon-system error; it also contains a time-mismatch contribution."
+          },
+          "omitted_loop_variables": [
+            "bias",
+            "bias_map",
+            "c",
+            "change",
+            "d",
+            "diff",
+            "gl_slice",
+            "idx",
+            "m",
+            "model_on_glodap",
+            "model_slice",
+            "ratio",
+            "s",
+            "src",
+            "tgt_valid",
+            "valid",
+            "vals"
+          ]
+        }
+      ],
+      "visualization_iterations": [
+        {
+          "iteration": 1,
+          "code": "import matplotlib.pyplot as plt\n\n# ---------------------------------------------------------------------------\n# Figure 1: 0-50 m DIC bias maps, shared diverging scale\n# ---------------------------------------------------------------------------\nall_abs = np.concatenate(\n    [np.abs(dic_bias_maps[m][np.isfinite(dic_bias_maps[m])]).ravel() for m in MODELS]\n)\nvmax = np.nanpercentile(all_abs, 98) if all_abs.size else 50.0\nvmax = max(vmax, 1.0)\n\nfig, axes = plt.subplots(1, 3, figsize=(15, 4.2), sharey=True)\nfor ax, m in zip(axes, MODELS):\n    pm = ax.pcolormesh(\n        glodap_lon,\n        glodap_lat,\n        dic_bias_maps[m],\n        cmap=\"RdBu_r\",\n        vmin=-vmax,\n        vmax=vmax,\n        shading=\"auto\",\n    )\n    ax.set_title(m)\n    ax.set_xlabel(\"Longitude\")\n    ax.set_ylabel(\"Latitude\")\n    ax.set_xlim(0, 360)\n    ax.set_ylim(-90, 90)\n\ncbar = fig.colorbar(\n    pm, ax=axes, orientation=\"horizontal\", fraction=0.05, pad=0.08, shrink=0.85\n)\ncbar.set_label(r\"DIC bias (model $-$ GLODAP), $\\mu$mol kg$^{-1}$\")\nfig.suptitle(\"0-50 m mean DIC bias against GLODAPv2.2016b\", y=1.02)\n\n\n# ---------------------------------------------------------------------------\n# Figure 2: vertical profile of global mean DIC bias\n# ---------------------------------------------------------------------------\nfig2, ax2 = plt.subplots(figsize=(5.5, 5.5))\nfor m in MODELS:\n    ax2.plot(\n        vertical_bias_df.loc[m].values,\n        profile_depths,\n        marker=\"o\",\n        label=m,\n    )\nax2.axvline(0.0, color=\"k\", linewidth=0.8)\nax2.invert_yaxis()\nax2.set_xlabel(r\"DIC bias (model $-$ GLODAP), $\\mu$mol kg$^{-1}$\")\nax2.set_ylabel(\"Depth (m)\")\nax2.set_title(\"Global mean DIC bias profile\")\nfor d in profile_depths:\n    ax2.axhline(d, color=\"0.7\", linewidth=0.4, linestyle=\":\")\nax2.legend(frameon=False)",
+          "success": true,
+          "output": {
+            "all_abs": {
+              "type": "ndarray",
+              "shape": [
+                125931
+              ],
+              "size": 125931,
+              "n_valid": 125931,
+              "min": 0.0007972087769303471,
+              "max": 1803.1752398234717,
+              "mean": 50.97547844971089,
+              "std": 67.43739030492515
+            },
+            "vmax": 178.02701445063423,
+            "fig": "Figure(1500x420)",
+            "axes": {
+              "type": "ndarray",
+              "shape": [
+                3
+              ],
+              "size": 3,
+              "values": [
+                "Axes(0.125,0.2101;0.227941x0.6699)",
+                "Axes(0.398529,0.2101;0.227941x0.6699)",
+                "Axes(0.672059,0.2101;0.227941x0.6699)"
+              ]
+            },
+            "cbar": "<matplotlib.colorbar.Colorbar object at 0x702807f85e50>",
+            "fig2": "Figure(550x550)",
+            "ax2": "Axes(0.125,0.11;0.775x0.77)"
+          },
+          "omitted_loop_variables": [
+            "ax",
+            "pm"
+          ]
+        }
+      ],
+      "visualization_paths": [
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T8_deepseek-flash_20261022_175254/turn01/figures/visualization_T8_deepseek-flash_20261022_175254_turn1_1.png",
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T8_deepseek-flash_20261022_175254/turn01/figures/visualization_T8_deepseek-flash_20261022_175254_turn1_2.png"
+      ],
+      "selected_data": {
+        "name": [
+          "glodap",
+          "cmip6_historical"
+        ],
+        "path": [
+          "/data1/lorraine-20419/ocean_data/GLODAPv2.2016b_MappedClimatologies",
+          "/data1/lorraine-20419/benchmark_cmip6/historical"
+        ],
+        "how": "inferred from the root directories the executed code names"
+      },
+      "observation": "[\n  {\n    \"type\": \"computation\",\n    \"status\": \"success\",\n    \"results\": {\n      \"HIST_ROOT\": \"/data1/lorraine-20419/benchmark_cmip6/historical\",\n      \"GLODAP_ROOT\": \"/data1/lorraine-20419/ocean_data/GLODAPv2.2016b_MappedClimatologies\",\n      \"MODELS\": {\n        \"CESM2\": {\n          \"y_dim\": \"nlat\",\n          \"x_dim\": \"nlon\",\n          \"lat\": \"lat\",\n          \"lon\": \"lon\",\n          \"depth_dim\": \"lev\",\n          \"depth_scale\": 0.01,\n          \"grid\": \"curvilinear\"\n        },\n        \"GFDL-ESM4\": {\n          \"y_dim\": \"lat\",\n          \"x_dim\": \"lon\",\n          \"lat\": \"lat\",\n          \"lon\": \"lon\",\n          \"depth_dim\": \"lev\",\n          \"depth_scale\": 1.0,\n          \"grid\": \"regular\"\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"y_dim\": \"j\",\n          \"x_dim\": \"i\",\n          \"lat\": \"latitude\",\n          \"lon\": \"longitude\",\n          \"depth_dim\": \"lev\",\n          \"depth_scale\": 1.0,\n          \"grid\": \"curvilinear\"\n        }\n      },\n      \"profile_depths\": [\n        0,\n        100,\n        500,\n        1000,\n        2000\n      ],\n      \"glodap_dic_da\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"depth\": 33,\n          \"lat\": 180,\n          \"lon\": 360\n        },\n        \"units\": \"micro-mol kg-1\",\n        \"long_name\": \"moles of dissolved inorganic carbon per unit mass in seawater\",\n        \"size\": 2138400,\n        \"n_valid\": 1103356,\n        \"min\": 1019.1619873046875,\n        \"max\": 2402.477294921875,\n        \"mean\": 2181.71025090623,\n        \"std\": 105.46550860707693\n      },\n      \"glodap_talk_da\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"depth\": 33,\n          \"lat\": 180,\n          \"lon\": 360\n        },\n        \"units\": \"micro-mol kg-1\",\n        \"long_name\": \"seawater alkalinity expressed as mole equivalent per unit mass\",\n        \"size\": 2138400,\n        \"n_valid\": 1101785,\n        \"min\": 1069.45556640625,\n        \"max\": 2659.830810546875,\n        \"mean\": 2324.9228543747763,\n        \"std\": 53.49204578692571\n      },\n      \"glodap_ph_da\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"depth\": 33,\n          \"lat\": 180,\n          \"lon\": 360\n        },\n        \"units\": \"\",\n        \"long_name\": \"seawater ph reported on total scale at in situ temperature and pressure\",\n        \"size\": 2138400,\n        \"n_valid\": 1101821,\n        \"min\": 7.426542282104492,\n        \"max\": 8.522977828979492,\n        \"mean\": 7.930877682557368,\n        \"std\": 0.14905358069576602\n      },\n      \"glodap_depth\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          33\n        ],\n        \"size\": 33,\n        \"n_valid\": 33,\n        \"min\": 0.0,\n        \"max\": 5500.0,\n        \"mean\": 1347.2727272727273,\n        \"std\": 1544.0296015518354,\n        \"values\": [\n          0.0,\n          10.0,\n          20.0,\n          30.0,\n          50.0,\n          75.0,\n          100.0,\n          125.0,\n          150.0,\n          200.0,\n          250.0,\n          300.0,\n          400.0,\n          500.0,\n          600.0,\n          700.0,\n          800.0,\n          900.0,\n          1000.0,\n          1100.0,\n          1200.0,\n          1300.0,\n          1400.0,\n          1500.0,\n          1750.0,\n          2000.0,\n          2500.0,\n          3000.0,\n          3500.0,\n          4000.0,\n          4500.0,\n          5000.0,\n          5500.0\n        ]\n      },\n      \"glodap_lat\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180\n        ],\n        \"size\": 180,\n        \"n_valid\": 180,\n        \"min\": -89.5,\n        \"max\": 89.5,\n        \"mean\": 0.0,\n        \"std\": 51.96072234550504\n      },\n      \"glodap_lon\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          360\n        ],\n        \"size\": 360,\n        \"n_valid\": 360,\n        \"min\": 0.5,\n        \"max\": 359.5,\n        \"mean\": 180.0,\n        \"std\": 103.92264751567228\n      },\n      \"glodap_dic\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          33,\n          180,\n          360\n        ],\n        \"size\": 2138400,\n        \"n_valid\": 1103356,\n        \"min\": 1019.1619873046875,\n        \"max\": 2402.477294921875,\n        \"mean\": 2181.71025090623,\n        \"std\": 105.46550860707693\n      },\n      \"glodap_talk\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          33,\n          180,\n          360\n        ],\n        \"size\": 2138400,\n        \"n_valid\": 1101785,\n        \"min\": 1069.45556640625,\n        \"max\": 2659.830810546875,\n        \"mean\": 2324.9228543747763,\n        \"std\": 53.49204578692571\n      },\n      \"glodap_ph\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          33,\n          180,\n          360\n        ],\n        \"size\": 2138400,\n        \"n_valid\": 1101821,\n        \"min\": 7.426542282104492,\n        \"max\": 8.522977828979492,\n        \"mean\": 7.930877682557368,\n        \"std\": 0.14905358069576602\n      },\n      \"glodap_thick_full\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          33\n        ],\n        \"size\": 33,\n        \"n_valid\": 33,\n        \"min\": 0.0,\n        \"max\": 15.0,\n        \"mean\": 1.5151515151515151,\n        \"std\": 3.790907879756607,\n        \"values\": [\n          5.0,\n          10.0,\n          10.0,\n          15.0,\n          10.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0,\n          0.0\n        ]\n      },\n      \"lev_g50\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          33\n        ],\n        \"size\": 33,\n        \"values\": [\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"True\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\"\n        ]\n      },\n      \"glodap_dic_50\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          5,\n          180,\n          360\n        ],\n        \"size\": 324000,\n        \"n_valid\": 203515,\n        \"min\": 1019.1619873046875,\n        \"max\": 2348.09130859375,\n        \"mean\": 2048.965751090991,\n        \"std\": 78.44239992401275\n      },\n      \"glodap_talk_50\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          5,\n          180,\n          360\n        ],\n        \"size\": 324000,\n        \"n_valid\": 203242,\n        \"min\": 1069.45556640625,\n        \"max\": 2659.830810546875,\n        \"mean\": 2290.0619428459972,\n        \"std\": 70.73093874375982\n      },\n      \"glodap_ph_50\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          5,\n          180,\n          360\n        ],\n        \"size\": 324000,\n        \"n_valid\": 202609,\n        \"min\": 7.426542282104492,\n        \"max\": 8.522977828979492,\n        \"mean\": 8.090291732884042,\n        \"std\": 0.04999398214545646\n      },\n      \"glodap_thick_50\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          5\n        ],\n        \"size\": 5,\n        \"n_valid\": 5,\n        \"min\": 5.0,\n        \"max\": 15.0,\n        \"mean\": 10.0,\n        \"std\": 3.1622776601683795,\n        \"values\": [\n          5.0,\n          10.0,\n          10.0,\n          15.0,\n          10.0\n        ]\n      },\n      \"glodap_dic_map\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 41977,\n        \"min\": 1019.1619873046875,\n        \"max\": 2313.45703125,\n        \"mean\": 2048.5587845105897,\n        \"std\": 78.49971077017891\n      },\n      \"glodap_talk_map\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 41952,\n        \"min\": 1071.3240559895833,\n        \"max\": 2627.9599609375,\n        \"mean\": 2287.2936559169134,\n        \"std\": 76.00204530780078\n      },\n      \"glodap_ph_map\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 41944,\n        \"min\": 7.662694931030273,\n        \"max\": 8.522977828979492,\n        \"mean\": 8.08946898324973,\n        \"std\": 0.04386619416972416\n      },\n      \"glodap_area\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 64800,\n        \"min\": 0.008726535498373897,\n        \"max\": 0.9999619230641713,\n        \"mean\": 0.6366278526673906,\n        \"std\": 0.3077417378389015\n      },\n      \"glodap_vol_50\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          5,\n          180,\n          360\n        ],\n        \"size\": 324000,\n        \"n_valid\": 324000,\n        \"min\": 0.043632677491869484,\n        \"max\": 14.99942884596257,\n        \"mean\": 6.366278526673907,\n        \"std\": 3.804010741416317\n      },\n      \"glodap_dic_global\": 2032.371322805601,\n      \"glodap_talk_global\": 2303.335285407343,\n      \"glodap_ph_global\": 8.082068862230763,\n      \"glodap_lat2d\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 64800,\n        \"min\": -89.5,\n        \"max\": 89.5,\n        \"mean\": 0.0,\n        \"std\": 51.96072234550504\n      },\n      \"glodap_lon2d\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 64800,\n        \"min\": 0.5,\n        \"max\": 359.5,\n        \"mean\": 180.0,\n        \"std\": 103.92264751567228\n      },\n      \"glodap_valid_map\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"values\": [\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\"\n        ]\n      },\n      \"model_results\": {\n        \"CESM2\": {\n          \"depth_m\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              60\n            ],\n            \"size\": 60,\n            \"n_valid\": 60,\n            \"min\": 5.0,\n            \"max\": 5375.0,\n            \"mean\": 1216.5627050781252,\n            \"std\": 1543.0631914862215\n          },\n          \"lat2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 122880,\n            \"min\": -79.2205226074621,\n            \"max\": 89.70640964187461,\n            \"mean\": 2.791601116953018,\n            \"std\": 43.44720217375342\n          },\n          \"lon2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 122880,\n            \"min\": 0.014731101635748343,\n            \"max\": 359.99602043021787,\n            \"mean\": 185.76465359587667,\n            \"std\": 106.55290281820834\n          },\n          \"area\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 122880,\n            \"min\": 334119264.0,\n            \"max\": 7288963072.0,\n            \"mean\": 4109057742.753646,\n            \"std\": 1421303047.3540154\n          },\n          \"dic_2002_umol\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              60,\n              384,\n              320\n            ],\n            \"size\": 7372800,\n            \"n_valid\": 4247539,\n            \"min\": 1114.1800649895756,\n            \"max\": 3386.488821113909,\n            \"mean\": 2152.765047190302,\n            \"std\": 131.53869933645396\n          },\n          \"talk_2002_umol\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              60,\n              384,\n              320\n            ],\n            \"size\": 7372800,\n            \"n_valid\": 4247539,\n            \"min\": 1231.347724994614,\n            \"max\": 4538.65005290439,\n            \"mean\": 2297.378457967762,\n            \"std\": 74.09568898045299\n          },\n          \"ph_2002\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              60,\n              384,\n              320\n            ],\n            \"size\": 7372800,\n            \"n_valid\": 4247539,\n            \"min\": 7.086112976074219,\n            \"max\": 8.945194244384766,\n            \"mean\": 7.8990640119389,\n            \"std\": 0.20404151975094537\n          },\n          \"dic_period_umol\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              60,\n              384,\n              320\n            ],\n            \"size\": 7372800,\n            \"n_valid\": 4247539,\n            \"min\": 1093.2767186831218,\n            \"max\": 3403.7828588529746,\n            \"mean\": 2146.6851110806215,\n            \"std\": 135.19039713005944\n          },\n          \"vol_2002\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              60,\n              384,\n              320\n            ],\n            \"size\": 7372800,\n            \"n_valid\": 7372800,\n            \"min\": 3341192448.0,\n            \"max\": 1822102913024.0,\n            \"mean\": 376662966104.7352,\n            \"std\": 444155523327.8274\n          },\n          \"vol_period\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              60,\n              384,\n              320\n            ],\n            \"size\": 7372800,\n            \"n_valid\": 7372800,\n            \"min\": 3341192448.0,\n            \"max\": 1822102913024.0,\n            \"mean\": 376662966104.7352,\n            \"std\": 444155523327.8274\n          },\n          \"dic_map\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 86096,\n            \"min\": 1242.7390248079078,\n            \"max\": 3094.6260071650036,\n            \"mean\": 1998.420056898587,\n            \"std\": 89.23277708872166\n          },\n          \"talk_map\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 86096,\n            \"min\": 1238.0837671883874,\n            \"max\": 3397.2938656239085,\n            \"mean\": 2255.3632325178837,\n            \"std\": 91.44246278256666\n          },\n          \"ph_map\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 86096,\n            \"min\": 7.845910167694091,\n            \"max\": 8.318596522013346,\n            \"mean\": 8.079826187570358,\n            \"std\": 0.02848070489921855\n          },\n          \"dic_global\": 1996.6512436991818,\n          \"talk_global\": 2264.0109274754473,\n          \"ph_global\": 8.079533407300165,\n          \"dic_global_map\": 1995.9011375406403,\n          \"talk_global_map\": 2263.0129921205894,\n          \"ph_global_map\": 8.079643267286501,\n          \"dic_period_global\": 1987.4336999344596,\n          \"dic_period_global_map\": 1986.6634172378017,\n          \"dic_bias_global\": -35.720079106419234,\n          \"talk_bias_global\": -39.32435793189552,\n          \"ph_bias_global\": -0.0025354549305980356\n        },\n        \"GFDL-ESM4\": {\n          \"depth_m\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              35\n            ],\n            \"size\": 35,\n            \"n_valid\": 35,\n            \"min\": 2.5,\n            \"max\": 6500.0,\n            \"mean\": 1631.0,\n            \"std\": 1882.9664049427056,\n            \"values\": [\n              2.5,\n              10.0,\n              20.0,\n              32.5,\n              51.25,\n              75.0,\n              100.0,\n              125.0,\n              156.25,\n              200.0,\n              250.0,\n              312.5,\n              400.0,\n              500.0,\n              600.0,\n              700.0,\n              800.0,\n              900.0,\n              1000.0,\n              1100.0,\n              1200.0,\n              1300.0,\n              1400.0,\n              1537.5,\n              1750.0,\n              2062.5,\n              2500.0,\n              3000.0,\n              3500.0,\n              4000.0,\n              4500.0,\n              5000.0,\n              5500.0,\n              6000.0,\n              6500.0\n            ]\n          },\n          \"lat2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 64800,\n            \"min\": -89.5,\n            \"max\": 89.5,\n            \"mean\": 0.0,\n            \"std\": 51.96072234550504\n          },\n          \"lon2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 64800,\n            \"min\": 0.5,\n            \"max\": 359.50000000000006,\n            \"mean\": 180.0,\n            \"std\": 103.92264751567228\n          },\n          \"area\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 64800,\n            \"min\": 0.0,\n            \"max\": 12390983680.0,\n            \"mean\": 5572699556.94468,\n            \"std\": 4892158005.51933\n          },\n          \"dic_2002_umol\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              35,\n              180,\n              360\n            ],\n            \"size\": 2268000,\n            \"n_valid\": 1212999,\n            \"min\": 346.95333859284045,\n            \"max\": 3157.2334585409503,\n            \"mean\": 2184.4535673077226,\n            \"std\": 104.47217545301342\n          },\n          \"talk_2002_umol\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              35,\n              180,\n              360\n            ],\n            \"size\": 2268000,\n            \"n_valid\": 1212999,\n            \"min\": 384.0311756186881,\n            \"max\": 4227.131856293257,\n            \"mean\": 2336.7675985478704,\n            \"std\": 73.04290287442284\n          },\n          \"ph_2002\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              35,\n              180,\n              360\n            ],\n            \"size\": 2268000,\n            \"n_valid\": 1212999,\n            \"min\": 7.27360725402832,\n            \"max\": 9.926178932189941,\n            \"mean\": 7.944673191347803,\n            \"std\": 0.15632633299589122\n          },\n          \"dic_period_umol\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              35,\n              180,\n              360\n            ],\n            \"size\": 2268000,\n            \"n_valid\": 1212999,\n            \"min\": 344.7516825490957,\n            \"max\": 3130.1433563106802,\n            \"mean\": 2178.603929928764,\n            \"std\": 108.04477111019976\n          },\n          \"vol_2002\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              35,\n              180,\n              360\n            ],\n            \"size\": 2268000,\n            \"n_valid\": 1212999,\n            \"min\": 324.1607971191406,\n            \"max\": 6196805238784.0,\n            \"mean\": 1100421518958.6997,\n            \"std\": 1469116169810.9407\n          },\n          \"vol_period\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              35,\n              180,\n              360\n            ],\n            \"size\": 2268000,\n            \"n_valid\": 1212999,\n            \"min\": 324.15374755859375,\n            \"max\": 6196801044480.0,\n            \"mean\": 1100420923230.5413,\n            \"std\": 1469115452693.025\n          },\n          \"dic_map\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 44564,\n            \"min\": 347.01310512653214,\n            \"max\": 3154.5089271228235,\n            \"mean\": 2062.375355672535,\n            \"std\": 131.93629857859904\n          },\n          \"talk_map\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 44564,\n            \"min\": 384.12171483171267,\n            \"max\": 4222.132695782923,\n            \"mean\": 2304.503361395767,\n            \"std\": 158.2552869635374\n          },\n          \"ph_map\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 44564,\n            \"min\": 7.650740975481393,\n            \"max\": 9.925735774780906,\n            \"mean\": 8.098480371728915,\n            \"std\": 0.052885862004676536\n          },\n          \"dic_global\": 2059.1846292721375,\n          \"talk_global\": 2335.6812602335776,\n          \"ph_global\": 8.088340151903468,\n          \"dic_global_map\": 2056.9400025244704,\n          \"talk_global_map\": 2332.843564597131,\n          \"ph_global_map\": 8.088047094789747,\n          \"dic_period_global\": 2046.7063800166045,\n          \"dic_period_global_map\": 2044.440857936349,\n          \"dic_bias_global\": 26.81330646653646,\n          \"talk_bias_global\": 32.34597482623485,\n          \"ph_bias_global\": 0.006271289672705294\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"depth_m\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              40\n            ],\n            \"size\": 40,\n            \"n_valid\": 40,\n            \"min\": 6.0,\n            \"max\": 5720.0,\n            \"mean\": 1378.925,\n            \"std\": 1571.0682136288672,\n            \"values\": [\n              6.0,\n              17.0,\n              27.0,\n              37.0,\n              47.0,\n              57.0,\n              68.5,\n              82.5,\n              100.0,\n              122.5,\n              150.0,\n              182.5,\n              220.0,\n              262.5,\n              310.0,\n              362.5,\n              420.0,\n              485.0,\n              560.0,\n              645.0,\n              740.0,\n              845.0,\n              960.0,\n              1085.0,\n              1220.0,\n              1365.0,\n              1525.0,\n              1700.0,\n              1885.0,\n              2080.0,\n              2290.0,\n              2525.0,\n              2785.0,\n              3070.0,\n              3395.0,\n              3770.0,\n              4195.0,\n              4670.0,\n              5170.0,\n              5720.0\n            ]\n          },\n          \"lat2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 56320,\n            \"min\": -83.96550988220439,\n            \"max\": 89.72660369238089,\n            \"mean\": 11.336055347692735,\n            \"std\": 55.357212731498535\n          },\n          \"lon2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 56320,\n            \"min\": 0.0071753680209129525,\n            \"max\": 359.99604092487033,\n            \"mean\": 210.8956971346869,\n            \"std\": 115.14908977381505\n          },\n          \"area\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 36791,\n            \"min\": 181538016.0,\n            \"max\": 33998391296.0,\n            \"mean\": 9947414086.556387,\n            \"std\": 9163450614.786087\n          },\n          \"dic_2002_umol\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              40,\n              220,\n              256\n            ],\n            \"size\": 2252800,\n            \"n_valid\": 1089671,\n            \"min\": 311.3290378910861,\n            \"max\": 2770.152166138101,\n            \"mean\": 2088.976959145064,\n            \"std\": 105.44561267856001\n          },\n          \"talk_2002_umol\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              40,\n              220,\n              256\n            ],\n            \"size\": 2252800,\n            \"n_valid\": 1089671,\n            \"min\": 293.49294542845394,\n            \"max\": 3187.3751404431405,\n            \"mean\": 2239.3253993754292,\n            \"std\": 77.48926123755676\n          },\n          \"ph_2002\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              40,\n              220,\n              256\n            ],\n            \"size\": 2252800,\n            \"n_valid\": 1089671,\n            \"min\": 6.8458991050720215,\n            \"max\": 8.229844093322754,\n            \"mean\": 7.976607591723793,\n            \"std\": 0.1528200897641408\n          },\n          \"dic_period_umol\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              40,\n              220,\n              256\n            ],\n            \"size\": 2252800,\n            \"n_valid\": 1089671,\n            \"min\": 353.0713219555558,\n            \"max\": 2769.812889447149,\n            \"mean\": 2083.750691251375,\n            \"std\": 107.42558840163622\n          },\n          \"vol_2002\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              40,\n              220,\n              256\n            ],\n            \"size\": 2252800,\n            \"n_valid\": 1089671,\n            \"min\": 1136050432.0,\n            \"max\": 26849056915456.0,\n            \"mean\": 1247278821033.7039,\n            \"std\": 2034768928121.9226\n          },\n          \"vol_period\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              40,\n              220,\n              256\n            ],\n            \"size\": 2252800,\n            \"n_valid\": 1089671,\n            \"min\": 1136050432.0,\n            \"max\": 26849056915456.0,\n            \"mean\": 1247278821033.7039,\n            \"std\": 2034768928121.9226\n          },\n          \"dic_map\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 36791,\n            \"min\": 318.39740021055235,\n            \"max\": 2734.6871769828676,\n            \"mean\": 2001.2187581659384,\n            \"std\": 101.44859061565866\n          },\n          \"talk_map\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 36791,\n            \"min\": 299.6164857758201,\n            \"max\": 3186.860802912093,\n            \"mean\": 2192.0141659680526,\n            \"std\": 124.39288356704299\n          },\n          \"ph_map\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 36791,\n            \"min\": 7.255028700988532,\n            \"max\": 8.206424015804071,\n            \"mean\": 8.070316490889613,\n            \"std\": 0.046576058863725685\n          },\n          \"dic_global\": 1974.0581253985138,\n          \"talk_global\": 2217.4802817136774,\n          \"ph_global\": 8.058560033463909,\n          \"dic_global_map\": 1972.68473805854,\n          \"talk_global_map\": 2215.709790008345,\n          \"ph_global_map\": 8.058190343417397,\n          \"dic_period_global\": 1963.220690507908,\n          \"dic_period_global_map\": 1961.8058041673573,\n          \"dic_bias_global\": -58.31319740708727,\n          \"talk_bias_global\": -85.85500369366537,\n          \"ph_bias_global\": -0.023508828766853895\n        }\n      },\n      \"map_metrics\": {\n        \"CESM2\": {\n          \"mean_bias\": -34.77620617061979,\n          \"rmse\": 65.87314368946282,\n          \"corr\": 0.7699836333872702\n        },\n        \"GFDL-ESM4\": {\n          \"mean_bias\": 20.6069114769911,\n          \"rmse\": 83.2441290531715,\n          \"corr\": 0.6373626719949481\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"mean_bias\": -67.6765104247207,\n          \"rmse\": 100.84665072075308,\n          \"corr\": 0.6597498222128831\n        }\n      },\n      \"dic_bias_maps\": {\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 41977,\n          \"min\": -884.4836419904764,\n          \"max\": 870.9361645261242,\n          \"mean\": -34.77620617061979,\n          \"std\": 55.94538894235307\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 41977,\n          \"min\": -1803.1752398234717,\n          \"max\": 723.482701366351,\n          \"mean\": 20.6069114769911,\n          \"std\": 80.65320961499627\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 41977,\n          \"min\": -1744.8954568648353,\n          \"max\": 683.2788660414349,\n          \"mean\": -67.6765104247207,\n          \"std\": 74.76588057614408\n        }\n      },\n      \"vertical_bias\": {\n        \"CESM2\": {\n          \"0\": -28.036937391175016,\n          \"100\": -49.43364811119501,\n          \"500\": -18.34772473329869,\n          \"1000\": -8.341923284598574,\n          \"2000\": -12.435741357483183\n        },\n        \"GFDL-ESM4\": {\n          \"0\": 24.522476271033288,\n          \"100\": 14.745886059338586,\n          \"500\": -6.467760056282574,\n          \"1000\": -0.08906648705256906,\n          \"2000\": -11.580595293753387\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"0\": -68.14169466536966,\n          \"100\": -68.00802067684866,\n          \"500\": -86.5218857877121,\n          \"1000\": -81.31145515755803,\n          \"2000\": -77.286948116889\n        }\n      },\n      \"period_table\": {\n        \"CESM2\": {\n          \"dic_2002\": 1996.6512436991818,\n          \"dic_1971_2000\": 1987.4336999344596,\n          \"change\": 9.217543764722222,\n          \"dic_bias_vs_glodap\": -35.720079106419234,\n          \"ratio\": -0.2580493659395548\n        },\n        \"GFDL-ESM4\": {\n          \"dic_2002\": 2059.1846292721375,\n          \"dic_1971_2000\": 2046.7063800166045,\n          \"change\": 12.478249255533001,\n          \"dic_bias_vs_glodap\": 26.81330646653646,\n          \"ratio\": 0.46537525206397445\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"dic_2002\": 1974.0581253985138,\n          \"dic_1971_2000\": 1963.220690507908,\n          \"change\": 10.837434890605664,\n          \"dic_bias_vs_glodap\": -58.31319740708727,\n          \"ratio\": -0.18584875075446478\n        }\n      },\n      \"source_rows\": [\n        {\n          \"source\": \"CESM2\",\n          \"DIC\": 1996.6512436991818,\n          \"TAlk\": 2264.0109274754473,\n          \"pH\": 8.079533407300165\n        },\n        {\n          \"source\": \"GFDL-ESM4\",\n          \"DIC\": 2059.1846292721375,\n          \"TAlk\": 2335.6812602335776,\n          \"pH\": 8.088340151903468\n        },\n        {\n          \"source\": \"MPI-ESM1-2-LR\",\n          \"DIC\": 1974.0581253985138,\n          \"TAlk\": 2217.4802817136774,\n          \"pH\": 8.058560033463909\n        },\n        {\n          \"source\": \"GLODAP\",\n          \"DIC\": 2032.371322805601,\n          \"TAlk\": 2303.335285407343,\n          \"pH\": 8.082068862230763\n        }\n      ],\n      \"global_mean_df\": \"                       DIC         TAlk        pH\\nsource                                           \\nCESM2          1996.651244  2264.010927  8.079533\\nGFDL-ESM4      2059.184629  2335.681260  8.088340\\nMPI-ESM1-2-LR  1974.058125  2217.480282  8.058560\\nGLODAP         2032.371323  2303.335285  8.082069\",\n      \"global_bias_df\": \"                     DIC       TAlk        pH\\nCESM2         -35.720079 -39.324358 -0.002535\\nGFDL-ESM4      26.813306  32.345975  0.006271\\nMPI-ESM1-2-LR -58.313197 -85.855004 -0.023509\",\n      \"global_mean_rounded\": \"                  DIC    TAlk     pH\\nsource                              \\nCESM2          1997.0  2264.0  8.080\\nGFDL-ESM4      2059.0  2336.0  8.088\\nMPI-ESM1-2-LR  1974.0  2217.0  8.059\\nGLODAP         2032.0  2303.0  8.082\",\n      \"global_bias_rounded\": \"                DIC  TAlk     pH\\nCESM2         -36.0 -39.0 -0.003\\nGFDL-ESM4      27.0  32.0  0.006\\nMPI-ESM1-2-LR -58.0 -86.0 -0.024\",\n      \"map_metrics_df\": \"               mean_bias        rmse      corr\\nCESM2         -34.776206   65.873144  0.769984\\nGFDL-ESM4      20.606911   83.244129  0.637363\\nMPI-ESM1-2-LR -67.676510  100.846651  0.659750\",\n      \"map_metrics_rounded\": \"               mean_bias   rmse   corr\\nCESM2              -35.0   66.0  0.770\\nGFDL-ESM4           21.0   83.0  0.637\\nMPI-ESM1-2-LR      -68.0  101.0  0.660\",\n      \"vertical_bias_df\": \"                    0          100        500        1000       2000\\nCESM2         -28.036937 -49.433648 -18.347725  -8.341923 -12.435741\\nGFDL-ESM4      24.522476  14.745886  -6.467760  -0.089066 -11.580595\\nMPI-ESM1-2-LR -68.141695 -68.008021 -86.521886 -81.311455 -77.286948\",\n      \"vertical_bias_rounded\": \"               0     100   500   1000  2000\\nCESM2         -28.0 -49.0 -18.0  -8.0 -12.0\\nGFDL-ESM4      25.0  15.0  -6.0  -0.0 -12.0\\nMPI-ESM1-2-LR -68.0 -68.0 -87.0 -81.0 -77.0\",\n      \"period_df\": \"                  dic_2002  dic_1971_2000  ...  dic_bias_vs_glodap     ratio\\nCESM2          1996.651244    1987.433700  ...          -35.720079 -0.258049\\nGFDL-ESM4      2059.184629    2046.706380  ...           26.813306  0.465375\\nMPI-ESM1-2-LR  1974.058125    1963.220691  ...          -58.313197 -0.185849\\n\\n[3 rows x 5 columns]\",\n      \"period_rounded\": \"               dic_2002  dic_1971_2000  change  dic_bias_vs_glodap  ratio\\nCESM2            1997.0         1987.0     9.0               -36.0  -0.26\\nGFDL-ESM4        2059.0         2047.0    12.0                27.0   0.47\\nMPI-ESM1-2-LR    1974.0         1963.0    11.0               -58.0  -0.19\",\n      \"sign_df\": \"               DIC  TAlk  pH\\nCESM2           -1    -1  -1\\nGFDL-ESM4        1     1   1\\nMPI-ESM1-2-LR   -1    -1  -1\",\n      \"model_scores\": \"CESM2            143.453036\\nGFDL-ESM4        148.674700\\nMPI-ESM1-2-LR    268.523681\\ndtype: float64\",\n      \"best_model\": \"CESM2\",\n      \"same_sign_across_models\": {\n        \"DIC\": false,\n        \"TAlk\": false,\n        \"pH\": false\n      },\n      \"within_model_consistency\": {\n        \"CESM2\": false,\n        \"GFDL-ESM4\": false,\n        \"MPI-ESM1-2-LR\": false\n      },\n      \"period_implication\": \"The 2002-minus-1971-2000 DIC change is of the same order as the model-minus-GLODAP DIC offset for at least some models. Because GLODAP is a 1972-2013 climatology while the model fields are for 2002, the offset cannot be interpreted as a pure model carbon-system error; it also contains a time-mismatch contribution.\"\n    }\n  },\n  {\n    \"type\": \"visualization\",\n    \"status\": \"success\",\n    \"paths\": [\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T8_deepseek-flash_20261022_175254/turn01/figures/visualization_T8_deepseek-flash_20261022_175254_turn1_1.png\",\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T8_deepseek-flash_20261022_175254/turn01/figures/visualization_T8_deepseek-flash_20261022_175254_turn1_2.png\"\n    ]\n  }\n]",
+      "solution": "<solution>\nUsing 2002 annual means for the CMIP6 models and the GLODAPv2.2016b mapped climatology, with model DIC and total alkalinity expressed in μmol kg⁻¹ and pH on the total scale:\n\n## 1. Global 0–50 m mean carbon-system state\n\n| Source | DIC (μmol kg⁻¹) | TAlk (μmol kg⁻¹) | pH |\n|---|---:|---:|---:|\n| CESM2 | 1997 | 2264 | 8.080 |\n| GFDL-ESM4 | 2059 | 2336 | 8.088 |\n| MPI-ESM1-2-LR | 1974 | 2217 | 8.059 |\n| GLODAP | 2032 | 2303 | 8.082 |\n\nModel minus GLODAP differences:\n\n| Model | ΔDIC (μmol kg⁻¹) | ΔTAlk (μmol kg⁻¹) | ΔpH |\n|---|---:|---:|---:|\n| CESM2 | −36 | −39 | −0.003 |\n| GFDL-ESM4 | +27 | +32 | +0.006 |\n| MPI-ESM1-2-LR | −58 | −86 | −0.024 |\n\nThus CESM2 and MPI-ESM1-2-LR are lower than GLODAP in both DIC and alkalinity, while GFDL-ESM4 is higher. The pH bias is very small in CESM2 and GFDL-ESM4, but MPI-ESM1-2-LR is substantially too acidic in this 0–50 m mean.\n\n## 2. 0–50 m DIC map comparison on the GLODAP 1° grid\n\n| Model | Mean bias (μmol kg⁻¹) | RMSE (μmol kg⁻¹) | Spatial correlation |\n|---|---:|---:|---:|\n| CESM2 | −35 | 66 | 0.770 |\n| GFDL-ESM4 | +21 | 83 | 0.637 |\n| MPI-ESM1-2-LR | −68 | 101 | 0.660 |\n\nCESM2 has the best spatial agreement, with the highest correlation and the smallest RMSE. GFDL-ESM4 has the smallest absolute mean bias on the GLODAP grid, but a poorer spatial pattern than CESM2. MPI-ESM1-2-LR is clearly the worst, with a large negative bias, largest RMSE, and only moderate correlation.\n\nThe vertical-profile comparison of global-mean DIC bias gives:\n\n| Depth | CESM2 | GFDL-ESM4 | MPI-ESM1-2-LR |\n|---:|---:|---:|---:|\n| 0 m | −28 | +25 | −68 |\n| 100 m | −49 | +15 | −68 |\n| 500 m | −18 | −6 | −87 |\n| 1000 m | −8 | 0 | −81 |\n| 2000 m | −12 | −12 | −77 |\n\n(all values μmol kg⁻¹, model minus GLODAP). CESM2 is negative at all sampled depths, GFDL-ESM4 changes from positive near the surface to near-zero/negative at depth, and MPI-ESM1-2-LR is strongly negative throughout.\n\n## 3. Temporal DIC change and interpretation of the bias\n\nGlobal 0–50 m DIC change, 2002 minus the 1971–2000 average:\n\n| Model | DIC 2002 | DIC 1971–2000 mean | Change 2002−1971–2000 | 2002 DIC bias vs GLODAP | Ratio change / bias |\n|---|---:|---:|---:|---:|---:|\n| CESM2 | 1997 | 1987 | +9 | −36 | −0.26 |\n| GFDL-ESM4 | 2059 | 2047 | +12 | +27 | +0.47 |\n| MPI-ESM1-2-LR | 1974 | 1963 | +11 | −58 | −0.19 |\n\nThe 1971–2000 to 2002 DIC increase is about 9–12 μmol kg⁻¹, i.e. roughly 19–47% of the magnitude of the model-minus-GLODAP DIC bias. Because GLODAPv2.2016b is a 1972–2013 climatology while the model field is for 2002, the comparison contains some time-window mismatch. Therefore the model-minus-GLODAP DIC offset should not be read as a pure model error. Nevertheless, the offset is generally larger than the recent 1971–2000 to 2002 change, so temporal mismatch alone is unlikely to explain all of it; structural model biases remain important, especially for MPI-ESM1-2-LR.\n\n## 4. Best model and sign consistency\n\nOverall, **CESM2 reproduces the observed carbon system best**: it has the highest 0–50 m DIC spatial correlation, the smallest RMSE, and a small pH bias. GFDL-ESM4 is close and actually has the smallest absolute global-mean DIC and TAlk biases, but its spatial DIC pattern is poorer. MPI-ESM1-2-LR performs worst by a large margin, with strongly negative DIC and alkalinity biases and the largest pH deficit.\n\nThe errors are **not consistent in sign across the three models**. GFDL-ESM4 is positive for DIC, TAlk and pH, whereas CESM2 and MPI-ESM1-2-LR are negative for all three. Within each individual model, the DIC, TAlk and pH biases happen to share the same sign in this calculation, but the magnitudes differ strongly, especially for MPI-ESM1-2-LR, whose alkalinity and pH deficits are much larger than those of the other models.\n\nFigure 1 shows the three 0–50 m DIC bias maps on a common diverging colour scale centred on zero, and Figure 2 shows the corresponding global-mean DIC bias vertical profiles with the five sampled depths marked.\n</solution>",
+      "timestamp": "2026-10-22T18:03:47.648016"
+    }
+  ]
+}

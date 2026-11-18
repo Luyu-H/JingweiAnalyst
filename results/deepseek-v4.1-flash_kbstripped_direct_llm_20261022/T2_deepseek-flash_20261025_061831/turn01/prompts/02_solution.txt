@@ -1,0 +1,992 @@
+# exchange 2: solution
+# elapsed: 22.3 s
+
+===== SYSTEM =====
+
+The user's question:
+Rebuild the Nino 3.4 index from the raw ERSSTv5 sea surface temperature field and check it against the series NOAA/CPC publishes, then use the same code to reproduce the offset between CPC's two baseline periods.
+
+Data to use:
+- ERSSTv5 monthly SST, 1950-01 to 2023-12, on its native 2-degree grid.
+- The CPC monthly Nino index on the 1991-2020 baseline (`ersst5_91-20`), Nino 3.4 anomaly column: the main reference.
+- The CPC monthly Nino index on the 1981-2010 baseline (`ersst5_81-10`), Nino 3.4 anomaly column: the control.
+- The CPC ONI series (`oni`), the official 3-month running index.
+
+Expected numerical results:
+- RECON_9120, the monthly Nino 3.4 index reconstructed from ERSSTv5 as the SST anomaly over 5S-5N, 170W-120W relative to a 1991-2020 monthly climatology, 1950-01 to 2023-12. Against the CPC 1991-2020 Nino 3.4 anomaly over that window, report the Pearson correlation to 6 decimal places, the RMSE in degrees Celsius to 4 decimal places, and the largest absolute deviation in degrees Celsius to 4 decimal places with the year and month at which it occurs.
+- The number of El Nino events in RECON_9120 over 1950-2023 under the operational ONI criterion (at least 5 consecutive overlapping 3-month seasons, i.e. values of the 3-month centred running mean, at or above +0.5 degrees Celsius), and the three events with the highest peak values, each with the year and month of its peak and its peak value in degrees Celsius to 2 decimal places.
+- The same count and the same three largest peaks for the CPC ONI series under the identical criterion, with an explanation of why the two counts differ.
+- The mean baseline offset of the reconstruction, RECON_8110 (the same index relative to the 1981-2010 baseline) minus RECON_9120, as the unweighted mean over the months of 1950-01 to 2020-12, in degrees Celsius to 3 decimal places.
+- The mean published baseline offset, CPC 1981-2010 minus CPC 1991-2020 Nino 3.4 anomaly, as the unweighted mean over the same months, in degrees Celsius to 3 decimal places, and how closely it agrees with the reconstructed offset.
+
+Expected visualizations:
+- Figure 1, a two-row figure sharing a time axis over 1950-2023. The upper row overlays the RECON_9120 and CPC 1991-2020 monthly anomalies, the 3-month running mean, the +0.5 and -0.5 degrees Celsius thresholds, and shading between the threshold and the running-mean curve, warm during detected El Nino events and cool during detected La Nina events (at least 5 consecutive seasons at or below -0.5 degrees Celsius). The lower row shows RECON_9120 minus CPC on its own vertical scale. Label both vertical axes in degrees Celsius.
+- Figure 2, a square scatter plot of RECON_9120 (y) against the CPC 1991-2020 series (x), one point per month, with identical axis ranges and ticks, a 1:1 reference line, and the correlation and RMSE annotated.
+
+The code that ran:
+<executed_code>
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+# -----------------------------------------------------------------------------
+# Load ERSSTv5 SST and form the Nino 3.4 region mean
+# -----------------------------------------------------------------------------
+ersst_path = "/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc"
+cpc_root = "/data1/lorraine-20419/ocean_data/CPC"
+
+ds = xr.open_dataset(ersst_path)
+sst = ds["sst"].sel(time=slice("1950-01-01", "2023-12-31"))
+
+# Nino 3.4: 5S-5N, 170W-120W.  ERSST lon is 0-360, so 170W=190E, 120W=240E.
+lat_mask = (sst["lat"] >= -5) & (sst["lat"] <= 5)
+lon360 = sst["lon"] % 360
+lon_mask = (lon360 >= 190) & (lon360 <= 240)
+
+sst_nino34 = (
+    sst.where(lat_mask, drop=True)
+       .where(lon_mask, drop=True)
+       .mean(dim=("lat", "lon"))
+       .compute()
+)
+
+def monthly_anomaly(da, clim_start, clim_end):
+    clim = da.sel(time=slice(clim_start, clim_end)).groupby("time.month").mean("time")
+    return da.groupby("time.month") - clim
+
+RECON_9120 = monthly_anomaly(sst_nino34, "1991-01-01", "2020-12-31").rename("RECON_9120")
+RECON_8110 = monthly_anomaly(sst_nino34, "1981-01-01", "2010-12-31").rename("RECON_8110")
+RECON_9120 = RECON_9120.compute()
+RECON_8110 = RECON_8110.compute()
+
+# -----------------------------------------------------------------------------
+# Read CPC monthly Nino indices
+# -----------------------------------------------------------------------------
+def load_cpc_monthly(path):
+    raw = pd.read_csv(path, sep=r"\s+", header=None, comment="#", dtype=str)
+    recs = []
+    for _, r in raw.iterrows():
+        if len(r) < 2:
+            continue
+        try:
+            yr = int(float(r.iloc[0]))
+            mo = int(float(r.iloc[1]))
+        except Exception:
+            continue
+        vals = []
+        for i in range(2, 10):
+            if i < len(r):
+                try:
+                    vals.append(float(r.iloc[i]))
+                except Exception:
+                    vals.append(np.nan)
+            else:
+                vals.append(np.nan)
+        recs.append([yr, mo] + vals)
+
+    cols = [
+        "YR", "MON", "NINO1+2", "NINO1+2_ANOM", "NINO3", "NINO3_ANOM",
+        "NINO4", "NINO4_ANOM", "NINO3.4", "NINO3.4_ANOM"
+    ]
+    df = pd.DataFrame(recs, columns=cols)
+    df["time"] = pd.to_datetime(dict(year=df["YR"].astype(int),
+                                     month=df["MON"].astype(int),
+                                     day=1))
+    return df.sort_values("time").reset_index(drop=True)
+
+cpc9120_df = load_cpc_monthly(cpc_root + "/ersst5.nino.mth.91-20.ascii")
+cpc8110_df = load_cpc_monthly(cpc_root + "/ersst5.nino.mth.81-10.ascii")
+
+cpc9120_s = cpc9120_df.set_index("time")["NINO3.4_ANOM"].sort_index()
+cpc8110_s = cpc8110_df.set_index("time")["NINO3.4_ANOM"].sort_index()
+cpc9120_win = cpc9120_s.loc["1950-01-01":"2023-12-31"]
+
+# -----------------------------------------------------------------------------
+# Read official CPC ONI seasonal series and map each 3-month season
+# to its centre month.
+# -----------------------------------------------------------------------------
+season_to_month = {
+    "DJF": 1, "JFM": 2, "FMA": 3, "MAM": 4, "AMJ": 5, "MJJ": 6,
+    "JJA": 7, "JAS": 8, "ASO": 9, "SON": 10, "OND": 11, "NDJ": 12,
+}
+
+def load_oni(path):
+    raw = pd.read_csv(path, sep=r"\s+", header=None, comment="#", dtype=str)
+    recs = []
+    for _, r in raw.iterrows():
+        if len(r) < 4:
+            continue
+        seas = str(r.iloc[0]).strip().upper()
+        if seas not in season_to_month:
+            continue
+        try:
+            yr = int(float(r.iloc[1]))
+            total = float(r.iloc[2])
+            anom = float(r.iloc[3])
+        except Exception:
+            continue
+        recs.append({
+            "time": pd.Timestamp(year=yr, month=season_to_month[seas], day=1),
+            "SEAS": seas, "YR": yr, "TOTAL": total, "ANOM": anom,
+        })
+    return pd.DataFrame(recs).sort_values("time").set_index("time")
+
+oni_df = load_oni(cpc_root + "/oni.ascii.txt")
+oni_anom = oni_df["ANOM"].loc["1950-01-01":"2023-12-31"]
+
+# -----------------------------------------------------------------------------
+# Monthly comparison statistics: RECON_9120 versus CPC 1991-2020 Nino3.4
+# -----------------------------------------------------------------------------
+recon_9120_s = RECON_9120.to_pandas()
+comp = pd.concat(
+    [recon_9120_s.rename("recon"), cpc9120_win.rename("cpc")],
+    axis=1, join="inner"
+).dropna()
+
+diff = comp["recon"] - comp["cpc"]
+
+corr_recon_cpc_9120 = float(np.corrcoef(comp["recon"].values, comp["cpc"].values)[0, 1])
+rmse_recon_cpc_9120 = float(np.sqrt(np.mean(diff.values ** 2)))
+
+max_abs_series = diff.abs()
+max_abs_dev_recon_cpc_9120 = float(max_abs_series.max())
+max_abs_dev_time = max_abs_series.idxmax()
+max_abs_dev_year = int(max_abs_dev_time.year)
+max_abs_dev_month = int(max_abs_dev_time.month)
+
+corr_recon_cpc_9120_6 = round(corr_recon_cpc_9120, 6)
+rmse_recon_cpc_9120_4 = round(rmse_recon_cpc_9120, 4)
+max_abs_dev_recon_cpc_9120_4 = round(max_abs_dev_recon_cpc_9120, 4)
+
+# -----------------------------------------------------------------------------
+# Event detection: ONI criterion, at least 5 consecutive 3-month values
+# at or above +0.5 C (or at or below -0.5 C for La Nina).
+# -----------------------------------------------------------------------------
+def find_runs(series, threshold, min_len=5, above=True):
+    s = series.dropna().sort_index()
+    if len(s) == 0:
+        return []
+
+    cond = (s >= threshold) if above else (s <= threshold)
+    times = s.index
+    events = []
+    n = len(s)
+    i = 0
+
+    while i < n:
+        if bool(cond.iloc[i]):
+            j = i
+            while (
+                j + 1 < n
+                and bool(cond.iloc[j + 1])
+                and (
+                    (times[j + 1].year * 12 + times[j + 1].month)
+                    - (times[j].year * 12 + times[j].month)
+                    == 1
+                )
+            ):
+                j += 1
+
+            length = j - i + 1
+            if length >= min_len:
+                seg = s.iloc[i:j + 1]
+                if above:
+                    peak_val = float(seg.max())
+                    peak_time = seg.idxmax()
+                else:
+                    peak_val = float(seg.min())
+                    peak_time = seg.idxmin()
+
+                events.append({
+                    "start": times[i],
+                    "end": times[j],
+                    "length": length,
+                    "peak_time": peak_time,
+                    "peak_value": peak_val,
+                })
+            i = j + 1
+        else:
+            i += 1
+
+    return events
+
+def summarize_events(events, n=3):
+    top = sorted(events, key=lambda e: (-e["peak_value"], e["peak_time"]))[:n]
+    return [{
+        "year": int(e["peak_time"].year),
+        "month": int(e["peak_time"].month),
+        "peak_value": round(float(e["peak_value"]), 2),
+        "start": e["start"].strftime("%Y-%m"),
+        "end": e["end"].strftime("%Y-%m"),
+        "length": e["length"],
+    } for e in top]
+
+recon_roll = recon_9120_s.rolling(window=3, center=True).mean()
+cpc_roll = cpc9120_s.rolling(window=3, center=True).mean()
+
+events_recon = find_runs(recon_roll, 0.5, min_len=5, above=True)
+n_el_nino_recon = len(events_recon)
+top3_el_nino_recon = summarize_events(events_recon, 3)
+
+events_recon_ln = find_runs(recon_roll, -0.5, min_len=5, above=False)
+
+events_cpc_oni = find_runs(oni_anom, 0.5, min_len=5, above=True)
+n_el_nino_cpc_oni = len(events_cpc_oni)
+top3_el_nino_cpc_oni = summarize_events(events_cpc_oni, 3)
+
+if n_el_nino_recon == n_el_nino_cpc_oni:
+    count_difference_explanation = (
+        f"Both series contain {n_el_nino_recon} El Nino events. "
+        "Small differences in event boundaries or peaks can still arise because "
+        "RECON_9120 uses a fixed 1991-2020 monthly climatology and a simple area "
+        "mean of ERSSTv5, while CPC ONI uses a 30-year centred baseline that is "
+        "rolled forward every five years, CPC's own quality-control and missing-data "
+        "treatment, and values rounded to 0.1 C."
+    )
+else:
+    count_difference_explanation = (
+        f"RECON_9120 gives {n_el_nino_recon} El Nino events, whereas the official "
+        f"CPC ONI series gives {n_el_nino_cpc_oni}. The discrepancy is caused by the "
+        "different climatology and processing: RECON_9120 uses a fixed 1991-2020 "
+        "monthly climatology and a simple area mean of the 2-degree ERSSTv5 grid, "
+        "while CPC ONI uses a 30-year centred normal rolled forward every five years, "
+        "CPC's own quality-control and missing-data treatment, and rounded 0.1 C "
+        "values. Near the +0.5 C threshold these differences can make a run one "
+        "season shorter or longer and thus add or remove an event."
+    )
+
+# -----------------------------------------------------------------------------
+# Baseline offsets: 1981-2010 anomaly minus 1991-2020 anomaly
+# -----------------------------------------------------------------------------
+recon_diff = (
+    RECON_8110.to_pandas() - RECON_9120.to_pandas()
+).loc["1950-01-01":"2020-12-31"]
+
+offset_recon_8110_minus_9120 = float(recon_diff.mean())
+
+cpc_offset_df = pd.concat(
+    [cpc8110_s.rename("cpc8110"), cpc9120_s.rename("cpc9120")],
+    axis=1, join="inner"
+).loc["1950-01-01":"2020-12-31"].dropna()
+
+offset_cpc_8110_minus_9120 = float(
+    (cpc_offset_df["cpc8110"] - cpc_offset_df["cpc9120"]).mean()
+)
+
+offset_recon_8110_minus_9120_3 = round(offset_recon_8110_minus_9120, 3)
+offset_cpc_8110_minus_9120_3 = round(offset_cpc_8110_minus_9120, 3)
+
+offset_difference_cpc_minus_recon = float(
+    offset_cpc_8110_minus_9120 - offset_recon_8110_minus_9120
+)
+offset_abs_difference = float(abs(offset_difference_cpc_minus_recon))
+
+# Convenience printout for checking the requested numbers.
+print("RECON_9120 versus CPC 1991-2020 Nino3.4:")
+print(f"  Pearson r = {corr_recon_cpc_9120:.6f}")
+print(f"  RMSE = {rmse_recon_cpc_9120:.4f} C")
+print(f"  max |dev| = {max_abs_dev_recon_cpc_9120:.4f} C "
+      f"at {max_abs_dev_year}-{max_abs_dev_month:02d}")
+print(f"El Nino count RECON_9120: {n_el_nino_recon}")
+print(f"  top3 = {top3_el_nino_recon}")
+print(f"El Nino count CPC ONI: {n_el_nino_cpc_oni}")
+print(f"  top3 = {top3_el_nino_cpc_oni}")
+print(f"Baseline offset RECON (8110-9120): "
+      f"{offset_recon_8110_minus_9120:.3f} C")
+print(f"Baseline offset CPC   (8110-9120): "
+      f"{offset_cpc_8110_minus_9120:.3f} C")
+print(f"CPC minus RECON offset difference: "
+      f"{offset_difference_cpc_minus_recon:.3f} C")
+print(count_difference_explanation)
+
+# --- visualization ---
+# -----------------------------------------------------------------------------
+# Figure 1: reconstructed and CPC monthly anomalies plus 3-month running means
+# -----------------------------------------------------------------------------
+fig1, (ax1, ax2) = plt.subplots(
+    2, 1, figsize=(14, 8), sharex=True,
+    gridspec_kw={"height_ratios": [3, 1]}
+)
+
+ax1.plot(
+    recon_9120_s.index, recon_9120_s.values,
+    color="tab:red", lw=0.7, alpha=0.45, label="RECON_9120 monthly"
+)
+ax1.plot(
+    cpc9120_win.index, cpc9120_win.values,
+    color="tab:blue", lw=0.7, alpha=0.45, label="CPC 1991-2020 monthly"
+)
+ax1.plot(
+    recon_roll.index, recon_roll.values,
+    color="tab:red", lw=2.0, label="RECON 3-month mean"
+)
+ax1.plot(
+    cpc_roll.index, cpc_roll.values,
+    color="tab:blue", lw=2.0, label="CPC 3-month mean"
+)
+
+ax1.axhline(0.5, color="0.35", ls="--", lw=1.0, label="±0.5°C threshold")
+ax1.axhline(-0.5, color="0.35", ls="--", lw=1.0)
+
+for ev in events_recon:
+    seg = recon_roll.loc[ev["start"]:ev["end"]]
+    ax1.fill_between(
+        seg.index, 0.5, seg.values,
+        where=(seg.values >= 0.5),
+        color="tab:red", alpha=0.20, interpolate=True
+    )
+
+for ev in events_recon_ln:
+    seg = recon_roll.loc[ev["start"]:ev["end"]]
+    ax1.fill_between(
+        seg.index, -0.5, seg.values,
+        where=(seg.values <= -0.5),
+        color="tab:blue", alpha=0.20, interpolate=True
+    )
+
+ax1.set_ylabel("Nino 3.4 anomaly (°C)")
+ax1.set_title("Reconstructed versus CPC Nino 3.4 index")
+ax1.legend(loc="upper left", ncol=2, fontsize=8)
+ax1.grid(True, alpha=0.25)
+
+ax2.plot(diff.index, diff.values, color="black", lw=0.8)
+ax2.axhline(0, color="0.5", lw=0.8)
+ax2.set_ylabel("RECON - CPC (°C)")
+ax2.set_xlabel("Year")
+ax2.grid(True, alpha=0.25)
+
+ax1.set_xlim(pd.Timestamp("1950-01-01"), pd.Timestamp("2023-12-31"))
+fig1.tight_layout()
+
+# -----------------------------------------------------------------------------
+# Figure 2: square scatter of RECON_9120 versus CPC 1991-2020
+# -----------------------------------------------------------------------------
+fig2, ax = plt.subplots(figsize=(7, 7))
+
+ax.scatter(
+    comp["cpc"].values, comp["recon"].values,
+    s=10, alpha=0.6, edgecolors="none"
+)
+
+lo = min(comp["cpc"].min(), comp["recon"].min())
+hi = max(comp["cpc"].max(), comp["recon"].max())
+span = hi - lo
+lo = lo - 0.05 * span
+hi = hi + 0.05 * span
+
+ax.plot([lo, hi], [lo, hi], "k--", lw=1)
+ax.set_xlim(lo, hi)
+ax.set_ylim(lo, hi)
+ax.set_aspect("equal", adjustable="box")
+
+ticks = np.linspace(lo, hi, 9)
+ax.set_xticks(ticks)
+ax.set_yticks(ticks)
+
+ax.set_xlabel("CPC Nino 3.4 anomaly 1991-2020 (°C)")
+ax.set_ylabel("RECON_9120 (°C)")
+ax.grid(True, alpha=0.3)
+
+ax.text(
+    0.05, 0.95,
+    f"r = {corr_recon_cpc_9120:.6f}\nRMSE = {rmse_recon_cpc_9120:.4f} °C",
+    transform=ax.transAxes, va="top",
+    bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.9)
+)
+
+fig2.tight_layout()
+</executed_code>
+
+Status: computation succeeded; visualization generated
+
+Results:
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "ersst_path": "/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc",
+      "cpc_root": "/data1/lorraine-20419/ocean_data/CPC",
+      "ds": {
+        "time_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "time": 2072,
+            "nbnds": 2
+          },
+          "long_name": "Time Boundaries",
+          "size": 4144,
+          "n_valid": 4144,
+          "min": 9.969209968386869e+36,
+          "max": 9.969209968386869e+36,
+          "mean": 9.969209968386869e+36,
+          "std": 0.0
+        },
+        "sst": {
+          "type": "DataArray",
+          "dims": {
+            "time": 2072,
+            "lat": 89,
+            "lon": 180
+          },
+          "units": "degC",
+          "long_name": "Monthly Means of Sea Surface Temperature",
+          "size": 33193440,
+          "n_valid": 22767136,
+          "min": -1.7999999523162842,
+          "max": 42.326358795166016,
+          "mean": 13.565886497497559,
+          "std": 11.497235298156738
+        }
+      },
+      "sst": {
+        "type": "DataArray",
+        "dims": {
+          "time": 888,
+          "lat": 89,
+          "lon": 180
+        },
+        "units": "degC",
+        "long_name": "Monthly Means of Sea Surface Temperature",
+        "size": 14225760,
+        "n_valid": 9757344,
+        "min": -1.7999999523162842,
+        "max": 34.33403396606445,
+        "mean": 13.73912239074707,
+        "std": 11.535490989685059
+      },
+      "lat_mask": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 89
+        },
+        "units": "degrees_north",
+        "long_name": "Latitude",
+        "size": 89,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "lon360": {
+        "type": "DataArray",
+        "dims": {
+          "lon": 180
+        },
+        "units": "degrees_east",
+        "long_name": "Longitude",
+        "size": 180,
+        "n_valid": 180,
+        "min": 0.0,
+        "max": 358.0,
+        "mean": 179.0,
+        "std": 103.92144775390625
+      },
+      "lon_mask": {
+        "type": "DataArray",
+        "dims": {
+          "lon": 180
+        },
+        "units": "degrees_east",
+        "long_name": "Longitude",
+        "size": 180,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "sst_nino34": {
+        "type": "DataArray",
+        "dims": {
+          "time": 888
+        },
+        "units": "degC",
+        "long_name": "Monthly Means of Sea Surface Temperature",
+        "size": 888,
+        "n_valid": 888,
+        "min": 24.251832962036133,
+        "max": 29.4149227142334,
+        "mean": 26.89883804321289,
+        "std": 0.985548734664917
+      },
+      "RECON_9120": {
+        "type": "DataArray",
+        "dims": {
+          "time": 888
+        },
+        "units": "degC",
+        "long_name": "Monthly Means of Sea Surface Temperature",
+        "size": 888,
+        "n_valid": 888,
+        "min": -2.4524002075195312,
+        "max": 2.7106895446777344,
+        "mean": -0.184556888030456,
+        "std": 0.8742478156246075
+      },
+      "RECON_8110": {
+        "type": "DataArray",
+        "dims": {
+          "time": 888
+        },
+        "units": "degC",
+        "long_name": "Monthly Means of Sea Surface Temperature",
+        "size": 888,
+        "n_valid": 888,
+        "min": -2.3759822845458984,
+        "max": 2.787107467651367,
+        "mean": -0.12440022477158555,
+        "std": 0.873885551521176
+      },
+      "cpc9120_df": "       YR  MON  NINO1+2  ...  NINO3.4  NINO3.4_ANOM       time\n0    1950    1    23.01  ...    24.55         -1.99 1950-01-01\n1    1950    2    24.32  ...    25.06         -1.69 1950-02-01\n2    1950    3    25.11  ...    25.87         -1.42 1950-03-01\n3    1950    4    23.63  ...    26.28         -1.54 1950-04-01\n4    1950    5    22.68  ...    26.18         -1.75 1950-05-01\n..    ...  ...      ...  ...      ...           ...        ...\n913  2026    2    26.82  ...    26.48         -0.27 2026-02-01\n914  2026    3    27.38  ...    27.27         -0.01 2026-03-01\n915  2026    4    26.85  ...    28.11          0.29 2026-04-01\n916  2026    5    26.23  ...    28.83          0.90 2026-05-01\n917  2026    6    25.94  ...    29.17          1.44 2026-06-01\n\n[918 rows x 11 columns]",
+      "cpc8110_df": "       YR  MON  NINO1+2  ...  NINO3.4  NINO3.4_ANOM       time\n0    1950    1    23.01  ...    24.55         -2.00 1950-01-01\n1    1950    2    24.32  ...    25.06         -1.68 1950-02-01\n2    1950    3    25.11  ...    25.87         -1.37 1950-03-01\n3    1950    4    23.63  ...    26.28         -1.43 1950-04-01\n4    1950    5    22.68  ...    26.18         -1.63 1950-05-01\n..    ...  ...      ...  ...      ...           ...        ...\n847  2020    8    19.96  ...    26.27         -0.57 2020-08-01\n848  2020    9    19.50  ...    25.89         -0.84 2020-09-01\n849  2020   10    20.25  ...    25.46         -1.21 2020-10-01\n850  2020   11    20.95  ...    25.29         -1.33 2020-11-01\n851  2020   12    22.03  ...    25.42         -1.14 2020-12-01\n\n[852 rows x 11 columns]",
+      "cpc9120_s": "time\n1950-01-01   -1.99\n1950-02-01   -1.69\n1950-03-01   -1.42\n1950-04-01   -1.54\n1950-05-01   -1.75\n              ... \n2026-02-01   -0.27\n2026-03-01   -0.01\n2026-04-01    0.29\n2026-05-01    0.90\n2026-06-01    1.44\nName: NINO3.4_ANOM, Length: 918, dtype: float64",
+      "cpc8110_s": "time\n1950-01-01   -2.00\n1950-02-01   -1.68\n1950-03-01   -1.37\n1950-04-01   -1.43\n1950-05-01   -1.63\n              ... \n2020-08-01   -0.57\n2020-09-01   -0.84\n2020-10-01   -1.21\n2020-11-01   -1.33\n2020-12-01   -1.14\nName: NINO3.4_ANOM, Length: 852, dtype: float64",
+      "cpc9120_win": "time\n1950-01-01   -1.99\n1950-02-01   -1.69\n1950-03-01   -1.42\n1950-04-01   -1.54\n1950-05-01   -1.75\n              ... \n2023-08-01    1.35\n2023-09-01    1.60\n2023-10-01    1.72\n2023-11-01    2.02\n2023-12-01    2.03\nName: NINO3.4_ANOM, Length: 888, dtype: float64",
+      "season_to_month": {
+        "DJF": 1,
+        "JFM": 2,
+        "FMA": 3,
+        "MAM": 4,
+        "AMJ": 5,
+        "MJJ": 6,
+        "JJA": 7,
+        "JAS": 8,
+        "ASO": 9,
+        "SON": 10,
+        "OND": 11,
+        "NDJ": 12
+      },
+      "oni_df": "           SEAS    YR  TOTAL  ANOM\ntime                              \n1950-01-01  DJF  1950  25.01 -1.32\n1950-02-01  JFM  1950  25.36 -1.20\n1950-03-01  FMA  1950  25.88 -1.12\n1950-04-01  MAM  1950  26.24 -1.08\n1950-05-01  AMJ  1950  26.35 -1.10\n...         ...   ...    ...   ...\n2026-03-01  FMA  2026  27.34  0.11\n2026-04-01  MAM  2026  28.09  0.46\n2026-05-01  AMJ  2026  28.74  0.95\n2026-06-01  MJJ  2026  29.02  1.39\n2026-07-01  JJA  2026  29.09  1.80\n\n[919 rows x 4 columns]",
+      "oni_anom": "time\n1950-01-01   -1.32\n1950-02-01   -1.20\n1950-03-01   -1.12\n1950-04-01   -1.08\n1950-05-01   -1.10\n              ... \n2023-08-01    1.25\n2023-09-01    1.50\n2023-10-01    1.74\n2023-11-01    1.90\n2023-12-01    1.99\nName: ANOM, Length: 888, dtype: float64",
+      "recon_9120_s": "time\n1950-01-01   -1.993368\n1950-02-01   -1.696186\n1950-03-01   -1.416945\n1950-04-01   -1.538149\n1950-05-01   -1.743454\n                ...   \n2023-08-01    1.348024\n2023-09-01    1.598368\n2023-10-01    1.719738\n2023-11-01    2.023252\n2023-12-01    2.030945\nName: RECON_9120, Length: 888, dtype: float64",
+      "comp": "               recon   cpc\ntime                      \n1950-01-01 -1.993368 -1.99\n1950-02-01 -1.696186 -1.69\n1950-03-01 -1.416945 -1.42\n1950-04-01 -1.538149 -1.54\n1950-05-01 -1.743454 -1.75\n...              ...   ...\n2023-08-01  1.348024  1.35\n2023-09-01  1.598368  1.60\n2023-10-01  1.719738  1.72\n2023-11-01  2.023252  2.02\n2023-12-01  2.030945  2.03\n\n[888 rows x 2 columns]",
+      "diff": "time\n1950-01-01   -0.003368\n1950-02-01   -0.006186\n1950-03-01    0.003055\n1950-04-01    0.001851\n1950-05-01    0.006546\n                ...   \n2023-08-01   -0.001976\n2023-09-01   -0.001632\n2023-10-01   -0.000262\n2023-11-01    0.003252\n2023-12-01    0.000945\nLength: 888, dtype: float64",
+      "corr_recon_cpc_9120": 0.9999714132900595,
+      "rmse_recon_cpc_9120": 0.007517260769325174,
+      "max_abs_series": "time\n1950-01-01    0.003368\n1950-02-01    0.006186\n1950-03-01    0.003055\n1950-04-01    0.001851\n1950-05-01    0.006546\n                ...   \n2023-08-01    0.001976\n2023-09-01    0.001632\n2023-10-01    0.000262\n2023-11-01    0.003252\n2023-12-01    0.000945\nLength: 888, dtype: float64",
+      "max_abs_dev_recon_cpc_9120": 0.022901382446289142,
+      "max_abs_dev_time": "1992-01-01 00:00:00",
+      "max_abs_dev_year": 1992,
+      "max_abs_dev_month": 1,
+      "corr_recon_cpc_9120_6": 0.999971,
+      "rmse_recon_cpc_9120_4": 0.0075,
+      "max_abs_dev_recon_cpc_9120_4": 0.0229,
+      "recon_roll": "time\n1950-01-01         NaN\n1950-02-01   -1.702166\n1950-03-01   -1.550426\n1950-04-01   -1.566182\n1950-05-01   -1.514152\n                ...   \n2023-08-01    1.322152\n2023-09-01    1.555377\n2023-10-01    1.780453\n2023-11-01    1.924645\n2023-12-01         NaN\nName: RECON_9120, Length: 888, dtype: float64",
+      "cpc_roll": "time\n1950-01-01         NaN\n1950-02-01   -1.700000\n1950-03-01   -1.550000\n1950-04-01   -1.570000\n1950-05-01   -1.520000\n                ...   \n2026-02-01   -0.286667\n2026-03-01    0.003333\n2026-04-01    0.393333\n2026-05-01    0.876667\n2026-06-01         NaN\nName: NINO3.4_ANOM, Length: 918, dtype: float64",
+      "events_recon": [
+        {
+          "start": "1957-05-01 00:00:00",
+          "end": "1958-04-01 00:00:00",
+          "length": 12,
+          "peak_time": "1958-01-01 00:00:00",
+          "peak_value": 1.5088863372802734
+        },
+        {
+          "start": "1963-08-01 00:00:00",
+          "end": "1964-01-01 00:00:00",
+          "length": 6,
+          "peak_time": "1963-12-01 00:00:00",
+          "peak_value": 0.8472251892089844
+        },
+        {
+          "start": "1965-07-01 00:00:00",
+          "end": "1966-03-01 00:00:00",
+          "length": 9,
+          "peak_time": "1965-11-01 00:00:00",
+          "peak_value": 1.3939622243245442
+        },
+        {
+          "start": "1972-06-01 00:00:00",
+          "end": "1973-02-01 00:00:00",
+          "length": 9,
+          "peak_time": "1972-12-01 00:00:00",
+          "peak_value": 1.9164110819498699
+        },
+        {
+          "start": "1982-07-01 00:00:00",
+          "end": "1983-05-01 00:00:00",
+          "length": 11,
+          "peak_time": "1983-01-01 00:00:00",
+          "peak_value": 2.147106170654297
+        },
+        {
+          "start": "1986-09-01 00:00:00",
+          "end": "1988-01-01 00:00:00",
+          "length": 17,
+          "peak_time": "1987-08-01 00:00:00",
+          "peak_value": 1.4935251871744792
+        },
+        {
+          "start": "1991-06-01 00:00:00",
+          "end": "1992-06-01 00:00:00",
+          "length": 13,
+          "peak_time": "1992-01-01 00:00:00",
+          "peak_value": 1.7506116231282551
+        },
+        {
+          "start": "1994-09-01 00:00:00",
+          "end": "1995-02-01 00:00:00",
+          "length": 6,
+          "peak_time": "1994-12-01 00:00:00",
+          "peak_value": 1.1245861053466797
+        },
+        {
+          "start": "1997-05-01 00:00:00",
+          "end": "1998-04-01 00:00:00",
+          "length": 12,
+          "peak_time": "1997-12-01 00:00:00",
+          "peak_value": 2.3529796600341797
+        },
+        {
+          "start": "2002-06-01 00:00:00",
+          "end": "2003-02-01 00:00:00",
+          "length": 9,
+          "peak_time": "2002-11-01 00:00:00",
+          "peak_value": 1.3536173502604167
+        },
+        {
+          "start": "2004-08-01 00:00:00",
+          "end": "2005-01-01 00:00:00",
+          "length": 6,
+          "peak_time": "2004-09-01 00:00:00",
+          "peak_value": 0.7570705413818359
+        },
+        {
+          "start": "2006-09-01 00:00:00",
+          "end": "2007-01-01 00:00:00",
+          "length": 5,
+          "peak_time": "2006-12-01 00:00:00",
+          "peak_value": 0.9435749053955078
+        },
+        {
+          "start": "2009-08-01 00:00:00",
+          "end": "2010-03-01 00:00:00",
+          "length": 8,
+          "peak_time": "2009-12-01 00:00:00",
+          "peak_value": 1.5641314188639324
+        },
+        {
+          "start": "2015-03-01 00:00:00",
+          "end": "2016-04-01 00:00:00",
+          "length": 14,
+          "peak_time": "2015-12-01 00:00:00",
+          "peak_value": 2.6431967417399087
+        },
+        {
+          "start": "2018-09-01 00:00:00",
+          "end": "2019-05-01 00:00:00",
+          "length": 9,
+          "peak_time": "2018-11-01 00:00:00",
+          "peak_value": 0.9097906748453776
+        },
+        {
+          "start": "2023-06-01 00:00:00",
+          "end": "2023-11-01 00:00:00",
+          "length": 6,
+          "peak_time": "2023-11-01 00:00:00",
+          "peak_value": 1.9246451059977214
+        }
+      ],
+      "n_el_nino_recon": 16,
+      "top3_el_nino_recon": [
+        {
+          "year": 2015,
+          "month": 12,
+          "peak_value": 2.64,
+          "start": "2015-03",
+          "end": "2016-04",
+          "length": 14
+        },
+        {
+          "year": 1997,
+          "month": 12,
+          "peak_value": 2.35,
+          "start": "1997-05",
+          "end": "1998-04",
+          "length": 12
+        },
+        {
+          "year": 1983,
+          "month": 1,
+          "peak_value": 2.15,
+          "start": "1982-07",
+          "end": "1983-05",
+          "length": 11
+        }
+      ],
+      "events_recon_ln": {
+        "type": "list",
+        "length": 25,
+        "head": [
+          {
+            "start": "1950-02-01 00:00:00",
+            "end": "1951-03-01 00:00:00",
+            "length": 14,
+            "peak_time": "1950-02-01 00:00:00",
+            "peak_value": -1.702166239420573
+          },
+          {
+            "start": "1954-04-01 00:00:00",
+            "end": "1957-01-01 00:00:00",
+            "length": 34,
+            "peak_time": "1955-11-01 00:00:00",
+            "peak_value": -2.2652276357014975
+          },
+          {
+            "start": "1959-07-01 00:00:00",
+            "end": "1959-11-01 00:00:00",
+            "length": 5,
+            "peak_time": "1959-08-01 00:00:00",
+            "peak_value": -0.8106066385904948
+          },
+          {
+            "start": "1961-08-01 00:00:00",
+            "end": "1963-01-01 00:00:00",
+            "length": 18,
+            "peak_time": "1962-12-01 00:00:00",
+            "peak_value": -0.888909657796224
+          },
+          {
+            "start": "1964-04-01 00:00:00",
+            "end": "1965-02-01 00:00:00",
+            "length": 11,
+            "peak_time": "1964-10-01 00:00:00",
+            "peak_value": -1.4027347564697266
+          }
+        ]
+      },
+      "events_cpc_oni": {
+        "type": "list",
+        "length": 22,
+        "head": [
+          {
+            "start": "1951-06-01 00:00:00",
+            "end": "1952-01-01 00:00:00",
+            "length": 8,
+            "peak_time": "1951-10-01 00:00:00",
+            "peak_value": 1.03
+          },
+          {
+            "start": "1953-04-01 00:00:00",
+            "end": "1953-12-01 00:00:00",
+            "length": 9,
+            "peak_time": "1953-10-01 00:00:00",
+            "peak_value": 0.78
+          },
+          {
+            "start": "1957-04-01 00:00:00",
+            "end": "1958-05-01 00:00:00",
+            "length": 14,
+            "peak_time": "1958-01-01 00:00:00",
+            "peak_value": 1.69
+          },
+          {
+            "start": "1963-07-01 00:00:00",
+            "end": "1964-02-01 00:00:00",
+            "length": 8,
+            "peak_time": "1963-11-01 00:00:00",
+            "peak_value": 1.19
+          },
+          {
+            "start": "1965-06-01 00:00:00",
+            "end": "1966-03-01 00:00:00",
+            "length": 10,
+            "peak_time": "1965-11-01 00:00:00",
+            "peak_value": 1.82
+          }
+        ]
+      },
+      "n_el_nino_cpc_oni": 22,
+      "top3_el_nino_cpc_oni": [
+        {
+          "year": 2015,
+          "month": 12,
+          "peak_value": 2.59,
+          "start": "2014-10",
+          "end": "2016-05",
+          "length": 20
+        },
+        {
+          "year": 1997,
+          "month": 12,
+          "peak_value": 2.37,
+          "start": "1997-05",
+          "end": "1998-04",
+          "length": 12
+        },
+        {
+          "year": 1983,
+          "month": 1,
+          "peak_value": 2.14,
+          "start": "1982-05",
+          "end": "1983-06",
+          "length": 14
+        }
+      ],
+      "count_difference_explanation": "RECON_9120 gives 16 El Nino events, whereas the official CPC ONI series gives 22. The discrepancy is caused by the different climatology and processing: RECON_9120 uses a fixed 1991-2020 monthly climatology and a simple area mean of the 2-degree ERSSTv5 grid, while CPC ONI uses a 30-year centred normal rolled forward every five years, CPC's own quality-control and missing-data treatment, and rounded 0.1 C values. Near the +0.5 C threshold these differences can make a run one season shorter or longer and thus add or remove an event.",
+      "recon_diff": "time\n1950-01-01   -0.005028\n1950-02-01    0.012232\n1950-03-01    0.050999\n1950-04-01    0.110170\n1950-05-01    0.122824\n                ...   \n2020-08-01    0.023769\n2020-09-01   -0.007050\n2020-10-01    0.045319\n2020-11-01    0.076418\n2020-12-01    0.038271\nLength: 852, dtype: float64",
+      "offset_recon_8110_minus_9120": 0.060156663258870445,
+      "cpc_offset_df": "            cpc8110  cpc9120\ntime                        \n1950-01-01    -2.00    -1.99\n1950-02-01    -1.68    -1.69\n1950-03-01    -1.37    -1.42\n1950-04-01    -1.43    -1.54\n1950-05-01    -1.63    -1.75\n...             ...      ...\n2020-08-01    -0.57    -0.59\n2020-09-01    -0.84    -0.83\n2020-10-01    -1.21    -1.26\n2020-11-01    -1.33    -1.42\n2020-12-01    -1.14    -1.15\n\n[852 rows x 2 columns]",
+      "offset_cpc_8110_minus_9120": 0.058333333333333334,
+      "offset_recon_8110_minus_9120_3": 0.06,
+      "offset_cpc_8110_minus_9120_3": 0.058,
+      "offset_difference_cpc_minus_recon": -0.0018233299255371108,
+      "offset_abs_difference": 0.0018233299255371108
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T2_deepseek-flash_20261025_061831/turn01/figures/visualization_T2_deepseek-flash_20261025_061831_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T2_deepseek-flash_20261025_061831/turn01/figures/visualization_T2_deepseek-flash_20261025_061831_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Answer the user's question inside <solution></solution> tags, based on these results.
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+The Nino 3.4 index was reconstructed from ERSSTv5 by averaging SST over 5°S–5°N, 170°W–120°W and subtracting the 1991–2020 monthly climatology.  The reconstruction (RECON_9120) was then compared with the CPC Nino 3.4 anomaly on the same 1991–2020 baseline over 1950-01 to 2023-12.
+
+**Monthly validation against CPC 1991–2020 Nino 3.4**
+- Pearson correlation: **0.999971** (to 6 decimal places)
+- RMSE: **0.0075 °C** (to 4 decimal places)
+- Largest absolute deviation: **0.0229 °C**, occurring in **1992-01**
+
+This is an essentially exact reproduction of the CPC monthly Nino 3.4 anomaly, with residuals at the level of a few hundredths of a degree Celsius.
+
+**El Nino events under the ONI criterion**
+
+Using at least five consecutive overlapping 3-month seasons with the 3-month running mean ≥ +0.5 °C:
+
+- RECON_9120: **16 El Nino events** over 1950–2023.
+  - Three highest peaks:
+    1. **2015-12, 2.64 °C**
+    2. **1997-12, 2.35 °C**
+    3. **1983-01, 2.15 °C**
+
+- CPC ONI: **22 El Nino events** over the same period.
+  - Three highest peaks:
+    1. **2015-12, 2.59 °C**
+    2. **1997-12, 2.37 °C**
+    3. **1983-01, 2.14 °C**
+
+The two series identify the same three strongest events, with small peak-amplitude differences.  The event-count difference arises because RECON_9120 uses a **fixed 1991–2020 monthly climatology** and unrounded ERSSTv5 area means, whereas the official CPC ONI uses its operational processing: a **rolling 30-year base period updated every five years**, CPC quality-control/missing-data treatment, and values rounded to 0.1 °C.  Near the ±0.5 °C threshold, those small baseline and rounding differences can lengthen, shorten, split, or merge marginal 3-month runs, producing 16 detected events in RECON_9120 versus 22 in the official ONI series.
+
+**Baseline offset between 1981–2010 and 1991–2020**
+
+Mean over 1950-01 to 2020-12 of (1981–2010 anomaly − 1991–2020 anomaly):
+
+- Reconstructed offset, RECON_8110 − RECON_9120: **0.060 °C**
+- Published CPC offset, CPC 1981–2010 − CPC 1991–2020: **0.058 °C**
+
+The two offsets agree to **0.0018 °C** in absolute value; i.e. the reconstructed baseline offset is within about **0.002 °C** of the published CPC offset.  The positive sign means that anomalies referenced to the cooler 1981–2010 climatology are slightly higher, on average, than those referenced to 1991–2020.
+
+**Figures generated**
+- **Figure 1**: two-panel time-series figure for 1950–2023.  The upper panel overlays RECON_9120 and CPC 1991–2020 monthly anomalies, their 3-month running means, the ±0.5 °C thresholds, and warm/cool shading for detected El Nino/La Nina events.  The lower panel shows RECON_9120 − CPC on its own vertical scale, labelled in °C.
+- **Figure 2**: square scatter plot of RECON_9120 (y) versus CPC 1991–2020 (x), with one point per month, identical axis ranges and ticks, a 1:1 reference line, and the correlation and RMSE annotated.
+</solution>

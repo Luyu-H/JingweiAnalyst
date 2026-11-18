@@ -1,0 +1,1223 @@
+# exchange 3: solution
+# elapsed: 41.9 s
+
+===== SYSTEM =====
+
+The user's question:
+Evaluate the ocean carbon system of three CMIP6 models against the GLODAPv2.2016b mapped climatology: dissolved inorganic carbon, total alkalinity and pH.
+
+Data to use:
+- CMIP6 historical `dissic`, `talk`, `ph`, `thetao` and `so` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, for the calendar year 2002, plus `dissic`, `thetao` and `so` for 1971-2000.
+- Each model's own areacello and volcello.
+- GLODAPv2.2016b mapped climatology: TCO2, TAlk and pH.
+
+Expected numerical results, with the models taken as their 2002 annual mean unless stated otherwise, and model DIC and alkalinity compared in micromoles per kilogram:
+- The global mean over 0-50 m of DIC and of total alkalinity for each model and for GLODAP (for every source one mean over all its 0-50 m cells), in micromoles per kilogram to the nearest whole unit, and each model's difference from GLODAP.
+- The same 0-50 m mean for pH on the total scale, to 3 decimal places, and each model's difference from GLODAP.
+- For the map of 0-50 m mean DIC (each cell's mean over its own 0-50 m levels), compared on the GLODAP 1-degree grid: each model's mean bias and RMSE in micromoles per kilogram to the nearest whole unit, and the spatial correlation to 3 decimal places.
+- For each model, the global mean DIC bias (model minus GLODAP) at 0, 100, 500, 1000 and 2000 m, compared on the GLODAP 1-degree grid and averaged, at each depth, over every cell where that model and GLODAP are both defined at that depth, in micromoles per kilogram to the nearest whole unit.
+- For each model, the period change of the global 0-50 m mean DIC, 2002 minus the 1971-2000 average, in micromoles per kilogram to the nearest whole unit, and its ratio to that model's 0-50 m DIC difference from GLODAP as defined in the first item to 2 decimal places, with what that implies for reading the bias as a model error.
+- Which model reproduces the observed carbon system best, and whether the three models' errors in DIC, alkalinity and pH are consistent in sign.
+
+Expected visualizations:
+- Figure 1, three global maps in one row, one per model, of the 0-50 m DIC bias against GLODAP on the cells of the map comparison, with one diverging colour scale centred on zero shared by all three panels and labelled in micromoles per kilogram.
+- Figure 2, a single panel of the vertical profile of the global mean DIC bias: depth on the vertical axis increasing downward, bias in micromoles per kilogram on the horizontal axis, one line per model, a vertical zero reference line, and the five sampled depths marked.
+
+The code that ran:
+<executed_code>
+import os
+import glob
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
+from matplotlib.colors import TwoSlopeNorm
+
+CMIP_ROOT = "/data1/lorraine-20419/benchmark_cmip6/historical"
+GLODAP_ROOT = "/data1/lorraine-20419/ocean_data/GLODAPv2.2016b_MappedClimatologies"
+
+MODELS = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+TARGET_DEPTHS = [0, 100, 500, 1000, 2000]
+
+MODEL_INFO = {
+    "CESM2": {"lat_coord": "lat", "lon_coord": "lon", "depth_coord": "lev"},
+    "GFDL-ESM4": {"lat_coord": "lat", "lon_coord": "lon", "depth_coord": "lev"},
+    "MPI-ESM1-2-LR": {"lat_coord": "latitude", "lon_coord": "longitude", "depth_coord": "lev"},
+}
+
+
+def _open_cmip(model, var):
+    files = sorted(glob.glob(os.path.join(CMIP_ROOT, model, var, "*.nc")))
+    if not files:
+        files = sorted(glob.glob(os.path.join(CMIP_ROOT, model, var.lower(), "*.nc")))
+    if not files:
+        raise FileNotFoundError(f"No CMIP6 files found for {model} / {var}")
+    if len(files) == 1:
+        return xr.open_dataset(files[0], use_cftime=True, decode_times=True)
+    return xr.open_mfdataset(
+        files, combine="by_coords", use_cftime=True, decode_times=True, parallel=False
+    )
+
+
+def _get_dataarray(ds, name):
+    if name in ds.data_vars:
+        return ds[name]
+    for v in ds.data_vars:
+        if v.lower() == name.lower():
+            return ds[v]
+    raise KeyError(f"{name} not found in dataset; variables are {list(ds.data_vars)}")
+
+
+def _select_years(da, y0, y1):
+    if "time" not in da.dims:
+        return da
+    yrs = da.time.dt.year
+    return da.sel(time=(yrs >= y0) & (yrs <= y1))
+
+
+def _lev_m(da, model):
+    lev = da[MODEL_INFO[model]["depth_coord"]]
+    units = str(lev.attrs.get("units", "")).lower()
+    if "centi" in units or units.strip() == "cm":
+        return lev * 0.01
+    return lev
+
+
+def _get_latlon2d(da, model):
+    info = MODEL_INFO[model]
+    lat = da[info["lat_coord"]]
+    lon = da[info["lon_coord"]]
+    if lat.ndim == 1 and lon.ndim == 1:
+        lon2d, lat2d = np.meshgrid(lon.values, lat.values)
+    else:
+        lat2d = lat.values
+        lon2d = lon.values
+    return lat2d, lon2d
+
+
+def _seawater_density(T, S, p_bar):
+    """UNESCO 1983 in-situ density approximation, pressure in bar, density in kg/m3."""
+    rho_w = (
+        999.842594
+        + 6.793952e-2 * T
+        - 9.095290e-3 * T**2
+        + 1.001685e-4 * T**3
+        - 1.120083e-6 * T**4
+        + 6.536332e-9 * T**5
+    )
+    A = (
+        8.24493e-1
+        - 4.0899e-3 * T
+        + 7.6438e-5 * T**2
+        - 8.2467e-7 * T**3
+        + 5.3875e-9 * T**4
+    )
+    B = -5.72466e-3 + 1.0227e-4 * T - 1.6546e-6 * T**2
+    C = 4.8314e-4
+    rho0 = rho_w + A * S + B * S**1.5 + C * S**2
+
+    Kw = (
+        19652.21
+        + 148.4206 * T
+        - 2.327105 * T**2
+        + 1.360477e-2 * T**3
+        - 5.155288e-5 * T**4
+    )
+    K0 = (
+        Kw
+        + S * (54.6746 - 0.603459 * T + 1.09987e-2 * T**2 - 6.1670e-5 * T**3)
+        + S**1.5 * (7.944e-2 + 1.6483e-2 * T - 5.3009e-4 * T**2)
+    )
+    rho = rho0 / (1.0 - p_bar / K0)
+    return rho
+
+
+def _remap_to_target(lat2d, lon2d, values, target_lat, target_lon):
+    """Nearest-neighbour remap of a 2-D field to a regular lat/lon target grid."""
+    lat2d = np.asarray(lat2d)
+    lon2d = np.asarray(lon2d)
+    values = np.asarray(values)
+
+    valid = np.isfinite(values) & np.isfinite(lat2d) & np.isfinite(lon2d)
+    if not valid.any():
+        return np.full((len(target_lat), len(target_lon)), np.nan)
+
+    lat = np.deg2rad(lat2d[valid])
+    lon = np.deg2rad(lon2d[valid])
+    xyz = np.column_stack(
+        [
+            np.cos(lat) * np.cos(lon),
+            np.cos(lat) * np.sin(lon),
+            np.sin(lat),
+        ]
+    )
+    tree = cKDTree(xyz)
+
+    tlon, tlat = np.meshgrid(np.deg2rad(target_lon), np.deg2rad(target_lat))
+    q = np.column_stack(
+        [
+            np.cos(tlat).ravel() * np.cos(tlon).ravel(),
+            np.cos(tlat).ravel() * np.sin(tlon).ravel(),
+            np.sin(tlat).ravel(),
+        ]
+    )
+    _, idx = tree.query(q, k=1)
+    out = values[valid][idx]
+    return out.reshape(len(target_lat), len(target_lon))
+
+
+def _load_glodap(varfile, varname):
+    path = os.path.join(GLODAP_ROOT, f"GLODAPv2.2016b.{varfile}.nc")
+    ds = xr.open_dataset(path)
+    da = _get_dataarray(ds, varname)
+
+    # Find the depth dimension.
+    depth_dim = None
+    for d in da.dims:
+        if "depth" in d.lower():
+            depth_dim = d
+            break
+    if depth_dim is None:
+        raise ValueError(f"No depth dimension found for {varfile}")
+
+    # GLODAP stores the depth values in a variable named "Depth" while the
+    # dimension is "depth_surface".  Attach those values as the dimension
+    # coordinate so that .sel(depth_surface=...) works correctly.
+    depth_coord = None
+    for cand in ("Depth", "depth", "depth_surface", depth_dim):
+        if cand in ds.variables and ds[cand].dims == (depth_dim,):
+            depth_coord = ds[cand]
+            break
+    if depth_coord is None:
+        for c in da.coords:
+            if (c == depth_dim or "depth" in c.lower()) and da[c].dims == (depth_dim,):
+                depth_coord = da[c]
+                break
+    if depth_coord is None:
+        raise ValueError(f"Could not find depth coordinate for {varfile}")
+
+    da = da.assign_coords({depth_dim: depth_coord})
+    depth_name = depth_dim
+
+    lat_name = None
+    lon_name = None
+    for c in da.coords:
+        if c.lower() in ("lat", "latitude"):
+            lat_name = c
+        if c.lower() in ("lon", "longitude"):
+            lon_name = c
+
+    if lat_name is None or lon_name is None:
+        raise ValueError(f"Could not find lat/lon coordinates for {varfile}")
+
+    new_lon = ((da[lon_name] + 180) % 360) - 180
+    da = da.assign_coords({lon_name: new_lon}).sortby(lon_name)
+    return da, lat_name, lon_name, depth_name
+
+
+def _glodap_surface_map(da, depth_name, max_depth=50.0):
+    depths = np.asarray(da[depth_name].values)
+    sel = depths <= max_depth
+    dsel = depths[sel]
+
+    bounds = np.zeros(len(dsel) + 1)
+    bounds[0] = 0.0
+    if len(dsel) > 1:
+        bounds[1:-1] = 0.5 * (dsel[:-1] + dsel[1:])
+    bounds[-1] = max_depth
+    dz = np.diff(bounds)
+
+    da_s = da.isel({depth_name: np.where(sel)[0]})
+    da_s = da_s.assign_coords({depth_name: dsel})
+    dz_da = xr.DataArray(dz, dims=depth_name, coords={depth_name: dsel})
+    return (da_s * dz_da).sum(depth_name) / dz.sum()
+
+
+def _glodap_global_mean(da, depth_name, lat_name):
+    vert = _glodap_surface_map(da, depth_name)
+    vals = vert.values
+    lat = da[lat_name].values
+    w = np.cos(np.deg2rad(lat))[:, None]
+    valid = np.isfinite(vals)
+    num = np.nansum(vals * w * valid)
+    den = np.nansum(w * valid)
+    return float(num / den)
+
+
+def _process_model_2002(model, glodap_dic_da, depth_name, target_lat, target_lon):
+    ds_dic = _open_cmip(model, "dissic")
+    ds_theta = _open_cmip(model, "thetao")
+    ds_so = _open_cmip(model, "so")
+    ds_talk = _open_cmip(model, "talk")
+    ds_ph = _open_cmip(model, "ph")
+    ds_vol = _open_cmip(model, "volcello")
+    ds_area = _open_cmip(model, "areacello")
+
+    def ann_mean(ds, var):
+        da = _get_dataarray(ds, var)
+        da = _select_years(da, 2002, 2002)
+        if "time" in da.dims:
+            da = da.mean("time")
+        return da
+
+    dic = ann_mean(ds_dic, "dissic")
+    theta = ann_mean(ds_theta, "thetao")
+    so = ann_mean(ds_so, "so")
+    talk = ann_mean(ds_talk, "talk")
+    ph = ann_mean(ds_ph, "ph")
+
+    vol = _get_dataarray(ds_vol, "volcello")
+    vol = _select_years(vol, 2002, 2002)
+    if "time" in vol.dims:
+        vol = vol.mean("time")
+
+    area = _get_dataarray(ds_area, "areacello")
+    if "time" in area.dims:
+        area = area.mean("time")
+
+    if model == "CESM2":
+        ds_sftof = _open_cmip(model, "sftof")
+        sftof = _get_dataarray(ds_sftof, "sftof")
+        if "time" in sftof.dims:
+            sftof = sftof.mean("time")
+        ocean_mask = sftof > 0
+        vol = vol.where(ocean_mask)
+        area = area.where(ocean_mask)
+
+    lev_m = _lev_m(dic, model)
+    depth = lev_m.broadcast_like(theta)
+    rho = _seawater_density(theta, so, depth / 10.0)
+
+    dic_umolkg = dic * 1e6 / rho
+    talk_umolkg = talk * 1e6 / rho
+
+    vol_pos = vol.where(vol > 0)
+    lev_mask = lev_m <= 50.0
+
+    def wglobal(da):
+        num = (da.where(lev_mask) * vol_pos.where(lev_mask)).sum()
+        den = vol_pos.where(lev_mask).sum()
+        return float((num / den).compute())
+
+    dic_global = wglobal(dic_umolkg)
+    alk_global = wglobal(talk_umolkg)
+    ph_global = wglobal(ph)
+
+    dic_map_da = (
+        (dic_umolkg.where(lev_mask) * vol_pos.where(lev_mask)).sum("lev")
+        / vol_pos.where(lev_mask).sum("lev")
+    )
+    dic_map = dic_map_da.compute().values
+    lat2d, lon2d = _get_latlon2d(dic, model)
+
+    dic_umolkg_np = dic_umolkg.compute().values
+    lev_vals = np.asarray(lev_m.values)
+    profile_bias = {}
+    for zd in TARGET_DEPTHS:
+        idx = int(np.argmin(np.abs(lev_vals - zd)))
+        level_vals = dic_umolkg_np[idx, ...]
+        model_on_glodap = _remap_to_target(
+            lat2d, lon2d, level_vals, target_lat, target_lon
+        )
+        glodap_at_z = glodap_dic_da.sel({depth_name: zd}, method="nearest").values
+        valid = np.isfinite(model_on_glodap) & np.isfinite(glodap_at_z)
+        if valid.any():
+            profile_bias[zd] = float(np.mean(model_on_glodap[valid] - glodap_at_z[valid]))
+        else:
+            profile_bias[zd] = np.nan
+
+    return {
+        "dic_global": dic_global,
+        "alk_global": alk_global,
+        "ph_global": ph_global,
+        "dic_map": dic_map,
+        "lat2d": lat2d,
+        "lon2d": lon2d,
+        "profile_bias": profile_bias,
+    }
+
+
+def _model_period_dic(model, y0, y1):
+    ds_dic = _open_cmip(model, "dissic")
+    ds_theta = _open_cmip(model, "thetao")
+    ds_so = _open_cmip(model, "so")
+    ds_vol = _open_cmip(model, "volcello")
+
+    def mean_period(ds, var):
+        da = _get_dataarray(ds, var)
+        da = _select_years(da, y0, y1)
+        if "time" in da.dims:
+            da = da.mean("time")
+        return da
+
+    dic = mean_period(ds_dic, "dissic")
+    theta = mean_period(ds_theta, "thetao")
+    so = mean_period(ds_so, "so")
+
+    vol = _get_dataarray(ds_vol, "volcello")
+    vol = _select_years(vol, y0, y1)
+    if "time" in vol.dims:
+        vol = vol.mean("time")
+
+    if model == "CESM2":
+        ds_sftof = _open_cmip(model, "sftof")
+        sftof = _get_dataarray(ds_sftof, "sftof")
+        if "time" in sftof.dims:
+            sftof = sftof.mean("time")
+        vol = vol.where(sftof > 0)
+
+    lev_m = _lev_m(dic, model)
+    depth = lev_m.broadcast_like(theta)
+    rho = _seawater_density(theta, so, depth / 10.0)
+    dic_umolkg = dic * 1e6 / rho
+
+    vol_pos = vol.where(vol > 0)
+    lev_mask = lev_m <= 50.0
+
+    num = (dic_umolkg.where(lev_mask) * vol_pos.where(lev_mask)).sum()
+    den = vol_pos.where(lev_mask).sum()
+    return float((num / den).compute())
+
+
+# --- Load GLODAP mapped climatology and put it on a -180..180 sorted grid ---
+glodap_dic_da, lat_name, lon_name, depth_name = _load_glodap("TCO2", "TCO2")
+glodap_alk_da, _, _, _ = _load_glodap("TAlk", "TAlk")
+glodap_ph_da, _, _, _ = _load_glodap("pHtsinsitutp", "pHtsinsitutp")
+
+target_lat = np.asarray(glodap_dic_da[lat_name].values)
+target_lon = np.asarray(glodap_dic_da[lon_name].values)
+
+glodap_dic_map = _glodap_surface_map(glodap_dic_da, depth_name).values
+glodap_alk_map = _glodap_surface_map(glodap_alk_da, depth_name).values
+glodap_ph_map = _glodap_surface_map(glodap_ph_da, depth_name).values
+
+glodap_dic_global = _glodap_global_mean(glodap_dic_da, depth_name, lat_name)
+glodap_alk_global = _glodap_global_mean(glodap_alk_da, depth_name, lat_name)
+glodap_ph_global = _glodap_global_mean(glodap_ph_da, depth_name, lat_name)
+
+global_means = {
+    "GLODAP": {
+        "DIC": glodap_dic_global,
+        "TAlk": glodap_alk_global,
+        "pH": glodap_ph_global,
+    }
+}
+
+bias_maps = {}
+model_on_glodap_maps = {}
+map_metrics = {}
+profile_bias = {}
+profile_models = {}
+
+for model in MODELS:
+    res = _process_model_2002(
+        model, glodap_dic_da, depth_name, target_lat, target_lon
+    )
+    global_means[model] = {
+        "DIC": res["dic_global"],
+        "TAlk": res["alk_global"],
+        "pH": res["ph_global"],
+    }
+
+    model_on_glodap = _remap_to_target(
+        res["lat2d"], res["lon2d"], res["dic_map"], target_lat, target_lon
+    )
+    bias_map = model_on_glodap - glodap_dic_map
+    valid = np.isfinite(bias_map)
+    map_metrics[model] = {
+        "mean_bias": float(np.mean(bias_map[valid])),
+        "rmse": float(np.sqrt(np.mean(bias_map[valid] ** 2))),
+        "corr": float(np.corrcoef(model_on_glodap[valid], glodap_dic_map[valid])[0, 1]),
+    }
+
+    bias_maps[model] = bias_map
+    model_on_glodap_maps[model] = model_on_glodap
+    profile_bias[model] = res["profile_bias"]
+    profile_models[model] = res
+
+dic_bias_0_50 = {
+    m: global_means[m]["DIC"] - global_means["GLODAP"]["DIC"] for m in MODELS
+}
+alk_bias_0_50 = {
+    m: global_means[m]["TAlk"] - global_means["GLODAP"]["TAlk"] for m in MODELS
+}
+ph_bias_0_50 = {
+    m: global_means[m]["pH"] - global_means["GLODAP"]["pH"] for m in MODELS
+}
+
+period_change = {}
+period_ratio = {}
+dic_1971_2000 = {}
+for model in MODELS:
+    dic_1971_2000[model] = _model_period_dic(model, 1971, 2000)
+    period_change[model] = global_means[model]["DIC"] - dic_1971_2000[model]
+    period_ratio[model] = (
+        period_change[model] / dic_bias_0_50[model]
+        if abs(dic_bias_0_50[model]) > 1e-12
+        else np.nan
+    )
+
+error_signs = {
+    m: {
+        "DIC": float(np.sign(dic_bias_0_50[m])),
+        "TAlk": float(np.sign(alk_bias_0_50[m])),
+        "pH": float(np.sign(ph_bias_0_50[m])),
+    }
+    for m in MODELS
+}
+
+sign_consistency = {
+    "DIC": len({np.sign(dic_bias_0_50[m]) for m in MODELS}) == 1,
+    "TAlk": len({np.sign(alk_bias_0_50[m]) for m in MODELS}) == 1,
+    "pH": len({np.sign(ph_bias_0_50[m]) for m in MODELS}) == 1,
+}
+
+# A simple combined score: DIC map RMSE plus absolute surface biases, pH scaled by 1000.
+model_scores = {
+    m: (
+        map_metrics[m]["rmse"]
+        + abs(dic_bias_0_50[m])
+        + abs(alk_bias_0_50[m])
+        + 1000.0 * abs(ph_bias_0_50[m])
+    )
+    for m in MODELS
+}
+best_model = min(model_scores, key=model_scores.get)
+
+# Useful summaries for the answer text.
+summary_table = pd.DataFrame(
+    {
+        "DIC_0_50": {m: global_means[m]["DIC"] for m in ["GLODAP"] + MODELS},
+        "TAlk_0_50": {m: global_means[m]["TAlk"] for m in ["GLODAP"] + MODELS},
+        "pH_0_50": {m: global_means[m]["pH"] for m in ["GLODAP"] + MODELS},
+        "DIC_bias": {m: dic_bias_0_50[m] for m in MODELS},
+        "TAlk_bias": {m: alk_bias_0_50[m] for m in MODELS},
+        "pH_bias": {m: ph_bias_0_50[m] for m in MODELS},
+        "DIC_RMSE": {m: map_metrics[m]["rmse"] for m in MODELS},
+        "DIC_corr": {m: map_metrics[m]["corr"] for m in MODELS},
+        "period_change_DIC": {m: period_change[m] for m in MODELS},
+        "period_ratio": {m: period_ratio[m] for m in MODELS},
+    }
+)
+
+print(summary_table)
+print("Best model by combined score:", best_model, model_scores)
+print("Sign consistency:", sign_consistency)
+print("Profile biases (umol/kg):", profile_bias)
+
+# --- Figures ---
+# Figure 1: three global maps of 0-50 m DIC bias against GLODAP
+vmax = max(np.nanmax(np.abs(bias_maps[m])) for m in MODELS)
+if vmax == 0 or not np.isfinite(vmax):
+    vmax = 1.0
+norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+
+fig, axes = plt.subplots(1, len(MODELS), figsize=(18, 5), sharex=True, sharey=True)
+for ax, model in zip(axes, MODELS):
+    im = ax.imshow(
+        bias_maps[model],
+        extent=[target_lon.min(), target_lon.max(), target_lat.min(), target_lat.max()],
+        origin="lower",
+        cmap="RdBu_r",
+        norm=norm,
+        aspect="auto",
+    )
+    ax.set_title(model)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_xlim(target_lon.min(), target_lon.max())
+    ax.set_ylim(target_lat.min(), target_lat.max())
+fig.colorbar(im, ax=axes.ravel().tolist(), label="DIC bias (µmol kg⁻¹)")
+plt.tight_layout()
+plt.savefig("figure1_dic_bias_maps.png", dpi=150)
+plt.close(fig)
+
+# Figure 2: vertical profile of the global mean DIC bias
+fig, ax = plt.subplots(figsize=(6, 6))
+for model in MODELS:
+    biases = [profile_bias[model][d] for d in TARGET_DEPTHS]
+    ax.plot(biases, TARGET_DEPTHS, marker="o", label=model)
+ax.axvline(0, color="k", linestyle="--", linewidth=1)
+ax.invert_yaxis()
+ax.set_xlabel("DIC bias (µmol kg⁻¹)")
+ax.set_ylabel("Depth (m)")
+ax.set_title("Global mean DIC bias profile")
+ax.legend()
+plt.tight_layout()
+plt.savefig("figure2_dic_bias_profile.png", dpi=150)
+plt.close(fig)
+
+# --- visualization ---
+# Figure 1: 0-50 m DIC bias maps, one panel per model, shared diverging colour scale.
+fig1, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+
+all_bias = np.concatenate(
+    [bias_maps[m][np.isfinite(bias_maps[m])].ravel() for m in MODELS]
+)
+vmax = np.nanpercentile(np.abs(all_bias), 95)
+if not np.isfinite(vmax) or vmax <= 0:
+    vmax = 1.0
+
+im = None
+for ax, model in zip(axes, MODELS):
+    im = ax.pcolormesh(
+        target_lon,
+        target_lat,
+        bias_maps[model],
+        cmap="RdBu_r",
+        vmin=-vmax,
+        vmax=vmax,
+        shading="auto",
+    )
+    ax.set_title(model)
+    ax.set_xlabel("Longitude")
+    ax.set_xlim([-180, 180])
+    ax.set_ylim([-90, 90])
+
+axes[0].set_ylabel("Latitude")
+fig1.colorbar(
+    im,
+    ax=axes,
+    orientation="horizontal",
+    fraction=0.05,
+    pad=0.15,
+    label="DIC bias (µmol kg$^{-1}$)",
+)
+fig1.suptitle("0–50 m mean DIC bias vs GLODAP", y=1.02)
+
+# Figure 2: vertical profile of global mean DIC bias.
+fig2, ax2 = plt.subplots(figsize=(5.5, 6))
+for model in MODELS:
+    vals = [profile_bias[model][d] for d in TARGET_DEPTHS]
+    ax2.plot(vals, TARGET_DEPTHS, marker="o", label=model)
+
+ax2.axvline(0.0, color="k", lw=0.8)
+for d in TARGET_DEPTHS:
+    ax2.axhline(d, color="gray", lw=0.3, alpha=0.6)
+
+ax2.invert_yaxis()
+ax2.set_xlabel("DIC bias (µmol kg$^{-1}$)")
+ax2.set_ylabel("Depth (m)")
+ax2.set_title("Global mean DIC bias vs GLODAP")
+ax2.legend()
+</executed_code>
+
+Status: computation succeeded; visualization generated
+
+Results:
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "CMIP_ROOT": "/data1/lorraine-20419/benchmark_cmip6/historical",
+      "GLODAP_ROOT": "/data1/lorraine-20419/ocean_data/GLODAPv2.2016b_MappedClimatologies",
+      "MODELS": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "TARGET_DEPTHS": [
+        0,
+        100,
+        500,
+        1000,
+        2000
+      ],
+      "MODEL_INFO": {
+        "CESM2": {
+          "lat_coord": "lat",
+          "lon_coord": "lon",
+          "depth_coord": "lev"
+        },
+        "GFDL-ESM4": {
+          "lat_coord": "lat",
+          "lon_coord": "lon",
+          "depth_coord": "lev"
+        },
+        "MPI-ESM1-2-LR": {
+          "lat_coord": "latitude",
+          "lon_coord": "longitude",
+          "depth_coord": "lev"
+        }
+      },
+      "glodap_dic_da": {
+        "type": "DataArray",
+        "dims": {
+          "depth_surface": 33,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "micro-mol kg-1",
+        "long_name": "moles of dissolved inorganic carbon per unit mass in seawater",
+        "size": 2138400,
+        "n_valid": 1103356,
+        "min": 1019.1619873046875,
+        "max": 2402.477294921875,
+        "mean": 2181.71025090623,
+        "std": 105.46550860707693
+      },
+      "lat_name": "lat",
+      "lon_name": "lon",
+      "depth_name": "depth_surface",
+      "glodap_alk_da": {
+        "type": "DataArray",
+        "dims": {
+          "depth_surface": 33,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "micro-mol kg-1",
+        "long_name": "seawater alkalinity expressed as mole equivalent per unit mass",
+        "size": 2138400,
+        "n_valid": 1101785,
+        "min": 1069.45556640625,
+        "max": 2659.830810546875,
+        "mean": 2324.9228543747768,
+        "std": 53.49204578692571
+      },
+      "glodap_ph_da": {
+        "type": "DataArray",
+        "dims": {
+          "depth_surface": 33,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "",
+        "long_name": "seawater ph reported on total scale at in situ temperature and pressure",
+        "size": 2138400,
+        "n_valid": 1101821,
+        "min": 7.426542282104492,
+        "max": 8.522977828979492,
+        "mean": 7.930877682557368,
+        "std": 0.14905358069576602
+      },
+      "target_lat": {
+        "type": "ndarray",
+        "shape": [
+          180
+        ],
+        "size": 180,
+        "n_valid": 180,
+        "min": -89.5,
+        "max": 89.5,
+        "mean": 0.0,
+        "std": 51.96072234550504
+      },
+      "target_lon": {
+        "type": "ndarray",
+        "shape": [
+          360
+        ],
+        "size": 360,
+        "n_valid": 360,
+        "min": -179.5,
+        "max": 179.5,
+        "mean": 0.0,
+        "std": 103.92264751567228
+      },
+      "glodap_dic_map": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 0.0,
+        "max": 2279.0046630859374,
+        "mean": 1283.8622111408615,
+        "std": 977.1774823088537
+      },
+      "glodap_alk_map": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 0.0,
+        "max": 2627.182763671875,
+        "mean": 1432.6235698919945,
+        "std": 1092.5447295149647
+      },
+      "glodap_ph_map": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 0.0,
+        "max": 8.337132358551026,
+        "mean": 5.040167074440278,
+        "std": 3.8414771536845427
+      },
+      "glodap_dic_global": 1383.8067330208764,
+      "glodap_alk_global": 1568.8987515249223,
+      "glodap_ph_global": 5.4777157448506415,
+      "global_means": {
+        "GLODAP": {
+          "DIC": 1383.8067330208764,
+          "TAlk": 1568.8987515249223,
+          "pH": 5.4777157448506415
+        },
+        "CESM2": {
+          "DIC": 1983.1503700580458,
+          "TAlk": 2248.702189867895,
+          "pH": 8.024908065795898
+        },
+        "GFDL-ESM4": {
+          "DIC": 2059.1826992018096,
+          "TAlk": 2335.679024206765,
+          "pH": 8.088339805603027
+        },
+        "MPI-ESM1-2-LR": {
+          "DIC": 1974.056689678286,
+          "TAlk": 2217.478634724125,
+          "pH": 8.058560371398926
+        }
+      },
+      "bias_maps": {
+        "CESM2": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 64800,
+          "min": -987.4696958887589,
+          "max": 3092.263134276532,
+          "mean": 628.3083884974345,
+          "std": 900.6933514869307
+        },
+        "GFDL-ESM4": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 64800,
+          "min": -1771.0226232999414,
+          "max": 3154.5024479823073,
+          "mean": 710.0927112098027,
+          "std": 925.1510881964027
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 64800,
+          "min": -1589.3220135479428,
+          "max": 2734.6868963056127,
+          "mean": 674.9815501736471,
+          "std": 958.2637407267628
+        }
+      },
+      "model_on_glodap_maps": {
+        "CESM2": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 64800,
+          "min": 745.6433749460605,
+          "max": 3094.3239655658276,
+          "mean": 1912.170599638296,
+          "std": 333.54650715798493
+        },
+        "GFDL-ESM4": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 64800,
+          "min": 347.01307242797554,
+          "max": 3154.5024479823073,
+          "mean": 1993.9549223506642,
+          "std": 338.01544519295834
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 64800,
+          "min": 318.39738246586097,
+          "max": 2734.6868963056127,
+          "mean": 1958.8437613145086,
+          "std": 199.1520963229473
+        }
+      },
+      "map_metrics": {
+        "CESM2": {
+          "mean_bias": 628.3083884974345,
+          "rmse": 1098.1893937154023,
+          "corr": 0.39100014807856315
+        },
+        "GFDL-ESM4": {
+          "mean_bias": 710.0927112098027,
+          "rmse": 1166.2487704191917,
+          "corr": 0.32277480900494493
+        },
+        "MPI-ESM1-2-LR": {
+          "mean_bias": 674.9815501736471,
+          "rmse": 1172.121789690162,
+          "corr": 0.19595393414571508
+        }
+      },
+      "profile_bias": {
+        "CESM2": {
+          "0": -28.03885389521504,
+          "100": -52.93639491972424,
+          "500": -21.15471643045401,
+          "1000": -9.257740643576104,
+          "2000": -12.707330436852311
+        },
+        "GFDL-ESM4": {
+          "0": 24.520557736196036,
+          "100": 14.749496072035111,
+          "500": -6.449635220448497,
+          "1000": -0.1618194270913737,
+          "2000": -12.266362688777221
+        },
+        "MPI-ESM1-2-LR": {
+          "0": -68.14341789994498,
+          "100": -68.004507817006,
+          "500": -88.16615555446802,
+          "1000": -84.17987738051991,
+          "2000": -77.47758337674037
+        }
+      },
+      "profile_models": {
+        "CESM2": {
+          "dic_global": 1983.1503700580458,
+          "alk_global": 2248.702189867895,
+          "ph_global": 8.024908065795898,
+          "dic_map": {
+            "type": "ndarray",
+            "shape": [
+              384,
+              320
+            ],
+            "size": 122880,
+            "n_valid": 86096,
+            "min": 745.6433749460605,
+            "max": 3094.3239655658276,
+            "mean": 1984.2917623606575,
+            "std": 142.92804105646306
+          },
+          "lat2d": {
+            "type": "ndarray",
+            "shape": [
+              384,
+              320
+            ],
+            "size": 122880,
+            "n_valid": 122880,
+            "min": -79.2205226074621,
+            "max": 89.70640964187461,
+            "mean": 2.791601116953018,
+            "std": 43.44720217375342
+          },
+          "lon2d": {
+            "type": "ndarray",
+            "shape": [
+              384,
+              320
+            ],
+            "size": 122880,
+            "n_valid": 122880,
+            "min": 0.014731101635748343,
+            "max": 359.99602043021787,
+            "mean": 185.76465359587667,
+            "std": 106.55290281820834
+          },
+          "profile_bias": {
+            "0": -28.03885389521504,
+            "100": -52.93639491972424,
+            "500": -21.15471643045401,
+            "1000": -9.257740643576104,
+            "2000": -12.707330436852311
+          }
+        },
+        "GFDL-ESM4": {
+          "dic_global": 2059.1826992018096,
+          "alk_global": 2335.679024206765,
+          "ph_global": 8.088339805603027,
+          "dic_map": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 44564,
+            "min": 347.01307242797554,
+            "max": 3154.5024479823073,
+            "mean": 2062.3739209196024,
+            "std": 131.93656817147593
+          },
+          "lat2d": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": -89.5,
+            "max": 89.5,
+            "mean": 0.0,
+            "std": 51.96072234550504
+          },
+          "lon2d": {
+            "type": "ndarray",
+            "shape": [
+              180,
+              360
+            ],
+            "size": 64800,
+            "n_valid": 64800,
+            "min": 0.5,
+            "max": 359.50000000000006,
+            "mean": 180.0,
+            "std": 103.92264751567228
+          },
+          "profile_bias": {
+            "0": 24.520557736196036,
+            "100": 14.749496072035111,
+            "500": -6.449635220448497,
+            "1000": -0.1618194270913737,
+            "2000": -12.266362688777221
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "dic_global": 1974.056689678286,
+          "alk_global": 2217.478634724125,
+          "ph_global": 8.058560371398926,
+          "dic_map": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 36791,
+            "min": 318.39738246586097,
+            "max": 2734.6868963056127,
+            "mean": 2001.2179617918,
+            "std": 101.44878390228362
+          },
+          "lat2d": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": -83.96550988220439,
+            "max": 89.72660369238089,
+            "mean": 11.336055347692735,
+            "std": 55.357212731498535
+          },
+          "lon2d": {
+            "type": "ndarray",
+            "shape": [
+              220,
+              256
+            ],
+            "size": 56320,
+            "n_valid": 56320,
+            "min": 0.0071753680209129525,
+            "max": 359.99604092487033,
+            "mean": 210.8956971346869,
+            "std": 115.14908977381505
+          },
+          "profile_bias": {
+            "0": -68.14341789994498,
+            "100": -68.004507817006,
+            "500": -88.16615555446802,
+            "1000": -84.17987738051991,
+            "2000": -77.47758337674037
+          }
+        }
+      },
+      "dic_bias_0_50": {
+        "CESM2": 599.3436370371694,
+        "GFDL-ESM4": 675.3759661809331,
+        "MPI-ESM1-2-LR": 590.2499566574095
+      },
+      "alk_bias_0_50": {
+        "CESM2": 679.8034383429726,
+        "GFDL-ESM4": 766.7802726818427,
+        "MPI-ESM1-2-LR": 648.5798831992029
+      },
+      "ph_bias_0_50": {
+        "CESM2": 2.547192320945257,
+        "GFDL-ESM4": 2.610624060752386,
+        "MPI-ESM1-2-LR": 2.5808446265482843
+      },
+      "period_change": {
+        "CESM2": 9.155183078253913,
+        "GFDL-ESM4": 12.478233945954116,
+        "MPI-ESM1-2-LR": 10.837400625492819
+      },
+      "period_ratio": {
+        "CESM2": 0.015275348752365477,
+        "GFDL-ESM4": 0.01847598163214946,
+        "MPI-ESM1-2-LR": 0.018360697028874193
+      },
+      "dic_1971_2000": {
+        "CESM2": 1973.995186979792,
+        "GFDL-ESM4": 2046.7044652558554,
+        "MPI-ESM1-2-LR": 1963.219289052793
+      },
+      "error_signs": {
+        "CESM2": {
+          "DIC": 1.0,
+          "TAlk": 1.0,
+          "pH": 1.0
+        },
+        "GFDL-ESM4": {
+          "DIC": 1.0,
+          "TAlk": 1.0,
+          "pH": 1.0
+        },
+        "MPI-ESM1-2-LR": {
+          "DIC": 1.0,
+          "TAlk": 1.0,
+          "pH": 1.0
+        }
+      },
+      "sign_consistency": {
+        "DIC": true,
+        "TAlk": true,
+        "pH": true
+      },
+      "model_scores": {
+        "CESM2": 4924.528790040801,
+        "GFDL-ESM4": 5219.029070034354,
+        "MPI-ESM1-2-LR": 4991.796256095058
+      },
+      "best_model": "CESM2",
+      "summary_table": "                  DIC_0_50    TAlk_0_50  ...  period_change_DIC  period_ratio\nGLODAP         1383.806733  1568.898752  ...                NaN           NaN\nCESM2          1983.150370  2248.702190  ...           9.155183      0.015275\nGFDL-ESM4      2059.182699  2335.679024  ...          12.478234      0.018476\nMPI-ESM1-2-LR  1974.056690  2217.478635  ...          10.837401      0.018361\n\n[4 rows x 10 columns]",
+      "vmax": 3154.5024479823073,
+      "fig": "Figure(600x600)",
+      "axes": {
+        "type": "ndarray",
+        "shape": [
+          3
+        ],
+        "size": 3,
+        "values": [
+          "Axes(0.0371682,0.116556;0.297489x0.812778)",
+          "Axes(0.365673,0.116556;0.297489x0.812778)",
+          "Axes(0.694178,0.116556;0.297489x0.812778)"
+        ]
+      },
+      "ax": "Axes(0.132963,0.0971296;0.842037x0.843981)"
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T8_deepseek-flash_20261025_162003/turn01/figures/visualization_T8_deepseek-flash_20261025_162003_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T8_deepseek-flash_20261025_162003/turn01/figures/visualization_T8_deepseek-flash_20261025_162003_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Answer the user's question inside <solution></solution> tags, based on these results.
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+
+The request was executed and the figures were produced, but the GLODAP 0–50 m calculation contains a serious land-mask artifact: all-NaN land columns become zero after the depth integration, so the GLODAP surface means are biased low. This contaminates the global means, map biases, and sign comparison. The table below therefore reports the numbers returned by the run, followed by a caution about their interpretation.
+
+### 1. Global 0–50 m means and model–GLODAP differences
+
+All DIC and total alkalinity values are in µmol kg⁻¹; pH is on the total scale.
+
+| Source | DIC mean | DIC diff. | TAlk mean | TAlk diff. | pH mean | pH diff. |
+|---|---:|---:|---:|---:|---:|---:|
+| GLODAPv2.2016b | 1384 | — | 1569 | — | 5.478 | — |
+| CESM2 | 1983 | +599 | 2249 | +680 | 8.025 | +2.547 |
+| GFDL-ESM4 | 2059 | +675 | 2336 | +767 | 8.088 | +2.611 |
+| MPI-ESM1-2-LR | 1974 | +590 | 2217 | +649 | 8.059 | +2.581 |
+
+These large positive “biases” are not physically credible; they mainly reflect the zero-valued land cells in the GLODAP surface map.
+
+### 2. 0–50 m DIC map comparison on the GLODAP 1° grid
+
+| Model | Mean bias (µmol kg⁻¹) | RMSE (µmol kg⁻¹) | Spatial correlation |
+|---|---:|---:|---:|
+| CESM2 | +628 | 1098 | 0.391 |
+| GFDL-ESM4 | +710 | 1166 | 0.323 |
+| MPI-ESM1-2-LR | +675 | 1172 | 0.196 |
+
+Again, these metrics are strongly affected by the land-zero artifact in the GLODAP map.
+
+### 3. Global mean DIC bias versus depth
+
+Bias = model − GLODAP, in µmol kg⁻¹, averaged over cells where both model and GLODAP are defined.
+
+| Depth | CESM2 | GFDL-ESM4 | MPI-ESM1-2-LR |
+|---:|---:|---:|---:|
+| 0 m | −28 | +25 | −68 |
+| 100 m | −53 | +15 | −68 |
+| 500 m | −21 | −6 | −88 |
+| 1000 m | −9 | 0 | −84 |
+| 2000 m | −13 | −12 | −77 |
+
+This depth-profile comparison is less contaminated because it excludes GLODAP land/missing cells. It shows GFDL-ESM4 generally closest to GLODAP, while MPI-ESM1-2-LR has a large persistent negative DIC bias.
+
+### 4. DIC change from 1971–2000 to 2002 and ratio to surface DIC bias
+
+| Model | 2002 − 1971–2000 mean 0–50 m DIC | Ratio to 0–50 m DIC difference from GLODAP |
+|---|---:|---:|
+| CESM2 | +9 µmol kg⁻¹ | 0.02 |
+| GFDL-ESM4 | +12 µmol kg⁻¹ | 0.02 |
+| MPI-ESM1-2-LR | +11 µmol kg⁻¹ | 0.02 |
+
+The exact ratios are about 0.015, 0.018, and 0.018, respectively, all rounding to 0.02. Thus the 2002–(1971–2000) change is only about 1.5–1.8% of the reported surface DIC “bias.” If that bias were interpreted as a real model error, it would be roughly 50–65 times larger than the recent anthropogenic DIC increase, so the mismatch could not be explained by a small temporal offset between model year and climatology. In this run, however, the bias is clearly dominated by the GLODAP land-zero processing error.
+
+### 5. Best model and sign consistency
+
+- The code’s combined score selected **CESM2** as the best model, mainly because it has the lowest DIC map RMSE (1098 µmol kg⁻¹) and highest spatial correlation (0.391). The scores were CESM2 = 4924.5, GFDL-ESM4 = 5219.0, and MPI-ESM1-2-LR = 4991.8.
+- This ranking is not scientifically trustworthy because the map/global metrics are corrupted by the GLODAP land-zero problem.
+- On the cleaner vertical-profile comparison, **GFDL-ESM4** is closest to GLODAP at most depths, with small DIC biases near the surface and around zero at 500–1000 m; MPI-ESM1-2-LR is the poorest.
+- In the contaminated 0–50 m global means, all three models have positive DIC, positive TAlk, and positive pH differences from GLODAP. However, the depth profile shows that near the surface CESM2 and MPI-ESM1-2-LR actually have negative DIC biases while GFDL-ESM4 has a positive bias. Therefore the apparent sign consistency in DIC is an artifact of the surface-mean land contamination.
+
+### Figures
+
+- **Figure 1** shows the three maps of 0–50 m DIC bias with a shared diverging colour scale centred on zero. The panels contain large positive and negative regional features, but the overall positive bias pattern is dominated by comparison against the zero-valued GLODAP land cells.
+- **Figure 2** shows the vertical profile of global mean DIC bias. CESM2 is negative at all sampled depths, GFDL-ESM4 is near zero with a small positive surface bias and negative deep bias, and MPI-ESM1-2-LR is strongly negative throughout the water column.
+
+**Bottom line:** the executed calculation reports very large positive surface DIC/TAlk/pH biases and selects CESM2 as “best,” but these results are not a valid evaluation of the model carbon systems because of the GLODAP land-masking error. After discounting that artifact, the depth-profile comparison suggests GFDL-ESM4 reproduces the observed DIC profile best among the three, while MPI-ESM1-2-LR is the worst; the apparent same-sign error structure is not robust.
+
+</solution>

@@ -1,0 +1,180 @@
+# exchange 3: planning
+# elapsed: 30.4 s
+
+===== SYSTEM =====
+You are an oceanographic data analysis assistant with conversation history support.
+
+
+
+Available tools: none. There are no project functions in this setting; the analysis code opens
+the datasets' raw files itself with numpy, pandas and xarray.
+
+Available datasets:
+{
+  "woa23": {
+    "description": "[climatology] World Ocean Atlas 2023 (NOAA/NCEI) 1.00 degree objectively analysed climatology. Temperature and salinity come on two climate normals, 1971-2000 and 1991-2020; oxygen, apparent oxygen utilization and percent oxygen saturation each provide both a 1971-2000 normal (the default) and a 1965-2022 all-period (all) composite; nutrients provide only the 1965-2022 all-period composite. Variables: apparent_oxygen_utilization, nitrate, oxygen, percent_oxygen_saturation, phosphate, salinity, silicate, temperature."
+  },
+  "glodap": {
+    "description": "[climatology] GLODAPv2 global ocean carbon chemistry mapped climatology (DIVA objective analysis), built from 1972-2013 input data. No time dimension, 33 standard depth levels. Variables: Cant, NO3, OmegaA, OmegaC, PI_TCO2, PO4, TAlk, TCO2, oxygen, pHts25p0, pHtsinsitutp, salinity, silicate, temperature. Climatology period 1972-2013."
+  },
+  "seanoe_mld": {
+    "description": "[climatology] Global ocean mixed layer depth (MLD) monthly climatology from the LOPS laboratory. The criterion is a potential density increase of 0.03 kg/m3 relative to the reference depth. Based on a month-by-month objective analysis of 1970-2021 Argo and WOD profiles. Variables: mask, mld_dr003, n_obs. Climatology period 1970-2021."
+  },
+  "ersst": {
+    "description": "[timeseries] NOAA Extended Reconstructed SST v5 (in situ observations only), monthly mean, 1854 to present. Surface only, no vertical dimension. Variables: sst."
+  },
+  "cpc_indices": {
+    "description": "[index] NOAA monthly climate indices. The four Nino products are CPC ENSO monitoring indices, giving regional mean SST and its anomaly in degC. The PDO product is a NOAA NCEI pattern index and is dimensionless; it is kept here so the monthly indices live together, despite the dataset id naming CPC. Products: ersst5_81-10, ersst5_91-20, oisst, oni, pdo."
+  },
+  "cmip6_historical": {
+    "description": "[timeseries] CMIP6 historical (all-forcing historical simulation) ocean component, Omon monthly frequency plus Ofx fixed fields. Three models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 1850-01 to 2014-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  },
+  "cmip6_ssp245": {
+    "description": "[timeseries] CMIP6 ScenarioMIP ssp245 (SSP2-4.5, concentration-driven). Grid and coordinate definitions are the same as historical; they differ in time range, variant label and variable coverage. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 2015-01 to 2100-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  }
+}
+
+Domain knowledge retrieved for this question (grouped by [fragment-id] (severity)):
+<domain_knowledge>
+[cmip6-bgc-units-per-volume] (must)
+- `no3`/`po4` are archived in mol m-3: convert to µmol kg-1 as µmol kg-1 = mmol m-3 × 1000 / ρ with ρ in kg m-3; mmol m-3 (= µmol L-1) is still per volume, not per mass.
+- The N:P ratio and its thresholds are invariant under scaling, so take them from the native per-volume fields; the question prescribes a constant ρ = 1025 kg/m3 for the µmol kg-1 regression (the fragment prefers in-situ density below the surface), so state the density used (`attrs['density_assumption']`) and that the difference is the question's choice.
+
+[monthly-means-are-time-averages] (must)
+- Average the monthly 1971-2000 fields with `temporal_aggregate` (day weights in the model calendar); `compute_basic_stat(op='mean', dim='time')` weights every month equally.
+- N:P is nonlinear in monthly means, so state the order: "average first, then diagnostic" is the like-for-like choice against the WOA23 climatology; "diagnostic first, then average" gives the mean of the monthly ratios instead.
+
+[basin-and-region-definitions] (should)
+- Basin means use the WOA23 mask (`select_basin`, `load_basin_mask`), the Ofx `basin` field being absent: state that mask was used, with marginal seas folded in (`include_marginal_seas=True`, as the question prescribes) and Southern and Arctic treated as separate basins and excluded.
+- Use the surface labels through the whole column (`depth_dependent=False`) for a named ocean; a marginal sea's own label stops at its sill below that depth.
+
+[cmip6-static-grid-fields] (should)
+- Take layer thickness for 200-1000 m as `volcello` / `areacello` (`cell_thickness_like`), not `lev_bnds` differences, which fail at partial bottom cells; GFDL-ESM4's `volcello` is monthly and must be used as such.
+- Volume-weighted means and volume fractions use each model's own `volcello`; state the volume/area origin (`attrs['volume_source']`) behind any integral.
+
+[omip-weighted-means-and-integrals] (should)
+- Use `op='volume_weighted_mean'` over the layer, restricted to the same valid cells; the mean of the cell-by-cell N:P (`compute_ratio`) and the ratio of the two volume-weighted means are different quantities — report both, labelled.
+- A volume percentage inside an N:P range is a volume share, not a share of cells: `compute_exceedance_fraction` keeps missing cells out of the denominator and returns the m3 behind the percentage.
+
+[cmip6-grid-labels] (should)
+- GFDL-ESM4 is `gr`, already remapped to 1°: its "native" numbers sit on the archive grid with a regridded land-sea mask and only approximately conservative budgets; CESM2 (100 km) versus MPI (250 km) resolution limits amplitude comparison of narrow features.
+
+[omip-native-grid-vs-regridded] (should)
+- Compute every number (means, ratios, volume percentages) on each source's own grid with its own weights; regrid to a common longitude-latitude frame only for the Figure 2 maps, using 'conservative' and stating the method.
+- Take the 200-1000 m layer without interpolating to other vertical levels: integrate thickness-weighted quantities on the original levels.
+</domain_knowledge>
+
+Data selection rules:
+1. <selected_data> must contain dataset IDs exactly as listed above (e.g. woa23, cmip6_historical).
+   Never put a file path there, and never invent a name. One dataset ID holds many variables, and
+   CMIP6 also holds several models; those are chosen in the next step, not here.
+2. Long-term trends, interannual variability and scenario projections need a timeseries dataset
+   (cmip6_historical, cmip6_ssp245, ersst). Mean state, seasonal cycle and vertical structure need a
+   climatology (woa23, glodap, seanoe_mld). A question about the ENSO monitoring index itself needs
+   cpc_indices.
+3. Select several datasets, comma-separated, when the question compares a model against observations
+   or needs variables that live in different products.
+4. Reading data: there are no loading functions. The code step opens the raw files of the datasets
+   you select and is shown where they live and how they are laid out; plan the reading as part of
+   the steps.
+5. Regional and global means are area- or volume-weighted, never plain averages over lat/lon: plan
+   where the weights come from (for CMIP6, the model's own areacello / volcello fixed fields).
+
+How to write the plan:
+1. Write the plan as numbered steps, each naming the datasets, variables and models it needs.
+   End it with an "Other notes:" section, one line each, holding only the caveats the answer must
+   state.
+2. Add no computational constraint of your own. Every definition, weighting, mask, threshold,
+   interpolation, filter or correction a step applies must come from the question or from what is
+   given above (the dataset descriptions, and any domain knowledge); do not devise one that
+   none of them states (an extra mask, a partial-layer weighting, a screening threshold).
+3. There are no project tools to call: plan every step as an operation the code performs on the raw
+   data with the standard libraries (numpy, pandas, xarray).
+4. Do not round intermediate values: later steps use the unrounded results of earlier ones, and a
+   value is rounded only where it is reported, to the precision the question asks for.
+5. The steps, any notes under them and Other notes all go inside the <plan> tags; nothing outside them
+   is passed on to the later steps.
+
+How to use the domain knowledge:
+1. Priority: definitions and procedures the user states explicitly in the question come first, the
+   dataset descriptions second, the knowledge fragments last. Use the fragments to settle
+   choices the question leaves open and to find the caveats that must be stated. When a fragment
+   conflicts with what the question prescribes, follow the question and record the difference under
+   Other notes so the answer can explain it.
+2. Under the step where a piece of knowledge FIRST matters, add one line "- Note [fragment-id]: ..."
+   carrying what to do (the formula, threshold, unit conversion or check). Each
+   fragment gets exactly ONE such note line in the whole plan, under a step or under Other notes, not
+   both. A later step that also depends on it names "[fragment-id]" inline in its own text, with no
+   further note line and no restatement - the next stage reads the whole plan. Do not copy the
+   knowledge text into the plan.
+3. Other notes also hold the differences between the question's definition and the protocol; a line
+   that comes from a fragment takes the form "- [fragment-id] ...".
+4. Cite every fragment of severity must at least once, in a step or under Other notes. Fragments of
+   severity should or info that end up unused may be left out.
+5. The notes may name functions of this project in backticks (`compute_basic_stat`,
+   `load_regular_data`, ...). None of them exists in this setting: read such a name as the operation
+   it stands for, and plan that operation on the raw data.
+
+Analyze the user's question and select appropriate data. Follow this format strictly:
+<plan>numbered steps: the datasets, variables and models each step needs, with the knowledge notes under each step, then Other notes</plan>
+<selected_data>comma-separated list of dataset IDs you will use</selected_data>
+
+IMPORTANT: Your response MUST contain all required XML tags, and tags must be properly closed.
+
+
+===== USER =====
+User question: Assess the nitrate-to-phosphate stoichiometry of intermediate water, 200 to 1000 m, in three CMIP6 models against the WOA23 observed climatology, and test whether the models reproduce the low-N:P signal left by denitrification.
+
+Data to use:
+- CMIP6 historical `no3` and `po4` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12, with each model's own volcello.
+- WOA23 nitrate and phosphate, the annual objectively analysed climatology.
+- The WOA23 basin mask (basinmask_01).
+
+Expected numerical results, for the 200-1000 m layer of each of the four sources (the three models' 1971-2000 climatologies and WOA23):
+- The mean N:P, to 2 decimal places, reported two ways and clearly labelled: the mean of the cell-by-cell N:P ratio (the headline value), and the ratio of the mean nitrate to the mean phosphate.
+- The ordinary least-squares regression NO3 = a * PO4 + b over all valid cells, each cell weighted equally, with model concentrations expressed in micromoles per kilogram at a constant density of 1025 kg/m3: the slope a to 2 decimal places, the intercept b in micromoles per kilogram to 2 decimal places, and the R-squared to 3 decimal places.
+- The percentage of water volume with N:P strictly between 14 and 18, to 1 decimal place.
+- For each of the four sources, the headline mean N:P in the Pacific, Atlantic and Indian Oceans (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded), to 2 decimal places.
+- The percentage of water volume with N:P below 12, globally and within the Pacific and the Indian Ocean, to 1 decimal place.
+- Whether each source's stoichiometry sits at, above or below Redfield, and whether each model reproduces the observed low-N:P volume and its basin distribution.
+
+Expected visualizations:
+- Figure 1, a 4-panel scatter of nitrate (y) against phosphate (x) in micromoles per kilogram over 200-1000 m, one panel per source in the order WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, with identical axis ranges and ticks, each panel showing its own fitted regression line and the Redfield 16:1 line through the origin, distinguishable from one another, and annotated with a, b and R-squared.
+- Figure 2, a 2-by-2 panel of global maps of the 200-1000 m mean N:P minus 16 for the four sources, drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only), on one shared diverging colour scale centred on zero.
+
+Now output your reasoning and selections.
+
+===== RESPONSE =====
+<plan>
+1. Open the WOA23 annual objectively analysed nutrient climatology and read `nitrate` and `phosphate` on the native 1° grid. Also open the WOA23 `basinmask_01` basin mask. Restrict the nutrient fields to the standard depth levels lying within 200–1000 m without vertical interpolation, and form WOA23 layer thicknesses from the depth-level bounds and cell areas from the 1° spherical grid for later volume weighting. Keep the native WOA23 nutrient units (µmol kg-1; convert only if the file metadata show otherwise) and compute the cell-by-cell N:P ratio where both nutrients are valid.
+
+2. Open the CMIP6 historical `no3` and `po4` fields for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR for monthly 1971-01 to 2000-12, together with each model’s `volcello` and `areacello` (GFDL-ESM4 `volcello` is monthly). Read each model on its own native grid; for GFDL-ESM4 this is the archive `gr` grid.
+   - Note [cmip6-bgc-units-per-volume]: `no3`/`po4` are archived in mol m-3; convert to µmol kg-1 as µmol kg-1 = mmol m-3 × 1000 / ρ with ρ = 1025 kg m-3, and record the density assumption (`attrs['density_assumption']`). Compute N:P from the native per-volume fields because the ratio and its thresholds are invariant under scaling.
+
+3. Average the monthly CMIP6 `no3`, `po4` and (for GFDL-ESM4) monthly `volcello` over 1971–2000 using day weights in each model’s calendar, producing 1971–2000 monthly climatological means for each model.
+   - Note [monthly-means-are-time-averages]: use day-weighted time averaging over the model calendar, not equal weighting of every month; state that the order used is “average monthly fields first, then compute the N:P diagnostic”, the like-for-like choice against the WOA23 climatology.
+
+4. For each CMIP6 model, construct the 200–1000 m layer thickness as `volcello` / `areacello` (`cell_thickness_like`) and use the model’s own `volcello` for volume weights, restricted to the same valid nutrient cells; do not interpolate to additional vertical levels.
+   - Note [cmip6-static-grid-fields]: take layer thickness for 200–1000 m from `volcello`/`areacello`, not from `lev_bnds` differences, because those fail at partial bottom cells; GFDL-ESM4’s monthly `volcello` must be used as monthly data. Record the volume/area origin (`attrs['volume_source']`).
+
+5. For each of the four sources (WOA23 and the three CMIP6 models), compute the 200–1000 m cell-by-cell N:P field on that source’s own grid, from nitrate and phosphate where both are valid, using the native per-volume concentrations for the ratio. For the regression only, convert each model cell’s nitrate and phosphate to µmol kg-1 with ρ = 1025 kg/m3; WOA23 is already treated in its native µmol kg-1 units. Do not regrid before computing any statistic.
+   - Note [omip-native-grid-vs-regridded]: compute every number (means, ratios, regressions, volume percentages, basin statistics) on each source’s own grid with its own weights; any regridding is only for the Figure 2 display maps and must use the ‘conservative’ method with the method stated.
+
+6. For each source, compute over the 200–1000 m layer: the headline mean N:P as the volume-weighted mean of the cell-by-cell N:P; the ratio of the volume-weighted mean nitrate to the volume-weighted mean phosphate; and the ordinary least-squares regression NO3 = a·PO4 + b over all valid cells with every cell weighted equally (not volume-weighted), reporting slope a, intercept b in µmol kg-1, and R². Also compute the percentage of water volume with N:P strictly between 14 and 18, and the percentage with N:P below 12, globally.
+   - Note [omip-weighted-means-and-integrals]: use volume-weighted means over the layer restricted to the same valid cells; keep the mean of the cell-by-cell N:P and the ratio of the two volume-weighted means separate and clearly labelled. Volume percentages are volume shares, computed with missing cells excluded from the denominator, with the corresponding water volume (m3) available behind the percentage.
+
+7. Map the WOA23 `basinmask_01` labels to each source’s grid (nearest WOA23 mask cell for curvilinear model grids) and compute, for each source, the headline volume-weighted mean N:P in the Pacific, Atlantic and Indian Oceans, plus the percentage of water volume with N:P below 12 in the Pacific and Indian Oceans. Use the surface basin label through the whole 200–1000 m column.
+   - Note [basin-and-region-definitions]: use the WOA23 basin mask (`select_basin`/`load_basin_mask` equivalent) with marginal seas folded into their parent ocean (`include_marginal_seas=True`), Southern and Arctic treated as separate basins and excluded from the Pacific/Atlantic/Indian means, and the surface label applied through the column (`depth_dependent=False`).
+
+8. Draw Figure 1 as a 4-panel scatter of nitrate (y) against phosphate (x) in µmol kg-1 over 200–1000 m, one panel per source in the order WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, using all valid cells equally weighted. Use identical axis ranges and ticks in every panel; show each panel’s own fitted regression line and the Redfield 16:1 line through the origin, made visually distinguishable, and annotate a, b and R² from step 6.
+
+9. Draw Figure 2 as a 2-by-2 panel of global maps of the 200–1000 m mean N:P minus 16 for the four sources. Compute each column’s layer mean N:P on the source’s own grid and subtract 16 first; then, for display only, put the curvilinear model fields on a common regular longitude–latitude grid using conservative regridding. Use one shared diverging colour scale centred on zero and make each panel a true geographic map, following the display-only treatment required by [omip-native-grid-vs-regridded].
+
+Other notes:
+- State that the WOA23 basin mask was used, with marginal seas folded into their parent ocean and Southern and Arctic basins excluded from the basin means.
+- State the density used for the µmol kg-1 conversion and regression as the prescribed constant ρ = 1025 kg/m3; this is the question’s choice, while the fragment notes that in-situ density below the surface would otherwise be preferred.
+- State that N:P was computed from native per-volume CMIP6 fields, and that monthly means were averaged before forming the diagnostic ratio.
+- State the volume/area origin behind each source’s integrals (`attrs['volume_source']`), noting that GFDL-ESM4 `volcello` is monthly.
+- [cmip6-grid-labels] GFDL-ESM4 is `gr`, already remapped to 1°; its “native” numbers sit on the archive grid with a regridded land–sea mask and only approximately conservative budgets. CESM2 (about 100 km) versus MPI-ESM1-2-LR (about 250 km) resolution limits amplitude comparison of narrow features.
+</plan>
+<selected_data>woa23, cmip6_historical</selected_data>

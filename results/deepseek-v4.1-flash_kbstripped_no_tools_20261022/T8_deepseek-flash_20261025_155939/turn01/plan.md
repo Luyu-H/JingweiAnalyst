@@ -1,0 +1,32 @@
+# Plan
+
+1. Read CMIP6 historical (`cmip6_historical`) for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR: monthly `dissic`, `talk`, `ph`, `thetao` and `so` for calendar year 2002, monthly `dissic`, `thetao` and `so` for 1971-2000, plus the fixed fields `areacello` and `volcello`. Average the 12 months of 2002 to an annual mean and the 1971-2000 record to a period mean. Record any variable a model does not publish as missing rather than substituting.
+   - Note [cmip6-carbonate-system-definitions]: `dissic` is total dissolved inorganic carbon, `talk` the total alkalinity (carbonate+borate+water+phosphate+silicate terms) and `ph` in-situ pH on the TOTAL scale under OMIP best-practice constants, so the pH comparison is made on the total scale.
+
+2. Read GLODAPv2.2016b mapped climatology (`glodap`): `TCO2`, `TAlk` and `pHtsinsitutp` (in-situ pH, total scale) on its 1-degree grid with its 33 standard depth levels; there is no time dimension and DIC/alkalinity are already in micromoles per kilogram.
+
+3. Convert the CMIP6 `dissic` and `talk` from mol m-3 to micromoles per kilogram using the in-situ density computed with gsw from `thetao` and `so`, and carry the density assumption through for reporting.
+   - Note [cmip6-bgc-units-per-volume]: µmol kg-1 = mmol m-3 × 1000 / ρ with the in-situ density (potential-density routine called with `ref_pressure=None`, not the constant default), never a bare ×1000 on the mol m-3 values, and report `attrs['density_assumption']`.
+   - Note [cmip6-thetao-potential-temperature]: `thetao` is potential temperature referenced to the surface (no `bigthetao`), so take the potential-temperature route in the TEOS-10 density calculation; at the surface θ equals in-situ temperature.
+   - Note [cmip6-so-practical-salinity]: `so` is practical salinity in units "0.001"; do not rescale the numbers but convert S_P to S_A with the location-dependent function before the gsw density routines.
+
+4. For each model and for GLODAP, form the column 0-50 m mean of DIC, total alkalinity and pH as the mean over all levels of that column lying within 0-50 m (no partial-layer interpolation), then a single global 0-50 m mean per source, weighting every valid cell by its volume (Σ x·volcello / Σ volcello for the models; for GLODAP, which has no volcello, by the cell volume built from the 1-degree cell area and the level thickness). Report DIC and TAlk in micromoles per kilogram to the nearest whole unit, pH to 3 decimals, and each model's difference from GLODAP from these unrounded values.
+   - Note [omip-weighted-means-and-integrals]: every global mean is weighted over valid cells only, volume-weighted for the 0-50 m means and area-weighted for horizontal maps; never a plain `mean()` on a curvilinear grid with shrinking polar cells and varying level thickness.
+
+5. Build each model's map of 0-50 m mean DIC on its native grid from the same column means, regrid it conservatively to the GLODAP 1-degree grid, and compare it with the GLODAP 0-50 m DIC map: one comparison mask (`build_comparison_mask`, `ocean_only=False`), applied with `.where(mask)` before any statistic; then the area-weighted mean bias, RMSE and spatial correlation (weighting='area') per model, bias/RMSE to the nearest whole µmol kg-1 and correlation to 3 decimals; keep the masked bias field for Figure 1 and report the cell counts.
+   - Note [omip-native-grid-vs-regridded]: compute the global means and the 2002-minus-1971-2000 change on each model's native grid with its own weights; use 'conservative' regridding, and state that method, only for the map comparison and the depth-level biases.
+   - Note [common-comparison-mask]: build the single comparison mask on the GLODAP grid with `ocean_only=False` and apply it before the map bias/RMSE/correlation, reporting the cell counts.
+
+6. Build the vertical profiles of DIC in micromoles per kilogram for each model and for GLODAP: interpolate every product vertically to 0, 100, 500, 1000 and 2000 m (linear `regrid_vertical`, not nearest-level selection), regrid the model fields conservatively to the GLODAP 1-degree grid, and at each depth average model-minus-GLODAP over every cell where that model and GLODAP are both defined at that depth, area-weighting those cells per [omip-weighted-means-and-integrals]; report each depth bias to the nearest whole µmol kg-1 and keep the profile for Figure 2.
+
+7. Compute each model's period change of the global 0-50 m DIC as the volume-weighted 2002 mean minus the volume-weighted 1971-2000 mean on the native grid, in micromoles per kilogram to the nearest whole unit, and its ratio to that model's 0-50 m DIC difference from GLODAP obtained in step 4, to 2 decimals, together with the interpretation of that ratio for reading the offset as a model error.
+
+8. Produce Figure 1 (one row of three global maps of the 2002 0-50 m DIC bias on the step-5 comparison cells, one panel per model, a single diverging colour scale centred on zero shared by the panels and labelled µmol kg-1) and Figure 2 (one panel, vertical profile of the step-6 global mean DIC bias, depth on the vertical axis increasing downward, µmol kg-1 on the horizontal axis, one line per model, a vertical zero line and the five sampled depths marked).
+
+Other notes:
+- [common-comparison-mask] The depth-level biases follow the question's pairwise definition ("every cell where that model and GLODAP are both defined at that depth"), not the single map mask; each depth's sample therefore differs between models and this is stated in the answer.
+- [cmip6-bgc-units-per-volume] The DIC and alkalinity figures are reported in µmol kg-1 only after the density conversion, with the density assumption used recorded and stated.
+- GLODAP DIC is `TCO2`, alkalinity `TAlk`, and pH is `pHtsinsitutp` (in-situ, total scale), so the pH comparison is like-for-like on the total scale; `pHts25p0` is not used.
+- The 0-50 m pH means are volume-weighted means of the in-situ total-scale pH values, taken as reported (no transformation), which is a caveat when interpreting a mean pH.
+- The 2002-minus-1971-2000 change is a 30-year model trend while GLODAP is a 1972-2013 climatology, so part of each model's offset can reflect the period mismatch; the ratio of step 7 quantifies how many such trends the offset corresponds to and is the reason the bias is not read as pure model error.
+- Only the map comparison and the depth-level biases are regridded; the global means and the period change stay on each model's native grid with its own weights.

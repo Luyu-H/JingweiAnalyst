@@ -1,0 +1,873 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
+
+# -----------------------------------------------------------------------------
+# Paths and model metadata
+# -----------------------------------------------------------------------------
+WOA_CLIM_ROOT = "/data1/lorraine-20419/ocean_data/WOA23/climatology"
+WOA_MASK_ROOT = "/data1/lorraine-20419/ocean_data/WOA23/masks"
+CMIP_ROOT = "/data1/lorraine-20419/benchmark_cmip6/historical"
+
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+
+model_info = {
+    "CESM2": dict(
+        y_dim="nlat", x_dim="nlon",
+        lat_coord="lat", lon_coord="lon",
+        depth_coord="lev", depth_scale=0.01,
+    ),
+    "GFDL-ESM4": dict(
+        y_dim="lat", x_dim="lon",
+        lat_coord="lat", lon_coord="lon",
+        depth_coord="lev", depth_scale=1.0,
+    ),
+    "MPI-ESM1-2-LR": dict(
+        y_dim="j", x_dim="i",
+        lat_coord="latitude", lon_coord="longitude",
+        depth_coord="lev", depth_scale=1.0,
+    ),
+}
+
+# -----------------------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------------------
+def read_msk_table(path):
+    """Read a WOA .msk ASCII table robustly.
+
+    WOA mask files are not guaranteed to be cleanly whitespace separated (they
+    may use commas) and can carry non-numeric header/comment rows that are not
+    prefixed with '#'.  Parsing them with pandas' whitespace engine can collapse
+    each line to a single field, which then makes ``df.dropna(subset=[0, 1])``
+    fail with ``KeyError: [1]``.
+
+    Instead, read line by line, skip comments/blanks, normalise delimiters, keep
+    only fully-numeric records and rebuild a DataFrame with integer column labels
+    0, 1, 2, ...  Rows shorter than the widest record are padded at the tail with
+    NaN (this naturally handles the basin-mask "empty deeper level" entries).
+    """
+    rows = []
+    with open(path, "r") as fh:
+        for line in fh:
+            s = line.strip()
+            if not s:
+                continue
+            if s[0] in "#!%":
+                continue
+            s = s.replace(",", " ").replace(";", " ")
+            parts = s.split()
+            if not parts:
+                continue
+            try:
+                vals = [float(p.replace("D", "E").replace("d", "e")) for p in parts]
+            except ValueError:
+                # header / metadata row
+                continue
+            rows.append(vals)
+
+    if not rows:
+        return pd.DataFrame()
+
+    ncol = max(len(r) for r in rows)
+    arr = np.full((len(rows), ncol), np.nan, dtype=float)
+    for i, r in enumerate(rows):
+        arr[i, :len(r)] = r
+
+    df = pd.DataFrame(arr)
+    drop_cols = [c for c in (0, 1) if c in df.columns]
+    if drop_cols:
+        df = df.dropna(subset=drop_cols).reset_index(drop=True)
+    return df
+
+
+def coord_indices(vals, coord):
+    coord = np.asarray(coord, dtype=float)
+    vals = np.asarray(vals, dtype=float)
+    if coord.size < 2:
+        return np.zeros_like(vals, dtype=int)
+    d = coord[1] - coord[0]
+    if d == 0:
+        return np.zeros_like(vals, dtype=int)
+    return np.rint((vals - coord[0]) / d).astype(int)
+
+
+def table_to_grid(df, lat_vals, lon_vals, value_col=2):
+    arr = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=float)
+    lat = df[0].values.astype(float)
+    lon = df[1].values.astype(float)
+    if value_col not in df.columns:
+        return arr
+    val = df[value_col].values.astype(float)
+    li = coord_indices(lat, lat_vals)
+    lj = coord_indices(lon, lon_vals)
+    good = (
+        (li >= 0) & (li < len(lat_vals)) &
+        (lj >= 0) & (lj < len(lon_vals)) &
+        np.isfinite(val)
+    )
+    arr[li[good], lj[good]] = val[good]
+    return arr
+
+
+def weighted_mean(field, weights, mask):
+    w = np.where(mask, weights, 0.0)
+    f = np.where(mask, field, np.nan)
+    den = np.nansum(w)
+    if den == 0:
+        return np.nan
+    return np.nansum(f * w) / den
+
+
+def weighted_mean_nomask(field, weights):
+    den = np.nansum(weights)
+    if den == 0:
+        return np.nan
+    return np.nansum(field * weights) / den
+
+
+def weighted_corr(x, y, w):
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(w) & (w > 0)
+    if valid.sum() == 0:
+        return np.nan
+    x = x[valid]
+    y = y[valid]
+    w = w[valid]
+    sw = np.sum(w)
+    mx = np.sum(w * x) / sw
+    my = np.sum(w * y) / sw
+    cov = np.sum(w * (x - mx) * (y - my)) / sw
+    vx = np.sum(w * (x - mx) ** 2) / sw
+    vy = np.sum(w * (y - my) ** 2) / sw
+    if vx <= 0 or vy <= 0:
+        return np.nan
+    return cov / np.sqrt(vx * vy)
+
+
+def weighted_rmse(x, y, w):
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(w) & (w > 0)
+    if valid.sum() == 0:
+        return np.nan
+    x = x[valid]
+    y = y[valid]
+    w = w[valid]
+    return np.sqrt(np.sum(w * (x - y) ** 2) / np.sum(w))
+
+
+def nitracline_from_profiles(field, depth, max_depth=1000.0):
+    """
+    field shape: (nlev, ...).  depth is 1-D level depths in metres, positive down.
+    Returns the depth of the upper level of the maximum positive vertical gradient,
+    searching only pairs whose upper level is at or above max_depth.  The next
+    deeper level is allowed to close the deepest gradient.
+    """
+    arr = np.asarray(field, dtype=float)
+    depth = np.asarray(depth, dtype=float)
+
+    # Ensure increasing depth
+    if np.any(np.diff(depth) < 0):
+        order = np.argsort(depth)
+        depth = depth[order]
+        arr = arr[order, ...]
+
+    nlev = arr.shape[0]
+    shape = arr.shape[1:]
+    arr2 = arr.reshape(nlev, -1)
+
+    out = np.full(arr2.shape[1], np.nan, dtype=float)
+    maxg = np.full(arr2.shape[1], -np.inf, dtype=float)
+
+    for k in range(nlev - 1):
+        if depth[k] > max_depth:
+            continue
+        dz = depth[k + 1] - depth[k]
+        if not np.isfinite(dz) or dz <= 0:
+            continue
+        g = (arr2[k + 1, :] - arr2[k, :]) / dz
+        valid = np.isfinite(g)
+        better = valid & (g > maxg)
+        maxg[better] = g[better]
+        out[better] = depth[k]
+
+    return out.reshape(shape)
+
+
+def lonlat_to_xyz(lat, lon):
+    lat = np.deg2rad(np.asarray(lat, dtype=float))
+    lon = np.deg2rad(np.asarray(lon, dtype=float))
+    return np.column_stack([
+        np.cos(lat) * np.cos(lon),
+        np.cos(lat) * np.sin(lon),
+        np.sin(lat),
+    ])
+
+
+def map_basin_to_grid(lat2d, lon2d, basin2d, woa_lat, woa_lon):
+    """Nearest WOA surface-basin label for each model grid point."""
+    woa_lon2d, woa_lat2d = np.meshgrid(woa_lon, woa_lat)
+    valid = np.isfinite(basin2d) & (basin2d > 0)
+    pts = lonlat_to_xyz(woa_lat2d[valid], woa_lon2d[valid])
+    vals = basin2d[valid]
+    tree = cKDTree(pts)
+    q = lonlat_to_xyz(np.asarray(lat2d).ravel(), np.asarray(lon2d).ravel())
+    _, idx = tree.query(q, k=1)
+    return vals[idx].reshape(np.asarray(lat2d).shape)
+
+
+def classify_basin_labels(basin2d, lat2d, lon2d):
+    labels = np.unique(basin2d[np.isfinite(basin2d) & (basin2d > 0)]).astype(int)
+    info = {}
+    for lab in labels:
+        m = basin2d == lab
+        if m.sum() == 0:
+            continue
+        la = lat2d[m]
+        lo = lon2d[m]
+        mean_lat = float(np.nanmean(la))
+        lonr = np.deg2rad(lo)
+        mean_lon = float(np.rad2deg(np.arctan2(
+            np.nanmean(np.sin(lonr)), np.nanmean(np.cos(lonr))
+        )))
+        info[int(lab)] = dict(mean_lat=mean_lat, mean_lon=mean_lon, count=int(m.sum()))
+
+    names = {}
+    for lab, d in info.items():
+        if d["mean_lat"] > 60:
+            names["Arctic"] = lab
+        elif d["mean_lat"] < -50:
+            names["Southern"] = lab
+
+    for lab in info:
+        if lab in names.values():
+            continue
+        lon = info[lab]["mean_lon"]
+        lon = ((lon + 180.0) % 360.0) - 180.0
+        if -80.0 <= lon <= 25.0:
+            names["Atlantic"] = lab
+        elif 25.0 < lon <= 120.0:
+            names["Indian"] = lab
+        else:
+            names["Pacific"] = lab
+
+    return names, info
+
+
+def get_cmip_files(model, variable):
+    d = os.path.join(CMIP_ROOT, model, variable)
+    files = sorted(glob.glob(os.path.join(d, "*.nc")))
+    if len(files) == 0:
+        raise FileNotFoundError(f"No files for {model}/{variable} under {d}")
+    return files
+
+
+def open_cmip_timeseries(model, variable):
+    files = get_cmip_files(model, variable)
+    return xr.open_mfdataset(
+        files,
+        combine="by_coords",
+        use_cftime=True,
+        decode_times=True,
+        chunks={"time": 12},
+    )
+
+
+def open_cmip_fixed(model, variable):
+    files = get_cmip_files(model, variable)
+    return xr.open_dataset(files[0], decode_times=False)
+
+
+def time_mean_weighted(da):
+    """Month-length-weighted mean over time."""
+    da = da.sortby("time")
+    w = da.time.dt.days_in_month.astype(float)
+    w = w.broadcast_like(da)
+    valid = da.notnull()
+    num = (da.fillna(0.0) * w.where(valid, 0.0)).sum("time")
+    den = w.where(valid, 0.0).sum("time")
+    out = num / den
+    out.attrs = da.attrs
+    return out
+
+
+def insitu_density_unesco(t, s, depth_m):
+    """UNESCO 1983 in-situ density (kg m-3) from T(degC), S(PSU), depth(m)."""
+    t = np.asarray(t, dtype=float)
+    s = np.asarray(s, dtype=float)
+    depth_m = np.asarray(depth_m, dtype=float)
+
+    if depth_m.ndim < t.ndim:
+        depth_m = depth_m.reshape(depth_m.shape + (1,) * (t.ndim - depth_m.ndim))
+
+    p = 1.0055 * depth_m / 10.0  # pressure in bars
+
+    t2 = t * t
+    t3 = t2 * t
+    t4 = t3 * t
+    t5 = t4 * t
+    s = np.maximum(s, 0.0)
+    s2 = s * s
+    p2 = p * p
+
+    rho_w = (
+        999.842594
+        + 6.793952e-2 * t
+        - 9.095290e-3 * t2
+        + 1.001685e-4 * t3
+        - 1.120083e-6 * t4
+        + 6.536332e-9 * t5
+    )
+    A = (
+        8.24493e-1
+        - 4.0899e-3 * t
+        + 7.6438e-5 * t2
+        - 8.2467e-7 * t3
+        + 5.3875e-9 * t4
+    )
+    B = -5.72466e-3 + 1.0227e-4 * t - 1.6546e-6 * t2
+    C = 4.8314e-4
+
+    rho0 = rho_w + A * s + B * s ** 1.5 + C * s2
+
+    K_w = (
+        19652.21
+        + 148.4206 * t
+        - 2.327105 * t2
+        + 1.360477e-2 * t3
+        - 5.155288e-5 * t4
+    )
+    K = (
+        K_w
+        + s * (54.6746 - 0.603459 * t + 1.09987e-2 * t2 - 6.1670e-5 * t3)
+        + s ** 1.5 * (7.944e-2 + 1.6483e-2 * t - 5.3009e-4 * t2)
+    )
+    K = K + p * (3.239908 + 1.43713e-3 * t + 1.16092e-4 * t2 - 5.77905e-7 * t3)
+    K = K + s * p * (2.2838e-3 - 1.0981e-5 * t - 1.6078e-6 * t2)
+    K = K + s ** 1.5 * p * (1.91075e-4)
+    K = K + p2 * (8.50935e-5 - 6.12293e-6 * t + 5.2787e-8 * t2)
+    K = K + s * p2 * (-9.9348e-7 + 2.0816e-8 * t + 9.1697e-10 * t2)
+
+    return rho0 / (1.0 - p / K)
+
+
+def zonal_section(data, depth_vals, lat2d, lon2d, area2d, target_lon):
+    """
+    Area-weighted zonal mean over 2S-2N, binned onto target_lon.
+    data shape: (nlev, ny, nx).  Returns DataArray(depth, lon).
+    """
+    data = np.asarray(data, dtype=float)
+    depth_vals = np.asarray(depth_vals, dtype=float)
+    lat2d = np.asarray(lat2d, dtype=float)
+    lon2d = np.asarray(lon2d, dtype=float)
+    area2d = np.asarray(area2d, dtype=float)
+
+    nlev = data.shape[0]
+    target_lon = np.asarray(target_lon, dtype=float)
+    nbin = len(target_lon)
+    bin_width = float(target_lon[1] - target_lon[0])
+    lon_min = float(target_lon[0] - bin_width / 2.0)
+    lon_max = float(target_lon[-1] + bin_width / 2.0)
+
+    lon360 = lon2d % 360.0
+    mask2d = (
+        (lat2d >= -2.0) & (lat2d <= 2.0) &
+        (lon360 >= lon_min) & (lon360 < lon_max) &
+        np.isfinite(area2d) & (area2d > 0)
+    )
+
+    lon_flat = lon360.ravel()
+    mask_flat = mask2d.ravel()
+    area_flat = area2d.ravel()
+
+    out = np.full((nlev, nbin), np.nan, dtype=float)
+
+    for k in range(nlev):
+        vals = data[k].ravel()
+        valid = mask_flat & np.isfinite(vals)
+        if not np.any(valid):
+            continue
+        idx = np.floor((lon_flat[valid] - lon_min) / bin_width).astype(int)
+        good = (idx >= 0) & (idx < nbin)
+        idx = idx[good]
+        v = vals[valid][good]
+        w = area_flat[valid][good]
+        num = np.bincount(idx, weights=v * w, minlength=nbin)
+        den = np.bincount(idx, weights=w, minlength=nbin)
+        out[k, :] = np.divide(
+            num, den,
+            out=np.full(nbin, np.nan, dtype=float),
+            where=den > 0,
+        )
+
+    return xr.DataArray(
+        out,
+        dims=("depth", "lon"),
+        coords={"depth": depth_vals, "lon": target_lon},
+    )
+
+
+def interp_to_depth(section, depth_src, depth_tgt):
+    vals = section.values
+    depth_src = np.asarray(depth_src, dtype=float)
+    depth_tgt = np.asarray(depth_tgt, dtype=float)
+
+    order = np.argsort(depth_src)
+    depth_src = depth_src[order]
+    vals = vals[order, :]
+
+    out = np.full((len(depth_tgt), vals.shape[1]), np.nan, dtype=float)
+    for j in range(vals.shape[1]):
+        y = vals[:, j]
+        good = np.isfinite(y) & np.isfinite(depth_src)
+        if good.sum() >= 2:
+            out[:, j] = np.interp(
+                depth_tgt, depth_src[good], y[good],
+                left=np.nan, right=np.nan,
+            )
+
+    return xr.DataArray(
+        out,
+        dims=("depth", "lon"),
+        coords={"depth": depth_tgt, "lon": section.lon.values},
+    )
+
+
+def conservative_regrid_to_woa(field, lat2d, lon2d, area2d, target_lat, target_lon):
+    """
+    Area-weighted binning to the WOA 1-degree target grid, followed by nearest
+    filling of any empty target cells.  This is the conservative remapping used
+    here (area weights from each model's areacello; target cells receive the
+    areacello-weighted mean of source cells whose centres fall in the cell).
+    """
+    field = np.asarray(field, dtype=float)
+    lat2d = np.asarray(lat2d, dtype=float)
+    lon2d = np.asarray(lon2d, dtype=float)
+    area2d = np.asarray(area2d, dtype=float)
+
+    target_lat = np.asarray(target_lat, dtype=float)
+    target_lon = np.asarray(target_lon, dtype=float)
+    nlat = len(target_lat)
+    nlon = len(target_lon)
+
+    lon_mod = ((lon2d + 180.0) % 360.0) - 180.0
+
+    lat_idx = np.rint((lat2d - target_lat[0]) / (target_lat[1] - target_lat[0])).astype(int)
+    lon_idx = np.rint((lon_mod - target_lon[0]) / (target_lon[1] - target_lon[0])).astype(int)
+
+    valid = (
+        np.isfinite(field) & np.isfinite(area2d) & (area2d > 0) &
+        (lat_idx >= 0) & (lat_idx < nlat) &
+        (lon_idx >= 0) & (lon_idx < nlon)
+    )
+
+    flat = lat_idx[valid] * nlon + lon_idx[valid]
+    num = np.bincount(
+        flat,
+        weights=field[valid] * area2d[valid],
+        minlength=nlat * nlon,
+    )
+    den = np.bincount(
+        flat,
+        weights=area2d[valid],
+        minlength=nlat * nlon,
+    )
+    out = np.divide(
+        num, den,
+        out=np.full(nlat * nlon, np.nan, dtype=float),
+        where=den > 0,
+    ).reshape(nlat, nlon)
+
+    if np.any(~np.isfinite(out)):
+        pts = np.column_stack([lon_mod[valid], lat2d[valid]])
+        tree = cKDTree(pts)
+        tlon, tlat = np.meshgrid(target_lon, target_lat)
+        q = np.column_stack([tlon.ravel(), tlat.ravel()])
+        _, idx = tree.query(q, k=1)
+        near = field[valid][idx].reshape(nlat, nlon)
+        out = np.where(np.isfinite(out), out, near)
+
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Load WOA23 nitrate annual all-period climatology
+# -----------------------------------------------------------------------------
+woa_file = os.path.join(
+    WOA_CLIM_ROOT, "nitrate", "all_time_periods", "woa23_all_n00_01.nc"
+)
+woa_ds = xr.open_dataset(woa_file, decode_times=False)
+
+woa_var_candidates = [
+    v for v in woa_ds.data_vars
+    if v.lower().endswith("_an") or v.lower() == "an"
+]
+if len(woa_var_candidates) == 0:
+    woa_var_candidates = [
+        v for v in woa_ds.data_vars
+        if {"depth", "lat", "lon"}.issubset(set(woa_ds[v].dims))
+    ]
+woa_var = woa_var_candidates[0]
+
+woa_nitrate = woa_ds[woa_var]
+if "time" in woa_nitrate.dims:
+    woa_nitrate = woa_nitrate.isel(time=0, drop=True)
+woa_nitrate = woa_nitrate.transpose("depth", "lat", "lon")
+
+woa_depth = woa_ds["depth"].values.astype(float)
+woa_lat = woa_ds["lat"].values.astype(float)
+woa_lon = woa_ds["lon"].values.astype(float)
+
+woa_lat2d, woa_lon2d = np.meshgrid(woa_lat, woa_lon, indexing="ij")
+woa_area_2d = (
+    np.cos(np.deg2rad(woa_lat))[:, None]
+    * np.ones((1, len(woa_lon)), dtype=float)
+)
+
+# -----------------------------------------------------------------------------
+# WOA23 masks: land-sea and surface basin labels
+# -----------------------------------------------------------------------------
+landsea_df = read_msk_table(os.path.join(WOA_MASK_ROOT, "landsea_01.msk"))
+landsea_mask = table_to_grid(landsea_df, woa_lat, woa_lon, value_col=2)
+ocean_mask_woa = landsea_mask > 1.0
+
+basin_df = read_msk_table(os.path.join(WOA_MASK_ROOT, "basinmask_01.msk"))
+basin_surface = table_to_grid(basin_df, woa_lat, woa_lon, value_col=2)
+
+basin_names, basin_info = classify_basin_labels(basin_surface, woa_lat2d, woa_lon2d)
+basins = ["Pacific", "Atlantic", "Indian"]
+
+# -----------------------------------------------------------------------------
+# WOA23 nitracline on its native 1-degree grid
+# -----------------------------------------------------------------------------
+woa_nitrate_vals = woa_nitrate.values.astype(float)
+woa_nitra_vals = nitracline_from_profiles(
+    woa_nitrate_vals, woa_depth, max_depth=1000.0
+)
+woa_nitra_vals = np.where(
+    ocean_mask_woa & np.isfinite(woa_nitra_vals),
+    woa_nitra_vals,
+    np.nan,
+)
+
+woa_nitra_da = xr.DataArray(
+    woa_nitra_vals,
+    dims=("lat", "lon"),
+    coords={"lat": woa_lat, "lon": woa_lon},
+    name="nitracline_depth",
+    attrs={"units": "m"},
+)
+
+# -----------------------------------------------------------------------------
+# Load CMIP6 models: no3, thetao, so, areacello
+# -----------------------------------------------------------------------------
+model_results = {}
+time_slice = slice("1971-01-01", "2000-12-31")
+
+for model in models:
+    info = model_info[model]
+    print(f"Loading {model} ...")
+
+    # --- no3 monthly, then month-length-weighted 1971-2000 mean
+    ds_no3 = open_cmip_timeseries(model, "no3")
+    no3 = ds_no3["no3"].sel(time=time_slice)
+    no3_mean = time_mean_weighted(no3).compute()
+
+    lev = ds_no3[info["depth_coord"]].values.astype(float)
+    depth_vals = lev * info["depth_scale"]
+
+    no3_mean_native = no3_mean.transpose(
+        info["depth_coord"], info["y_dim"], info["x_dim"]
+    )
+
+    # --- model horizontal coordinates and areacello
+    lat2d = np.asarray(no3_mean_native[info["lat_coord"]].values, dtype=float)
+    lon2d = np.asarray(no3_mean_native[info["lon_coord"]].values, dtype=float)
+
+    area_ds = open_cmip_fixed(model, "areacello")
+    area = area_ds["areacello"].squeeze(drop=True)
+    area_vals = area.transpose(info["y_dim"], info["x_dim"]).values.astype(float)
+
+    # --- thetao and so, same period, for in-situ density in the Figure 2 conversion
+    ds_thetao = open_cmip_timeseries(model, "thetao")
+    thetao = ds_thetao["thetao"].sel(time=time_slice)
+    thetao_mean = time_mean_weighted(thetao).compute()
+
+    ds_so = open_cmip_timeseries(model, "so")
+    so = ds_so["so"].sel(time=time_slice)
+    so_mean = time_mean_weighted(so).compute()
+
+    thetao_mean_native = thetao_mean.transpose(
+        info["depth_coord"], info["y_dim"], info["x_dim"]
+    )
+    so_mean_native = so_mean.transpose(
+        info["depth_coord"], info["y_dim"], info["x_dim"]
+    )
+
+    thetao_vals = thetao_mean_native.values.astype(float)
+    so_vals = so_mean_native.values.astype(float)
+    no3_vals = no3_mean_native.values.astype(float)
+
+    # In-situ density from time-mean T/S, with pressure approximated from depth.
+    pressure_depth = depth_vals[:, None, None] * np.ones_like(no3_vals)
+    rho = insitu_density_unesco(thetao_vals, so_vals, pressure_depth)
+
+    # Native mol m-3 -> umol kg-1 for sections/comparison plotting.
+    no3_umolkg_vals = no3_vals * 1.0e6 / rho
+    no3_umolkg = xr.DataArray(
+        no3_umolkg_vals,
+        dims=no3_mean_native.dims,
+        coords=no3_mean_native.coords,
+    )
+    no3_umolkg.attrs["units"] = "umol kg-1"
+    no3_umolkg.attrs["density_assumption"] = (
+        "UNESCO 1983 in-situ density from time-mean thetao and so; "
+        "pressure approximated as 1.0055 dbar per metre depth"
+    )
+
+    # --- nitracline on the native model grid and native mol m-3 field
+    nitra_vals = nitracline_from_profiles(no3_vals, depth_vals, max_depth=1000.0)
+    valid_model = (
+        np.isfinite(nitra_vals) &
+        np.isfinite(area_vals) &
+        (area_vals > 0)
+    )
+    nitra_vals = np.where(valid_model, nitra_vals, np.nan)
+
+    template = no3_mean_native.isel({info["depth_coord"]: 0}, drop=True)
+    nitra_da = xr.DataArray(
+        nitra_vals,
+        dims=template.dims,
+        coords=template.coords,
+        name="nitracline_depth",
+        attrs={"units": "m"},
+    )
+
+    model_results[model] = dict(
+        no3_mean_native=no3_mean_native,
+        no3_umolkg=no3_umolkg,
+        nitra_da=nitra_da,
+        nitra_vals=nitra_vals,
+        depth_vals=depth_vals,
+        area_vals=area_vals,
+        lat2d=lat2d,
+        lon2d=lon2d,
+        valid=valid_model,
+    )
+
+# -----------------------------------------------------------------------------
+# Native-grid global and basin means
+# -----------------------------------------------------------------------------
+native_global = {}
+native_global["WOA23"] = weighted_mean(
+    woa_nitra_vals,
+    woa_area_2d,
+    ocean_mask_woa & np.isfinite(woa_nitra_vals),
+)
+
+for model in models:
+    r = model_results[model]
+    native_global[model] = weighted_mean(
+        r["nitra_vals"], r["area_vals"], r["valid"]
+    )
+
+native_global_means = pd.Series(native_global, name="global_mean_m").to_frame()
+
+native_basin = {}
+# WOA
+for bname in basins:
+    lab = basin_names[bname]
+    mask = (
+        ocean_mask_woa &
+        np.isfinite(woa_nitra_vals) &
+        (basin_surface == lab)
+    )
+    native_basin[("WOA23", bname)] = weighted_mean(
+        woa_nitra_vals, woa_area_2d, mask
+    )
+
+# Models
+for model in models:
+    r = model_results[model]
+    basin_model = map_basin_to_grid(
+        r["lat2d"], r["lon2d"], basin_surface, woa_lat, woa_lon
+    )
+    for bname in basins:
+        lab = basin_names[bname]
+        mask = r["valid"] & (basin_model == lab)
+        native_basin[(model, bname)] = weighted_mean(
+            r["nitra_vals"], r["area_vals"], mask
+        )
+
+native_basin_means = pd.DataFrame(
+    index=["WOA23"] + models,
+    columns=basins,
+    dtype=float,
+)
+for source in ["WOA23"] + models:
+    for bname in basins:
+        native_basin_means.loc[source, bname] = native_basin[(source, bname)]
+
+# -----------------------------------------------------------------------------
+# Regrid model nitracline fields to the WOA 1-degree grid
+# -----------------------------------------------------------------------------
+model_nitra_regrid = {}
+for model in models:
+    r = model_results[model]
+    model_nitra_regrid[model] = conservative_regrid_to_woa(
+        r["nitra_vals"],
+        r["lat2d"],
+        r["lon2d"],
+        r["area_vals"],
+        woa_lat,
+        woa_lon,
+    )
+
+# One common comparison mask from WOA ocean mask and valid overlap of all four.
+comparison_mask = (
+    ocean_mask_woa &
+    np.isfinite(woa_nitra_vals)
+)
+for model in models:
+    comparison_mask &= np.isfinite(model_nitra_regrid[model])
+
+n_comparison_cells = int(comparison_mask.sum())
+
+woa_nitra_shared = np.where(comparison_mask, woa_nitra_vals, np.nan)
+model_nitra_shared = {
+    model: np.where(comparison_mask, model_nitra_regrid[model], np.nan)
+    for model in models
+}
+
+w_shared = woa_area_2d * comparison_mask
+
+# -----------------------------------------------------------------------------
+# Shared-sample global metrics and differences
+# -----------------------------------------------------------------------------
+shared_metrics_list = []
+for model in models:
+    x = model_nitra_shared[model]
+    y = woa_nitra_shared
+
+    corr = weighted_corr(x, y, w_shared)
+    rmse = weighted_rmse(x, y, w_shared)
+    mean_model = weighted_mean_nomask(x, w_shared)
+    mean_woa = weighted_mean_nomask(y, w_shared)
+    diff = mean_model - mean_woa
+
+    shared_metrics_list.append(dict(
+        model=model,
+        correlation=corr,
+        rmse_m=rmse,
+        mean_model_m=mean_model,
+        mean_woa_m=mean_woa,
+        difference_m=diff,
+    ))
+
+shared_metrics = pd.DataFrame(shared_metrics_list).set_index("model")
+
+# -----------------------------------------------------------------------------
+# Shared-sample basin means and differences
+# -----------------------------------------------------------------------------
+shared_basin_list = []
+for model in models:
+    x = model_nitra_shared[model]
+    y = woa_nitra_shared
+    for bname in basins:
+        lab = basin_names[bname]
+        bmask = comparison_mask & (basin_surface == lab)
+        wb = woa_area_2d * bmask
+
+        mean_model = weighted_mean_nomask(x, wb)
+        mean_woa = weighted_mean_nomask(y, wb)
+        diff = mean_model - mean_woa
+
+        shared_basin_list.append(dict(
+            model=model,
+            basin=bname,
+            mean_model_m=mean_model,
+            mean_woa_m=mean_woa,
+            difference_m=diff,
+        ))
+
+shared_basin_metrics = pd.DataFrame(shared_basin_list)
+
+# -----------------------------------------------------------------------------
+# Basin-order assessment and best model
+# -----------------------------------------------------------------------------
+woa_order = sorted(basins, key=lambda b: native_basin_means.loc["WOA23", b])
+basin_order_matches = {}
+basin_orders = {}
+for model in models:
+    model_order = sorted(basins, key=lambda b: native_basin_means.loc[model, b])
+    basin_orders[model] = model_order
+    basin_order_matches[model] = (model_order == woa_order)
+
+best_model = shared_metrics.sort_values(
+    ["correlation", "rmse_m"], ascending=[False, True]
+).index[0]
+
+# -----------------------------------------------------------------------------
+# Figure 2 source sections: equatorial Pacific, 2S-2N, 120E-80W
+# -----------------------------------------------------------------------------
+target_lon = np.arange(120.5, 280.0, 1.0)
+display_depth = woa_depth[woa_depth <= 1100.0]
+
+# WOA section
+section_woa_native = zonal_section(
+    woa_nitrate_vals,
+    woa_depth,
+    woa_lat2d,
+    woa_lon2d,
+    woa_area_2d,
+    target_lon,
+)
+section_woa_display = section_woa_native.sel(depth=display_depth)
+
+section_display = {"WOA23": section_woa_display}
+nitra_line_section = {
+    "WOA23": nitracline_from_profiles(
+        section_woa_display.values, display_depth, max_depth=1000.0
+    )
+}
+
+for model in models:
+    r = model_results[model]
+    sec_native = zonal_section(
+        r["no3_umolkg"].values,
+        r["depth_vals"],
+        r["lat2d"],
+        r["lon2d"],
+        r["area_vals"],
+        target_lon,
+    )
+    sec_display = interp_to_depth(sec_native, r["depth_vals"], display_depth)
+    section_display[model] = sec_display
+    nitra_line_section[model] = nitracline_from_profiles(
+        sec_display.values, display_depth, max_depth=1000.0
+    )
+
+# -----------------------------------------------------------------------------
+# Print summary
+# -----------------------------------------------------------------------------
+print("\nNative-grid global mean nitracline depth (m):")
+print(native_global_means.round(0))
+
+print("\nNative-grid basin mean nitracline depth (m):")
+print(native_basin_means.round(0))
+
+print("\nShared-sample metrics on WOA 1-degree grid:")
+print(shared_metrics.round({"correlation": 3, "rmse_m": 1, "mean_model_m": 0,
+                            "mean_woa_m": 0, "difference_m": 0}))
+print(f"Shared comparison cells: {n_comparison_cells}")
+
+print("\nShared-sample basin differences (model - WOA23, m):")
+print(shared_basin_metrics.pivot(index="model", columns="basin", values="difference_m").round(0))
+
+print("\nWOA23 basin order (shallow to deep):", woa_order)
+for model in models:
+    print(f"{model} basin order: {basin_orders[model]}  matches WOA23: {basin_order_matches[model]}")
+
+print(f"\nBest model by highest correlation / lowest RMSE: {best_model}")
+print(f"density_assumption: {model_results[models[0]]['no3_umolkg'].attrs['density_assumption']}")

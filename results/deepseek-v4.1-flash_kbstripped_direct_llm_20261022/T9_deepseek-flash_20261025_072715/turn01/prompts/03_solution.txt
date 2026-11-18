@@ -1,0 +1,1817 @@
+# exchange 3: solution
+# elapsed: 26.8 s
+
+===== SYSTEM =====
+
+The user's question:
+Assess the Pacific Decadal Oscillation (PDO) simulated by three CMIP6 models against ERSSTv5 observations, over 1950-01 to 2014-12.
+
+Data to use:
+- CMIP6 historical `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1950-01 to 2014-12.
+- ERSSTv5 monthly SST over the same window.
+- The published PDO index (product `pdo` in the index registry).
+
+The PDO is the leading EOF of monthly North Pacific SST anomalies over 20N-70N, 110E-100W, relative to a 1950-2014 monthly climatology.
+
+Expected numerical results, for each of the four sources over 1950-2014, with any regridding done by bilinear interpolation onto the 1-degree grid:
+- The percentage of variance explained by the leading mode, to 1 decimal place.
+- The amplitude of the mode, in degrees Celsius per standard deviation, to 3 decimal places.
+- The lag-1-year (12-month) autocorrelation of the monthly standardized index, to 3 decimal places.
+- The Pearson correlation of the ERSSTv5-derived index with the published PDO series, to 3 decimal places, and what that correlation does and does not demonstrate.
+- For each model, the spatial Pearson correlation between its regression pattern and the ERSSTv5 regression pattern, to 3 decimal places.
+- The observed PDO phase-transition years over 1950-2014, defined as the years in which the 9-year (108-month) centred running mean of the ERSSTv5 index changes sign (a crossing less than 3 years after the last counted transition is merged into it, keeping the earlier year), and which of them correspond to documented Pacific climate shifts.
+- Which model reproduces the observed pattern best, and whether the models' amplitude and persistence are consistent with observations.
+
+Expected visualizations:
+- Figure 1, a 2-by-2 panel of the regression pattern over the PDO domain, in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, on one diverging colour scale centred on zero labelled in degrees Celsius per standard deviation, each panel annotated with its explained variance and, for the models, its pattern correlation with observations.
+- Figure 2, a single time-series panel of the standardized index of all four sources plus the published PDO series as a distinguishable fifth line, with the 9-year smoothed ERSSTv5 curve and the transition years marked, and the y axis labelled as a standardized index.
+
+The code that ran:
+<executed_code>
+import glob
+import warnings
+import numpy as np
+import pandas as pd
+import xarray as xr
+from scipy.spatial import Delaunay
+from scipy.interpolate import LinearNDInterpolator
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# ---------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------
+cmip_root = "/data1/lorraine-20419/benchmark_cmip6/historical"
+ersst_path = "/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc"
+pdo_path = "/data1/lorraine-20419/ocean_data/CPC/ersst.v6.pdo.dat"
+
+start_sel, end_sel = "1950-01-01", "2014-12-31"
+time_common = pd.date_range("1950-01-01", "2014-12-01", freq="MS")
+months = time_common.month.values
+n_time = len(time_common)
+
+# 1-degree target grid over the PDO domain: 20N-70N, 110E-100W.
+# Keep longitudes in 0-360 convention, so the domain is 110E to 260E.
+lat_t = np.arange(20.0, 70.5, 1.0)
+lon_t = np.arange(110.0, 260.5, 1.0)
+LON_T, LAT_T = np.meshgrid(lon_t, lat_t)
+
+# Standard climate-EOF practice is area weighting by sqrt(cos(lat)).
+# Set to False for an unweighted grid-point EOF.
+AREA_WEIGHT = True
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def to_celsius(da):
+    """Convert Kelvin to degC if the declared units are Kelvin."""
+    units = str(da.attrs.get("units", "")).lower()
+    if ("k" in units and "deg" not in units) or "kelvin" in units:
+        return da - 273.15
+    return da
+
+
+def regrid_regular(da, lat_name="lat", lon_name="lon",
+                   target_lat=lat_t, target_lon=lon_t):
+    """Bilinear regrid a rectilinear lat/lon DataArray to the target grid."""
+    if lat_name not in da.coords and "latitude" in da.coords:
+        lat_name = "latitude"
+    if lon_name not in da.coords and "longitude" in da.coords:
+        lon_name = "longitude"
+
+    da = da.sortby(lat_name).sortby(lon_name)
+
+    # Put longitude into 0-360 if needed.
+    lon_vals = da[lon_name].values
+    if np.nanmin(lon_vals) < 0:
+        da = da.assign_coords({lon_name: (da[lon_name] % 360)}).sortby(lon_name)
+
+    # Subset before interpolating for efficiency.
+    lat_min, lat_max = float(target_lat.min()) - 5, float(target_lat.max()) + 5
+    lon_min, lon_max = float(target_lon.min()) - 5, float(target_lon.max()) + 5
+    da = da.sel({lat_name: slice(lat_min, lat_max),
+                 lon_name: slice(lon_min, lon_max)})
+
+    out = da.interp({lat_name: target_lat, lon_name: target_lon},
+                    method="linear")
+    return out
+
+
+def regrid_curvilinear(tos, lat2d, lon2d,
+                       target_lat=lat_t, target_lon=lon_t):
+    """
+    Bilinear-ish regrid of a curvilinear CMIP6 grid to the target grid using a
+    linear Delaunay interpolation over the source ocean points.
+    """
+    lat2d = np.asarray(lat2d)
+    lon2d = np.asarray(lon2d)
+    if np.nanmin(lon2d) < 0:
+        lon2d = lon2d % 360
+
+    vals = np.asarray(tos.values)  # time, y, x
+    finite0 = np.isfinite(vals[0])
+
+    # Build the triangulation only over the PDO domain plus a margin.
+    box = ((lat2d >= target_lat.min() - 5) & (lat2d <= target_lat.max() + 5) &
+           (lon2d >= target_lon.min() - 5) & (lon2d <= target_lon.max() + 5))
+    src_mask = box & finite0
+
+    pts = np.column_stack([lon2d[src_mask], lat2d[src_mask]])
+    if pts.shape[0] < 4:
+        raise ValueError("Not enough valid source points for interpolation")
+
+    tri = Delaunay(pts)
+    tgt = np.column_stack([LON_T.ravel(), LAT_T.ravel()])
+
+    out = np.empty((vals.shape[0], len(target_lat), len(target_lon)),
+                   dtype=float)
+    for i in range(vals.shape[0]):
+        interp = LinearNDInterpolator(tri, vals[i][src_mask])
+        out[i] = interp(tgt).reshape(len(target_lat), len(target_lon))
+    return out
+
+
+def pdo_eof(arr, lat_t, lon_t, months, area_weight=True,
+            orient_pc=None, orient_reg=None):
+    """
+    Leading EOF/PC of monthly SST anomalies.
+
+    Parameters
+    ----------
+    arr : (time, lat, lon) degC, with NaN over land/missing.
+    months : length-time array of calendar months (1..12).
+    orient_pc : optional length-time reference PC for sign orientation.
+    orient_reg : optional 2-D reference regression pattern for sign orientation.
+
+    Returns
+    -------
+    dict with standardized PC, regression pattern (degC per std),
+    variance explained, amplitude, lag-12 autocorrelation, etc.
+    """
+    arr = np.asarray(arr, dtype=float)
+
+    # Monthly climatology over 1950-2014.
+    clim = np.empty((12, arr.shape[1], arr.shape[2]), dtype=float)
+    for m in range(1, 13):
+        clim[m - 1] = np.nanmean(arr[months == m], axis=0)
+
+    anom = arr - clim[months - 1]
+
+    # Keep grid points with a complete anomaly time series.
+    valid = np.isfinite(anom).all(axis=0)
+    X = anom[:, valid]
+    X = X - X.mean(axis=0, keepdims=True)
+
+    # Area weights for the EOF.
+    if area_weight:
+        w2d = np.sqrt(np.cos(np.deg2rad(lat_t)))[:, None] * np.ones((1, len(lon_t)))
+        w = w2d[valid]
+    else:
+        w = np.ones(X.shape[1])
+
+    Xw = X * w
+    U, s, Vt = np.linalg.svd(Xw, full_matrices=False)
+
+    pc = U[:, 0] * s[0]
+    var_expl = float(100.0 * s[0] ** 2 / np.sum(s ** 2))
+
+    pc_std = (pc - pc.mean()) / pc.std(ddof=1)
+
+    # Regression pattern in degC per one standard deviation of the PC.
+    reg = (X.T @ pc_std) / (len(pc_std) - 1.0)
+    reg_grid = np.full(arr.shape[1:], np.nan, dtype=float)
+    reg_grid[valid] = reg
+
+    # Orient the EOF sign.
+    if orient_pc is not None:
+        orient_pc = np.asarray(orient_pc)
+        good = np.isfinite(orient_pc)
+        if good.sum() > 10:
+            c = np.corrcoef(pc_std[good], orient_pc[good])[0, 1]
+            if c < 0:
+                pc_std = -pc_std
+                reg_grid = -reg_grid
+
+    if orient_reg is not None:
+        orient_reg = np.asarray(orient_reg)
+        good = np.isfinite(reg_grid) & np.isfinite(orient_reg)
+        if good.sum() > 10:
+            c = np.corrcoef(reg_grid[good], orient_reg[good])[0, 1]
+            if c < 0:
+                pc_std = -pc_std
+                reg_grid = -reg_grid
+
+    reg = reg_grid[valid]
+    amp_max = float(np.nanmax(np.abs(reg)))
+    amp_rms = float(np.sqrt(np.nanmean(reg ** 2)))
+    acf12 = float(np.corrcoef(pc_std[:-12], pc_std[12:])[0, 1])
+
+    return dict(pc_std=pc_std, reg_grid=reg_grid, valid=valid,
+                var_expl=var_expl, amp_max=amp_max, amp_rms=amp_rms,
+                acf12=acf12, anom=anom, clim=clim)
+
+
+# ---------------------------------------------------------------------
+# Published PDO index
+# ---------------------------------------------------------------------
+month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+# The published PDO file is a whitespace-delimited table whose comment/meta
+# lines do not all contain the same number of fields, which makes a plain
+# pandas.read_csv(sep=r"\s+") fail with
+#     ParserError: Expected 3 fields in line 2, saw 13
+# Parse it line by line instead, retaining only genuine year data rows
+# (a 4-digit year followed by 12 numeric monthly values).
+with open(pdo_path, "r") as fh:
+    raw_lines = fh.read().splitlines()
+
+pdo_rows = []
+for line in raw_lines:
+    s = line.strip()
+    if not s or s.startswith("#"):
+        continue
+    parts = s.split()
+    if len(parts) < 13:
+        continue
+    try:
+        year = int(float(parts[0]))
+    except (ValueError, TypeError):
+        continue
+    try:
+        monthly_vals = [float(tok) for tok in parts[1:13]]
+    except ValueError:
+        continue
+    pdo_rows.append([year] + monthly_vals)
+
+if not pdo_rows:
+    raise ValueError("Could not parse any data rows from the PDO file")
+
+pdo_raw = pd.DataFrame(pdo_rows, columns=["Year"] + month_names)
+
+pdo_long = pdo_raw.melt(id_vars="Year", var_name="month_name",
+                        value_name="pdo")
+pdo_long["month"] = pdo_long["month_name"].map(
+    {m: i + 1 for i, m in enumerate(month_names)}
+)
+pdo_long["date"] = pd.to_datetime(dict(
+    year=pdo_long["Year"].astype(int),
+    month=pdo_long["month"].astype(int),
+    day=1
+))
+pdo_long["pdo"] = pd.to_numeric(pdo_long["pdo"], errors="coerce")
+pdo_long.loc[np.isclose(pdo_long["pdo"], 99.99), "pdo"] = np.nan
+
+pdo_pub = pdo_long.set_index("date").sort_index()["pdo"].reindex(time_common)
+pdo_pub_std = (pdo_pub - pdo_pub.mean()) / pdo_pub.std(ddof=1)
+
+# ---------------------------------------------------------------------
+# ERSSTv5
+# ---------------------------------------------------------------------
+ds_e = xr.open_dataset(ersst_path)
+sst = ds_e["sst"].sel(time=slice(start_sel, end_sel))
+
+# ERSST latitude is descending; longitude is already 0-360.
+sst = sst.sortby("lat")
+if float(sst.lon.min()) < 0:
+    sst = sst.assign_coords(lon=(sst.lon % 360)).sortby("lon")
+
+sst_sub = sst.sel(
+    lat=slice(lat_t.min() - 5, lat_t.max() + 5),
+    lon=slice(lon_t.min() - 5, lon_t.max() + 5)
+)
+sst_t = sst_sub.interp(lat=lat_t, lon=lon_t, method="linear")
+ersst_arr = np.asarray(sst_t.values, dtype=float)
+
+if ersst_arr.shape[0] != n_time:
+    raise ValueError(f"ERSST time length {ersst_arr.shape[0]} != {n_time}")
+
+# Common ocean mask used to make the regridded products directly comparable.
+common_mask = np.isfinite(ersst_arr).all(axis=0)
+
+ersst_res = pdo_eof(
+    ersst_arr, lat_t, lon_t, months,
+    area_weight=AREA_WEIGHT,
+    orient_pc=pdo_pub.values
+)
+
+good_pub = np.isfinite(ersst_res["pc_std"]) & np.isfinite(pdo_pub.values)
+corr_ersst_pub = float(np.corrcoef(
+    ersst_res["pc_std"][good_pub],
+    pdo_pub.values[good_pub]
+)[0, 1])
+
+# ---------------------------------------------------------------------
+# CMIP6 historical tos
+# ---------------------------------------------------------------------
+model_cfg = {
+    "CESM2": dict(grid="curvilinear", lat_coord="lat", lon_coord="lon"),
+    "GFDL-ESM4": dict(grid="regular", lat_coord="lat", lon_coord="lon"),
+    "MPI-ESM1-2-LR": dict(grid="curvilinear",
+                          lat_coord="latitude", lon_coord="longitude"),
+}
+
+results = {"ERSSTv5": ersst_res}
+
+for model, cfg in model_cfg.items():
+    files = sorted(glob.glob(
+        f"{cmip_root}/{model}/tos/tos_Omon_{model}_historical_*.nc"
+    ))
+    if not files:
+        raise FileNotFoundError(f"No tos files found for {model}")
+
+    if len(files) == 1:
+        ds = xr.open_dataset(files[0], use_cftime=True)
+    else:
+        ds = xr.open_mfdataset(files, combine="by_coords",
+                               use_cftime=True, decode_times=True)
+
+    tos = ds["tos"].sel(time=slice(start_sel, end_sel))
+    tos = to_celsius(tos)
+
+    if len(tos.time) != n_time:
+        # Fallback for cftime calendars with slightly different string slicing.
+        tos = tos.sel(time=slice("1950-01-01", "2014-12-01"))
+
+    if len(tos.time) != n_time:
+        raise ValueError(
+            f"{model}: selected {len(tos.time)} months, expected {n_time}"
+        )
+
+    if cfg["grid"] == "regular":
+        arr_t = regrid_regular(
+            tos,
+            lat_name=cfg["lat_coord"],
+            lon_name=cfg["lon_coord"]
+        )
+        arr = np.asarray(arr_t.values, dtype=float)
+    else:
+        lat2d = ds[cfg["lat_coord"]].values
+        lon2d = ds[cfg["lon_coord"]].values
+        arr = regrid_curvilinear(tos, lat2d, lon2d)
+
+    # Apply the common ERSST ocean mask.
+    arr = arr.copy()
+    arr[:, ~common_mask] = np.nan
+
+    res = pdo_eof(
+        arr, lat_t, lon_t, months,
+        area_weight=AREA_WEIGHT,
+        orient_reg=ersst_res["reg_grid"]
+    )
+
+    good = np.isfinite(res["reg_grid"]) & np.isfinite(ersst_res["reg_grid"])
+    res["pattern_corr"] = float(np.corrcoef(
+        res["reg_grid"][good],
+        ersst_res["reg_grid"][good]
+    )[0, 1])
+
+    results[model] = res
+    ds.close()
+
+# ---------------------------------------------------------------------
+# Summary table
+# ---------------------------------------------------------------------
+source_order = ["ERSSTv5", "CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+
+rows = []
+for name in source_order:
+    r = results[name]
+    rows.append(dict(
+        source=name,
+        variance_explained_pct=r["var_expl"],
+        amplitude_degC_per_std=r["amp_max"],
+        amplitude_rms_degC_per_std=r["amp_rms"],
+        lag12_autocorr=r["acf12"],
+        pattern_corr_vs_ERSST=(
+            1.0 if name == "ERSSTv5"
+            else r["pattern_corr"]
+        )
+    ))
+results_df = pd.DataFrame(rows).set_index("source")
+
+# ---------------------------------------------------------------------
+# Observed PDO phase transitions from the ERSSTv5-derived index
+# ---------------------------------------------------------------------
+ersst_pc = pd.Series(results["ERSSTv5"]["pc_std"], index=time_common)
+
+# 9-year (108-month) centred running mean.  min_periods=1 keeps the
+# end points available so a transition near 2014 can still be detected.
+smoothed_ersst = ersst_pc.rolling(
+    window=108, center=True, min_periods=1
+).mean()
+
+transitions = []
+transition_direction = []
+
+for i in range(1, len(smoothed_ersst)):
+    a = smoothed_ersst.iloc[i - 1]
+    b = smoothed_ersst.iloc[i]
+    if np.isfinite(a) and np.isfinite(b) and a * b < 0:
+        yr = int(smoothed_ersst.index[i].year)
+        direction = "neg->pos" if b > 0 else "pos->neg"
+        if transitions and yr - transitions[-1] < 3:
+            # Merge into the earlier counted transition.
+            continue
+        transitions.append(yr)
+        transition_direction.append(direction)
+
+transition_df = pd.DataFrame({
+    "year": transitions,
+    "direction": transition_direction
+})
+
+documented_shifts = {
+    1976: "1976/77 Pacific climate shift",
+    1989: "1988/89 Pacific climate shift",
+    1998: "1998/99 Pacific climate shift",
+    2014: "2013/14 Pacific climate shift",
+}
+transition_df["documented_shift"] = transition_df["year"].map(
+    documented_shifts
+).fillna("")
+
+# Interpretation note requested with the ERSST-vs-published correlation.
+corr_ersst_pub_note = (
+    "This correlation demonstrates that the leading EOF of ERSSTv5 over the "
+    "chosen North Pacific domain reproduces the canonical published PDO "
+    "time variability. It does not demonstrate that the two products are "
+    "identical or interchangeable: the published PDO is built from ERSSTv6 "
+    "and uses its own preprocessing, baseline and global-mean treatment."
+)
+
+# ---------------------------------------------------------------------
+# Report numerical results
+# ---------------------------------------------------------------------
+summary = results_df.copy()
+summary["variance_explained_pct"] = summary["variance_explained_pct"].round(1)
+summary["amplitude_degC_per_std"] = summary["amplitude_degC_per_std"].round(3)
+summary["amplitude_rms_degC_per_std"] = summary["amplitude_rms_degC_per_std"].round(3)
+summary["lag12_autocorr"] = summary["lag12_autocorr"].round(3)
+summary["pattern_corr_vs_ERSST"] = summary["pattern_corr_vs_ERSST"].round(3)
+
+print("PDO leading-mode summary (1950-2014)")
+print(summary.to_string())
+print()
+print(f"ERSSTv5-derived index vs published PDO correlation: {corr_ersst_pub:.3f}")
+print(corr_ersst_pub_note)
+print()
+print("Observed PDO phase-transition years (9-yr smoothed ERSSTv5 index):")
+if len(transition_df):
+    print(transition_df.to_string(index=False))
+else:
+    print("  none detected")
+
+# ---------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # Figure 1: regression patterns
+    fig1, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+    vmax = max(np.nanmax(np.abs(results[n]["reg_grid"])) for n in source_order)
+    levels = np.linspace(-vmax, vmax, 21)
+    xticks = [110, 140, 170, 200, 230, 260]
+    xticklabels = ["110E", "140E", "170E", "160W", "130W", "100W"]
+
+    for ax, name in zip(axes.ravel(), source_order):
+        reg = results[name]["reg_grid"]
+        cf = ax.contourf(lon_t, lat_t, reg, levels=levels,
+                         cmap="RdBu_r", extend="both")
+        ax.set_title(name)
+        ax.set_xlim(lon_t.min(), lon_t.max())
+        ax.set_ylim(lat_t.min(), lat_t.max())
+        ax.set_xticks(xticks)
+        ax.set_xticklabels(xticklabels)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+
+        ann = f"Var exp: {results[name]['var_expl']:.1f}%"
+        if name != "ERSSTv5":
+            ann += f"\nPattern corr: {results[name]['pattern_corr']:.3f}"
+        ax.text(0.02, 0.02, ann, transform=ax.transAxes, fontsize=8,
+                bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"))
+
+    cbar = fig1.colorbar(cf, ax=axes.ravel().tolist(), shrink=0.8)
+    cbar.set_label("degC per standard deviation")
+    fig1.savefig("pdo_regression_patterns.png", dpi=150)
+
+    # Figure 2: standardized indices and transition years
+    fig2, ax = plt.subplots(figsize=(12, 4.5), constrained_layout=True)
+    colors = {"ERSSTv5": "black", "CESM2": "C0",
+              "GFDL-ESM4": "C1", "MPI-ESM1-2-LR": "C2"}
+    for name in source_order:
+        ax.plot(time_common, results[name]["pc_std"],
+                lw=0.8, color=colors[name], label=name)
+    ax.plot(time_common, pdo_pub_std.values,
+            lw=1.0, ls="--", color="C4", label="Published PDO")
+    ax.plot(time_common, smoothed_ersst.values,
+            lw=2.0, color="red", label="ERSSTv5 9-yr smoothed")
+    for yr in transitions:
+        ax.axvline(pd.Timestamp(f"{yr}-01-01"),
+                   color="0.5", ls=":", lw=0.8)
+    ax.axhline(0, color="0.7", lw=0.5)
+    ax.set_ylabel("Standardized index")
+    ax.set_xlabel("Year")
+    ax.legend(ncol=3, fontsize=8)
+    fig2.savefig("pdo_indices_timeseries.png", dpi=150)
+
+    plt.close(fig1)
+    plt.close(fig2)
+except Exception as exc:
+    print(f"Figure generation skipped: {exc}")
+
+# --- visualization ---
+# ---------------------------------------------------------------------
+# Figure 1: PDO regression patterns
+# ---------------------------------------------------------------------
+fig, axes = plt.subplots(2, 2, figsize=(13, 9), sharex=True, sharey=True)
+
+vmax = np.nanmax([
+    np.nanmax(np.abs(results[name]["reg_grid"]))
+    for name in source_order
+])
+if not np.isfinite(vmax) or vmax == 0:
+    vmax = 1.0
+
+for ax, name in zip(axes.flat, source_order):
+    reg = results[name]["reg_grid"]
+    im = ax.pcolormesh(
+        lon_t, lat_t, reg,
+        cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto"
+    )
+    ax.set_title(name)
+    ax.set_xlabel("Longitude (0-360)")
+    ax.set_ylabel("Latitude")
+    ax.set_xlim(lon_t.min(), lon_t.max())
+    ax.set_ylim(lat_t.min(), lat_t.max())
+
+    text = f"Var. expl.: {results[name]['var_expl']:.1f}%"
+    if name != "ERSSTv5":
+        text += f"\nPattern corr.: {results[name]['pattern_corr']:.3f}"
+    ax.text(
+        0.02, 0.98, text,
+        transform=ax.transAxes, va="top", ha="left", fontsize=9,
+        bbox=dict(facecolor="white", alpha=0.75, edgecolor="none")
+    )
+
+cbar = fig.colorbar(
+    im, ax=axes, orientation="horizontal",
+    fraction=0.05, pad=0.06
+)
+cbar.set_label("°C per standard deviation")
+fig.suptitle("PDO regression patterns, 1950-2014", y=0.98)
+
+# ---------------------------------------------------------------------
+# Figure 2: standardized indices, smoothed ERSSTv5, transitions
+# ---------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(14, 4.5))
+
+colors = {
+    "ERSSTv5": "C0",
+    "CESM2": "C1",
+    "GFDL-ESM4": "C2",
+    "MPI-ESM1-2-LR": "C3",
+}
+
+for name in source_order:
+    ax.plot(
+        time_common, results[name]["pc_std"],
+        label=name, color=colors[name], lw=1.2
+    )
+
+ax.plot(
+    time_common, pdo_pub_std,
+    label="Published PDO", color="black", ls="--", lw=1.5
+)
+
+ax.plot(
+    time_common, smoothed_ersst,
+    label="ERSSTv5 9-yr running mean", color="red", lw=2.5
+)
+
+for yr in transitions:
+    x = pd.Timestamp(f"{yr}-01-01")
+    ax.axvline(x, color="0.5", ls=":", lw=1)
+    ax.text(
+        x, 1.02, str(yr),
+        transform=ax.get_xaxis_transform(),
+        ha="center", va="bottom", fontsize=8, color="0.35"
+    )
+
+ax.axhline(0, color="0.7", lw=0.8)
+ax.set_ylabel("Standardized index")
+ax.set_xlabel("Year")
+ax.set_title("PDO indices, 1950-2014")
+ax.legend(ncol=3, fontsize=8, loc="lower left")
+</executed_code>
+
+Status: computation succeeded; visualization generated
+
+Results:
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "cmip_root": "/data1/lorraine-20419/benchmark_cmip6/historical",
+      "ersst_path": "/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc",
+      "pdo_path": "/data1/lorraine-20419/ocean_data/CPC/ersst.v6.pdo.dat",
+      "start_sel": "1950-01-01",
+      "end_sel": "2014-12-31",
+      "time_common": "DatetimeIndex(['1950-01-01', '1950-02-01', '1950-03-01', '1950-04-01',\n               '1950-05-01', '1950-06-01', '1950-07-01', '1950-08-01',\n               '1950-09-01', '1950-10-01',\n               ...\n               '2014-03-01', '2014-04-01', '2014-05-01', '2014-06-01',\n               '2014-07-01', '2014-08-01', '2014-09-01', '2014-10-01',\n               '2014-11-01', '2014-12-01'],\n              dtype='datetime64[ns]', length=780, freq='MS')",
+      "months": {
+        "type": "ndarray",
+        "shape": [
+          780
+        ],
+        "size": 780,
+        "n_valid": 780,
+        "min": 1.0,
+        "max": 12.0,
+        "mean": 6.5,
+        "std": 3.452052529534663
+      },
+      "n_time": 780,
+      "lat_t": {
+        "type": "ndarray",
+        "shape": [
+          51
+        ],
+        "size": 51,
+        "n_valid": 51,
+        "min": 20.0,
+        "max": 70.0,
+        "mean": 45.0,
+        "std": 14.719601443879744
+      },
+      "lon_t": {
+        "type": "ndarray",
+        "shape": [
+          151
+        ],
+        "size": 151,
+        "n_valid": 151,
+        "min": 110.0,
+        "max": 260.0,
+        "mean": 185.0,
+        "std": 43.58898943540674
+      },
+      "LON_T": {
+        "type": "ndarray",
+        "shape": [
+          51,
+          151
+        ],
+        "size": 7701,
+        "n_valid": 7701,
+        "min": 110.0,
+        "max": 260.0,
+        "mean": 185.0,
+        "std": 43.58898943540674
+      },
+      "LAT_T": {
+        "type": "ndarray",
+        "shape": [
+          51,
+          151
+        ],
+        "size": 7701,
+        "n_valid": 7701,
+        "min": 20.0,
+        "max": 70.0,
+        "mean": 45.0,
+        "std": 14.719601443879744
+      },
+      "AREA_WEIGHT": true,
+      "month_names": [
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec"
+      ],
+      "fh": "<_io.TextIOWrapper name='/data1/lorraine-20419/ocean_data/CPC/ersst.v6.pdo.dat' mode='r' encoding='UTF-8'>",
+      "raw_lines": {
+        "type": "list",
+        "length": 179,
+        "head": [
+          " ERSST PDO Index:",
+          "Year  Jan   Feb   Mar   Apr   May   Jun   Jul   Aug   Sep   Oct   Nov   Dec",
+          "1850  1.06 -0.95 -1.77 -2.77 -1.28 -1.46 -0.22  1.10  0.13 -2.41 -1.17  2.74",
+          "1851 -0.66  0.73  0.44 -0.45 -0.60 -0.39 -0.17 -0.30  0.37  2.08  1.49  0.86",
+          "1852 -0.37 -0.38 -1.30  0.50  1.18  1.28  2.23  2.61  0.30  2.51  0.19 -2.21"
+        ]
+      },
+      "pdo_rows": {
+        "type": "list",
+        "length": 177,
+        "head": [
+          [
+            1850,
+            1.06,
+            -0.95,
+            -1.77,
+            -2.77,
+            -1.28,
+            -1.46,
+            -0.22,
+            1.1,
+            0.13,
+            -2.41,
+            -1.17,
+            2.74
+          ],
+          [
+            1851,
+            -0.66,
+            0.73,
+            0.44,
+            -0.45,
+            -0.6,
+            -0.39,
+            -0.17,
+            -0.3,
+            0.37,
+            2.08,
+            1.49,
+            0.86
+          ],
+          [
+            1852,
+            -0.37,
+            -0.38,
+            -1.3,
+            0.5,
+            1.18,
+            1.28,
+            2.23,
+            2.61,
+            0.3,
+            2.51,
+            0.19,
+            -2.21
+          ],
+          [
+            1853,
+            0.17,
+            -1.71,
+            2.69,
+            0.87,
+            -0.86,
+            -0.71,
+            -1.7,
+            0.22,
+            -0.12,
+            0.9,
+            0.32,
+            -0.97
+          ],
+          [
+            1854,
+            -0.13,
+            -1.81,
+            0.16,
+            0.52,
+            -0.77,
+            -1.43,
+            1.29,
+            1.46,
+            -0.81,
+            -0.54,
+            0.07,
+            1.1
+          ]
+        ]
+      },
+      "pdo_raw": "     Year   Jan   Feb   Mar   Apr   May  ...   Jul   Aug    Sep    Oct    Nov    Dec\n0    1850  1.06 -0.95 -1.77 -2.77 -1.28  ... -0.22  1.10   0.13  -2.41  -1.17   2.74\n1    1851 -0.66  0.73  0.44 -0.45 -0.60  ... -0.17 -0.30   0.37   2.08   1.49   0.86\n2    1852 -0.37 -0.38 -1.30  0.50  1.18  ...  2.23  2.61   0.30   2.51   0.19  -2.21\n3    1853  0.17 -1.71  2.69  0.87 -0.86  ... -1.70  0.22  -0.12   0.90   0.32  -0.97\n4    1854 -0.13 -1.81  0.16  0.52 -0.77  ...  1.29  1.46  -0.81  -0.54   0.07   1.10\n..    ...   ...   ...   ...   ...   ...  ...   ...   ...    ...    ...    ...    ...\n172  2022 -2.22 -1.72 -1.63 -2.19 -2.44  ... -2.44 -1.78  -1.78  -1.48  -1.83  -1.85\n173  2023 -1.24 -1.79 -2.50 -3.13 -2.46  ... -2.44 -2.02  -2.52  -1.88  -1.16  -1.20\n174  2024 -1.48 -1.33 -1.27 -1.99 -",
+      "pdo_long": "      Year month_name   pdo  month       date\n0     1850        Jan  1.06      1 1850-01-01\n1     1851        Jan -0.66      1 1851-01-01\n2     1852        Jan -0.37      1 1852-01-01\n3     1853        Jan  0.17      1 1853-01-01\n4     1854        Jan -0.13      1 1854-01-01\n...    ...        ...   ...    ...        ...\n2119  2022        Dec -1.85     12 2022-12-01\n2120  2023        Dec -1.20     12 2023-12-01\n2121  2024        Dec -1.57     12 2024-12-01\n2122  2025        Dec -0.39     12 2025-12-01\n2123  2026        Dec   NaN     12 2026-12-01\n\n[2124 rows x 5 columns]",
+      "pdo_pub": "1950-01-01   -1.41\n1950-02-01   -1.93\n1950-03-01   -1.59\n1950-04-01   -1.56\n1950-05-01   -3.11\n              ... \n2014-08-01    0.71\n2014-09-01    1.10\n2014-10-01    1.76\n2014-11-01    1.73\n2014-12-01    2.04\nFreq: MS, Name: pdo, Length: 780, dtype: float64",
+      "pdo_pub_std": "1950-01-01   -1.385030\n1950-02-01   -1.894584\n1950-03-01   -1.561414\n1950-04-01   -1.532017\n1950-05-01   -3.050880\n                ...   \n2014-08-01    0.692383\n2014-09-01    1.074549\n2014-10-01    1.721290\n2014-11-01    1.691893\n2014-12-01    1.995666\nFreq: MS, Name: pdo, Length: 780, dtype: float64",
+      "ds_e": {
+        "time_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "time": 2072,
+            "nbnds": 2
+          },
+          "long_name": "Time Boundaries",
+          "size": 4144,
+          "n_valid": 4144,
+          "min": 9.969209968386869e+36,
+          "max": 9.969209968386869e+36,
+          "mean": 9.969209968386869e+36,
+          "std": 0.0
+        },
+        "sst": {
+          "type": "DataArray",
+          "dims": {
+            "time": 2072,
+            "lat": 89,
+            "lon": 180
+          },
+          "units": "degC",
+          "long_name": "Monthly Means of Sea Surface Temperature",
+          "size": 33193440,
+          "n_valid": 22767136,
+          "min": -1.7999999523162842,
+          "max": 42.326358795166016,
+          "mean": 13.565886497497559,
+          "std": 11.497235298156738
+        }
+      },
+      "sst": {
+        "type": "DataArray",
+        "dims": {
+          "time": 780,
+          "lat": 89,
+          "lon": 180
+        },
+        "units": "degC",
+        "long_name": "Monthly Means of Sea Surface Temperature",
+        "size": 12495600,
+        "n_valid": 8570640,
+        "min": -1.7999999523162842,
+        "max": 34.07516098022461,
+        "mean": 13.684885025024414,
+        "std": 11.519001007080078
+      },
+      "sst_sub": {
+        "type": "DataArray",
+        "dims": {
+          "time": 780,
+          "lat": 30,
+          "lon": 80
+        },
+        "units": "degC",
+        "long_name": "Monthly Means of Sea Surface Temperature",
+        "size": 1872000,
+        "n_valid": 1197300,
+        "min": -1.7999999523162842,
+        "max": 32.83179473876953,
+        "mean": 14.790618896484375,
+        "std": 10.113533973693848
+      },
+      "sst_t": {
+        "type": "DataArray",
+        "dims": {
+          "time": 780,
+          "lat": 51,
+          "lon": 151
+        },
+        "units": "degC",
+        "long_name": "Monthly Means of Sea Surface Temperature",
+        "size": 6006780,
+        "n_valid": 3474900,
+        "min": -1.8000001907348633,
+        "max": 32.83179473876953,
+        "mean": 15.62428075452171,
+        "std": 8.41449311775557
+      },
+      "ersst_arr": {
+        "type": "ndarray",
+        "shape": [
+          780,
+          51,
+          151
+        ],
+        "size": 6006780,
+        "n_valid": 3474900,
+        "min": -1.8000001907348633,
+        "max": 32.83179473876953,
+        "mean": 15.62428075452171,
+        "std": 8.41449311775557
+      },
+      "common_mask": {
+        "type": "ndarray",
+        "shape": [
+          51,
+          151
+        ],
+        "size": 7701,
+        "values": [
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "False",
+          "False",
+          "False",
+          "False",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True"
+        ]
+      },
+      "ersst_res": {
+        "pc_std": {
+          "type": "ndarray",
+          "shape": [
+            780
+          ],
+          "size": 780,
+          "n_valid": 780,
+          "min": -2.7239673554723614,
+          "max": 3.0416052819222417,
+          "mean": 0.0,
+          "std": 0.9993587687702292
+        },
+        "reg_grid": {
+          "type": "ndarray",
+          "shape": [
+            51,
+            151
+          ],
+          "size": 7701,
+          "n_valid": 4455,
+          "min": -0.6785531777849386,
+          "max": 0.6216382110094549,
+          "mean": 0.005967284944054741,
+          "std": 0.32763289601957213
+        },
+        "valid": {
+          "type": "ndarray",
+          "shape": [
+            51,
+            151
+          ],
+          "size": 7701,
+          "values": [
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "False",
+            "False",
+            "False",
+            "False",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True",
+            "True"
+          ]
+        },
+        "var_expl": 22.83443253839027,
+        "amp_max": 0.6785531777849386,
+        "amp_rms": 0.3276872335684979,
+        "acf12": 0.34166240230694245,
+        "anom": {
+          "type": "ndarray",
+          "shape": [
+            780,
+            51,
+            151
+          ],
+          "size": 6006780,
+          "n_valid": 3474900,
+          "min": -8.680697162334734,
+          "max": 4.956903780423676,
+          "mean": -8.375444029104061e-18,
+          "std": 0.6934554498751431
+        },
+        "clim": {
+          "type": "ndarray",
+          "shape": [
+            12,
+            51,
+            151
+          ],
+          "size": 92412,
+          "n_valid": 53460,
+          "min": -1.7999999541502731,
+          "max": 30.639252970768855,
+          "mean": 15.62428075452171,
+          "std": 8.385869899288583
+        }
+      },
+      "good_pub": {
+        "type": "ndarray",
+        "shape": [
+          780
+        ],
+        "size": 780,
+        "values": [
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True",
+          "True"
+        ]
+      },
+      "corr_ersst_pub": 0.9570957979546844,
+      "model_cfg": {
+        "CESM2": {
+          "grid": "curvilinear",
+          "lat_coord": "lat",
+          "lon_coord": "lon"
+        },
+        "GFDL-ESM4": {
+          "grid": "regular",
+          "lat_coord": "lat",
+          "lon_coord": "lon"
+        },
+        "MPI-ESM1-2-LR": {
+          "grid": "curvilinear",
+          "lat_coord": "latitude",
+          "lon_coord": "longitude"
+        }
+      },
+      "results": {
+        "ERSSTv5": {
+          "pc_std": {
+            "type": "ndarray",
+            "shape": [
+              780
+            ],
+            "size": 780,
+            "n_valid": 780,
+            "min": -2.7239673554723614,
+            "max": 3.0416052819222417,
+            "mean": 0.0,
+            "std": 0.9993587687702292
+          },
+          "reg_grid": {
+            "type": "ndarray",
+            "shape": [
+              51,
+              151
+            ],
+            "size": 7701,
+            "n_valid": 4455,
+            "min": -0.6785531777849386,
+            "max": 0.6216382110094549,
+            "mean": 0.005967284944054741,
+            "std": 0.32763289601957213
+          },
+          "valid": {
+            "type": "ndarray",
+            "shape": [
+              51,
+              151
+            ],
+            "size": 7701,
+            "values": [
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "False",
+              "False",
+              "False",
+              "False",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True"
+            ]
+          },
+          "var_expl": 22.83443253839027,
+          "amp_max": 0.6785531777849386,
+          "amp_rms": 0.3276872335684979,
+          "acf12": 0.34166240230694245,
+          "anom": {
+            "type": "ndarray",
+            "shape": [
+              780,
+              51,
+              151
+            ],
+            "size": 6006780,
+            "n_valid": 3474900,
+            "min": -8.680697162334734,
+            "max": 4.956903780423676,
+            "mean": -8.375444029104061e-18,
+            "std": 0.6934554498751431
+          },
+          "clim": {
+            "type": "ndarray",
+            "shape": [
+              12,
+              51,
+              151
+            ],
+            "size": 92412,
+            "n_valid": 53460,
+            "min": -1.7999999541502731,
+            "max": 30.639252970768855,
+            "mean": 15.62428075452171,
+            "std": 8.385869899288583
+          }
+        },
+        "CESM2": {
+          "pc_std": {
+            "type": "ndarray",
+            "shape": [
+              780
+            ],
+            "size": 780,
+            "n_valid": 780,
+            "min": -2.7373511085771387,
+            "max": 2.6025131722436323,
+            "mean": 7.287617802667694e-17,
+            "std": 0.9993587687702293
+          },
+          "reg_grid": {
+            "type": "ndarray",
+            "shape": [
+              51,
+              151
+            ],
+            "size": 7701,
+            "n_valid": 4455,
+            "min": -1.073107619632055,
+            "max": 0.13843249637749774,
+            "mean": -0.30136078805904726,
+            "std": 0.23763769333122292
+          },
+          "valid": {
+            "type": "ndarray",
+            "shape": [
+              51,
+              151
+            ],
+            "size": 7701,
+            "values": [
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "False",
+              "False",
+              "False",
+              "False",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True"
+            ]
+          },
+          "var_expl": 25.773479371084363,
+          "amp_max": 1.073107619632055,
+          "amp_rms": 0.38378379052710704,
+          "acf12": 0.5299306763624649,
+          "anom": {
+            "type": "ndarray",
+            "shape": [
+              780,
+              51,
+              151
+            ],
+            "size": 6006780,
+            "n_valid": 3474900,
+            "min": -5.280168139473487,
+            "max": 5.731342874933426,
+            "mean": -1.6750888058208122e-17,
+            "std": 0.7572705503366411
+          },
+          "clim": {
+            "type": "ndarray",
+            "shape": [
+              12,
+              51,
+              151
+            ],
+            "size": 92412,
+            "n_valid": 53460,
+            "min": -1.8335073595448468,
+            "max": 30.730169330234812,
+            "mean": 16.005794653049726,
+            "std": 8.212792221133713
+          },
+          "pattern_corr": 0.790256933040403
+        },
+        "GFDL-ESM4": {
+          "pc_std": {
+            "type": "ndarray",
+            "shape": [
+              780
+            ],
+            "size": 780,
+            "n_valid": 780,
+            "min": -3.231739393294317,
+            "max": 3.122853718112068,
+            "mean": 1.8219044506669236e-17,
+            "std": 0.9993587687702293
+          },
+          "reg_grid": {
+            "type": "ndarray",
+            "shape": [
+              51,
+              151
+            ],
+            "size": 7701,
+            "n_valid": 4339,
+            "min": -0.6311193886468959,
+            "max": 0.8216711514049918,
+            "mean": 0.08396823970806024,
+            "std": 0.2881188318769538
+          },
+          "valid": {
+            "type": "ndarray",
+            "shape": [
+              51,
+              151
+            ],
+            "size": 7701,
+            "values": [
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "False",
+              "False",
+              "False",
+              "False",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True"
+            ]
+          },
+          "var_expl": 15.120518405225962,
+          "amp_max": 0.8216711514049918,
+          "amp_rms": 0.30010519249391643,
+          "acf12": 0.21936884172498955,
+          "anom": {
+            "type": "ndarray",
+            "shape": [
+              780,
+              51,
+              151
+            ],
+            "size": 6006780,
+            "n_valid": 3384420,
+            "min": -6.956199853236859,
+            "max": 7.260844978432242,
+            "mean": 2.7947905101726305e-17,
+            "std": 0.7480964942690527
+          },
+          "clim": {
+            "type": "ndarray",
+            "shape": [
+              12,
+              51,
+              151
+            ],
+            "size": 92412,
+            "n_valid": 52068,
+            "min": -1.8158655547178708,
+            "max": 31.34409341078538,
+            "mean": 15.306460022574147,
+            "std": 8.169514794736704
+          },
+          "pattern_corr": 0.9003995069518699
+        },
+        "MPI-ESM1-2-LR": {
+          "pc_std": {
+            "type": "ndarray",
+            "shape": [
+              780
+            ],
+            "size": 780,
+            "n_valid": 780,
+            "min": -2.868514874867175,
+            "max": 2.5497744457911256,
+            "mean": -3.643808901333847e-17,
+            "std": 0.9993587687702293
+          },
+          "reg_grid": {
+            "type": "ndarray",
+            "shape": [
+              51,
+              151
+            ],
+            "size": 7701,
+            "n_valid": 4455,
+            "min": -2.4051447814092164,
+            "max": 0.41291985746421245,
+            "mean": -0.22137087421017776,
+            "std": 0.35050042581428675
+          },
+          "valid": {
+            "type": "ndarray",
+            "shape": [
+              51,
+              151
+            ],
+            "size": 7701,
+            "values": [
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "False",
+              "False",
+              "False",
+              "False",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True",
+              "True"
+            ]
+          },
+          "var_expl": 21.550114416233544,
+          "amp_max": 2.4051447814092164,
+          "amp_rms": 0.4145547158633884,
+          "acf12": 0.5715874071466911,
+          "anom": {
+            "type": "ndarray",
+            "shape": [
+              780,
+              51,
+              151
+            ],
+            "size": 6006780,
+            "n_valid": 3474900,
+            "min": -13.428436159127054,
+            "max": 9.739780284563897,
+            "mean": 1.6750888058208122e-17,
+            "std": 0.8922635762664806
+          },
+          "clim": {
+            "type": "ndarray",
+            "shape": [
+              12,
+              51,
+              151
+            ],
+            "size": 92412,
+            "n_valid": 53460,
+            "min": -1.8999942204246663,
+            "max": 31.30074777937325,
+            "mean": 14.386177897967857,
+            "std": 8.304615126757168
+          },
+          "pattern_corr": 0.7001794122132765
+        }
+      },
+      "source_order": [
+        "ERSSTv5",
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "rows": [
+        {
+          "source": "ERSSTv5",
+          "variance_explained_pct": 22.83443253839027,
+          "amplitude_degC_per_std": 0.6785531777849386,
+          "amplitude_rms_degC_per_std": 0.3276872335684979,
+          "lag12_autocorr": 0.34166240230694245,
+          "pattern_corr_vs_ERSST": 1.0
+        },
+        {
+          "source": "CESM2",
+          "variance_explained_pct": 25.773479371084363,
+          "amplitude_degC_per_std": 1.073107619632055,
+          "amplitude_rms_degC_per_std": 0.38378379052710704,
+          "lag12_autocorr": 0.5299306763624649,
+          "pattern_corr_vs_ERSST": 0.790256933040403
+        },
+        {
+          "source": "GFDL-ESM4",
+          "variance_explained_pct": 15.120518405225962,
+          "amplitude_degC_per_std": 0.8216711514049918,
+          "amplitude_rms_degC_per_std": 0.30010519249391643,
+          "lag12_autocorr": 0.21936884172498955,
+          "pattern_corr_vs_ERSST": 0.9003995069518699
+        },
+        {
+          "source": "MPI-ESM1-2-LR",
+          "variance_explained_pct": 21.550114416233544,
+          "amplitude_degC_per_std": 2.4051447814092164,
+          "amplitude_rms_degC_per_std": 0.4145547158633884,
+          "lag12_autocorr": 0.5715874071466911,
+          "pattern_corr_vs_ERSST": 0.7001794122132765
+        }
+      ],
+      "results_df": "               variance_explained_pct  ...  pattern_corr_vs_ERSST\nsource                                 ...                       \nERSSTv5                     22.834433  ...               1.000000\nCESM2                       25.773479  ...               0.790257\nGFDL-ESM4                   15.120518  ...               0.900400\nMPI-ESM1-2-LR               21.550114  ...               0.700179\n\n[4 rows x 5 columns]",
+      "ersst_pc": "1950-01-01   -1.261173\n1950-02-01   -1.571304\n1950-03-01   -1.247889\n1950-04-01   -1.320771\n1950-05-01   -2.365641\n                ...   \n2014-08-01    1.369253\n2014-09-01    1.536450\n2014-10-01    1.839289\n2014-11-01    1.783898\n2014-12-01    2.218203\nFreq: MS, Length: 780, dtype: float64",
+      "smoothed_ersst": "1950-01-01   -0.834083\n1950-02-01   -0.821477\n1950-03-01   -0.806161\n1950-04-01   -0.797767\n1950-05-01   -0.779170\n                ...   \n2014-08-01   -0.516824\n2014-09-01   -0.535704\n2014-10-01   -0.547770\n2014-11-01   -0.559566\n2014-12-01   -0.568314\nFreq: MS, Length: 780, dtype: float64",
+      "transitions": [
+        1960,
+        1963,
+        1976,
+        2001
+      ],
+      "transition_direction": [
+        "neg->pos",
+        "pos->neg",
+        "neg->pos",
+        "pos->neg"
+      ],
+      "transition_df": "   year direction               documented_shift\n0  1960  neg->pos                               \n1  1963  pos->neg                               \n2  1976  neg->pos  1976/77 Pacific climate shift\n3  2001  pos->neg                               ",
+      "documented_shifts": {
+        "1976": "1976/77 Pacific climate shift",
+        "1989": "1988/89 Pacific climate shift",
+        "1998": "1998/99 Pacific climate shift",
+        "2014": "2013/14 Pacific climate shift"
+      },
+      "corr_ersst_pub_note": "This correlation demonstrates that the leading EOF of ERSSTv5 over the chosen North Pacific domain reproduces the canonical published PDO time variability. It does not demonstrate that the two products are identical or interchangeable: the published PDO is built from ERSSTv6 and uses its own preprocessing, baseline and global-mean treatment.",
+      "summary": "               variance_explained_pct  ...  pattern_corr_vs_ERSST\nsource                                 ...                       \nERSSTv5                          22.8  ...                   1.00\nCESM2                            25.8  ...                   0.79\nGFDL-ESM4                        15.1  ...                   0.90\nMPI-ESM1-2-LR                    21.6  ...                   0.70\n\n[4 rows x 5 columns]",
+      "fig1": "Figure(1200x900)",
+      "axes": {
+        "type": "ndarray",
+        "shape": [
+          2,
+          2
+        ],
+        "size": 4,
+        "values": [
+          "Axes(0.0420373,0.551605;0.370476x0.420432)",
+          "Axes(0.477849,0.551605;0.370476x0.420432)",
+          "Axes(0.0420373,0.0512349;0.370476x0.420432)",
+          "Axes(0.477849,0.0512349;0.370476x0.420432)"
+        ]
+      },
+      "vmax": 2.4051447814092164,
+      "levels": {
+        "type": "ndarray",
+        "shape": [
+          21
+        ],
+        "size": 21,
+        "n_valid": 21,
+        "min": -2.4051447814092164,
+        "max": 2.4051447814092164,
+        "mean": 0.0,
+        "std": 1.4563874898178695,
+        "values": [
+          -2.405145,
+          -2.16463,
+          -1.924116,
+          -1.683601,
+          -1.443087,
+          -1.202572,
+          -0.962058,
+          -0.721543,
+          -0.481029,
+          -0.240514,
+          0.0,
+          0.240514,
+          0.481029,
+          0.721543,
+          0.962058,
+          1.202572,
+          1.443087,
+          1.683601,
+          1.924116,
+          2.16463,
+          2.405145
+        ]
+      },
+      "xticks": [
+        110,
+        140,
+        170,
+        200,
+        230,
+        260
+      ],
+      "xticklabels": [
+        "110E",
+        "140E",
+        "170E",
+        "160W",
+        "130W",
+        "100W"
+      ],
+      "ax": "Axes(0.0388429,0.10247;0.957685x0.88827)",
+      "cbar": "<matplotlib.colorbar.Colorbar object at 0x7a1f193137d0>",
+      "fig2": "Figure(1200x450)",
+      "colors": {
+        "ERSSTv5": "black",
+        "CESM2": "C0",
+        "GFDL-ESM4": "C1",
+        "MPI-ESM1-2-LR": "C2"
+      }
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T9_deepseek-flash_20261025_072715/turn01/figures/visualization_T9_deepseek-flash_20261025_072715_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T9_deepseek-flash_20261025_072715/turn01/figures/visualization_T9_deepseek-flash_20261025_072715_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Answer the user's question inside <solution></solution> tags, based on these results.
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+I assessed the PDO as the leading EOF of monthly North Pacific SST anomalies over 20°N–70°N, 110°E–100°W, relative to a 1950–2014 monthly climatology. The target grid was 1°, with area weighting by \(\sqrt{\cos\phi}\). The leading PC was standardized, and the regression pattern is in °C per one standard deviation.
+
+| Source | Variance explained (%) | Amplitude, max |reg| (°C/std) [RMS] | Lag-12 autocorrelation | Pattern correlation vs ERSSTv5 |
+|---|---:|---:|---:|---:|
+| ERSSTv5 | 22.8 | 0.679 [0.328] | 0.342 | 1.000 |
+| CESM2 | 25.8 | 1.073 [0.384] | 0.530 | 0.790 |
+| GFDL-ESM4 | 15.1 | 0.822 [0.300] | 0.219 | 0.900 |
+| MPI-ESM1-2-LR | 21.6 | 2.405 [0.415] | 0.572 | 0.700 |
+
+The ERSSTv5-derived PDO index correlates with the published PDO series at **r = 0.957**. This demonstrates that the leading EOF over the chosen domain closely reproduces the canonical temporal PDO variability. It does **not** demonstrate that the two products are identical or interchangeable: the published PDO is based on ERSSTv6 and uses its own preprocessing, baseline, and global-mean treatment. It also does not by itself validate the simulated spatial pattern or mechanisms.
+
+Using the 9-year centered running mean of the ERSSTv5-derived index, the detected sign-change years over 1950–2014 are:
+
+- **1960** (negative→positive)
+- **1963** (positive→negative)
+- **1976** (negative→positive)
+- **2001** (positive→negative)
+
+Applying the stated rule that crossings less than 3 years after the last counted transition are merged, these remain the detected transitions. Of these, only **1976** corresponds directly to a documented Pacific climate shift in the supplied list, namely the **1976/77 Pacific climate shift**. The 1960, 1963, and 2001 crossings are not among the listed canonical shift years; 2001 is near the 1998/99 shift in time but is not the same year. The method as configured did not flag 1989, 1998, or 2014.
+
+**Model assessment:** GFDL-ESM4 reproduces the observed spatial regression pattern best, with pattern correlation **0.900**, compared with **0.790** for CESM2 and **0.700** for MPI-ESM1-2-LR. However, no model is fully consistent with the observations in both amplitude and persistence. All models overestimate the maximum regression amplitude relative to ERSSTv5 (0.679 °C/std): GFDL-ESM4 is closest at 0.822, CESM2 is 1.073, and MPI-ESM1-2-LR is much too strong at 2.405. In RMS amplitude, GFDL-ESM4 (0.300) is closest to observed (0.328), while CESM2 (0.384) and MPI-ESM1-2-LR (0.415) are high. For persistence, observed lag-12 autocorrelation is 0.342: CESM2 (0.530) and MPI-ESM1-2-LR (0.572) are too persistent, whereas GFDL-ESM4 (0.219) is too weak. Thus, GFDL-ESM4 best captures the pattern, but not the persistence; CESM2 has reasonable variance but too much amplitude and memory; MPI-ESM1-2-LR has the poorest pattern, strongly excessive amplitude, and excessive persistence.
+
+Figure 1 shows the four regression patterns on one common diverging color scale, annotated with variance explained and model–observation pattern correlations. Figure 2 shows the standardized ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, and published PDO series, with the 9-year smoothed ERSSTv5 index and detected transition years marked.
+</solution>

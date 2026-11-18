@@ -1,0 +1,970 @@
+# exchange 5: solution
+# elapsed: 55.7 s
+
+===== SYSTEM =====
+
+The user's question:
+Assess the nitracline depth simulated by three CMIP6 models against the WOA23 observed nitrate climatology, globally and by ocean basin.
+
+Data to use:
+- CMIP6 historical `no3` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12, each on its own native grid with its own areacello.
+- WOA23 nitrate, the all-time-periods annual climatology, objectively analysed, on the 1-degree grid.
+- The WOA23 land-sea mask (landsea_01, ocean is value > 1) and basin mask (basinmask_01).
+
+The nitracline is the depth of the maximum vertical gradient of nitrate concentration, searched over the levels within the top 1000 m only (the gradient at the deepest of these still uses the level just below 1000 m, so load the profile below 1000 m).
+
+Expected numerical results:
+- The global mean nitracline depth of each model (1971-2000 climatology) and of WOA23, in metres to the nearest whole metre, and each model's difference from WOA23.
+- The mean nitracline depth in the Pacific, Atlantic and Indian Oceans (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded) for each of the four sources, in metres to the nearest whole metre, and each model's difference from WOA23 in each basin.
+- For each model, the spatial Pearson correlation with WOA23 to 3 decimal places and the RMSE in metres to 1 decimal place, on the WOA23 1-degree grid.
+- Which model reproduces the observed nitracline best, and whether each model reproduces the observed ordering of nitracline depth across the three basins.
+
+Expected visualizations:
+- Figure 1, a 2-by-2 panel of global maps of nitracline depth for the three models and WOA23, all four on one shared sequential colour scale on which deeper is visually heavier.
+- Figure 2, a 4-panel longitude-depth section of nitrate concentration through the equatorial Pacific averaged over 2S-2N, in the order WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, covering 120E to 80W and the top 1000 m with depth increasing downward, all four panels on one shared colour scale in the same concentration unit, and each panel's own nitracline depth overlaid as a line.
+
+The analysis plan:
+1. Load WOA23 nitrate as the all-time-periods annual climatology on the 1° grid, together with WOA23 depth levels/layer boundaries, landsea_01, and basinmask_01. Use load_climatology_data and load_depth_levels, retaining levels below 1000 m so the gradient at the deepest level within the top 1000 m can use the next deeper level.
+2. Load CMIP6 historical no3 monthly for 1971-01 to 2000-12 for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, each on its native grid with its own areacello, using load_regular_data and load_areas; load each model’s depth levels. Aggregate monthly fields to the 1971–2000 day-weighted long-term mean with temporal_aggregate.
+3. Compute nitracline depth for WOA23 and for each model with compute_nutricline_depth, defined as the depth of the maximum vertical nitrate gradient searched only over levels within the top 1000 m, with the gradient at 1000 m using the level just below 1000 m.
+4. Compute global area-weighted mean nitracline depth for each model using its native areacello and for WOA23 using WOA23 cell areas, via compute_basic_stat; report each model’s difference from WOA23.
+5. Regrid each model’s nitracline-depth field to the WOA23 1° grid with regrid_horizontal. Build the common comparison mask using WOA23 landsea_01 ocean cells (value > 1) and valid regridded model cells with build_comparison_mask. On that common mask, compute each model’s spatial Pearson correlation with WOA23 using analyze_correlation and RMSE using compute_difference_metrics.
+6. Load the WOA23 basin mask with load_basin_mask. For each source, use select_basin to isolate the Pacific, Atlantic and Indian Oceans, with marginal seas folded into their parent ocean and the Southern and Arctic Oceans excluded. Compute area-weighted mean nitracline depth in each basin with compute_basic_stat, using WOA23 cell areas after regridding models to the WOA23 grid; report model−WOA23 differences and compare basin orderings.
+7. Figure 1: produce a 2-by-2 panel of global nitracline-depth maps for CESM2, GFDL-ESM4, MPI-ESM1-2-LR and WOA23, all on one shared sequential colour scale with deeper values visually heavier.
+8. Figure 2: load the equatorial Pacific section from 120°E to 80°W (treated as 120–280°E) and 2°S–2°N, including levels below 1000 m for the nitracline calculation, for WOA23 and each model. Use the 1971–2000 climatology for models, transform_unit to put all sources into the same nitrate concentration unit, average over 2°S–2°N with compute_basic_stat, and use regrid_vertical for model sections onto WOA23 depth levels for display. Compute each panel’s nitracline with compute_nutricline_depth and overlay it as a line. Panel order: WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR; shared colour scale, top 1000 m, depth increasing downward.
+9. Identify the model that reproduces the observed nitracline best from correlation and RMSE, and assess whether each model reproduces the WOA23 ordering of nitracline depth across the Pacific, Atlantic and Indian basins.
+
+Other notes:
+- Nitracline is strictly the depth of maximum vertical nitrate gradient within the top 1000 m; the gradient at 1000 m uses the level just below 1000 m.
+- Basin definitions come from WOA23 basinmask_01; marginal seas are folded into parent oceans, and Southern and Arctic Oceans are excluded from basin means.
+- Global means use native model areacello; basin means, maps, correlation and RMSE use the WOA23 1° grid and WOA23 areas.
+- Correlation and RMSE are computed on the common WOA23 ocean cells where all four nitracline fields are valid.
+- Differences are model minus WOA23; rounding is applied only at reporting: depths to the nearest metre, correlation to 3 decimal places, RMSE to 1 decimal place.
+- Figure 1 uses a shared sequential scale with deeper visually heavier; Figure 2 uses a shared concentration unit and colour scale, depth downward, with each panel’s own nitracline line.
+
+The code that actually ran and produced the results below:
+<executed_code>
+# ============================================================================
+# Nitracline depth: 3 CMIP6 models (1971-2000) vs WOA23 observed climatology
+# ============================================================================
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+DEPTH_LOAD_MAX = 1300.0     # keep the level just below 1000 m for the gradient
+NITRA_MAX      = 1000.0     # nitracline searched in the top 1000 m
+MODELS         = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+
+# ----------------------------------------------------------------------------
+# 1. WOA23 observed nitrate (all-period annual climatology) + vertical grid
+# ----------------------------------------------------------------------------
+woa_no3 = load_climatology_data(dataset="woa23", variable="nitrate", time_slice="annual")
+woa_levels, woa_bounds = load_depth_levels(dataset="woa23", variable="nitrate",
+                                           time_slice="annual")
+print("WOA23 nitrate levels (m):", np.asarray(woa_levels).size,
+      "top/bottom:", float(np.min(woa_levels)), float(np.max(woa_levels)))
+
+woa_nit = compute_nutricline_depth(woa_no3, min_depth=0.0, max_depth=NITRA_MAX).compute()
+woa_nit_global = float(compute_basic_stat(woa_nit, op="area_weighted_mean",
+                                          dim=["lat", "lon"]).compute())
+
+# ----------------------------------------------------------------------------
+# 2.-3. CMIP6 hist. no3 -> 1971-2000 day-weighted mean -> unit conv. -> nitracline
+# ----------------------------------------------------------------------------
+model_no3_clim   = {}
+model_nit_native = {}
+model_nit_1deg   = {}
+model_nit_global = {}
+
+for m in MODELS:
+    raw = load_regular_data(dataset="cmip6_historical", variable="no3", model=m,
+                            time_range=["1971-01", "2000-12"],
+                            depth_range=[0.0, DEPTH_LOAD_MAX])
+    clim = temporal_aggregate(raw, freq="mean", op="mean")          # day-weighted
+    clim = transform_unit(clim, from_unit="mol m-3", to_unit="umol/kg")
+    model_no3_clim[m] = clim
+
+    nit = compute_nutricline_depth(clim, min_depth=0.0, max_depth=NITRA_MAX).compute()
+    model_nit_native[m] = nit
+
+    model_nit_global[m] = float(compute_basic_stat(nit, op="area_weighted_mean",
+                                                   dim=["lat", "lon"]).compute())
+    # step 5: onto the WOA23 1-degree grid (native global field, so conservative ok)
+    model_nit_1deg[m] = regrid_horizontal(nit, target="woa23",
+                                          method="conservative").compute()
+
+print("\n=== Global mean nitracline depth (m) ===")
+print(f"WOA23        : {woa_nit_global:.0f}")
+for m in MODELS:
+    print(f"{m:13s}: {model_nit_global[m]:.0f}   (model - WOA23 = "
+          f"{model_nit_global[m] - woa_nit_global:+.0f} m)")
+
+# ----------------------------------------------------------------------------
+# 4./6. Basin definitions (WOA23 basinmask) and basin means
+# ----------------------------------------------------------------------------
+basin_codes_da = load_basin_mask(depth_levels="0m")     # surface labels, 2-D
+BASINS = ["Pacific", "Atlantic", "Indian"]
+
+basin_mean = {}
+for b in BASINS:
+    basin_mean[("WOA23", b)] = float(compute_basic_stat(
+        select_basin(woa_nit, basin=b, include_marginal_seas=True),
+        op="area_weighted_mean", dim=["lat", "lon"]).compute())
+    for m in MODELS:
+        basin_mean[(m, b)] = float(compute_basic_stat(
+            select_basin(model_nit_1deg[m], basin=b, include_marginal_seas=True),
+            op="area_weighted_mean", dim=["lat", "lon"]).compute())
+
+print("\n=== Mean nitracline depth by basin (m, WOA23 mask, marginal seas folded in) ===")
+basin_rows = []
+for b in BASINS:
+    row = {"basin": b, "WOA23": basin_mean[("WOA23", b)]}
+    for m in MODELS:
+        row[m] = basin_mean[(m, b)]
+        row[m + "_diff"] = basin_mean[(m, b)] - basin_mean[("WOA23", b)]
+    basin_rows.append(row)
+basin_table = pd.DataFrame(basin_rows).set_index("basin")
+print(basin_table.round(1).to_string())
+
+print("\nBasin ordering (deep -> shallow):")
+for name in ["WOA23"] + MODELS:
+    order = sorted(BASINS, key=lambda b: -basin_mean[(name, b)])
+    print(f"  {name:13s}: " + " > ".join(order))
+
+# ----------------------------------------------------------------------------
+# 5. Common WOA23 ocean cell set -> spatial correlation and RMSE
+# ----------------------------------------------------------------------------
+common_mask = build_comparison_mask(
+    fields=[woa_nit] + [model_nit_1deg[m] for m in MODELS], ocean_only=True)
+print("\nCommon comparison cells:", int(common_mask.sum().compute()))
+
+corr_val, rmse_val, bias_val = {}, {}, {}
+for m in MODELS:
+    a = model_nit_1deg[m].where(common_mask)
+    b = woa_nit.where(common_mask)
+    corr_val[m] = float(analyze_correlation(var1=a, var2=b, dim=["lat", "lon"],
+                                            method="pearson")["correlation"].compute())
+    met = compute_difference_metrics(data=a, reference=b, dim=["lat", "lon"])
+    # compute_difference_metrics returns plain floats for scalar metrics over all
+    # reduced dims -> no .compute() here
+    rmse_val[m] = float(met["rmse"])
+    bias_val[m] = float(met["bias"])
+
+print("\n=== Pattern statistics on the common WOA23 ocean cells ===")
+for m in MODELS:
+    print(f"{m:13s}: r = {corr_val[m]:.3f}   RMSE = {rmse_val[m]:.1f} m   "
+          f"bias = {bias_val[m]:+.1f} m")
+
+best_model = min(MODELS, key=lambda m: rmse_val[m])
+print("Best model by RMSE:", best_model,
+      f"(r={corr_val[best_model]:.3f}, RMSE={rmse_val[best_model]:.1f} m)")
+
+summary = pd.DataFrame({
+    "global_mean_m":   {**{"WOA23": woa_nit_global}, **model_nit_global},
+    "diff_vs_WOA23_m": {**{"WOA23": 0.0},
+                        **{m: model_nit_global[m] - woa_nit_global for m in MODELS}},
+    "r":               {m: corr_val[m] for m in MODELS},
+    "RMSE_m":          {m: rmse_val[m] for m in MODELS},
+})
+print("\n", summary.round(2).to_string())
+
+# ----------------------------------------------------------------------------
+# 7./8. Equatorial Pacific section, 120E-280E, 2S-2N (continuous longitude)
+# ----------------------------------------------------------------------------
+woa_sec = load_climatology_data(dataset="woa23", variable="nitrate", time_slice="annual",
+                                lat_range=[-2.0, 2.0], lon_range=[120.0, 280.0],
+                                depth_range=[0.0, DEPTH_LOAD_MAX])
+sec_lat = np.asarray(woa_sec["lat"].values, dtype=float)
+woa_sec_mean = compute_basic_stat(woa_sec, op="mean", dim="lat").compute()
+sec_lon = np.asarray(woa_sec_mean["lon"].values, dtype=float)
+print("\nSection grid:", sec_lat.size, "latitudes", sec_lat[[0, -1]],
+      "|", sec_lon.size, "longitudes", sec_lon[0], "->", sec_lon[-1])
+
+woa_sec_nit = compute_nutricline_depth(woa_sec_mean, min_depth=0.0,
+                                       max_depth=NITRA_MAX).compute()
+
+# template on the WOA23 section grid for the curvilinear models.
+# Build it from an existing WOA23 field (isel a level) so it keeps the
+# 'source_dataset' provenance attribute; a bare xr.DataArray would drop it and
+# break compute_nutricline_depth's grid lookup.
+template = woa_sec.isel(depth=0, drop=True)
+
+model_sec, model_sec_nit = {}, {}
+for m in MODELS:
+    raw = load_regular_data(dataset="cmip6_historical", variable="no3", model=m,
+                            time_range=["1971-01", "2000-12"],
+                            lat_range=[-2.0, 2.0], lon_range=[120.0, 280.0],
+                            depth_range=[0.0, DEPTH_LOAD_MAX])
+    clim = temporal_aggregate(raw, freq="mean", op="mean")
+    clim = transform_unit(clim, from_unit="mol m-3", to_unit="umol/kg")
+    onsec = regrid_horizontal(clim, target=template, method="bilinear")
+    onsec = regrid_vertical(onsec, target="woa23", method="linear")
+    onsec = compute_basic_stat(onsec, op="mean", dim="lat").compute()
+    model_sec[m] = onsec
+    model_sec_nit[m] = compute_nutricline_depth(onsec, min_depth=0.0,
+                                                max_depth=NITRA_MAX).compute()
+
+print("\nSection nitracline: mean over the basin (m)")
+print(f"  WOA23        : {float(woa_sec_nit.mean()):.0f}")
+for m in MODELS:
+    print(f"  {m:13s}: {float(model_sec_nit[m].mean()):.0f}")
+
+# --- visualization ---
+# ============================================================================
+# Figure 1 - global nitracline depth maps (2 x 2, shared sequential scale)
+# ============================================================================
+panels1 = [("CESM2",         model_nit_1deg["CESM2"]),
+           ("GFDL-ESM4",     model_nit_1deg["GFDL-ESM4"]),
+           ("MPI-ESM1-2-LR", model_nit_1deg["MPI-ESM1-2-LR"]),
+           ("WOA23 (obs)",   woa_nit)]
+
+pooled1 = np.concatenate([np.asarray(p.transpose("lat", "lon").values).ravel()
+                          for _, p in panels1])
+vmin1 = max(0.0, float(np.nanpercentile(pooled1, 1)))
+vmax1 = float(np.nanpercentile(pooled1, 99))
+
+cmap1 = plt.get_cmap("YlGnBu").copy()
+cmap1.set_bad("0.85")
+
+fig1, axes1 = plt.subplots(2, 2, figsize=(14, 8.0), constrained_layout=True)
+for ax, (name, field) in zip(axes1.ravel(), panels1):
+    da = field.transpose("lat", "lon")
+    mesh1 = ax.pcolormesh(da["lon"].values, da["lat"].values, da.values,
+                          cmap=cmap1, vmin=vmin1, vmax=vmax1, shading="auto")
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-70, 75)
+    ax.set_xticks([-180, -120, -60, 0, 60, 120, 180])
+    ax.set_yticks([-60, -30, 0, 30, 60])
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    if name == "WOA23 (obs)":
+        ax.set_title(f"{name}\nglobal mean {woa_nit_global:.0f} m", fontweight="bold")
+    else:
+        ax.set_title(f"{name}\nglobal mean {model_nit_global[name]:.0f} m "
+                     f"({model_nit_global[name] - woa_nit_global:+.0f} m), "
+                     f"r={corr_val[name]:.3f}, RMSE={rmse_val[name]:.1f} m")
+
+cb1 = fig1.colorbar(mesh1, ax=axes1.ravel().tolist(), shrink=0.9, extend="both")
+cb1.set_label("Nitracline depth (m)")
+fig1.suptitle("Figure 1 - Nitracline depth (depth of max vertical nitrate gradient, "
+              "top 1000 m); shared scale clipped at 1st/99th percentile",
+              fontsize=12, fontweight="bold")
+
+# ============================================================================
+# Figure 2 - equatorial Pacific nitrate sections (2S-2N mean), 120E-280E
+# ============================================================================
+panels2 = [("WOA23 (obs)",   woa_sec_mean,   woa_sec_nit),
+           ("CESM2",         model_sec["CESM2"],         model_sec_nit["CESM2"]),
+           ("GFDL-ESM4",     model_sec["GFDL-ESM4"],     model_sec_nit["GFDL-ESM4"]),
+           ("MPI-ESM1-2-LR", model_sec["MPI-ESM1-2-LR"], model_sec_nit["MPI-ESM1-2-LR"])]
+
+pooled2 = np.concatenate([np.asarray(da.sel(depth=slice(0, 1000))
+                                     .transpose("depth", "lon").values).ravel()
+                          for _, da, _ in panels2])
+vmin2 = float(np.nanpercentile(pooled2, 1))
+vmax2 = float(np.nanpercentile(pooled2, 99))
+
+cmap2 = plt.get_cmap("YlGnBu").copy()
+cmap2.set_bad("0.85")
+
+xt = [120, 150, 180, 210, 240, 270]
+xl = ["120°E", "150°E", "180°", "150°W", "120°W", "90°W"]
+
+fig2, axes2 = plt.subplots(4, 1, figsize=(12, 13), constrained_layout=True)
+for ax, (name, da, nit) in zip(axes2, panels2):
+    d = da.sel(depth=slice(0, 1000)).transpose("depth", "lon")
+    mesh2 = ax.pcolormesh(d["lon"].values, d["depth"].values, d.values,
+                          cmap=cmap2, vmin=vmin2, vmax=vmax2, shading="auto")
+    nl = nit["lon"].values
+    nd = nit.values
+    ax.plot(nl, nd, color="red", lw=1.8, label="nitracline")
+    ax.set_ylim(0, 1000)
+    ax.invert_yaxis()
+    ax.set_xlim(float(sec_lon[0]), float(sec_lon[-1]))
+    ax.set_xticks(xt)
+    ax.set_xticklabels(xl)
+    ax.set_ylabel("Depth (m)")
+    ax.set_title(f"{name} - mean section nitracline {float(np.nanmean(nd)):.0f} m")
+    ax.legend(loc="lower left", framealpha=0.85)
+
+axes2[-1].set_xlabel("Longitude (equatorial Pacific, averaged over 2°S-2°N)")
+cb2 = fig2.colorbar(mesh2, ax=axes2.tolist(), shrink=0.9, extend="both")
+cb2.set_label(r"Nitrate ($\mu$mol kg$^{-1}$)")
+fig2.suptitle("Figure 2 - Equatorial Pacific nitrate sections (1971-2000), "
+              "top 1000 m; shared scale clipped at 1st/99th percentile",
+              fontsize=12, fontweight="bold")
+</executed_code>
+
+Here are the results of code execution:
+
+Status Summary:
+- Computation: Success
+- Visualization: Generated
+
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "DEPTH_LOAD_MAX": 1300.0,
+      "NITRA_MAX": 1000.0,
+      "MODELS": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "woa_no3": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 102,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "micromoles_per_kilogram",
+        "long_name": "Objectively analyzed mean fields for moles_of_nitrate_per_unit_mass_in_sea_water at standard depth levels.",
+        "source_dataset": "woa23",
+        "size": 6609600,
+        "n_valid": 3305010,
+        "min": 0.0,
+        "max": 49.30696105957031,
+        "mean": 22.99764060974121,
+        "std": 13.058621406555176
+      },
+      "woa_levels": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 102
+        },
+        "units": "meters",
+        "long_name": "depth",
+        "size": 102,
+        "n_valid": 102,
+        "min": 0.0,
+        "max": 5500.0,
+        "mean": 1738.235294117647,
+        "std": 1683.6734242538364
+      },
+      "woa_bounds": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 102,
+          "nbounds": 2
+        },
+        "units": "meters",
+        "long_name": "depth bounds",
+        "size": 204,
+        "n_valid": 204,
+        "min": 0.0,
+        "max": 5500.0,
+        "mean": 1738.235294117647,
+        "std": 1683.3564083633198
+      },
+      "woa_nit": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "m",
+        "long_name": "Nutricline depth (nitrate)",
+        "source_dataset": "woa23",
+        "size": 64800,
+        "n_valid": 41029,
+        "min": 0.0,
+        "max": 900.0,
+        "mean": 139.09320236905603,
+        "std": 162.81288486235505
+      },
+      "woa_nit_global": 165.74271406813267,
+      "model_no3_clim": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 42,
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Nitrate Concentration",
+          "source_dataset": "cmip6_historical",
+          "size": 5160960,
+          "n_valid": 3362242,
+          "min": -1.2429112443421524,
+          "max": 43.60682032085472,
+          "mean": 14.620350603246017,
+          "std": 9.052482684164753
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 22,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Nitrate Concentration",
+          "source_dataset": "cmip6_historical",
+          "size": 1425600,
+          "n_valid": 896530,
+          "min": 0.0008779046975262134,
+          "max": 254.35609675845112,
+          "mean": 17.65260778429577,
+          "std": 11.83213077265294
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 25,
+            "j": 220,
+            "i": 254
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Nitrate Concentration",
+          "source_dataset": "cmip6_historical",
+          "size": 1397000,
+          "n_valid": 807326,
+          "min": 0.015438009457072965,
+          "max": 49.93491677207428,
+          "mean": 14.331682731890206,
+          "std": 8.139774784759386
+        }
+      },
+      "model_nit_native": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "m",
+          "long_name": "Nutricline depth (nutrient)",
+          "source_dataset": "cmip6_historical",
+          "size": 122880,
+          "n_valid": 85673,
+          "min": 5.0,
+          "max": 707.563281,
+          "mean": 139.195765007587,
+          "std": 95.16702105222716
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "Nutricline depth (nutrient)",
+          "source_dataset": "cmip6_historical",
+          "size": 64800,
+          "n_valid": 44008,
+          "min": 2.5,
+          "max": 900.0,
+          "mean": 113.8637009180149,
+          "std": 119.54286946439808
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "j": 220,
+            "i": 254
+          },
+          "units": "m",
+          "long_name": "Nutricline depth (nutrient)",
+          "source_dataset": "cmip6_historical",
+          "size": 55880,
+          "n_valid": 36448,
+          "min": 6.0,
+          "max": 960.0,
+          "mean": 76.8102913740123,
+          "std": 111.71207536726129
+        }
+      },
+      "model_nit_1deg": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "Nutricline depth (nutrient)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 42399,
+          "min": 4.999999999999999,
+          "max": 669.1459637343315,
+          "mean": 138.07709092492968,
+          "std": 92.62692922886905
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "Nutricline depth (nutrient)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 44008,
+          "min": 2.5,
+          "max": 900.0,
+          "mean": 113.8637009180149,
+          "std": 119.54286946439808
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "m",
+          "long_name": "Nutricline depth (nutrient)",
+          "source_dataset": "woa23",
+          "size": 64800,
+          "n_valid": 42638,
+          "min": 5.999999999999997,
+          "max": 960.0000000000002,
+          "mean": 106.51452381185668,
+          "std": 140.2383223978085
+        }
+      },
+      "model_nit_global": {
+        "CESM2": 147.36374550229982,
+        "GFDL-ESM4": 133.55147120807396,
+        "MPI-ESM1-2-LR": 132.22052778106223
+      },
+      "basin_codes_da": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "long_name": "WOA23 Basin Mask",
+        "size": 64800,
+        "n_valid": 41088,
+        "min": 1.0,
+        "max": 56.0,
+        "mean": 5.052132009345795,
+        "std": 5.361917020836556
+      },
+      "BASINS": [
+        "Pacific",
+        "Atlantic",
+        "Indian"
+      ],
+      "basin_mean": {
+        "('WOA23', 'Pacific')": 200.79841941988855,
+        "('CESM2', 'Pacific')": 162.6797791995807,
+        "('GFDL-ESM4', 'Pacific')": 159.57162294982814,
+        "('MPI-ESM1-2-LR', 'Pacific')": 184.13343485479413,
+        "('WOA23', 'Atlantic')": 165.1841728631693,
+        "('CESM2', 'Atlantic')": 109.37895993247085,
+        "('GFDL-ESM4', 'Atlantic')": 91.13198401046208,
+        "('MPI-ESM1-2-LR', 'Atlantic')": 111.05764441379232,
+        "('WOA23', 'Indian')": 179.92303114236853,
+        "('CESM2', 'Indian')": 165.71229018997292,
+        "('GFDL-ESM4', 'Indian')": 169.7895633617952,
+        "('MPI-ESM1-2-LR', 'Indian')": 121.4699657041203
+      },
+      "basin_rows": [
+        {
+          "basin": "Pacific",
+          "WOA23": 200.79841941988855,
+          "CESM2": 162.6797791995807,
+          "CESM2_diff": -38.11864022030784,
+          "GFDL-ESM4": 159.57162294982814,
+          "GFDL-ESM4_diff": -41.22679647006041,
+          "MPI-ESM1-2-LR": 184.13343485479413,
+          "MPI-ESM1-2-LR_diff": -16.664984565094414
+        },
+        {
+          "basin": "Atlantic",
+          "WOA23": 165.1841728631693,
+          "CESM2": 109.37895993247085,
+          "CESM2_diff": -55.805212930698445,
+          "GFDL-ESM4": 91.13198401046208,
+          "GFDL-ESM4_diff": -74.05218885270722,
+          "MPI-ESM1-2-LR": 111.05764441379232,
+          "MPI-ESM1-2-LR_diff": -54.12652844937698
+        },
+        {
+          "basin": "Indian",
+          "WOA23": 179.92303114236853,
+          "CESM2": 165.71229018997292,
+          "CESM2_diff": -14.21074095239561,
+          "GFDL-ESM4": 169.7895633617952,
+          "GFDL-ESM4_diff": -10.13346778057334,
+          "MPI-ESM1-2-LR": 121.4699657041203,
+          "MPI-ESM1-2-LR_diff": -58.45306543824823
+        }
+      ],
+      "basin_table": "               WOA23       CESM2  ...  MPI-ESM1-2-LR  MPI-ESM1-2-LR_diff\nbasin                             ...                                   \nPacific   200.798419  162.679779  ...     184.133435          -16.664985\nAtlantic  165.184173  109.378960  ...     111.057644          -54.126528\nIndian    179.923031  165.712290  ...     121.469966          -58.453065\n\n[3 rows x 7 columns]",
+      "common_mask": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "long_name": "cells covered by every field in the comparison",
+        "source_dataset": "woa23",
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "corr_val": {
+        "CESM2": 0.39766986998388326,
+        "GFDL-ESM4": 0.5025931621734285,
+        "MPI-ESM1-2-LR": 0.6179543180182634
+      },
+      "rmse_val": {
+        "CESM2": 162.89567986135776,
+        "GFDL-ESM4": 161.28095059077373,
+        "MPI-ESM1-2-LR": 151.67928119251508
+      },
+      "bias_val": {
+        "CESM2": -16.659030337965746,
+        "GFDL-ESM4": -31.533279145887533,
+        "MPI-ESM1-2-LR": -32.49958469709028
+      },
+      "best_model": "MPI-ESM1-2-LR",
+      "summary": "               global_mean_m  diff_vs_WOA23_m         r      RMSE_m\nWOA23             165.742714         0.000000       NaN         NaN\nCESM2             147.363746       -18.378969  0.397670  162.895680\nGFDL-ESM4         133.551471       -32.191243  0.502593  161.280951\nMPI-ESM1-2-LR     132.220528       -33.522186  0.617954  151.679281",
+      "woa_sec": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 53,
+          "lat": 4,
+          "lon": 160
+        },
+        "units": "micromoles_per_kilogram",
+        "long_name": "Objectively analyzed mean fields for moles_of_nitrate_per_unit_mass_in_sea_water at standard depth levels.",
+        "source_dataset": "woa23",
+        "size": 33920,
+        "n_valid": 31876,
+        "min": 0.014339558780193329,
+        "max": 43.50259780883789,
+        "mean": 21.777450561523438,
+        "std": 14.945332527160645
+      },
+      "sec_lat": {
+        "type": "ndarray",
+        "shape": [
+          4
+        ],
+        "size": 4,
+        "n_valid": 4,
+        "min": -1.5,
+        "max": 1.5,
+        "mean": 0.0,
+        "std": 1.118033988749895,
+        "values": [
+          -1.5,
+          -0.5,
+          0.5,
+          1.5
+        ]
+      },
+      "woa_sec_mean": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 53,
+          "lon": 160
+        },
+        "units": "micromoles_per_kilogram",
+        "long_name": "Objectively analyzed mean fields for moles_of_nitrate_per_unit_mass_in_sea_water at standard depth levels.",
+        "source_dataset": "woa23",
+        "size": 8480,
+        "n_valid": 8450,
+        "min": 0.034896958619356155,
+        "max": 43.08572006225586,
+        "mean": 21.562881469726562,
+        "std": 14.908740997314453
+      },
+      "sec_lon": {
+        "type": "ndarray",
+        "shape": [
+          160
+        ],
+        "size": 160,
+        "n_valid": 160,
+        "min": 120.5,
+        "max": 279.5,
+        "mean": 200.0,
+        "std": 46.18711941656461
+      },
+      "woa_sec_nit": {
+        "type": "DataArray",
+        "dims": {
+          "lon": 160
+        },
+        "units": "m",
+        "long_name": "Nutricline depth (nitrate)",
+        "source_dataset": "woa23",
+        "size": 160,
+        "n_valid": 160,
+        "min": 30.0,
+        "max": 300.0,
+        "mean": 114.21875,
+        "std": 67.30886567486857
+      },
+      "template": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 4,
+          "lon": 160
+        },
+        "units": "micromoles_per_kilogram",
+        "long_name": "Objectively analyzed mean fields for moles_of_nitrate_per_unit_mass_in_sea_water at standard depth levels.",
+        "source_dataset": "woa23",
+        "size": 640,
+        "n_valid": 604,
+        "min": 0.024026496335864067,
+        "max": 8.682402610778809,
+        "mean": 2.981166124343872,
+        "std": 2.1807291507720947
+      },
+      "model_sec": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 102,
+            "lon": 160
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Nitrate Concentration",
+          "source_dataset": "woa23",
+          "size": 16320,
+          "n_valid": 8088,
+          "min": -0.4220009749697843,
+          "max": 35.364301535800074,
+          "mean": 14.365683329364906,
+          "std": 11.049900375132886
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 102,
+            "lon": 160
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Nitrate Concentration",
+          "source_dataset": "woa23",
+          "size": 16320,
+          "n_valid": 8480,
+          "min": 0.017677684936938613,
+          "max": 38.23732236390497,
+          "mean": 19.76769466858578,
+          "std": 12.065107303873093
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 102,
+            "lon": 160
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Nitrate Concentration",
+          "source_dataset": "woa23",
+          "size": 16320,
+          "n_valid": 8157,
+          "min": 0.017557971385239242,
+          "max": 38.26082885087937,
+          "mean": 14.499752377322762,
+          "std": 10.765106943880234
+        }
+      },
+      "model_sec_nit": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lon": 160
+          },
+          "units": "m",
+          "long_name": "Nutricline depth (nutrient)",
+          "source_dataset": "woa23",
+          "size": 160,
+          "n_valid": 159,
+          "min": 30.0,
+          "max": 200.0,
+          "mean": 120.66037735849056,
+          "std": 54.00650207636361
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lon": 160
+          },
+          "units": "m",
+          "long_name": "Nutricline depth (nutrient)",
+          "source_dataset": "woa23",
+          "size": 160,
+          "n_valid": 160,
+          "min": 15.0,
+          "max": 225.0,
+          "mean": 118.78125,
+          "std": 69.64810405486642
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lon": 160
+          },
+          "units": "m",
+          "long_name": "Nutricline depth (nutrient)",
+          "source_dataset": "woa23",
+          "size": 160,
+          "n_valid": 160,
+          "min": 10.0,
+          "max": 95.0,
+          "mean": 39.03125,
+          "std": 28.20957768981131
+        }
+      }
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_no_knowledge_20261020/T6_deepseek-flash_20261021_010358/turn01/figures/visualization_T6_deepseek-flash_20261021_010358_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_no_knowledge_20261020/T6_deepseek-flash_20261021_010358/turn01/figures/visualization_T6_deepseek-flash_20261021_010358_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Please provide a clear scientific summary inside <solution></solution> tags.
+
+Describe the methodology strictly from the <executed_code> above, never by inferring it from variable
+names: the baseline period, the source of any climatology, the weighting, the units, the region and
+time range, the range of lags — all of it must match the tools and arguments the code actually
+called. Do not report a step the code did not take. Where a variable name in the observation is
+ambiguous, the code decides what it means.
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
+4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, tool choice, computation and visualization attempts
+3. Suggestions for how to reformulate the query
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+The executed analysis compares the depth of the maximum vertical nitrate gradient within the top 1000 m (the nitracline) for CESM2, GFDL-ESM4, MPI-ESM1-2-LR and WOA23. CMIP6 historical nitrate was used for January 1971–December 2000, aggregated with `temporal_aggregate(..., freq="mean", op="mean")`, loaded from 0–1300 m so the gradient at 1000 m could use the next deeper level, converted from mol m⁻³ to µmol kg⁻¹, and passed to `compute_nutricline_depth(min_depth=0, max_depth=1000)`. WOA23 used the all-time-periods annual nitrate climatology. Global means were computed with `compute_basic_stat(..., op="area_weighted_mean", dim=["lat","lon"])` on each source’s own grid. For basin statistics, models were conservatively regridded to the WOA23 1° grid. Basins were selected from the WOA23 basin mask for Pacific, Atlantic and Indian with `select_basin(..., include_marginal_seas=True)`; Southern and Arctic basins were not included. Correlation and RMSE were computed over the common ocean-valid cell mask obtained from `build_comparison_mask(..., ocean_only=True)` after regridding all model nitracline fields to the WOA23 grid. Differences are model minus WOA23 and were computed before rounding.
+
+### Global mean nitracline depth
+
+| Source | Global mean depth (m) | Model − WOA23 (m) |
+|---|---:|---:|
+| WOA23 | 166 | — |
+| CESM2 | 147 | −18 |
+| GFDL-ESM4 | 134 | −32 |
+| MPI-ESM1-2-LR | 132 | −34 |
+
+All three models simulate a globally shallower nitracline than WOA23.
+
+### Basin mean nitracline depth
+Values are mean depth in metres; parentheses give model minus WOA23, computed before rounding. Marginal seas are folded into the parent basin.
+
+| Basin | WOA23 | CESM2 | GFDL-ESM4 | MPI-ESM1-2-LR |
+|---|---:|---:|---:|---:|
+| Pacific | 201 | 163 (−38) | 160 (−41) | 184 (−17) |
+| Atlantic | 165 | 109 (−56) | 91 (−74) | 111 (−54) |
+| Indian | 180 | 166 (−14) | 170 (−10) | 121 (−58) |
+
+WOA23 basin ordering from deepest to shallowest is **Pacific > Indian > Atlantic**.  
+CESM2 gives **Indian > Pacific > Atlantic**.  
+GFDL-ESM4 gives **Indian > Pacific > Atlantic**.  
+MPI-ESM1-2-LR gives **Pacific > Indian > Atlantic**.
+
+Thus only MPI-ESM1-2-LR reproduces the WOA23 ordering of the three basins; CESM2 and GFDL-ESM4 both place the Indian Ocean slightly deeper than the Pacific, contrary to WOA23.
+
+### Spatial pattern statistics on the WOA23 1° common mask
+
+| Model | Pearson r | RMSE (m) | Bias (m) |
+|---|---:|---:|---:|
+| CESM2 | 0.398 | 162.9 | −16.7 |
+| GFDL-ESM4 | 0.503 | 161.3 | −31.5 |
+| MPI-ESM1-2-LR | 0.618 | 151.7 | −32.5 |
+
+MPI-ESM1-2-LR has the highest spatial correlation and the lowest RMSE, so it is the best model by the RMSE criterion used in the code. However, all correlations are low to moderate and the RMSE values are very large relative to the mean nitracline depth, indicating substantial spatial mismatches. CESM2 has the smallest global mean bias but a weaker spatial correlation and larger RMSE than MPI-ESM1-2-LR.
+
+### Equatorial Pacific section diagnostics
+For the 120°E–280°E, 2°S–2°N section, after horizontal/vertical regridding to the WOA23 section grid and averaging over latitude, the mean section nitraclines are:
+
+| Source | Mean section nitracline (m) |
+|---|---:|
+| WOA23 | 114 |
+| CESM2 | 121 |
+| GFDL-ESM4 | 119 |
+| MPI-ESM1-2-LR | 39 |
+
+MPI-ESM1-2-LR is much shallower than the other sources in this equatorial Pacific section.
+
+### Figures
+**Figure 1** is a 2×2 panel of global nitracline-depth maps in the order CESM2, GFDL-ESM4, MPI-ESM1-2-LR and WOA23. All panels use one shared sequential `YlGnBu` colour scale, with deeper values visually heavier/darker. The shared scale is clipped at the pooled 1st and 99th percentiles, and missing values are shown in grey. Panel titles include the global mean depth and, for models, the difference from WOA23, the spatial correlation and RMSE. The maps are shown over longitude −180° to 180° and latitude −70° to 75°.
+
+**Figure 2** shows four longitude–depth nitrate sections for the equatorial Pacific from 120°E to 280°E, averaged over 2°S–2°N, in the order WOA23, CESM2, GFDL-ESM4 and MPI-ESM1-2-LR. All panels cover the top 1000 m with depth increasing downward and use a shared `YlGnBu` concentration scale in µmol kg⁻¹, clipped at the pooled 1st/99th percentiles. Each panel overlays its own nitracline depth as a red line. Model sections were regridded horizontally to the WOA23 section template and vertically to WOA23 depth levels before display.
+
+### Overall assessment
+The models capture only a modest amount of the observed nitracline spatial structure. All models are biased shallow globally, especially in the Atlantic. MPI-ESM1-2-LR performs best by spatial correlation and RMSE on the WOA23 grid and is the only model that preserves the observed WOA23 basin ordering, but it still has a large negative global bias, a very shallow equatorial Pacific section nitracline, and the Indian and Atlantic basins are much shallower than observed. CESM2 has the smallest global mean bias but weaker spatial agreement; GFDL-ESM4 has intermediate correlation and a strong shallow bias, particularly in the Atlantic and Pacific.
+</solution>

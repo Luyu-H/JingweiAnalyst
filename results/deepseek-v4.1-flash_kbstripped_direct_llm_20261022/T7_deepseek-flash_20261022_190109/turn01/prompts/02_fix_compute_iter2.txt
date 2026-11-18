@@ -1,0 +1,2415 @@
+# exchange 2: fix_compute_iter2
+# elapsed: 253.6 s
+
+===== SYSTEM =====
+You are a code debugging expert.
+
+===== USER =====
+The following compute code failed to execute:
+
+<failed_code>
+import os, glob, re, warnings
+warnings.filterwarnings('ignore')
+
+# -----------------------------------------------------------------------------
+# Constants and configuration
+# -----------------------------------------------------------------------------
+RHO = 1025.0
+R_EARTH = 6371000.0
+CMIP_ROOT = '/data1/lorraine-20419/benchmark_cmip6/historical'
+WOA_ROOT = '/data1/lorraine-20419/ocean_data/WOA23/climatology'
+WOA_MASK = '/data1/lorraine-20419/ocean_data/WOA23/masks/basinmask_01.msk'
+
+SOURCES = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']
+MODELS = ['CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']
+
+MODEL_CFG = {
+    'CESM2': dict(lat='lat', lon='lon', depth='lev', depth_scale=0.01),
+    'GFDL-ESM4': dict(lat='lat', lon='lon', depth='lev', depth_scale=1.0),
+    'MPI-ESM1-2-LR': dict(lat='latitude', lon='longitude', depth='lev', depth_scale=1.0),
+}
+
+def parse_variant(fn):
+    m = re.search(r'(r\d+i\d+p\d+f\d+)', os.path.basename(fn))
+    return m.group(1) if m else None
+
+def files_in_dir(d):
+    return sorted(glob.glob(os.path.join(d, '*.nc')))
+
+def choose_variant_files(d, desired=None):
+    fs = files_in_dir(d)
+    if not fs:
+        raise FileNotFoundError(d)
+    vs = {parse_variant(f) for f in fs}
+    vs.discard(None)
+    if desired is not None and desired in vs:
+        return [f for f in fs if parse_variant(f) == desired]
+    if 'r1i1p1f1' in vs:
+        return [f for f in fs if parse_variant(f) == 'r1i1p1f1']
+    if vs:
+        counts = {v: sum(parse_variant(f) == v for f in fs) for v in vs}
+        v = max(counts, key=counts.get)
+        return [f for f in fs if parse_variant(f) == v]
+    return fs
+
+def open_nc_maybe_mf(files):
+    if len(files) == 1:
+        try:
+            return xr.open_dataset(files[0], use_cftime=True, chunks={'time': 12})
+        except Exception:
+            return xr.open_dataset(files[0], use_cftime=True)
+    try:
+        return xr.open_mfdataset(files, combine='by_coords', use_cftime=True,
+                                  chunks={'time': 12})
+    except Exception:
+        return xr.open_mfdataset(files, combine='by_coords', use_cftime=True)
+
+def mean_period(da, y0=1971, y1=2000):
+    if 'time' not in da.dims:
+        return da
+    sel = da
+    try:
+        sel = da.sel(time=slice(f'{y0}-01-01', f'{y1}-12-31'))
+    except Exception:
+        sel = da
+    if sel.sizes.get('time', 0) == 0:
+        try:
+            yr = da.time.dt.year
+            sel = da.where((yr >= y0) & (yr <= y1), drop=True)
+        except Exception:
+            sel = da
+    if sel.sizes.get('time', 0) == 0:
+        return da.mean('time')
+    return sel.mean('time')
+
+def find_dim(da, names):
+    for n in names:
+        if n in da.dims:
+            return n
+    for d in da.dims:
+        ld = d.lower()
+        for n in names:
+            if n in ld:
+                return d
+    return None
+
+def get_latlon_2d(ds, cfg, fallback=None):
+    try:
+        lat = ds[cfg['lat']]
+        lon = ds[cfg['lon']]
+    except Exception:
+        ds = fallback
+        lat = ds[cfg['lat']]
+        lon = ds[cfg['lon']]
+    if lat.ndim == 1 and lon.ndim == 1:
+        lat2d, lon2d = xr.broadcast(lat, lon)
+    else:
+        lat2d, lon2d = lat, lon
+    return np.asarray(lat2d.values, dtype=float), np.asarray(lon2d.values, dtype=float)
+
+# -----------------------------------------------------------------------------
+# WOA readers
+# -----------------------------------------------------------------------------
+def load_woa_field(varkey, prefix):
+    if varkey == 'nitrate':
+        path = os.path.join(WOA_ROOT, 'nitrate', 'all_time_periods', 'woa23_all_n00_01.nc')
+    elif varkey == 'phosphate':
+        path = os.path.join(WOA_ROOT, 'phosphate', 'all_time_periods', 'woa23_all_p00_01.nc')
+    else:
+        raise ValueError(varkey)
+    ds = xr.open_dataset(path, decode_times=False)
+
+    cands = []
+    for v in ds.data_vars:
+        vl = v.lower()
+        if ('_an' in vl or vl.endswith('an') or vl == 'an') and vl.startswith(prefix.lower()):
+            cands.append(v)
+    if not cands:
+        cands = [v for v in ds.data_vars if '_an' in v.lower() or v.lower().endswith('an')]
+    if not cands:
+        cands = [v for v in ds.data_vars if ds[v].ndim >= 3]
+    var = cands[0]
+    da = ds[var]
+    if 'time' in da.dims:
+        da = da.isel(time=0)
+    da = da.squeeze(drop=True)
+    return ds, da
+
+def woa_layer_fields(n, p):
+    depth_name = find_dim(n, ['depth', 'lev', 'z'])
+    lat_name = find_dim(n, ['lat', 'latitude'])
+    lon_name = find_dim(n, ['lon', 'longitude'])
+    if depth_name is None or lat_name is None or lon_name is None:
+        raise ValueError('Could not identify WOA dimensions')
+
+    n = n.transpose(depth_name, lat_name, lon_name)
+    p = p.transpose(depth_name, lat_name, lon_name)
+
+    depth = np.asarray(n[depth_name].values, dtype=float)
+    lat = np.asarray(n[lat_name].values, dtype=float)
+    lon = np.asarray(n[lon_name].values, dtype=float)
+
+    if depth[0] > depth[-1]:
+        n = n.isel({depth_name: slice(None, None, -1)})
+        p = p.isel({depth_name: slice(None, None, -1)})
+        depth = depth[::-1]
+
+    if len(depth) > 1:
+        edges = np.empty(len(depth) + 1)
+        edges[1:-1] = 0.5 * (depth[:-1] + depth[1:])
+        edges[0] = max(0.0, depth[0] - 0.5 * (depth[1] - depth[0]))
+        edges[-1] = depth[-1] + 0.5 * (depth[-1] - depth[-2])
+    else:
+        edges = np.array([0.0, depth[0] + 1.0])
+
+    thick_layer = np.clip(
+        np.minimum(edges[1:], 1000.0) - np.maximum(edges[:-1], 200.0),
+        0.0, None
+    )
+
+    dlat = np.deg2rad(np.median(np.abs(np.diff(lat)))) if len(lat) > 1 else np.deg2rad(1.0)
+    dlon = np.deg2rad(np.median(np.abs(np.diff(lon)))) if len(lon) > 1 else np.deg2rad(1.0)
+    area = R_EARTH**2 * np.cos(np.deg2rad(lat)) * dlat * dlon
+    area2d = np.broadcast_to(area[:, None], (len(lat), len(lon)))
+
+    w = thick_layer[:, None, None] * area2d[None, :, :]
+    nv = np.asarray(n.values, dtype=float)
+    pv = np.asarray(p.values, dtype=float)
+
+    valid = np.isfinite(nv) & np.isfinite(pv) & (w > 0)
+    wj = np.where(valid, w, 0.0)
+    vol_layer = wj.sum(axis=0)
+
+    no3_layer = np.divide(
+        (np.where(valid, nv, 0.0) * wj).sum(axis=0),
+        vol_layer,
+        out=np.full_like(vol_layer, np.nan),
+        where=vol_layer > 0
+    )
+    po4_layer = np.divide(
+        (np.where(valid, pv, 0.0) * wj).sum(axis=0),
+        vol_layer,
+        out=np.full_like(vol_layer, np.nan),
+        where=vol_layer > 0
+    )
+
+    lat2d, lon2d = np.meshgrid(lat, lon, indexing='ij')
+    return no3_layer, po4_layer, vol_layer, lat2d, lon2d, lat, lon
+
+# -----------------------------------------------------------------------------
+# WOA basin mask
+# -----------------------------------------------------------------------------
+def load_basin_mask(path, nlev, lat_centers, lon_centers):
+    rows = []
+    with open(path, 'r', errors='ignore') as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if s[0] in '#!%':
+                continue
+            parts = s.split()
+            try:
+                vals = [float(x) for x in parts]
+            except ValueError:
+                continue
+            if len(vals) >= 3:
+                rows.append(vals)
+
+    if not rows:
+        raise ValueError(f'No numeric rows found in {path}')
+
+    lats = np.asarray(lat_centers, dtype=float)
+    lons = np.asarray(lon_centers, dtype=float)
+    nlat, nlon = len(lats), len(lons)
+    basin_h = np.zeros((nlat, nlon), dtype=int)
+
+    def idx(v, arr):
+        if len(arr) == 1:
+            return 0
+        step = arr[1] - arr[0]
+        if step == 0:
+            return 0
+        return int(np.clip(int(round((v - arr[0]) / step)), 0, len(arr) - 1))
+
+    # WOA basin mask is a sparse table: one row per ocean horizontal point,
+    # with latitude, longitude and basin numbers for the standard levels.
+    maxlen = max(len(r) for r in rows)
+    if len(rows) > 1000 and maxlen > 10:
+        use_rows = [r for r in rows if len(r) >= 3]
+        nfirst = min(6, min(len(r) for r in use_rows))
+        first = np.array([r[:nfirst] for r in use_rows], dtype=float)
+
+        lat_candidates = []
+        lon_candidates = []
+        for c in range(nfirst):
+            col = first[:, c]
+            finite = col[np.isfinite(col)]
+            if len(finite) == 0:
+                continue
+            mx = np.nanmax(np.abs(finite))
+            if mx <= 90.0:
+                lat_candidates.append(c)
+            if mx <= 360.0:
+                lon_candidates.append(c)
+
+        latcol = lat_candidates[0] if lat_candidates else 0
+        lon_candidates = [c for c in lon_candidates if c != latcol]
+        if lon_candidates:
+            best = None
+            for c in lon_candidates:
+                mx = np.nanmax(np.abs(first[:, c]))
+                if mx > 90.0:
+                    best = c
+                    break
+            loncol = best if best is not None else lon_candidates[0]
+        else:
+            loncol = 1 if latcol == 0 else 0
+
+        start = max(latcol, loncol) + 1
+        for r in use_rows:
+            if len(r) <= max(latcol, loncol):
+                continue
+            la, lo = r[latcol], r[loncol]
+            if not (np.isfinite(la) and np.isfinite(lo)):
+                continue
+            i = idx(la, lats)
+            j = idx(lo, lons)
+            code = 0
+            for v in r[start:]:
+                if np.isfinite(v) and 0.0 < v < 50.0:
+                    code = int(round(v))
+                    break
+            if code > 0:
+                basin_h[i, j] = code
+        return basin_h
+
+    # Fallback: long table with latitude, longitude, level and basin columns.
+    arr = np.array(rows, dtype=float)
+    ncol = arr.shape[1]
+
+    levcol = None
+    for c in range(ncol):
+        col = arr[:, c]
+        finite = col[np.isfinite(col)]
+        if len(finite) == 0:
+            continue
+        if (np.nanmin(finite) >= 1 and np.nanmax(finite) <= nlev and
+                np.allclose(finite, np.round(finite)) and len(np.unique(finite)) > 6):
+            levcol = c
+            break
+
+    latcol = loncol = None
+    for c in range(ncol):
+        if c == levcol:
+            continue
+        col = arr[:, c]
+        finite = col[np.isfinite(col)]
+        if len(finite) == 0:
+            continue
+        mx = np.nanmax(np.abs(finite))
+        if latcol is None and mx <= 90.0:
+            latcol = c
+        elif loncol is None and mx <= 360.0 and c != latcol:
+            loncol = c
+
+    basincol = None
+    for c in range(ncol):
+        if c not in (latcol, loncol, levcol):
+            basincol = c
+            break
+
+    if basincol is None or latcol is None or loncol is None:
+        return basin_h
+
+    for r in arr:
+        la, lo, b = r[latcol], r[loncol], r[basincol]
+        if not (np.isfinite(la) and np.isfinite(lo) and np.isfinite(b)):
+            continue
+        if not (0.0 < b < 50.0):
+            continue
+        i = idx(la, lats)
+        j = idx(lo, lons)
+        basin_h[i, j] = int(round(b))
+    return basin_h
+
+def fill_basin_nearest(b):
+    b = b.astype(int).copy()
+    for _ in range(60):
+        if not np.any(b == 0):
+            break
+        neigh = []
+        for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                       (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            neigh.append(np.roll(b, shift=(di, dj), axis=(0, 1)))
+        fill = np.zeros_like(b)
+        for s in neigh:
+            fill = np.where((fill == 0) & (s > 0), s, fill)
+        if not np.any(fill > 0):
+            break
+        b = np.where(b == 0, fill, b)
+    return b
+
+def identify_basins(basin_h, lat2d, lon2d):
+    codes = [int(c) for c in np.unique(basin_h) if c > 0]
+    info = {}
+    for c in codes:
+        m = basin_h == c
+        la = lat2d[m]
+        lo = lon2d[m]
+        if len(la) == 0:
+            continue
+        w = np.cos(np.deg2rad(la))
+        if np.sum(w) == 0:
+            w = np.ones_like(la)
+        mlat = float(np.average(la, weights=w))
+        ang = np.deg2rad(lo)
+        mlon = float(np.rad2deg(np.arctan2(
+            np.average(np.sin(ang), weights=w),
+            np.average(np.cos(ang), weights=w)
+        )))
+        info[c] = (mlat, mlon)
+
+    names = {}
+    used = set()
+
+    cand = [c for c in codes if c in info and info[c][0] > 60.0]
+    if cand:
+        c = max(cand, key=lambda x: info[x][0])
+        names[c] = 'Arctic'
+        used.add(c)
+
+    cand = [c for c in codes if c in info and c not in used and info[c][0] < -60.0]
+    if cand:
+        c = min(cand, key=lambda x: info[x][0])
+        names[c] = 'Southern'
+        used.add(c)
+
+    rem = [c for c in codes if c not in used]
+    for c in rem:
+        mlat, mlon = info.get(c, (0.0, 0.0))
+        lon360 = mlon % 360.0
+        if 30.0 <= lon360 < 110.0:
+            names[c] = 'Indian'
+        elif 110.0 <= lon360 < 260.0:
+            names[c] = 'Pacific'
+        else:
+            names[c] = 'Atlantic'
+
+    return names, info
+
+def map_basin(lat2d, lon2d, basin_h, lat_woa, lon_woa):
+    lon_w = ((lon2d + 180.0) % 360.0) - 180.0
+    step_lat = lat_woa[1] - lat_woa[0] if len(lat_woa) > 1 else 1.0
+    step_lon = lon_woa[1] - lon_woa[0] if len(lon_woa) > 1 else 1.0
+    i = np.rint((lat2d - lat_woa[0]) / step_lat).astype(int)
+    j = np.rint((lon_w - lon_woa[0]) / step_lon).astype(int)
+    i = np.clip(i, 0, len(lat_woa) - 1)
+    j = np.clip(j, 0, len(lon_woa) - 1)
+    return basin_h[i, j]
+
+# -----------------------------------------------------------------------------
+# CMIP6 readers
+# -----------------------------------------------------------------------------
+def model_layer_fields(model, cfg):
+    dir_n = os.path.join(CMIP_ROOT, model, 'no3')
+    dir_p = os.path.join(CMIP_ROOT, model, 'po4')
+    dir_v = os.path.join(CMIP_ROOT, model, 'volcello')
+
+    fs_n_all = files_in_dir(dir_n)
+    fs_p_all = files_in_dir(dir_p)
+    vs_n = {parse_variant(f) for f in fs_n_all}
+    vs_p = {parse_variant(f) for f in fs_p_all}
+    vs_n.discard(None)
+    vs_p.discard(None)
+    common = vs_n & vs_p
+
+    if common:
+        desired = 'r1i1p1f1' if 'r1i1p1f1' in common else sorted(common)[0]
+        fs_n = [f for f in fs_n_all if parse_variant(f) == desired]
+        fs_p = [f for f in fs_p_all if parse_variant(f) == desired]
+    else:
+        desired = None
+        fs_n, fs_p = fs_n_all, fs_p_all
+
+    fs_v = choose_variant_files(dir_v, desired)
+
+    ds_n = open_nc_maybe_mf(fs_n)
+    ds_p = open_nc_maybe_mf(fs_p)
+    ds_v = open_nc_maybe_mf(fs_v)
+
+    no3_tm = mean_period(ds_n['no3'])
+    po4_tm = mean_period(ds_p['po4'])
+    vol_tm = mean_period(ds_v['volcello'])
+
+    no3_tm, po4_tm, vol_tm = xr.align(no3_tm, po4_tm, vol_tm, join='inner')
+
+    lev_name = cfg['depth']
+    if lev_name not in no3_tm.dims:
+        lev_name = find_dim(no3_tm, ['lev', 'depth'])
+
+    depth_da = no3_tm[lev_name]
+    depth_m = depth_da * cfg['depth_scale']
+    depth_mask = (depth_m >= 200.0) & (depth_m <= 1000.0)
+
+    valid3 = (
+        np.isfinite(no3_tm) &
+        np.isfinite(po4_tm) &
+        np.isfinite(vol_tm) &
+        (vol_tm > 0.0) &
+        depth_mask
+    )
+
+    w3 = xr.where(valid3, vol_tm, 0.0)
+    vol_layer = w3.sum(dim=lev_name)
+    num_n = xr.where(valid3, no3_tm * vol_tm, 0.0).sum(dim=lev_name)
+    num_p = xr.where(valid3, po4_tm * vol_tm, 0.0).sum(dim=lev_name)
+
+    no3_layer = (num_n / vol_layer).where(vol_layer > 0.0)
+    po4_layer = (num_p / vol_layer).where(vol_layer > 0.0)
+
+    out = xr.Dataset({
+        'no3': no3_layer,
+        'po4': po4_layer,
+        'vol': vol_layer,
+    }).compute()
+
+    # CMIP6 no3/po4 are mol m-3; convert to umol kg-1 at rho = 1025 kg m-3.
+    fac = 1000.0 / RHO
+    no3 = np.asarray(out['no3'].values, dtype=float) * fac
+    po4 = np.asarray(out['po4'].values, dtype=float) * fac
+    vol = np.asarray(out['vol'].values, dtype=float)
+
+    lat2d, lon2d = get_latlon_2d(out, cfg, fallback=ds_n)
+    return no3, po4, vol, lat2d, lon2d
+
+# -----------------------------------------------------------------------------
+# Metrics
+# -----------------------------------------------------------------------------
+def valid_mask(no3, po4, vol):
+    return (
+        np.isfinite(no3) & np.isfinite(po4) &
+        (no3 >= 0.0) & (po4 > 0.0) &
+        np.isfinite(vol) & (vol > 0.0)
+    )
+
+def compute_source_metrics(name, no3, po4, vol, basin_codes, basin_names):
+    no3 = np.asarray(no3, dtype=float)
+    po4 = np.asarray(po4, dtype=float)
+    vol = np.asarray(vol, dtype=float)
+    basin_codes = np.asarray(basin_codes)
+
+    valid = valid_mask(no3, po4, vol)
+    ratio = np.full(no3.shape, np.nan, dtype=float)
+    ratio[valid] = no3[valid] / po4[valid]
+
+    w = vol[valid]
+    r = ratio[valid]
+    x = po4[valid]
+    y = no3[valid]
+    total_w = float(np.sum(w))
+
+    # Headline means: volume-weighted across water parcels.
+    np_mean_cell = float(np.sum(w * r) / total_w) if total_w > 0 else np.nan
+    np_ratio_means = float(np.sum(w * y) / np.sum(w * x)) if np.sum(w * x) > 0 else np.nan
+
+    # Equal-cell versions retained for transparency.
+    np_mean_cell_unw = float(np.nanmean(r)) if len(r) > 0 else np.nan
+    np_ratio_means_unw = (
+        float(np.nanmean(y) / np.nanmean(x))
+        if len(x) > 0 and np.nanmean(x) > 0 else np.nan
+    )
+
+    if len(x) > 1:
+        slope, intercept = np.polyfit(x, y, 1)
+        yhat = slope * x + intercept
+        ss_res = float(np.sum((y - yhat) ** 2))
+        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    else:
+        slope = intercept = r2 = np.nan
+
+    pct_14_18 = (
+        100.0 * float(np.sum(w[(r > 14.0) & (r < 18.0)]) / total_w)
+        if total_w > 0 else np.nan
+    )
+    pct_lt12 = (
+        100.0 * float(np.sum(w[r < 12.0]) / total_w)
+        if total_w > 0 else np.nan
+    )
+
+    code_by_name = {v: k for k, v in basin_names.items()}
+
+    out = {
+        'source': name,
+        'np_mean_cell': np_mean_cell,
+        'np_ratio_means': np_ratio_means,
+        'np_mean_cell_unweighted': np_mean_cell_unw,
+        'np_ratio_means_unweighted': np_ratio_means_unw,
+        'slope': float(slope),
+        'intercept': float(intercept),
+        'r2': float(r2),
+        'pct_14_18': pct_14_18,
+        'pct_lt12_global': pct_lt12,
+    }
+
+    for bname in ['Pacific', 'Atlantic', 'Indian']:
+        code = code_by_name.get(bname)
+        key_np = 'np_' + bname.lower()
+        key_pct = 'pct_lt12_' + bname.lower()
+        if code is None:
+            out[key_np] = np.nan
+            out[key_pct] = np.nan
+            continue
+        m = valid & (basin_codes == code)
+        if not np.any(m):
+            out[key_np] = np.nan
+            out[key_pct] = np.nan
+            continue
+        wb = vol[m]
+        rb = ratio[m]
+        tw = float(np.sum(wb))
+        out[key_np] = float(np.sum(wb * rb) / tw) if tw > 0 else np.nan
+        out[key_pct] = 100.0 * float(np.sum(wb[rb < 12.0]) / tw) if tw > 0 else np.nan
+
+    if np.isfinite(np_mean_cell):
+        if np_mean_cell < 15.95:
+            out['redfield_position'] = 'below'
+        elif np_mean_cell > 16.05:
+            out['redfield_position'] = 'above'
+        else:
+            out['redfield_position'] = 'at'
+    else:
+        out['redfield_position'] = np.nan
+
+    return out
+
+# -----------------------------------------------------------------------------
+# Read WOA23 nitrate and phosphate
+# -----------------------------------------------------------------------------
+dsn, n_woa = load_woa_field('nitrate', 'n')
+dsp, p_woa = load_woa_field('phosphate', 'p')
+n_woa, p_woa = xr.align(n_woa, p_woa, join='inner')
+
+no3_woa, po4_woa, vol_woa, lat2d_woa, lon2d_woa, lat_woa, lon_woa = woa_layer_fields(n_woa, p_woa)
+
+depth_name_woa = find_dim(n_woa, ['depth', 'lev', 'z'])
+nlev_woa = int(n_woa.sizes[depth_name_woa])
+
+basin_raw = load_basin_mask(WOA_MASK, nlev_woa, lat_woa, lon_woa)
+basin_names, basin_info = identify_basins(basin_raw, lat2d_woa, lon2d_woa)
+basin_h = fill_basin_nearest(basin_raw)
+basin_code_by_name = {v: k for k, v in basin_names.items()}
+
+# -----------------------------------------------------------------------------
+# Build fields, scatter data and metrics
+# -----------------------------------------------------------------------------
+fields = {}
+scatter_data = {}
+metric_rows = []
+
+# WOA23
+m_woa = valid_mask(no3_woa, po4_woa, vol_woa)
+ratio_woa = np.full(no3_woa.shape, np.nan, dtype=float)
+ratio_woa[m_woa] = no3_woa[m_woa] / po4_woa[m_woa]
+
+fields['WOA23'] = {
+    'no3': no3_woa,
+    'po4': po4_woa,
+    'ratio': ratio_woa,
+    'vol': vol_woa,
+    'lat': lat2d_woa,
+    'lon': lon2d_woa,
+    'basin': basin_raw,
+}
+scatter_data['WOA23'] = (po4_woa[m_woa], no3_woa[m_woa])
+metric_rows.append(compute_source_metrics(
+    'WOA23', no3_woa, po4_woa, vol_woa, basin_raw, basin_names
+))
+
+# CMIP6 models
+for model in MODELS:
+    no3_m, po4_m, vol_m, lat_m, lon_m = model_layer_fields(model, MODEL_CFG[model])
+    basin_m = map_basin(lat_m, lon_m, basin_h, lat_woa, lon_woa)
+
+    mm = valid_mask(no3_m, po4_m, vol_m)
+    ratio_m = np.full(no3_m.shape, np.nan, dtype=float)
+    ratio_m[mm] = no3_m[mm] / po4_m[mm]
+
+    fields[model] = {
+        'no3': no3_m,
+        'po4': po4_m,
+        'ratio': ratio_m,
+        'vol': vol_m,
+        'lat': lat_m,
+        'lon': lon_m,
+        'basin': basin_m,
+    }
+    scatter_data[model] = (po4_m[mm], no3_m[mm])
+    metric_rows.append(compute_source_metrics(
+        model, no3_m, po4_m, vol_m, basin_m, basin_names
+    ))
+
+metrics_df = pd.DataFrame(metric_rows)
+
+# Add explicit model-vs-WOA differences.
+woa_row = metrics_df.loc[metrics_df['source'] == 'WOA23'].iloc[0]
+for col in ['np_mean_cell', 'np_ratio_means',
+            'pct_lt12_global', 'pct_lt12_pacific', 'pct_lt12_indian',
+            'np_pacific', 'np_atlantic', 'np_indian']:
+    if col in metrics_df.columns:
+        metrics_df['delta_' + col + '_vs_WOA'] = metrics_df[col] - woa_row[col]
+
+# Useful summary objects left for the answer.
+basin_metrics = metrics_df[[
+    'source', 'np_pacific', 'np_atlantic', 'np_indian',
+    'pct_lt12_global', 'pct_lt12_pacific', 'pct_lt12_indian'
+]].copy()
+
+model_low_np_assessment = metrics_df[[
+    'source',
+    'pct_lt12_global', 'delta_pct_lt12_global_vs_WOA',
+    'pct_lt12_pacific', 'delta_pct_lt12_pacific_vs_WOA',
+    'pct_lt12_indian', 'delta_pct_lt12_indian_vs_WOA',
+    'np_pacific', 'delta_np_pacific_vs_WOA',
+    'np_indian', 'delta_np_indian_vs_WOA'
+]].copy()
+</failed_code>
+
+<error_info>
+Error Type: ValueError
+Error Message: No numeric rows found in /data1/lorraine-20419/ocean_data/WOA23/masks/basinmask_01.msk
+
+
+Traceback:
+Traceback (most recent call last):
+  File "/home/lorraine/projects/2025-jingwei_QA_GMD/src/models/agent_with_tools.py", line 717, in _safe_execute_tool
+    exec(code, sandbox_globals)
+  File "<string>", line 589, in <module>
+  File "<string>", line 210, in load_basin_mask
+ValueError: No numeric rows found in /data1/lorraine-20419/ocean_data/WOA23/masks/basinmask_01.msk
+
+</error_info>
+
+Original task: Assess the nitrate-to-phosphate stoichiometry of intermediate water, 200 to 1000 m, in three CMIP6 models against the WOA23 observed climatology, and test whether the models reproduce the low-N:P signal left by denitrification.
+
+Data to use:
+- CMIP6 historical `no3` and `po4` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12, with each model's own volcello.
+- WOA23 nitrate and phosphate, the annual objectively analysed climatology.
+- The WOA23 basin mask (basinmask_01).
+
+Expected numerical results, for the 200-1000 m layer of each of the four sources (the three models' 1971-2000 climatologies and WOA23):
+- The mean N:P, to 2 decimal places, reported two ways and clearly labelled: the mean of the cell-by-cell N:P ratio (the headline value), and the ratio of the mean nitrate to the mean phosphate.
+- The ordinary least-squares regression NO3 = a * PO4 + b over all valid cells, each cell weighted equally, with model concentrations expressed in micromoles per kilogram at a constant density of 1025 kg/m3: the slope a to 2 decimal places, the intercept b in micromoles per kilogram to 2 decimal places, and the R-squared to 3 decimal places.
+- The percentage of water volume with N:P strictly between 14 and 18, to 1 decimal place.
+- For each of the four sources, the headline mean N:P in the Pacific, Atlantic and Indian Oceans (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded), to 2 decimal places.
+- The percentage of water volume with N:P below 12, globally and within the Pacific and the Indian Ocean, to 1 decimal place.
+- Whether each source's stoichiometry sits at, above or below Redfield, and whether each model reproduces the observed low-N:P volume and its basin distribution.
+
+Expected visualizations:
+- Figure 1, a 4-panel scatter of nitrate (y) against phosphate (x) in micromoles per kilogram over 200-1000 m, one panel per source in the order WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, with identical axis ranges and ticks, each panel showing its own fitted regression line and the Redfield 16:1 line through the origin, distinguishable from one another, and annotated with a, b and R-squared.
+- Figure 2, a 2-by-2 panel of global maps of the 200-1000 m mean N:P minus 16 for the four sources, drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only), on one shared diverging colour scale centred on zero.
+
+Datasets available on this machine:
+{
+  "woa23": {
+    "kind": "climatology",
+    "root": "/data1/lorraine-20419/ocean_data/WOA23/climatology",
+    "masks_root": "/data1/lorraine-20419/ocean_data/WOA23/masks",
+    "description": "World Ocean Atlas 2023 (NOAA/NCEI) 1.00 degree objectively analysed climatology. Temperature and salinity come on two climate normals, 1971-2000 and 1991-2020; oxygen, apparent oxygen utilization and percent oxygen saturation each provide both a 1971-2000 normal (the default) and a 1965-2022 all-period (all) composite; nutrients provide only the 1965-2022 all-period composite.",
+    "grid": {
+      "type": "regular",
+      "resolution": 1.0,
+      "lat": [
+        -89.5,
+        89.5
+      ],
+      "lon": [
+        -179.5,
+        179.5
+      ],
+      "lon_convention": "-180_180"
+    },
+    "filename_template": "woa23_{tag}_{prefix}{nn:02d}_01.nc",
+    "time": {
+      "decode": false,
+      "slices": {
+        "annual": [
+          0
+        ],
+        "monthly": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "seasonal": [
+          13,
+          14,
+          15,
+          16
+        ]
+      },
+      "season_names": {
+        "13": "winter",
+        "14": "spring",
+        "15": "summer",
+        "16": "autumn"
+      }
+    },
+    "fields": {
+      "an": "objectively analysed mean field",
+      "mn": "statistical mean of interpolated observations",
+      "dd": "number of observations per grid cell per standard level",
+      "sd": "standard deviation of the statistical mean",
+      "se": "standard error of the statistical mean",
+      "oa": "statistical mean minus objectively analysed mean",
+      "gp": "number of grid points with statistical mean within radius of influence",
+      "sea": "standard error of the objectively analysed mean",
+      "sdo": "standard deviation of the objectively analysed field (t/s only, all time slices; o annual mean only)",
+      "ma": "seasonal/monthly-only field (absent from the annual-mean files, nn=00)"
+    },
+    "default_field": "an",
+    "period_priority": [
+      "1971-2000",
+      "1991-2020",
+      "all"
+    ],
+    "aliases": {
+      "t": "temperature",
+      "temp": "temperature",
+      "thetao": "temperature",
+      "sst": "temperature",
+      "tos": "temperature",
+      "s": "salinity",
+      "so": "salinity",
+      "salt": "salinity",
+      "o": "oxygen",
+      "o2": "oxygen",
+      "n": "nitrate",
+      "no3": "nitrate",
+      "p": "phosphate",
+      "po4": "phosphate",
+      "i": "silicate",
+      "si": "silicate",
+      "sio2": "silicate",
+      "aou": "apparent_oxygen_utilization",
+      "o2sat": "percent_oxygen_saturation",
+      "osat": "percent_oxygen_saturation",
+      "po2sat": "percent_oxygen_saturation"
+    },
+    "variables": {
+      "temperature": {
+        "prefix": "t",
+        "units": "degrees_celsius",
+        "standard_name": "sea_water_temperature",
+        "periods": {
+          "1971-2000": {
+            "subdir": "temperature/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 102
+            }
+          },
+          "1991-2020": {
+            "subdir": "temperature/1991-2020_climate_normal",
+            "tag": "decav91C0",
+            "time_epoch": "1991-01-01",
+            "depth_levels": {
+              "monthly": 57
+            }
+          }
+        }
+      },
+      "salinity": {
+        "prefix": "s",
+        "units": "1",
+        "standard_name": "sea_water_practical_salinity",
+        "periods": {
+          "1971-2000": {
+            "subdir": "salinity/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 102
+            }
+          },
+          "1991-2020": {
+            "subdir": "salinity/1991-2020_climate_normal",
+            "tag": "decav91C0",
+            "time_epoch": "1991-01-01",
+            "depth_levels": {
+              "monthly": 57
+            }
+          }
+        }
+      },
+      "oxygen": {
+        "prefix": "o",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_oxygen_per_unit_mass_in_sea_water",
+        "periods": {
+          "1971-2000": {
+            "subdir": "oxygen/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          },
+          "all": {
+            "subdir": "oxygen/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          }
+        }
+      },
+      "nitrate": {
+        "prefix": "n",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_nitrate_per_unit_mass_in_sea_water",
+        "periods": {
+          "all": {
+            "subdir": "nitrate/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 43,
+              "seasonal": 43
+            }
+          }
+        }
+      },
+      "phosphate": {
+        "prefix": "p",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_phosphate_per_unit_mass_in_sea_water",
+        "periods": {
+          "all": {
+            "subdir": "phosphate/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 43,
+              "seasonal": 43
+            }
+          }
+        }
+      },
+      "silicate": {
+        "prefix": "i",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_silicate_per_unit_mass_in_sea_water",
+        "periods": {
+          "all": {
+            "subdir": "silicate/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 43,
+              "seasonal": 43
+            }
+          }
+        }
+      },
+      "apparent_oxygen_utilization": {
+        "prefix": "A",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "apparent_oxygen_utilization_in_sea_water",
+        "periods": {
+          "1971-2000": {
+            "subdir": "apparent_oxygen_utilization/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          },
+          "all": {
+            "subdir": "apparent_oxygen_utilization/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          }
+        }
+      },
+      "percent_oxygen_saturation": {
+        "prefix": "O",
+        "units": "percent",
+        "standard_name": "fractional_saturation_of_oxygen_in_sea_water",
+        "periods": {
+          "1971-2000": {
+            "subdir": "percent_oxygen_saturation/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          },
+          "all": {
+            "subdir": "percent_oxygen_saturation/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          }
+        }
+      }
+    },
+    "depth_reference_file": "nitrate/all_time_periods/woa23_all_n00_01.nc",
+    "masks": {
+      "basin": {
+        "file": "basinmask_01.msk",
+        "note": "Sparse table (41090 rows < 180x360), ocean grid points only. Gives a basin number for each of the 102 standard levels; levels below the sea floor are empty fields. Longitude convention -180~180. Labelling follows WOA13."
+      },
+      "landsea": {
+        "file": "landsea_01.msk",
+        "note": "Full grid table (64800 points + 2 header/comment rows). Bottom_Standard_Level is not 0/1: 1 = land; for every other point (value - 1) is exactly the index of the deepest standard level with data there, verified cell by cell against the WOA23 nitrate field (all 37712 points with mask <= 102 match exactly). Values above 103 mean the sea floor is deeper than the 5500 m bottom of the climatology, and index WOA's longer list of standard levels (down to 138 at the deepest trenches), which has no counterpart on the 102-level axis. The ocean points selected by mask > 1 (41088 of them) are exactly the points where WOA23 has data. Row order is not raster-scan order, so the index must be rebuilt from the Latitude/Longitude columns."
+      }
+    },
+    "notes": [
+      "The directory layout is climatology/<variable>/<period>/; the \"temperature_1971-2000\" spelling in DATA_METADATA.md section 7.2 is wrong.",
+      "The time epoch varies with the period (1971 / 1991 / 1965); DATA_METADATA.md section 7.5 is wrong to claim a uniform 1971.",
+      "Temperature, salinity, oxygen, apparent oxygen utilization and percent oxygen saturation all publish a 1971-2000 normal. The NUTRIENTS (nitrate, phosphate, silicate) do not. They exist only as the 1965-2022 all-period composite, so any model comparison against them carries a period mismatch that cannot be removed, and it must be stated.",
+      "Only temperature and salinity also publish the 1991-2020 normal."
+    ]
+  },
+  "glodap": {
+    "kind": "climatology",
+    "root": "/data1/lorraine-20419/ocean_data/GLODAPv2.2016b_MappedClimatologies",
+    "description": "GLODAPv2 global ocean carbon chemistry mapped climatology (DIVA objective analysis), built from 1972-2013 input data. No time dimension, 33 standard depth levels.",
+    "grid": {
+      "type": "regular",
+      "resolution": 1.0,
+      "lat": [
+        -89.5,
+        89.5
+      ],
+      "lon": [
+        20.5,
+        379.5
+      ],
+      "lon_convention": "20_380"
+    },
+    "filename_template": "GLODAPv2.2016b.{varfile}.nc",
+    "climatology_years": "1972-2013",
+    "depth": {
+      "source_variable": "Depth",
+      "dim": "depth_surface",
+      "levels": [
+        0,
+        10,
+        20,
+        30,
+        50,
+        75,
+        100,
+        125,
+        150,
+        200,
+        250,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900,
+        1000,
+        1100,
+        1200,
+        1300,
+        1400,
+        1500,
+        1750,
+        2000,
+        2500,
+        3000,
+        3500,
+        4000,
+        4500,
+        5000,
+        5500
+      ]
+    },
+    "fields": {
+      "main": "{var}",
+      "error": "{var}_error",
+      "relerr": "{var}_relerr",
+      "input_mean": "Input_mean",
+      "input_std": "Input_std",
+      "input_n": "Input_N"
+    },
+    "default_field": "main",
+    "aliases": {
+      "no3": "NO3",
+      "nitrate": "NO3",
+      "po4": "PO4",
+      "phosphate": "PO4",
+      "si": "silicate",
+      "sio2": "silicate",
+      "o2": "oxygen",
+      "dic": "TCO2",
+      "tco2": "TCO2",
+      "talk": "TAlk",
+      "alkalinity": "TAlk",
+      "cant": "Cant",
+      "temp": "temperature",
+      "thetao": "temperature",
+      "so": "salinity",
+      "ph": "pHtsinsitutp"
+    },
+    "variables": {
+      "temperature": {
+        "varfile": "temperature",
+        "units": "degrees celcius"
+      },
+      "salinity": {
+        "varfile": "salinity",
+        "units": ""
+      },
+      "oxygen": {
+        "varfile": "oxygen",
+        "units": "micro-mol kg-1"
+      },
+      "NO3": {
+        "varfile": "NO3",
+        "units": "micro-mol kg-1"
+      },
+      "PO4": {
+        "varfile": "PO4",
+        "units": "micro-mol kg-1"
+      },
+      "silicate": {
+        "varfile": "silicate",
+        "units": "micro-mol kg-1"
+      },
+      "TCO2": {
+        "varfile": "TCO2",
+        "units": "micro-mol kg-1"
+      },
+      "PI_TCO2": {
+        "varfile": "PI_TCO2",
+        "units": "micro-mol kg-1"
+      },
+      "Cant": {
+        "varfile": "Cant",
+        "units": "micro-mol kg-1"
+      },
+      "TAlk": {
+        "varfile": "TAlk",
+        "units": "micro-mol kg-1"
+      },
+      "pHtsinsitutp": {
+        "varfile": "pHtsinsitutp",
+        "units": ""
+      },
+      "pHts25p0": {
+        "varfile": "pHts25p0",
+        "units": ""
+      },
+      "OmegaA": {
+        "varfile": "OmegaA",
+        "units": ""
+      },
+      "OmegaC": {
+        "varfile": "OmegaC",
+        "units": ""
+      }
+    },
+    "notes": [
+      "The units attribute of Input_mean / Input_std is hard-coded to \"micro-mol kg-1\" in every file. That is an error in the product metadata; take the units from the main variable.",
+      "temperature's units string is spelt \"degrees celcius\" (a typo in the source), which cf_units/pint cannot parse.",
+      "The units attribute of salinity / pH / Omega is an empty string.",
+      "The global Comment attribute is mojibake and unusable."
+    ]
+  },
+  "seanoe_mld": {
+    "kind": "climatology",
+    "root": "/data1/lorraine-20419/ocean_data/SEANOE",
+    "description": "Global ocean mixed layer depth (MLD) monthly climatology from the LOPS laboratory. The criterion is a potential density increase of 0.03 kg/m3 relative to the reference depth. Based on a month-by-month objective analysis of 1970-2021 Argo and WOD profiles.",
+    "grid": {
+      "type": "regular",
+      "resolution": 1.0,
+      "lat": [
+        -89.5,
+        89.5
+      ],
+      "lon": [
+        -179.5,
+        179.5
+      ],
+      "lon_convention": "-180_180"
+    },
+    "climatology_years": "1970-2021",
+    "time": {
+      "decode": false,
+      "dim": "time",
+      "values": [
+        14,
+        45,
+        73,
+        104,
+        134,
+        165,
+        195,
+        226,
+        257,
+        287,
+        318,
+        348
+      ],
+      "interpretation": "day of year at the centre of each month, mapped directly to month = 1..12"
+    },
+    "depth": null,
+    "default_version": "v2024",
+    "versions": {
+      "v2024": {
+        "file": "mld_dr003_ref5m_v2024.nc",
+        "reference_depth_m": 5,
+        "doi": "10.17882/98226",
+        "valid_range": [
+          5.0,
+          1236.94
+        ]
+      },
+      "v2023": {
+        "file": "mld_dr003_ref10m_v2023.nc",
+        "reference_depth_m": 10,
+        "doi": "10.17882/91774",
+        "valid_range": [
+          10.01,
+          1221.18
+        ]
+      }
+    },
+    "variables": {
+      "mld_dr003": {
+        "units": "m",
+        "long_name": "mixed layer depth"
+      },
+      "n_obs": {
+        "units": "count",
+        "long_name": "number of profiles per cell per month"
+      },
+      "mask": {
+        "units": "1",
+        "long_name": "land/sea mask, 0=land 1=ocean",
+        "dims": [
+          "lat",
+          "lon"
+        ]
+      }
+    },
+    "default_variable": "mld_dr003",
+    "notes": [
+      "Every coordinate and variable spells its units attribute `unit`, not CF's `units`, so CF tools do not pick it up; the opener rewrites it to units.",
+      "v2023 references 10 m and v2024 references 5 m, so their MLD lower bounds differ; the two versions cannot be swapped or differenced directly.",
+      "The Timestamp attribute of the v2024 file says 2023, a slip in the product metadata."
+    ]
+  },
+  "ersst": {
+    "kind": "timeseries",
+    "root": "/data1/lorraine-20419/ocean_data/ERSSTv5",
+    "file": "sst.mnmean.nc",
+    "description": "NOAA Extended Reconstructed SST v5 (in situ observations only), monthly mean, 1854 to present. Surface only, no vertical dimension.",
+    "grid": {
+      "type": "regular",
+      "resolution": 2.0,
+      "lat": [
+        -88.0,
+        88.0
+      ],
+      "lon": [
+        0.0,
+        358.0
+      ],
+      "lon_convention": "0_360",
+      "lat_order": "descending"
+    },
+    "time": {
+      "decode": true,
+      "frequency": "monthly",
+      "range": [
+        "1854-01-01",
+        "2026-08-01"
+      ],
+      "stamp": "month_start"
+    },
+    "depth": null,
+    "variables": {
+      "sst": {
+        "units": "degC",
+        "long_name": "Monthly Means of Sea Surface Temperature",
+        "valid_range": [
+          -1.8,
+          45.0
+        ]
+      }
+    },
+    "default_variable": "sst",
+    "notes": [
+      "The global climatology attribute states that the product's internal climatology is based on 1971-2000, but the file stores absolute temperature, not anomalies.",
+      "This is a near-real-time copy (data_modified 2026-09-03); the trailing months may be revised."
+    ]
+  },
+  "cpc_indices": {
+    "kind": "index",
+    "root": "/data1/lorraine-20419/ocean_data/CPC",
+    "description": "NOAA monthly climate indices. The four Nino products are CPC ENSO monitoring indices, giving regional mean SST and its anomaly in degC. The PDO product is a NOAA NCEI pattern index and is dimensionless; it is kept here so the monthly indices live together, despite the dataset id naming CPC.",
+    "default_product": "ersst5_91-20",
+    "products": {
+      "oni": {
+        "file": "oni.ascii.txt",
+        "columns": [
+          "SEAS",
+          "YR",
+          "TOTAL",
+          "ANOM"
+        ],
+        "layout": "seasonal",
+        "range": [
+          "DJF 1950",
+          "JJA 2026"
+        ],
+        "note": "ONI is a 3-month running mean of Nino3.4 SST; the official baseline is a 30-year centred normal rolled forward every 5 years."
+      },
+      "ersst5_91-20": {
+        "file": "ersst5.nino.mth.91-20.ascii",
+        "columns": [
+          "YR",
+          "MON",
+          "NINO1+2",
+          "ANOM",
+          "NINO3",
+          "ANOM",
+          "NINO4",
+          "ANOM",
+          "NINO3.4",
+          "ANOM"
+        ],
+        "layout": "monthly",
+        "baseline": "1991-2020",
+        "range": [
+          "1950-01",
+          "2026-06"
+        ],
+        "note": "the operational baseline CPC has used for all its indices since 2021-01; use this one for routine analysis."
+      },
+      "ersst5_81-10": {
+        "file": "ersst5.nino.mth.81-10.ascii",
+        "columns": [
+          "YR",
+          "MON",
+          "NINO1+2",
+          "ANOM",
+          "NINO3",
+          "ANOM",
+          "NINO4",
+          "ANOM",
+          "NINO3.4",
+          "ANOM"
+        ],
+        "layout": "monthly",
+        "baseline": "1981-2010",
+        "range": [
+          "1950-01",
+          "2020-12"
+        ],
+        "note": "archive of the old baseline, discontinued in 2020-12."
+      },
+      "oisst": {
+        "file": "sstoi.indices",
+        "columns": [
+          "YR",
+          "MON",
+          "NINO1+2",
+          "ANOM",
+          "NINO3",
+          "ANOM",
+          "NINO4",
+          "ANOM",
+          "NINO3.4",
+          "ANOM"
+        ],
+        "layout": "monthly",
+        "source": "OI SST",
+        "range": [
+          "1982-01",
+          "2026-08"
+        ]
+      },
+      "pdo": {
+        "file": "ersst.v6.pdo.dat",
+        "columns": [
+          "Year",
+          "Jan",
+          "Feb",
+          "Mar",
+          "Apr",
+          "May",
+          "Jun",
+          "Jul",
+          "Aug",
+          "Sep",
+          "Oct",
+          "Nov",
+          "Dec"
+        ],
+        "layout": "year_rows",
+        "source": "NOAA NCEI",
+        "sst_product": "ERSST v6",
+        "domain": "North Pacific",
+        "units": "1",
+        "missing_value": 99.99,
+        "range": [
+          "1850-01",
+          "2026-08"
+        ],
+        "note": "The leading principal component of North Pacific SST anomalies, published by NCEI rather than CPC and built from ERSST v6. The gridded `ersst` dataset in this registry is v5, so an index reconstructed from it and this published series rest on different SST products; their difference is not purely an operator difference and must be reported as such."
+      }
+    },
+    "regions": {
+      "NINO1+2": {
+        "lat": [
+          -10,
+          0
+        ],
+        "lon": [
+          -90,
+          -80
+        ]
+      },
+      "NINO3": {
+        "lat": [
+          -5,
+          5
+        ],
+        "lon": [
+          -150,
+          -90
+        ]
+      },
+      "NINO3.4": {
+        "lat": [
+          -5,
+          5
+        ],
+        "lon": [
+          -170,
+          -120
+        ]
+      },
+      "NINO4": {
+        "lat": [
+          -5,
+          5
+        ],
+        "lon": [
+          160,
+          -150
+        ]
+      }
+    },
+    "notes": [
+      "The three Nino files overlap in time but differ in baseline and in how they are produced, so their values must not be mixed.",
+      "The pdo product is a different kind of quantity from the Nino ones. It is a dimensionless pattern index over a whole basin, with no absolute value and no region to select, and comes from a different SST product version, so it is not interchangeable with them.",
+      "The raw header has four columns all named ANOM; the opener renames them to <region>_ANOM."
+    ]
+  },
+  "cmip6_historical": {
+    "kind": "timeseries",
+    "root": "/data1/lorraine-20419/benchmark_cmip6/historical",
+    "experiment": "historical",
+    "description": "CMIP6 historical (all-forcing historical simulation) ocean component, Omon monthly frequency plus Ofx fixed fields. Three models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR.",
+    "layout": "{root}/{model}/{variable}/",
+    "filename_template": "{variable}_{table}_{model}_{experiment}_{variant}_{grid}[_{YYYYMM-YYYYMM}].nc",
+    "time": {
+      "decode": true,
+      "use_cftime": true,
+      "frequency": "monthly",
+      "range": [
+        "1850-01",
+        "2014-12"
+      ],
+      "n_steps": 1980,
+      "normalize_to": "month_start"
+    },
+    "models": {
+      "CESM2": {
+        "institution": "NCAR",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "nlat",
+        "x_dim": "nlon",
+        "shape": [
+          384,
+          320
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "centimeters",
+        "depth_scale": 0.01,
+        "n_levels": 60,
+        "calendar": "noleap",
+        "ocean_mask_from": "sftof",
+        "notes": [
+          "lev is in centimetres and must be multiplied by depth_scale to get metres (500 cm -> 5 m, 537500 cm -> 5375 m).",
+          "But lev_bnds in the same file declares its units as m rather than centimetres, so the layer bounds are already in metres. Applying lev's conversion factor to lev_bnds as well would make layer thicknesses 100 times too small and corrupt vertical integrals outright. load_depth_levels converts each according to its own declared units.",
+          "The raw areacello carries no land-sea mask and covers the whole globe (0.990 of the Earth's surface), whereas GFDL-ESM4 and MPI-ESM1-2-LR publish theirs already masked to the ocean (0.708 / 0.718). After the opener applies the ocean_mask_from above it comes to 0.7068, the same order as the other two models.",
+          "chl has only 15 levels (the top 150 m), unlike the other three-dimensional variables."
+        ]
+      },
+      "GFDL-ESM4": {
+        "institution": "NOAA-GFDL",
+        "grid_type": "regular",
+        "grid_label": "gr",
+        "y_dim": "lat",
+        "x_dim": "lon",
+        "shape": [
+          180,
+          360
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 35,
+        "calendar": "noleap",
+        "notes": [
+          "The only model that can be sliced directly by lat/lon.",
+          "volcello is Omon (time-varying, split across files), not an Ofx fixed field."
+        ]
+      },
+      "MPI-ESM1-2-LR": {
+        "institution": "MPI-M",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "j",
+        "x_dim": "i",
+        "shape": [
+          220,
+          256
+        ],
+        "lat_coord": "latitude",
+        "lon_coord": "longitude",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 40,
+        "calendar": "proleptic_gregorian",
+        "notes": [
+          "wo / wmo use 41 interface levels (0 ~ 6020 m); the coordinate is still named lev (DATA_METADATA.md is wrong to call it lev_2)."
+        ]
+      }
+    },
+    "fixed_field_table": "Ofx",
+    "fixed_fields": [
+      "areacello",
+      "deptho",
+      "sftof",
+      "volcello"
+    ],
+    "notes": [
+      "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1.",
+      "In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory.",
+      "CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof.",
+      "so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+    ]
+  },
+  "cmip6_ssp245": {
+    "kind": "timeseries",
+    "root": "/data1/lorraine-20419/benchmark_cmip6/ssp245",
+    "experiment": "ssp245",
+    "description": "CMIP6 ScenarioMIP ssp245 (SSP2-4.5, concentration-driven). Grid and coordinate definitions are the same as historical; they differ in time range, variant label and variable coverage.",
+    "layout": "{root}/{model}/{variable}/",
+    "filename_template": "{variable}_{table}_{model}_{experiment}_{variant}_{grid}[_{YYYYMM-YYYYMM}].nc",
+    "time": {
+      "decode": true,
+      "use_cftime": true,
+      "frequency": "monthly",
+      "range": [
+        "2015-01",
+        "2100-12"
+      ],
+      "n_steps": 1032,
+      "normalize_to": "month_start"
+    },
+    "models": {
+      "CESM2": {
+        "institution": "NCAR",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "nlat",
+        "x_dim": "nlon",
+        "shape": [
+          384,
+          320
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "centimeters",
+        "depth_scale": 0.01,
+        "n_levels": 60,
+        "calendar": "noleap",
+        "ocean_mask_from": "sftof",
+        "notes": [
+          "lev is in centimetres and must be multiplied by depth_scale to get metres (500 cm -> 5 m, 537500 cm -> 5375 m).",
+          "But lev_bnds in the same file declares its units as m rather than centimetres, so the layer bounds are already in metres. Applying lev's conversion factor to lev_bnds as well would make layer thicknesses 100 times too small and corrupt vertical integrals outright. load_depth_levels converts each according to its own declared units.",
+          "The raw areacello carries no land-sea mask and covers the whole globe (0.990 of the Earth's surface), whereas GFDL-ESM4 and MPI-ESM1-2-LR publish theirs already masked to the ocean (0.708 / 0.718). After the opener applies the ocean_mask_from above it comes to 0.7068, the same order as the other two models.",
+          "chl has only 15 levels (the top 150 m), unlike the other three-dimensional variables."
+        ]
+      },
+      "GFDL-ESM4": {
+        "institution": "NOAA-GFDL",
+        "grid_type": "regular",
+        "grid_label": "gr",
+        "y_dim": "lat",
+        "x_dim": "lon",
+        "shape": [
+          180,
+          360
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 35,
+        "calendar": "noleap",
+        "notes": [
+          "The only model that can be sliced directly by lat/lon.",
+          "volcello is Omon (time-varying, split across files), not an Ofx fixed field."
+        ]
+      },
+      "MPI-ESM1-2-LR": {
+        "institution": "MPI-M",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "j",
+        "x_dim": "i",
+        "shape": [
+          220,
+          256
+        ],
+        "lat_coord": "latitude",
+        "lon_coord": "longitude",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 40,
+        "calendar": "proleptic_gregorian",
+        "notes": [
+          "wo / wmo use 41 interface levels (0 ~ 6020 m); the coordinate is still named lev (DATA_METADATA.md is wrong to call it lev_2)."
+        ]
+      }
+    },
+    "fixed_field_table": "Ofx",
+    "fixed_fields": [
+      "areacello",
+      "deptho",
+      "sftof",
+      "volcello"
+    ],
+    "fixed_field_fallback": "cmip6_historical",
+    "notes": [
+      "tos and mlotst are missing from ssp245 for all three models (historical has them); for scenario-period SST, the top level of thetao is a usable approximation.",
+      "The bulk of CESM2's ssp245 is r10i1p1f1, but the deptho and sftof fixed fields are r1i1p1f1.",
+      "ssp245/CESM2 has o2 and o2sat (historical/CESM2 does not); ph in ssp245/MPI-ESM1-2-LR is r1i1p1f1 (historical is r10).",
+      "CESM2's ssp245 calendar attribute is written 365_day and historical's noleap; the two are equivalent but the strings differ."
+    ]
+  }
+}
+
+Fix this compute block and output the corrected, complete version inside <execute></execute> tags.
+
+
+===== RESPONSE =====
+<execute>
+import os, glob, re, warnings
+warnings.filterwarnings('ignore')
+
+try:
+    import numpy as np
+except Exception:
+    pass
+try:
+    import xarray as xr
+except Exception:
+    pass
+try:
+    import pandas as pd
+except Exception:
+    pass
+
+# -----------------------------------------------------------------------------
+# Constants and configuration
+# -----------------------------------------------------------------------------
+RHO = 1025.0
+R_EARTH = 6371000.0
+CMIP_ROOT = '/data1/lorraine-20419/benchmark_cmip6/historical'
+WOA_ROOT = '/data1/lorraine-20419/ocean_data/WOA23/climatology'
+WOA_MASK = '/data1/lorraine-20419/ocean_data/WOA23/masks/basinmask_01.msk'
+
+SOURCES = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']
+MODELS = ['CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']
+
+MODEL_CFG = {
+    'CESM2': dict(lat='lat', lon='lon', depth='lev', depth_scale=0.01),
+    'GFDL-ESM4': dict(lat='lat', lon='lon', depth='lev', depth_scale=1.0),
+    'MPI-ESM1-2-LR': dict(lat='latitude', lon='longitude', depth='lev', depth_scale=1.0),
+}
+
+def parse_variant(fn):
+    m = re.search(r'(r\d+i\d+p\d+f\d+)', os.path.basename(fn))
+    return m.group(1) if m else None
+
+def files_in_dir(d):
+    return sorted(glob.glob(os.path.join(d, '*.nc')))
+
+def choose_variant_files(d, desired=None):
+    fs = files_in_dir(d)
+    if not fs:
+        raise FileNotFoundError(d)
+    vs = {parse_variant(f) for f in fs}
+    vs.discard(None)
+    if desired is not None and desired in vs:
+        return [f for f in fs if parse_variant(f) == desired]
+    if 'r1i1p1f1' in vs:
+        return [f for f in fs if parse_variant(f) == 'r1i1p1f1']
+    if vs:
+        counts = {v: sum(parse_variant(f) == v for f in fs) for v in vs}
+        v = max(counts, key=counts.get)
+        return [f for f in fs if parse_variant(f) == v]
+    return fs
+
+def open_nc_maybe_mf(files):
+    if len(files) == 1:
+        try:
+            return xr.open_dataset(files[0], use_cftime=True, chunks={'time': 12})
+        except Exception:
+            return xr.open_dataset(files[0], use_cftime=True)
+    try:
+        return xr.open_mfdataset(files, combine='by_coords', use_cftime=True,
+                                  chunks={'time': 12})
+    except Exception:
+        return xr.open_mfdataset(files, combine='by_coords', use_cftime=True)
+
+def mean_period(da, y0=1971, y1=2000):
+    """Robust 1971-2000 mean that works with cftime indexes."""
+    if 'time' not in da.dims:
+        return da
+    yr = None
+    try:
+        tidx = da.indexes.get('time', None)
+        if tidx is not None and hasattr(tidx, 'year'):
+            yr = np.asarray(tidx.year)
+    except Exception:
+        yr = None
+    if yr is None:
+        try:
+            yr = np.asarray(da.time.dt.year.values)
+        except Exception:
+            yr = None
+    if yr is not None:
+        sel = (yr >= y0) & (yr <= y1)
+        if np.any(sel):
+            return da.isel(time=np.where(sel)[0]).mean('time')
+    return da.mean('time')
+
+def find_dim(da, names):
+    for n in names:
+        if n in da.dims:
+            return n
+    for d in da.dims:
+        ld = d.lower()
+        for n in names:
+            if n in ld:
+                return d
+    return None
+
+def get_latlon_2d(ds, cfg, fallback=None):
+    try:
+        lat = ds[cfg['lat']]
+        lon = ds[cfg['lon']]
+    except Exception:
+        ds = fallback
+        lat = ds[cfg['lat']]
+        lon = ds[cfg['lon']]
+    if lat.ndim == 1 and lon.ndim == 1:
+        lat2d, lon2d = xr.broadcast(lat, lon)
+    else:
+        lat2d, lon2d = lat, lon
+    return np.asarray(lat2d.values, dtype=float), np.asarray(lon2d.values, dtype=float)
+
+def unit_umol_per_kg(units, rho=RHO):
+    """Return multiplication factor to convert a concentration to umol kg-1."""
+    if units is None:
+        return None
+    u = str(units).strip().lower()
+    u = (u.replace('μ', 'u').replace('µ', 'u')
+           .replace('−', '-').replace('⁻', '-')
+           .replace('³', '3').replace('²', '2'))
+    u = u.replace(' ', '').replace('**', '^')
+    per_vol = ('m-3' in u) or ('m^-3' in u) or ('/m3' in u) or ('m3-1' in u)
+    per_kg = ('kg-1' in u) or ('kg^-1' in u) or ('/kg' in u)
+    if u.startswith('nmol'):
+        amt = 1.0e-3
+    elif u.startswith('umol') or u.startswith('umole'):
+        amt = 1.0
+    elif u.startswith('mmol'):
+        amt = 1.0e3
+    elif u.startswith('mol'):
+        amt = 1.0e6
+    else:
+        return None
+    if per_vol:
+        return amt / rho
+    if per_kg:
+        return amt
+    return None
+
+# -----------------------------------------------------------------------------
+# WOA readers
+# -----------------------------------------------------------------------------
+def load_woa_field(varkey, prefix):
+    if varkey == 'nitrate':
+        path = os.path.join(WOA_ROOT, 'nitrate', 'all_time_periods', 'woa23_all_n00_01.nc')
+    elif varkey == 'phosphate':
+        path = os.path.join(WOA_ROOT, 'phosphate', 'all_time_periods', 'woa23_all_p00_01.nc')
+    else:
+        raise ValueError(varkey)
+    ds = xr.open_dataset(path, decode_times=False)
+
+    cands = []
+    for v in ds.data_vars:
+        vl = v.lower()
+        if ('_an' in vl or vl.endswith('an') or vl == 'an') and vl.startswith(prefix.lower()):
+            cands.append(v)
+    if not cands:
+        cands = [v for v in ds.data_vars if '_an' in v.lower() or v.lower().endswith('an')]
+    if not cands:
+        cands = [v for v in ds.data_vars if ds[v].ndim >= 3]
+    var = cands[0]
+    da = ds[var]
+    if 'time' in da.dims:
+        da = da.isel(time=0)
+    da = da.squeeze(drop=True)
+    return ds, da
+
+def woa_layer_fields(n, p):
+    depth_name = find_dim(n, ['depth', 'lev', 'z'])
+    lat_name = find_dim(n, ['lat', 'latitude'])
+    lon_name = find_dim(n, ['lon', 'longitude'])
+    if depth_name is None or lat_name is None or lon_name is None:
+        raise ValueError('Could not identify WOA dimensions')
+
+    n = n.transpose(depth_name, lat_name, lon_name)
+    p = p.transpose(depth_name, lat_name, lon_name)
+
+    depth = np.asarray(n[depth_name].values, dtype=float)
+    lat = np.asarray(n[lat_name].values, dtype=float)
+    lon = np.asarray(n[lon_name].values, dtype=float)
+
+    if depth[0] > depth[-1]:
+        n = n.isel({depth_name: slice(None, None, -1)})
+        p = p.isel({depth_name: slice(None, None, -1)})
+        depth = depth[::-1]
+
+    if len(depth) > 1:
+        edges = np.empty(len(depth) + 1)
+        edges[1:-1] = 0.5 * (depth[:-1] + depth[1:])
+        edges[0] = max(0.0, depth[0] - 0.5 * (depth[1] - depth[0]))
+        edges[-1] = depth[-1] + 0.5 * (depth[-1] - depth[-2])
+    else:
+        edges = np.array([0.0, depth[0] + 1.0])
+
+    thick_layer = np.clip(
+        np.minimum(edges[1:], 1000.0) - np.maximum(edges[:-1], 200.0),
+        0.0, None
+    )
+
+    dlat = np.deg2rad(np.median(np.abs(np.diff(lat)))) if len(lat) > 1 else np.deg2rad(1.0)
+    dlon = np.deg2rad(np.median(np.abs(np.diff(lon)))) if len(lon) > 1 else np.deg2rad(1.0)
+    area = R_EARTH**2 * np.cos(np.deg2rad(lat)) * dlat * dlon
+    area2d = np.broadcast_to(area[:, None], (len(lat), len(lon)))
+
+    w = thick_layer[:, None, None] * area2d[None, :, :]
+    nv = np.asarray(n.values, dtype=float)
+    pv = np.asarray(p.values, dtype=float)
+
+    valid = np.isfinite(nv) & np.isfinite(pv) & (w > 0)
+    wj = np.where(valid, w, 0.0)
+    vol_layer = wj.sum(axis=0)
+
+    no3_layer = np.divide(
+        (np.where(valid, nv, 0.0) * wj).sum(axis=0),
+        vol_layer,
+        out=np.full_like(vol_layer, np.nan),
+        where=vol_layer > 0
+    )
+    po4_layer = np.divide(
+        (np.where(valid, pv, 0.0) * wj).sum(axis=0),
+        vol_layer,
+        out=np.full_like(vol_layer, np.nan),
+        where=vol_layer > 0
+    )
+
+    lat2d, lon2d = np.meshgrid(lat, lon, indexing='ij')
+    return no3_layer, po4_layer, vol_layer, lat2d, lon2d, lat, lon
+
+# -----------------------------------------------------------------------------
+# WOA basin mask
+# -----------------------------------------------------------------------------
+_NUM_RE = re.compile(r'[-+]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[EeDd][-+]?\d+)?')
+
+def _parse_numeric_line(s):
+    """Extract all numeric tokens from a line, tolerating labels/missing markers."""
+    tokens = [m.group(0) for m in _NUM_RE.finditer(s)]
+    vals = []
+    for t in tokens:
+        tt = t.replace('D', 'E').replace('d', 'e')
+        try:
+            v = float(tt)
+        except ValueError:
+            continue
+        vals.append((v, t))
+    # If a short row contains one very long integer token, it is almost
+    # certainly a run of concatenated single-digit basin codes.
+    if 0 < len(vals) <= 8:
+        expanded = []
+        for v, t in vals:
+            if re.fullmatch(r'\d{15,}', t):
+                expanded.extend(float(ch) for ch in t)
+            else:
+                expanded.append(v)
+        return expanded
+    return [v for v, _ in vals]
+
+def load_basin_mask(path, nlev, lat_centers, lon_centers):
+    rows = []
+    with open(path, 'r', errors='ignore') as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if s[0] in '#!%':
+                continue
+            vals = _parse_numeric_line(s)
+            if len(vals) >= 3:
+                rows.append(vals)
+
+    if not rows:
+        raise ValueError(f'No numeric rows found in {path}')
+
+    lats = np.asarray(lat_centers, dtype=float)
+    lons = np.asarray(lon_centers, dtype=float)
+    nlat, nlon = len(lats), len(lons)
+    basin_h = np.zeros((nlat, nlon), dtype=int)
+
+    def idx(v, arr):
+        if len(arr) <= 1:
+            return 0
+        step = arr[1] - arr[0]
+        if step == 0:
+            return 0
+        return int(np.clip(int(round((v - arr[0]) / step)), 0, len(arr) - 1))
+
+    # --- Identify the latitude/longitude columns robustly -------------------
+    minlen = min(len(r) for r in rows)
+    ncol = min(8, max(3, minlen))
+    use = [r for r in rows if len(r) >= ncol]
+    if not use:
+        use = rows
+        ncol = max(3, min(len(r) for r in rows))
+
+    stats = {}
+    for c in range(ncol):
+        col = np.array([r[c] for r in use], dtype=float)
+        fin = col[np.isfinite(col)]
+        if fin.size == 0:
+            stats[c] = None
+        else:
+            stats[c] = (float(fin.min()), float(fin.max()),
+                        int(len(np.unique(np.round(fin, 4)))))
+
+    lat_cands = [c for c in range(ncol)
+                 if stats.get(c) is not None
+                 and -90.0 <= stats[c][0] and stats[c][1] <= 90.0
+                 and stats[c][2] > 20
+                 and (stats[c][1] - stats[c][0]) > 20.0]
+    lon_cands = [c for c in range(ncol)
+                 if stats.get(c) is not None
+                 and -360.0 <= stats[c][0] and stats[c][1] <= 360.0
+                 and stats[c][2] > 20
+                 and (stats[c][1] - stats[c][0]) > 20.0]
+
+    latcol = lat_cands[0] if lat_cands else 0
+    lon_cands = [c for c in lon_cands if c != latcol]
+    if lon_cands:
+        loncol = max(lon_cands, key=lambda c: stats[c][1] - stats[c][0])
+    else:
+        loncol = 1 if latcol == 0 else 0
+
+    # --- Assign the surface/first valid basin code at each point ------------
+    start = max(latcol, loncol) + 1
+    for r in rows:
+        if len(r) <= max(latcol, loncol):
+            continue
+        la, lo = r[latcol], r[loncol]
+        if not (np.isfinite(la) and np.isfinite(lo)):
+            continue
+
+        code_seq = []
+        for v in r[start:]:
+            if not np.isfinite(v):
+                continue
+            if abs(v - round(v)) < 1e-6 and v >= 0.0:
+                iv = int(round(v))
+                if iv < 50:
+                    code_seq.append(iv)
+                else:
+                    # concatenated run of single-digit codes
+                    code_seq.extend(int(ch) for ch in str(iv))
+        code = next((c for c in code_seq if 0 < c < 50), 0)
+        if code > 0:
+            i = idx(la, lats)
+            j = idx(lo, lons)
+            basin_h[i, j] = code
+    return basin_h
+
+def fill_basin_nearest(b):
+    b = b.astype(int).copy()
+    for _ in range(60):
+        if not np.any(b == 0):
+            break
+        neigh = []
+        for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                       (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            neigh.append(np.roll(b, shift=(di, dj), axis=(0, 1)))
+        fill = np.zeros_like(b)
+        for s in neigh:
+            fill = np.where((fill == 0) & (s > 0), s, fill)
+        if not np.any(fill > 0):
+            break
+        b = np.where(b == 0, fill, b)
+    return b
+
+def identify_basins(basin_h, lat2d, lon2d):
+    """Classify mask codes into Arctic/Southern/Pacific/Atlantic/Indian.
+
+    The five largest codes are treated as the principal basins. Any remaining
+    (marginal-sea) codes are folded into the nearest non-polar principal basin.
+    """
+    codes = [int(c) for c in np.unique(basin_h) if int(c) > 0]
+    info = {}
+    area = {}
+    lat2d = np.asarray(lat2d, dtype=float)
+    lon2d = np.asarray(lon2d, dtype=float)
+
+    for c in codes:
+        m = basin_h == c
+        la = lat2d[m]
+        lo = lon2d[m]
+        if la.size == 0:
+            continue
+        w = np.cos(np.deg2rad(la))
+        if np.sum(w) == 0:
+            w = np.ones_like(la)
+        mlat = float(np.average(la, weights=w))
+        ang = np.deg2rad(lo)
+        mlon = float(np.rad2deg(np.arctan2(
+            np.average(np.sin(ang), weights=w),
+            np.average(np.cos(ang), weights=w)
+        )))
+        info[c] = (mlat, mlon)
+        area[c] = float(np.sum(w))
+
+    names = {}
+    usable = [c for c in codes if c in info]
+    if not usable:
+        return names, info
+
+    main = sorted(usable, key=lambda c: area.get(c, 0.0), reverse=True)[:5]
+    main_set = set(main)
+
+    for c in main:
+        mlat, mlon = info[c]
+        if mlat > 60.0:
+            names[c] = 'Arctic'
+        elif mlat < -60.0:
+            names[c] = 'Southern'
+        else:
+            lon360 = mlon % 360.0
+            if 30.0 <= lon360 < 110.0:
+                names[c] = 'Indian'
+            elif 110.0 <= lon360 < 280.0:
+                names[c] = 'Pacific'
+            else:
+                names[c] = 'Atlantic'
+
+    parents = [c for c in main if names.get(c) in ('Atlantic', 'Pacific', 'Indian')]
+
+    def gc_dist(a, b):
+        la1, lo1 = np.deg2rad(a[0]), np.deg2rad(a[1])
+        la2, lo2 = np.deg2rad(b[0]), np.deg2rad(b[1])
+        dlon = lo2 - lo1
+        d = (np.sin((la2 - la1) / 2.0) ** 2
+             + np.cos(la1) * np.cos(la2) * np.sin(dlon / 2.0) ** 2)
+        return float(np.arcsin(np.sqrt(np.clip(d, 0.0, 1.0))))
+
+    for c in usable:
+        if c in names:
+            continue
+        if parents:
+            p = min(parents, key=lambda x: gc_dist(info[c], info[x]))
+            names[c] = names[p]
+        else:
+            mlat, mlon = info[c]
+            lon360 = mlon % 360.0
+            if 30.0 <= lon360 < 110.0:
+                names[c] = 'Indian'
+            elif 110.0 <= lon360 < 280.0:
+                names[c] = 'Pacific'
+            else:
+                names[c] = 'Atlantic'
+
+    return names, info
+
+def map_basin(lat2d, lon2d, basin_h, lat_woa, lon_woa):
+    lon_w = ((lon2d + 180.0) % 360.0) - 180.0
+    step_lat = lat_woa[1] - lat_woa[0] if len(lat_woa) > 1 else 1.0
+    step_lon = lon_woa[1] - lon_woa[0] if len(lon_woa) > 1 else 1.0
+    i = np.rint((lat2d - lat_woa[0]) / step_lat).astype(int)
+    j = np.rint((lon_w - lon_woa[0]) / step_lon).astype(int)
+    i = np.clip(i, 0, len(lat_woa) - 1)
+    j = np.clip(j, 0, len(lon_woa) - 1)
+    return basin_h[i, j]
+
+# -----------------------------------------------------------------------------
+# CMIP6 readers
+# -----------------------------------------------------------------------------
+def model_layer_fields(model, cfg):
+    dir_n = os.path.join(CMIP_ROOT, model, 'no3')
+    dir_p = os.path.join(CMIP_ROOT, model, 'po4')
+    dir_v = os.path.join(CMIP_ROOT, model, 'volcello')
+
+    fs_n_all = files_in_dir(dir_n)
+    fs_p_all = files_in_dir(dir_p)
+    vs_n = {parse_variant(f) for f in fs_n_all}
+    vs_p = {parse_variant(f) for f in fs_p_all}
+    vs_n.discard(None)
+    vs_p.discard(None)
+    common = vs_n & vs_p
+
+    if common:
+        desired = 'r1i1p1f1' if 'r1i1p1f1' in common else sorted(common)[0]
+        fs_n = [f for f in fs_n_all if parse_variant(f) == desired]
+        fs_p = [f for f in fs_p_all if parse_variant(f) == desired]
+    else:
+        desired = None
+        fs_n, fs_p = fs_n_all, fs_p_all
+
+    fs_v = choose_variant_files(dir_v, desired)
+
+    ds_n = open_nc_maybe_mf(fs_n)
+    ds_p = open_nc_maybe_mf(fs_p)
+    ds_v = open_nc_maybe_mf(fs_v)
+
+    no3_tm = mean_period(ds_n['no3'])
+    po4_tm = mean_period(ds_p['po4'])
+    vol_tm = mean_period(ds_v['volcello'])
+
+    no3_tm, po4_tm, vol_tm = xr.align(no3_tm, po4_tm, vol_tm, join='inner')
+
+    lev_name = cfg['depth']
+    if lev_name not in no3_tm.dims:
+        lev_name = find_dim(no3_tm, ['lev', 'depth'])
+
+    depth_da = no3_tm[lev_name]
+    depth_m = depth_da * cfg['depth_scale']
+    depth_mask = (depth_m >= 200.0) & (depth_m <= 1000.0)
+
+    valid3 = (
+        np.isfinite(no3_tm) &
+        np.isfinite(po4_tm) &
+        np.isfinite(vol_tm) &
+        (vol_tm > 0.0) &
+        depth_mask
+    )
+
+    w3 = xr.where(valid3, vol_tm, 0.0)
+    vol_layer = w3.sum(dim=lev_name)
+    num_n = xr.where(valid3, no3_tm * vol_tm, 0.0).sum(dim=lev_name)
+    num_p = xr.where(valid3, po4_tm * vol_tm, 0.0).sum(dim=lev_name)
+
+    no3_layer = (num_n / vol_layer).where(vol_layer > 0.0)
+    po4_layer = (num_p / vol_layer).where(vol_layer > 0.0)
+
+    out = xr.Dataset({
+        'no3': no3_layer,
+        'po4': po4_layer,
+        'vol': vol_layer,
+    }).compute()
+
+    # Convert model concentrations to umol kg-1 using the declared units.
+    u_n = ds_n['no3'].attrs.get('units')
+    u_p = ds_p['po4'].attrs.get('units')
+    fac_n = unit_umol_per_kg(u_n)
+    fac_p = unit_umol_per_kg(u_p)
+    if fac_n is None:
+        fac_n = 1.0e6 / RHO
+    if fac_p is None:
+        fac_p = 1.0e6 / RHO
+
+    no3 = np.asarray(out['no3'].values, dtype=float) * fac_n
+    po4 = np.asarray(out['po4'].values, dtype=float) * fac_p
+    vol = np.asarray(out['vol'].values, dtype=float)
+
+    lat2d, lon2d = get_latlon_2d(out, cfg, fallback=ds_n)
+    return no3, po4, vol, lat2d, lon2d
+
+# -----------------------------------------------------------------------------
+# Metrics
+# -----------------------------------------------------------------------------
+def valid_mask(no3, po4, vol):
+    return (
+        np.isfinite(no3) & np.isfinite(po4) &
+        (no3 >= 0.0) & (po4 > 0.0) &
+        np.isfinite(vol) & (vol > 0.0)
+    )
+
+def compute_source_metrics(name, no3, po4, vol, basin_codes, basin_names):
+    no3 = np.asarray(no3, dtype=float)
+    po4 = np.asarray(po4, dtype=float)
+    vol = np.asarray(vol, dtype=float)
+    basin_codes = np.asarray(basin_codes)
+
+    valid = valid_mask(no3, po4, vol)
+    ratio = np.full(no3.shape, np.nan, dtype=float)
+    ratio[valid] = no3[valid] / po4[valid]
+
+    w = vol[valid]
+    r = ratio[valid]
+    x = po4[valid]
+    y = no3[valid]
+    total_w = float(np.sum(w))
+
+    # Headline means: volume-weighted across water parcels.
+    np_mean_cell = float(np.sum(w * r) / total_w) if total_w > 0 else np.nan
+    np_ratio_means = float(np.sum(w * y) / np.sum(w * x)) if np.sum(w * x) > 0 else np.nan
+
+    # Equal-cell versions retained for transparency.
+    np_mean_cell_unw = float(np.nanmean(r)) if len(r) > 0 else np.nan
+    np_ratio_means_unw = (
+        float(np.nanmean(y) / np.nanmean(x))
+        if len(x) > 0 and np.nanmean(x) > 0 else np.nan
+    )
+
+    if len(x) > 1:
+        slope, intercept = np.polyfit(x, y, 1)
+        yhat = slope * x + intercept
+        ss_res = float(np.sum((y - yhat) ** 2))
+        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    else:
+        slope = intercept = r2 = np.nan
+
+    pct_14_18 = (
+        100.0 * float(np.sum(w[(r > 14.0) & (r < 18.0)]) / total_w)
+        if total_w > 0 else np.nan
+    )
+    pct_lt12 = (
+        100.0 * float(np.sum(w[r < 12.0]) / total_w)
+        if total_w > 0 else np.nan
+    )
+
+    # basenames can contain several mask codes (main basin + folded marginal seas)
+    codes_by_name = {}
+    for code, nm in basin_names.items():
+        codes_by_name.setdefault(nm, []).append(int(code))
+
+    out = {
+        'source': name,
+        'np_mean_cell': np_mean_cell,
+        'np_ratio_means': np_ratio_means,
+        'np_mean_cell_unweighted': np_mean_cell_unw,
+        'np_ratio_means_unweighted': np_ratio_means_unw,
+        'slope': float(slope),
+        'intercept': float(intercept),
+        'r2': float(r2),
+        'pct_14_18': pct_14_18,
+        'pct_lt12_global': pct_lt12,
+    }
+
+    for bname in ['Pacific', 'Atlantic', 'Indian']:
+        codes_b = codes_by_name.get(bname, [])
+        key_np = 'np_' + bname.lower()
+        key_pct = 'pct_lt12_' + bname.lower()
+        if not codes_b:
+            out[key_np] = np.nan
+            out[key_pct] = np.nan
+            continue
+        m = valid & np.isin(basin_codes, np.asarray(codes_b, dtype=int))
+        if not np.any(m):
+            out[key_np] = np.nan
+            out[key_pct] = np.nan
+            continue
+        wb = vol[m]
+        rb = ratio[m]
+        tw = float(np.sum(wb))
+        out[key_np] = float(np.sum(wb * rb) / tw) if tw > 0 else np.nan
+        out[key_pct] = 100.0 * float(np.sum(wb[rb < 12.0]) / tw) if tw > 0 else np.nan
+
+    if np.isfinite(np_mean_cell):
+        if np_mean_cell < 15.95:
+            out['redfield_position'] = 'below'
+        elif np_mean_cell > 16.05:
+            out['redfield_position'] = 'above'
+        else:
+            out['redfield_position'] = 'at'
+    else:
+        out['redfield_position'] = np.nan
+
+    return out
+
+# -----------------------------------------------------------------------------
+# Read WOA23 nitrate and phosphate
+# -----------------------------------------------------------------------------
+dsn, n_woa = load_woa_field('nitrate', 'n')
+dsp, p_woa = load_woa_field('phosphate', 'p')
+n_woa, p_woa = xr.align(n_woa, p_woa, join='inner')
+
+no3_woa, po4_woa, vol_woa, lat2d_woa, lon2d_woa, lat_woa, lon_woa = woa_layer_fields(n_woa, p_woa)
+
+depth_name_woa = find_dim(n_woa, ['depth', 'lev', 'z'])
+nlev_woa = int(n_woa.sizes[depth_name_woa])
+
+basin_raw = load_basin_mask(WOA_MASK, nlev_woa, lat_woa, lon_woa)
+basin_names, basin_info = identify_basins(basin_raw, lat2d_woa, lon2d_woa)
+basin_h = fill_basin_nearest(basin_raw)
+basin_code_by_name = {v: k for k, v in basin_names.items()}
+
+# -----------------------------------------------------------------------------
+# Build fields, scatter data and metrics
+# -----------------------------------------------------------------------------
+fields = {}
+scatter_data = {}
+metric_rows = []
+
+# WOA23
+m_woa = valid_mask(no3_woa, po4_woa, vol_woa)
+ratio_woa = np.full(no3_woa.shape, np.nan, dtype=float)
+ratio_woa[m_woa] = no3_woa[m_woa] / po4_woa[m_woa]
+
+fields['WOA23'] = {
+    'no3': no3_woa,
+    'po4': po4_woa,
+    'ratio': ratio_woa,
+    'vol': vol_woa,
+    'lat': lat2d_woa,
+    'lon': lon2d_woa,
+    'basin': basin_raw,
+}
+scatter_data['WOA23'] = (po4_woa[m_woa], no3_woa[m_woa])
+metric_rows.append(compute_source_metrics(
+    'WOA23', no3_woa, po4_woa, vol_woa, basin_raw, basin_names
+))
+
+# CMIP6 models
+for model in MODELS:
+    no3_m, po4_m, vol_m, lat_m, lon_m = model_layer_fields(model, MODEL_CFG[model])
+    basin_m = map_basin(lat_m, lon_m, basin_h, lat_woa, lon_woa)
+
+    mm = valid_mask(no3_m, po4_m, vol_m)
+    ratio_m = np.full(no3_m.shape, np.nan, dtype=float)
+    ratio_m[mm] = no3_m[mm] / po4_m[mm]
+
+    fields[model] = {
+        'no3': no3_m,
+        'po4': po4_m,
+        'ratio': ratio_m,
+        'vol': vol_m,
+        'lat': lat_m,
+        'lon': lon_m,
+        'basin': basin_m,
+    }
+    scatter_data[model] = (po4_m[mm], no3_m[mm])
+    metric_rows.append(compute_source_metrics(
+        model, no3_m, po4_m, vol_m, basin_m, basin_names
+    ))
+
+metrics_df = pd.DataFrame(metric_rows)
+
+# Add explicit model-vs-WOA differences.
+woa_row = metrics_df.loc[metrics_df['source'] == 'WOA23'].iloc[0]
+for col in ['np_mean_cell', 'np_ratio_means',
+            'pct_lt12_global', 'pct_lt12_pacific', 'pct_lt12_indian',
+            'np_pacific', 'np_atlantic', 'np_indian']:
+    if col in metrics_df.columns:
+        metrics_df['delta_' + col + '_vs_WOA'] = metrics_df[col] - woa_row[col]
+
+# Useful summary objects left for the answer.
+basin_metrics = metrics_df[[
+    'source', 'np_pacific', 'np_atlantic', 'np_indian',
+    'pct_lt12_global', 'pct_lt12_pacific', 'pct_lt12_indian'
+]].copy()
+
+model_low_np_assessment = metrics_df[[
+    'source',
+    'pct_lt12_global', 'delta_pct_lt12_global_vs_WOA',
+    'pct_lt12_pacific', 'delta_pct_lt12_pacific_vs_WOA',
+    'pct_lt12_indian', 'delta_pct_lt12_indian_vs_WOA',
+    'np_pacific', 'delta_np_pacific_vs_WOA',
+    'np_indian', 'delta_np_indian_vs_WOA'
+]].copy()
+</execute>

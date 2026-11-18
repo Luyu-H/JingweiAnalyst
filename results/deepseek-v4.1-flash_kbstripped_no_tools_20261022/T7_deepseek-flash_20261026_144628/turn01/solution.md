@@ -1,0 +1,36 @@
+## Summary
+
+The analysis compares the 200–1000 m nitrate-to-phosphate stoichiometry in WOA23 and three CMIP6 historical models: CESM2, GFDL-ESM4 and MPI-ESM1-2-LR.
+
+### Methodology actually used
+
+- **WOA23:** used the annual objectively analysed nitrate and phosphate fields (`n_an`, `p_an`) from the all-period WOA23 files. Values with magnitude ≥1e19 were set to missing. The 200–1000 m layer value at each horizontal cell was a thickness-weighted mean over the standard depth levels whose centres lie in 200–1000 m, using the WOA depth bounds. Horizontal volume weights for statistics used \(\cos(lat)\times \Delta lon \times \Delta z\), with each field’s own valid mask and with N:P computed only where both nitrate and phosphate were valid.
+- **CMIP6:** used historical monthly `no3` and `po4` for 1971–2000 inclusive. For each model, each calendar month was averaged across years, then the 12 monthly climatologies were averaged to an annual-mean state, without day weighting. Concentrations were converted from mmol m\(^{-3}\) to µmol kg\(^{-1}\) using the stated constant density \(\rho = 1025\) kg m\(^{-3}\): \(x_{\mu mol\,kg^{-1}} = x_{mmol\,m^{-3}}\times 1000/1025\). The 200–1000 m layer mean was formed as \(\sum(x\cdot \mathrm{volcello})/\sum(\mathrm{volcello})\) over model levels with centres in 200–1000 m; `volcello` supplied all volume weights, and ocean points were defined from each field’s valid cells/`deptho`.
+- **Statistics:** N:P was computed from the climatological-mean nitrate and phosphate fields, not as a time average of instantaneous ratios. The headline mean N:P is the volume-weighted mean of cell-by-cell N:P. The second mean is the ratio of the volume-weighted mean nitrate to the volume-weighted mean phosphate. The OLS regression \(\mathrm{NO3}=a\,\mathrm{PO4}+b\) used equal cell weights over all valid cells, as requested; the means and exceedance percentages were volume-weighted.
+- **Basins:** WOA23 `basinmask_01` was read; the surface label was used throughout the layer (`depth_dependent=False`). Marginal-sea codes were folded into parent oceans via the code’s centroid-based classifier. Southern and Arctic were kept separate and excluded from named-ocean basin means. For CMIP6, the WOA basin grid was sampled nearest-neighbour at model cell centres.
+- **Missing data:** 1e20-style fill values were decoded before statistics; missing cells were excluded from both numerator and denominator in exceedance percentages.
+
+## Key numerical results
+
+All values are for the 200–1000 m layer. `Mean N:P` is the volume-weighted cell-by-cell N:P. `NO3/PO4` is the ratio of volume-weighted mean nitrate to volume-weighted mean phosphate. `a`, `b` and \(R^2\) are from the equal-cell-weight OLS regression; `b` is in µmol kg\(^{-1}\).
+
+| Source | Mean N:P | NO3/PO4 | OLS a | OLS b | R² | % vol 14<N:P<18 | % vol N:P<12 global | N:P Atlantic | N:P Pacific | N:P Indian | %<12 Pacific | %<12 Indian |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| WOA23 | 14.21 | 14.00 | 12.42 | 2.96 | 0.889 | 52.0 | 1.9 | 15.47 | 13.71 | 13.84 | 2.1 | 4.4 |
+| CESM2 | 11.75 | 10.93 | 2.39 | 16.25 | 0.061 | 17.1 | 38.1 | 13.49 | 10.48 | 11.08 | 60.8 | 40.1 |
+| GFDL-ESM4 | 14.05 | 13.65 | 11.10 | 4.40 | 0.809 | 70.0 | 8.0 | 15.05 | 13.21 | 14.69 | 17.2 | 0.3 |
+| MPI-ESM1-2-LR | 12.35 | 11.78 | 7.98 | 6.60 | 0.653 | 0.5 | 21.7 | 13.18 | 11.43 | 12.64 | 39.7 | 11.1 |
+
+## Interpretation
+
+- **All four sources sit below Redfield overall.** WOA23 has a headline mean N:P of 14.21 and an OLS slope of 12.42, both below 16. The three models also have headline means below 16 (11.75–14.05) and fitted slopes below 16 (2.39–11.10). None is at or above Redfield in the 200–1000 m global mean.
+- **WOA23 observed structure:** the observed global low-N:P volume is modest: only 1.9% of volume has N:P<12, with 2.1% in the Pacific and 4.4% in the Indian Ocean. The Atlantic is closest to Redfield (15.47), while the Pacific and Indian are lower (13.71 and 13.84). The observed low-N:P denitrification signature is therefore present mainly in the Pacific and Indian, but it involves only a small fraction of the 200–1000 m volume.
+- **GFDL-ESM4 is closest to WOA23 in the global mean and regression.** Its headline mean is 14.05, slope 11.10 and \(R^2=0.809\), and 70.0% of its volume lies between N:P 14 and 18 versus 52.0% for WOA23. However, its low-N:P volume is too large globally (8.0% vs 1.9%) and in the Pacific (17.2% vs 2.1%), while its Indian low-N:P volume is essentially absent (0.3% vs 4.4%). Thus GFDL-ESM4 broadly matches the near-Redfield global stoichiometry but does not reproduce the observed Indian low-N:P signature.
+- **CESM2 strongly overproduces low-N:P water.** Its global mean is 11.75 and its slope only 2.39 with \(R^2=0.061\), indicating a very weak linear NO3–PO4 relationship in the climatological mean. It has 38.1% of global volume below N:P 12, with 60.8% in the Pacific and 40.1% in the Indian. This is far larger than observed, although the sign of the low-N:P signal is in the right basins.
+- **MPI-ESM1-2-LR also overproduces low-N:P water.** Its mean is 12.35, slope 7.98 and \(R^2=0.653\). The global N:P<12 volume is 21.7%, with 39.7% in the Pacific and 11.1% in the Indian. It qualitatively places enhanced low N:P in the Pacific and Indian, but the amplitude is much larger than WOA23. It has almost no volume between N:P 14 and 18 (0.5%), so its distribution is strongly skewed away from Redfield compared with the observed 52.0%.
+- **Cross-model spread is consistent with the different N:P formulations.** GFDL-ESM4’s fixed N:P per plankton type produces a narrower distribution closer to Redfield and misses the Indian low-N:P volume. MPI-ESM1-2-LR’s prescribed Redfield formulation produces a lower mean and too much low-N:P volume. CESM2’s variable C:P formulation produces a very broad, weakly correlated NO3–PO4 distribution and dramatically overestimates low-N:P volume. None of the models quantitatively reproduces the observed low-N:P volume and basin distribution, although CESM2 and MPI-ESM1-2-LR at least place the strongest low-N:P signal in the Pacific/Indian rather than the Atlantic.
+
+## Figures
+
+- **Figure 1** is a four-panel scatter of nitrate versus phosphate for 200–1000 m, ordered WOA23, CESM2, GFDL-ESM4 and MPI-ESM1-2-LR. All panels use common axis limits and ticks. Each panel shows its own equal-cell-weight OLS line from the reported regression and the Redfield 16:1 line through the origin as a separate style. The panel annotations give the fitted slope `a`, intercept `b` and \(R^2\). The figure is intended to show both the overall N:P level and how tightly nitrate and phosphate covary within each source.
+- **Figure 2** is a 2×2 map of 200–1000 m mean N:P minus 16 for the four sources. It uses a common longitude–latitude frame and one shared diverging colour scale centred on zero, with the scale limit taken from the pooled 98th percentile of absolute departures. WOA23 is plotted on its native grid; the curvilinear model fields were regridded to a regular 1° longitude–latitude grid for display only, using linear interpolation with nearest-neighbour fill near edges. The maps show where each source is above or below Redfield in the 200–1000 m layer; no regridding was used for the numerical statistics.

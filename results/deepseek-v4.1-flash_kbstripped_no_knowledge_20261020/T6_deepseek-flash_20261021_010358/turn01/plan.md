@@ -1,0 +1,19 @@
+# Plan
+
+1. Load WOA23 nitrate as the all-time-periods annual climatology on the 1° grid, together with WOA23 depth levels/layer boundaries, landsea_01, and basinmask_01. Use load_climatology_data and load_depth_levels, retaining levels below 1000 m so the gradient at the deepest level within the top 1000 m can use the next deeper level.
+2. Load CMIP6 historical no3 monthly for 1971-01 to 2000-12 for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, each on its native grid with its own areacello, using load_regular_data and load_areas; load each model’s depth levels. Aggregate monthly fields to the 1971–2000 day-weighted long-term mean with temporal_aggregate.
+3. Compute nitracline depth for WOA23 and for each model with compute_nutricline_depth, defined as the depth of the maximum vertical nitrate gradient searched only over levels within the top 1000 m, with the gradient at 1000 m using the level just below 1000 m.
+4. Compute global area-weighted mean nitracline depth for each model using its native areacello and for WOA23 using WOA23 cell areas, via compute_basic_stat; report each model’s difference from WOA23.
+5. Regrid each model’s nitracline-depth field to the WOA23 1° grid with regrid_horizontal. Build the common comparison mask using WOA23 landsea_01 ocean cells (value > 1) and valid regridded model cells with build_comparison_mask. On that common mask, compute each model’s spatial Pearson correlation with WOA23 using analyze_correlation and RMSE using compute_difference_metrics.
+6. Load the WOA23 basin mask with load_basin_mask. For each source, use select_basin to isolate the Pacific, Atlantic and Indian Oceans, with marginal seas folded into their parent ocean and the Southern and Arctic Oceans excluded. Compute area-weighted mean nitracline depth in each basin with compute_basic_stat, using WOA23 cell areas after regridding models to the WOA23 grid; report model−WOA23 differences and compare basin orderings.
+7. Figure 1: produce a 2-by-2 panel of global nitracline-depth maps for CESM2, GFDL-ESM4, MPI-ESM1-2-LR and WOA23, all on one shared sequential colour scale with deeper values visually heavier.
+8. Figure 2: load the equatorial Pacific section from 120°E to 80°W (treated as 120–280°E) and 2°S–2°N, including levels below 1000 m for the nitracline calculation, for WOA23 and each model. Use the 1971–2000 climatology for models, transform_unit to put all sources into the same nitrate concentration unit, average over 2°S–2°N with compute_basic_stat, and use regrid_vertical for model sections onto WOA23 depth levels for display. Compute each panel’s nitracline with compute_nutricline_depth and overlay it as a line. Panel order: WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR; shared colour scale, top 1000 m, depth increasing downward.
+9. Identify the model that reproduces the observed nitracline best from correlation and RMSE, and assess whether each model reproduces the WOA23 ordering of nitracline depth across the Pacific, Atlantic and Indian basins.
+
+Other notes:
+- Nitracline is strictly the depth of maximum vertical nitrate gradient within the top 1000 m; the gradient at 1000 m uses the level just below 1000 m.
+- Basin definitions come from WOA23 basinmask_01; marginal seas are folded into parent oceans, and Southern and Arctic Oceans are excluded from basin means.
+- Global means use native model areacello; basin means, maps, correlation and RMSE use the WOA23 1° grid and WOA23 areas.
+- Correlation and RMSE are computed on the common WOA23 ocean cells where all four nitracline fields are valid.
+- Differences are model minus WOA23; rounding is applied only at reporting: depths to the nearest metre, correlation to 3 decimal places, RMSE to 1 decimal place.
+- Figure 1 uses a shared sequential scale with deeper visually heavier; Figure 2 uses a shared concentration unit and colour scale, depth downward, with each panel’s own nitracline line.

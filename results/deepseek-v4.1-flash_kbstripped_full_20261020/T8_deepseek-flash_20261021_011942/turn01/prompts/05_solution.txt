@@ -1,0 +1,2627 @@
+# exchange 5: solution
+# elapsed: 28.7 s
+
+===== SYSTEM =====
+
+The user's question:
+Evaluate the ocean carbon system of three CMIP6 models against the GLODAPv2.2016b mapped climatology: dissolved inorganic carbon, total alkalinity and pH.
+
+Data to use:
+- CMIP6 historical `dissic`, `talk`, `ph`, `thetao` and `so` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, for the calendar year 2002, plus `dissic`, `thetao` and `so` for 1971-2000.
+- Each model's own areacello and volcello.
+- GLODAPv2.2016b mapped climatology: TCO2, TAlk and pH.
+
+Expected numerical results, with the models taken as their 2002 annual mean unless stated otherwise, and model DIC and alkalinity compared in micromoles per kilogram:
+- The global mean over 0-50 m of DIC and of total alkalinity for each model and for GLODAP (for every source one mean over all its 0-50 m cells), in micromoles per kilogram to the nearest whole unit, and each model's difference from GLODAP.
+- The same 0-50 m mean for pH on the total scale, to 3 decimal places, and each model's difference from GLODAP.
+- For the map of 0-50 m mean DIC (each cell's mean over its own 0-50 m levels), compared on the GLODAP 1-degree grid: each model's mean bias and RMSE in micromoles per kilogram to the nearest whole unit, and the spatial correlation to 3 decimal places.
+- For each model, the global mean DIC bias (model minus GLODAP) at 0, 100, 500, 1000 and 2000 m, compared on the GLODAP 1-degree grid and averaged, at each depth, over every cell where that model and GLODAP are both defined at that depth, in micromoles per kilogram to the nearest whole unit.
+- For each model, the period change of the global 0-50 m mean DIC, 2002 minus the 1971-2000 average, in micromoles per kilogram to the nearest whole unit, and its ratio to that model's 0-50 m DIC difference from GLODAP as defined in the first item to 2 decimal places, with what that implies for reading the bias as a model error.
+- Which model reproduces the observed carbon system best, and whether the three models' errors in DIC, alkalinity and pH are consistent in sign.
+
+Expected visualizations:
+- Figure 1, three global maps in one row, one per model, of the 0-50 m DIC bias against GLODAP on the cells of the map comparison, with one diverging colour scale centred on zero shared by all three panels and labelled in micromoles per kilogram.
+- Figure 2, a single panel of the vertical profile of the global mean DIC bias: depth on the vertical axis increasing downward, bias in micromoles per kilogram on the horizontal axis, one line per model, a vertical zero reference line, and the five sampled depths marked.
+
+The analysis plan:
+1. Load the fields with `load_regular_data` (dataset `cmip6_historical`), for each of CESM2, GFDL-ESM4 and MPI-ESM1-2-LR: monthly `dissic`, `talk`, `ph`, `thetao`, `so` for calendar year 2002, and monthly `dissic`, `thetao`, `so` for 1971–2000; also load each model's fixed `areacello` and `volcello` (via `load_areas` and `load_volumes_for_cmip6`, noting the `attrs['area_source']`/`attrs['volume_source']`). Take the 2002 annual mean of each monthly field so the year is one annual-mean state.
+   - Note [cmip6-carbonate-system-definitions]: compare model `ph` (total scale, in situ) only with GLODAP `pHtsinsitutp`, never `pHts25p0`; if the pH result leans on CESM2's carbonate constants, flag in the answer that the CESM2 paper does not document them (unverified assumption).
+
+2. Load the reference with `load_climatology_data` (dataset `glodap`): `TCO2`, `TAlk` and `pHtsinsitutp` (33 standard levels, no time dimension) as the observational climatology for all comparisons.
+
+3. Put the model carbon fields on a per-kilogram basis. Compute in-situ density for every model cell with `compute_potential_density_anomaly` using `thetao` + salinity and `ref_pressure=None`; use `transform_unit` only for the mol m-3 → mmol m-3 factor, then divide by that density in code to reach µmol kg-1.
+   - Note [cmip6-so-practical-salinity]: `so` holds practical-salinity numbers (order 35) despite the units string "0.001" — never rescale it; convert S_P to S_A with the location-dependent gsw function before it enters the density calculation.
+   - Note [cmip6-bgc-units-per-volume]: `dissic`/`talk` are mol m-3, so µmol kg-1 = mmol m-3 × 1000 / ρ with ρ from `compute_potential_density_anomaly` (`ref_pressure=None`); do not use `transform_unit`'s constant default (mean surface density), which errs by about a per cent in the deep ocean, and record the density used in `attrs['density_assumption']`.
+
+4. Build the 0–50 m weights: for each model cell take the cell thickness as `volcello`/`areacello` (per the `cell_thickness_like` recipe) and restrict the vertical weighting to the 0–50 m levels each column actually has.
+   - Note [cmip6-static-grid-fields]: weight with each model's own `areacello`/`volcello`; the 0–50 m thickness is `volcello`/`areacello` (`cell_thickness_like`), since `thkcello`/`masscello`/`rhozero` are absent and `lev_bnds` differences fail at partial bottom cells; report `attrs['area_source']` and `attrs['volume_source']`.
+
+5. Compute, per source (three models and GLODAP), the single global 0–50 m mean of DIC, total alkalinity and pH over all of that source's own 0–50 m cells, and each model's difference from GLODAP; report DIC and alkalinity to the nearest µmol kg-1, pH to 3 decimals.
+   - Note [omip-weighted-means-and-integrals]: use `compute_basic_stat` with `op='volume_weighted_mean'` for the means that span depth (all 0–50 m means) and `op='area_weighted_mean'` for the horizontal ones, with weights restricted to the same valid (NaN-free) cells; never take an unweighted `mean()` over (y, x) or over latitude.
+   - Note [omip-native-grid-vs-regridded]: compute each source's global means, and the 2002-minus-1971–2000 change of step 8, on its own native grid with its own weights; regrid (`regrid_horizontal`, 'conservative') only for the map comparison, and state which numbers come from which grid.
+
+6. Build the 0–50 m DIC map for each source: per column, the mean of DIC over that column's own 0–50 m levels (volume-weighted), then `regrid_horizontal` with 'conservative' onto the GLODAP 1° grid. Score the maps with `build_comparison_mask` (`ocean_only=False`, the reference is not WOA23), applied by `.where(mask)`, then `compute_difference_metrics` for mean bias and RMSE (µm kg-1, nearest whole unit) and `analyze_correlation` with `weighting='area'` for the spatial correlation (3 decimals).
+   - Note [common-comparison-mask]: put all sources on the GLODAP 1° grid and take the DIC bias/RMSE/correlation on one mask from `build_comparison_mask` with `ocean_only=False`, applied by `.where(mask)`; report the cell counts and each model's `mean_data`/`mean_reference` beside the bias, and state that the per-source 0–50 m global means of step 5 each cover that source's own cells, so their model-minus-GLODAP difference is not the shared-mask bias.
+
+7. Vertical-profile biases: interpolate every product onto 0, 100, 500, 1000 and 2000 m with `regrid_vertical` (never select the nearest level), regrid horizontally onto the GLODAP 1° grid as in step 6, and at each depth average model-minus-GLODAP DIC over every cell where both are defined at that depth, using `compute_difference_metrics` (area-weighted), reporting to the nearest µmol kg-1.
+
+8. Period change: for each model, 2002 annual-mean 0–50 m global DIC minus the 1971–2000 mean of the same quantity, computed on that model's native grid with its own weights (`compute_basic_stat`, `op='volume_weighted_mean'`), reported to the nearest µmol kg-1; divide this change by the model's step-5 0–50 m DIC difference from GLODAP (2 decimals) and state what the ratio implies about reading the bias as a model error.
+
+9. Synthesise: rank the models on DIC, alkalinity and pH difference from GLODAP and on the map bias/RMSE/correlation to say which reproduces the observed carbon system best, and check whether the three models' DIC, alkalinity and pH errors agree in sign.
+
+10. Figures (own code, no tool covers plotting): Figure 1 — the three 0–50 m DIC-bias maps on the step-6 shared mask, one row, one diverging colour scale centred on zero, labelled µmol kg-1; Figure 2 — single panel, vertical DIC-bias profile from step 7, depth axis increasing downward, µmol kg-1 on the horizontal axis, one line per model, vertical zero line, the five sampled depths marked.
+
+Other notes:
+- All intermediate values are carried unrounded; rounding happens only where the question requests a precision (whole µmol kg-1, 3 decimals, 2 decimals).
+- GLODAPv2 has no time dimension, so its single TCO2/TAlk/pH climatology is the reference state against which each model's 2002 annual mean is scored.
+- The 0–50 m global means (step 5) and the map/depth metrics (steps 6–7) rest on different cell sets — native valid cells versus the shared GLODAP-grid mask — and the answer must keep them distinct.
+- Report the per-model density assumption (`attrs['density_assumption']`) and grid-weight sources (`attrs['area_source']`, `attrs['volume_source']`) alongside the numbers.
+
+The code that actually ran and produced the results below:
+<executed_code>
+# =====================================================================
+# Ocean carbon system: 3 CMIP6 models (2002 annual mean) vs GLODAPv2
+# =====================================================================
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+DS = "cmip6_historical"
+
+def depth_dim(da):
+    for n in ("depth", "lev", "olevel", "z", "st_ocean"):
+        if n in da.dims:
+            return n
+    raise KeyError(f"no depth dimension found in {da.dims}")
+
+def restore(da, attrs, units, long_name=None):
+    """Re-attach the loader provenance (grid identity) after an operation changed the quantity."""
+    d = {k: v for k, v in attrs.items() if k != "units"}
+    d["units"] = units
+    if long_name is not None:
+        d["long_name"] = long_name
+    return da.assign_attrs(**d)
+
+def per_kg(field, rho_abs, attrs, long_name):
+    """mol m-3 -> mmol m-3 -> umol kg-1 using the cell-by-cell in-situ density (absolute, kg/m3)."""
+    mm = transform_unit(field, field.attrs.get("units", "mol m-3"), "mmol m-3")
+    out = mm * 1000.0 / rho_abs
+    out = restore(out, attrs, "umol kg-1", long_name)
+    out.attrs["density_assumption"] = (
+        "cell-by-cell in-situ density (sigma computed with TEOS-10, ref_pressure=None, +1000); "
+        "umol kg-1 = mmol m-3 * 1000 / rho")
+    return out
+
+def global_mean_0_50(da):
+    """Single volume-weighted global mean over all of the source's own 0-50 m cells."""
+    dd = depth_dim(da)
+    sub = da.sel({dd: slice(0.0, 50.0)})
+    return float(compute_basic_stat(data=sub, op="volume_weighted_mean", dim=None).compute())
+
+# ---------------------------------------------------------------------
+# Step 1: load the CMIP6 fields (monthly 2002; monthly 1971-2000 for DIC/T/S)
+# ---------------------------------------------------------------------
+state2002, attrs2002 = {}, {}
+state_hist, attrs_hist = {}, {}
+
+for m in models:
+    st, at = {}, {}
+    for v in ["dissic", "talk", "ph", "thetao", "so"]:
+        da = load_regular_data(dataset=DS, variable=v, model=m,
+                               time_range=["2002-01", "2002-12"])
+        at[v] = dict(da.attrs)
+        st[v] = da.mean(dim="time")            # 2002 annual-mean state
+    state2002[m], attrs2002[m] = st, at
+
+    h, ha = {}, {}
+    for v in ["dissic", "thetao", "so"]:
+        da = load_regular_data(dataset=DS, variable=v, model=m,
+                               time_range=["1971-01", "2000-12"],
+                               depth_range=[0.0, 50.0])
+        ha[v] = dict(da.attrs)
+        h[v] = da.mean(dim="time")             # 1971-2000 mean state, already 0-50 m
+    state_hist[m], attrs_hist[m] = h, ha
+
+# grid-weight provenance (lazy, only attrs are read)
+grid_provenance = {}
+for m in models:
+    a = load_areas(dataset=DS, model=m, variable="thetao")
+    v = load_volumes_for_cmip6(dataset=DS, model=m)
+    grid_provenance[m] = {
+        "area_source": a.attrs.get("area_source"),
+        "volume_source": v.attrs.get("volume_source"),
+    }
+
+# ---------------------------------------------------------------------
+# Step 3: put the carbon fields on a per-kilogram basis
+# ---------------------------------------------------------------------
+dic_kg, talk_kg, ph_kg, dic_hist_kg = {}, {}, {}, {}
+density_note = {}
+
+for m in models:
+    st = state2002[m]
+    rho = compute_potential_density_anomaly(temp_data=st["thetao"], sal_data=st["so"],
+                                            ref_pressure=None, temperature_type="auto")
+    rho_abs = rho + 1000.0
+
+    dic_kg[m]  = per_kg(st["dissic"], rho_abs, attrs2002[m]["dissic"], "DIC")
+    talk_kg[m] = per_kg(st["talk"],   rho_abs, attrs2002[m]["talk"],   "Total alkalinity")
+    ph_kg[m]   = restore(st["ph"], attrs2002[m]["ph"], "1", "pH (total scale, in situ)")
+    density_note[m] = dic_kg[m].attrs["density_assumption"]
+
+    h = state_hist[m]
+    rho_h = compute_potential_density_anomaly(temp_data=h["thetao"], sal_data=h["so"],
+                                              ref_pressure=None, temperature_type="auto")
+    dic_hist_kg[m] = per_kg(h["dissic"], rho_h + 1000.0, attrs_hist[m]["dissic"], "DIC")
+
+# ---------------------------------------------------------------------
+# Step 2: GLODAP reference climatology (full depth, subset later)
+# ---------------------------------------------------------------------
+glodap_tco2 = load_climatology_data(dataset="glodap", variable="TCO2")
+glodap_talk = load_climatology_data(dataset="glodap", variable="TAlk")
+glodap_ph   = load_climatology_data(dataset="glodap", variable="pHtsinsitutp")
+
+# ---------------------------------------------------------------------
+# Step 5: one global 0-50 m volume-weighted mean per source
+# ---------------------------------------------------------------------
+DIC_mean, TALK_mean, PH_mean = {}, {}, {}
+for m in models:
+    DIC_mean[m]  = global_mean_0_50(dic_kg[m])
+    TALK_mean[m] = global_mean_0_50(talk_kg[m])
+    PH_mean[m]   = global_mean_0_50(ph_kg[m])
+
+DIC_mean["GLODAP"]  = global_mean_0_50(glodap_tco2)
+TALK_mean["GLODAP"] = global_mean_0_50(glodap_talk)
+PH_mean["GLODAP"]   = global_mean_0_50(glodap_ph)
+
+DIC_diff  = {m: DIC_mean[m]  - DIC_mean["GLODAP"]  for m in models}
+TALK_diff = {m: TALK_mean[m] - TALK_mean["GLODAP"] for m in models}
+PH_diff   = {m: PH_mean[m]   - PH_mean["GLODAP"]   for m in models}
+
+# ---------------------------------------------------------------------
+# Step 6: 0-50 m DIC maps, regridded to the GLODAP 1-degree grid
+# ---------------------------------------------------------------------
+dic_map = {}
+for m in models:
+    dd = depth_dim(dic_kg[m])
+    col = compute_basic_stat(data=dic_kg[m].sel({dd: slice(0.0, 50.0)}),
+                             op="volume_weighted_mean", dim=dd)
+    col = restore(col, attrs2002[m]["dissic"], "umol kg-1", "DIC 0-50 m")
+    dic_map[m] = regrid_horizontal(data=col, target="glodap", method="conservative")
+
+glodap_map = compute_basic_stat(data=glodap_tco2.sel(depth=slice(0.0, 50.0)),
+                                op="volume_weighted_mean", dim="depth")
+glodap_map = restore(glodap_map, glodap_tco2.attrs, "umol kg-1", "DIC 0-50 m")
+
+comparison_mask = build_comparison_mask(
+    fields=[dic_map[m] for m in models] + [glodap_map],
+    ocean_only=False)
+
+map_metrics, map_corr = {}, {}
+for m in models:
+    a = dic_map[m].where(comparison_mask)
+    b = glodap_map.where(comparison_mask)
+    met = compute_difference_metrics(data=a, reference=b, dim=["lat", "lon"])
+    cor = analyze_correlation(var1=a, var2=b, dim=["lat", "lon"],
+                              method="pearson", weighting="area")
+    map_metrics[m] = met
+    map_corr[m] = cor
+
+bias_maps = {m: dic_map[m].where(comparison_mask) - glodap_map.where(comparison_mask)
+             for m in models}
+
+# ---------------------------------------------------------------------
+# Step 7: vertical profile bias at 0, 100, 500, 1000, 2000 m
+# ---------------------------------------------------------------------
+target_depths = [0.0, 100.0, 500.0, 1000.0, 2000.0]
+
+glodap_prof = regrid_vertical(data=glodap_tco2, target=target_depths, method="linear")
+
+dic_prof = {}
+for m in models:
+    prof = regrid_vertical(data=dic_kg[m], target=target_depths, method="linear")
+    prof = restore(prof, attrs2002[m]["dissic"], "umol kg-1", "DIC")
+    dic_prof[m] = regrid_horizontal(data=prof, target="glodap", method="conservative")
+
+profile_bias, profile_ncells = {}, {}
+for m in models:
+    row, nrow = {}, {}
+    for d in target_depths:
+        a = dic_prof[m].sel(depth=d, method="nearest")
+        b = glodap_prof.sel(depth=d, method="nearest")
+        met = compute_difference_metrics(data=a, reference=b, dim=["lat", "lon"])
+        row[d] = float(met["bias"])
+        nrow[d] = int(met["n_valid"])
+    profile_bias[m] = row
+    profile_ncells[m] = nrow
+
+# ---------------------------------------------------------------------
+# Step 8: 2002 minus 1971-2000 change of the global 0-50 m DIC mean
+# ---------------------------------------------------------------------
+DIC_hist_mean = {m: global_mean_0_50(dic_hist_kg[m]) for m in models}
+period_change = {m: DIC_mean[m] - DIC_hist_mean[m] for m in models}
+change_to_bias = {m: period_change[m] / DIC_diff[m] for m in models}
+
+# ---------------------------------------------------------------------
+# Summary objects
+# ---------------------------------------------------------------------
+summary = {
+    "DIC_mean": DIC_mean, "DIC_diff": DIC_diff,
+    "TALK_mean": TALK_mean, "TALK_diff": TALK_diff,
+    "PH_mean": PH_mean, "PH_diff": PH_diff,
+    "map_bias": {m: float(map_metrics[m]["bias"]) for m in models},
+    "map_rmse": {m: float(map_metrics[m]["rmse"]) for m in models},
+    "map_corr": {m: float(map_corr[m]["correlation"]) for m in models},
+    "map_n_valid": {m: int(map_metrics[m]["n_valid"]) for m in models},
+    "map_mean_model": {m: float(map_metrics[m]["mean_data"]) for m in models},
+    "map_mean_glodap": {m: float(map_metrics[m]["mean_reference"]) for m in models},
+    "n_mask_cells": int(comparison_mask.sum().compute()),
+    "profile_bias": profile_bias,
+    "profile_ncells": profile_ncells,
+    "period_change": period_change,
+    "change_to_bias": change_to_bias,
+    "density_note": density_note,
+    "grid_provenance": grid_provenance,
+}
+print(summary)
+
+# --- visualization ---
+# ---------------------------------------------------------------------
+# Figure 1: 0-50 m DIC bias maps (model - GLODAP) on the shared mask
+# ---------------------------------------------------------------------
+for m in models:
+    bias_maps[m] = bias_maps[m].compute()
+
+pooled = np.concatenate([np.asarray(bias_maps[m].values).ravel() for m in models])
+pooled = pooled[np.isfinite(pooled)]
+vmax = float(np.nanpercentile(np.abs(pooled), 98))
+
+lons = np.asarray(bias_maps[models[0]]["lon"].values)
+lats = np.asarray(bias_maps[models[0]]["lat"].values)
+
+fig1, axes = plt.subplots(1, 3, figsize=(17, 4.2), constrained_layout=True)
+for ax, m in zip(axes, models):
+    pm = ax.pcolormesh(lons, lats, np.asarray(bias_maps[m].values),
+                       cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
+    ax.set_title(f"{m}  (bias {summary['map_bias'][m]:+.0f}, "
+                 f"RMSE {summary['map_rmse'][m]:.0f}, r {summary['map_corr'][m]:.3f})",
+                 fontsize=10)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-90, 90)
+
+fig1.colorbar(pm, ax=list(axes), shrink=0.85, extend="both",
+              label="DIC bias (µmol kg$^{-1}$)")
+fig1.suptitle("0–50 m DIC bias vs GLODAPv2 (2002 annual mean); shared scale clipped at "
+              "the pooled 98th percentile of |bias|", fontsize=11)
+
+# ---------------------------------------------------------------------
+# Figure 2: vertical profile of the global mean DIC bias
+# ---------------------------------------------------------------------
+fig2, ax2 = plt.subplots(figsize=(6.2, 5.2), constrained_layout=True)
+for m in models:
+    vals = [profile_bias[m][d] for d in target_depths]
+    ax2.plot(vals, target_depths, marker="o", label=m)
+ax2.axvline(0.0, color="k", linestyle="--", linewidth=1)
+ax2.invert_yaxis()
+ax2.set_yticks(target_depths)
+ax2.set_ylabel("Depth (m)")
+ax2.set_xlabel("DIC bias (µmol kg$^{-1}$)")
+ax2.set_title("Global mean DIC bias vs GLODAPv2 (area-weighted on the GLODAP 1° grid)")
+ax2.legend(loc="best", frameon=True)
+ax2.grid(alpha=0.3)
+</executed_code>
+
+Here are the results of code execution:
+
+Status Summary:
+- Computation: Success
+- Visualization: Generated
+
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "models": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "DS": "cmip6_historical",
+      "state2002": {
+        "CESM2": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 1.1290364265441895,
+            "max": 3.4657819271087646,
+            "mean": 2.218221426010132,
+            "std": 0.14454272389411926
+          },
+          "talk": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "mol m-3",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 1.2385084629058838,
+            "max": 4.657229900360107,
+            "mean": 2.3668811321258545,
+            "std": 0.08362820744514465
+          },
+          "ph": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "1",
+            "long_name": "pH",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 7.086112976074219,
+            "max": 8.945194244384766,
+            "mean": 7.899064540863037,
+            "std": 0.20404152572155
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": -1.9296846389770508,
+            "max": 32.11983108520508,
+            "mean": 9.415316581726074,
+            "std": 8.282252311706543
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 6.952856063842773,
+            "max": 45.51041793823242,
+            "mean": 34.59302520751953,
+            "std": 1.0570012331008911
+          }
+        },
+        "GFDL-ESM4": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 0.34695175290107727,
+            "max": 3.3009119033813477,
+            "mean": 2.253709077835083,
+            "std": 0.11626921594142914
+          },
+          "talk": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "mol m-3",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 0.38417255878448486,
+            "max": 4.419498920440674,
+            "mean": 2.4105496406555176,
+            "std": 0.07997167855501175
+          },
+          "ph": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "1",
+            "long_name": "pH",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 7.27360725402832,
+            "max": 9.926178932189941,
+            "mean": 7.944672584533691,
+            "std": 0.15632633864879608
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": -1.9115304946899414,
+            "max": 32.7458610534668,
+            "mean": 6.748224258422852,
+            "std": 7.656941890716553
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 0.01000000536441803,
+            "max": 64.43219757080078,
+            "mean": 34.585697174072266,
+            "std": 1.2617849111557007
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 0.31240275502204895,
+            "max": 2.889784574508667,
+            "mean": 2.1538777351379395,
+            "std": 0.1143297404050827
+          },
+          "talk": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "mol m-3",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 0.29450514912605286,
+            "max": 3.3006162643432617,
+            "mean": 2.308739423751831,
+            "std": 0.08439386636018753
+          },
+          "ph": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "1",
+            "long_name": "pH",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 6.8458991050720215,
+            "max": 8.229844093322754,
+            "mean": 7.97658634185791,
+            "std": 0.15298721194267273
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": -1.899964451789856,
+            "max": 31.33868980407715,
+            "mean": 6.669050693511963,
+            "std": 6.673981189727783
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 4.306586265563965,
+            "max": 50.82075119018555,
+            "mean": 34.59857177734375,
+            "std": 1.0271272659301758
+          }
+        }
+      },
+      "attrs2002": {
+        "CESM2": {
+          "dissic": {
+            "cell_measures": "area: areacello volume: volcello",
+            "cell_methods": "area: mean where sea time: mean",
+            "comment": "Dissolved inorganic carbon (CO3+HCO3+H2CO3) concentration",
+            "description": "Dissolved inorganic carbon (CO3+HCO3+H2CO3) concentration",
+            "frequency": "mon",
+            "id": "dissic",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "mipTable": "Omon",
+            "out_name": "dissic",
+            "prov": "Omon ((isd.003))",
+            "realm": "ocnBgchem",
+            "standard_name": "mole_concentration_of_dissolved_inorganic_carbon_in_sea_water",
+            "time": "time",
+            "time_label": "time-mean",
+            "time_title": "Temporal mean",
+            "title": "Dissolved Inorganic Carbon Concentration",
+            "type": "real",
+            "units": "mol m-3",
+            "variable_id": "dissic",
+            "source_dataset": "cmip6_historical",
+            "model": "CESM2",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "nlat",
+            "x_dim": "nlon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 1,
+            "original_units": "mol m-3",
+            "cmip6_variable": "dissic",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "talk": {
+            "cell_measures": "area: areacello volume: volcello",
+            "cell_methods": "area: mean where sea time: mean",
+            "comment": "total alkalinity equivalent concentration (including carbonate, borate, phosphorus, silicon, and nitrogen components)",
+            "description": "total alkalinity equivalent concentration (including carbonate, borate, phosphorus, silicon, and nitrogen components)",
+            "frequency": "mon",
+            "id": "talk",
+            "long_name": "Total Alkalinity",
+            "mipTable": "Omon",
+            "out_name": "talk",
+            "prov": "Omon ((isd.003))",
+            "realm": "ocnBgchem",
+            "standard_name": "sea_water_alkalinity_expressed_as_mole_equivalent",
+            "time": "time",
+            "time_label": "time-mean",
+            "time_title": "Temporal mean",
+            "title": "Total Alkalinity",
+            "type": "real",
+            "units": "mol m-3",
+            "variable_id": "talk",
+            "source_dataset": "cmip6_historical",
+            "model": "CESM2",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "nlat",
+            "x_dim": "nlon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 1,
+            "original_units": "mol m-3",
+            "cmip6_variable": "talk",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "ph": {
+            "cell_measures": "area: areacello volume: volcello",
+            "cell_methods": "area: mean where sea time: mean",
+            "comment": "negative log10 of hydrogen ion concentration with the concentration expressed as mol H kg-1.",
+            "description": "negative log10 of hydrogen ion concentration with the concentration expressed as mol H kg-1.",
+            "frequency": "mon",
+            "id": "ph",
+            "long_name": "pH",
+            "mipTable": "Omon",
+            "out_name": "ph",
+            "prov": "Omon ((isd.003))",
+            "realm": "ocnBgchem",
+            "standard_name": "sea_water_ph_reported_on_total_scale",
+            "time": "time",
+            "time_label": "time-mean",
+            "time_title": "Temporal mean",
+            "title": "pH",
+            "type": "real",
+            "units": "1",
+            "variable_id": "ph",
+            "source_dataset": "cmip6_historical",
+            "model": "CESM2",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "nlat",
+            "x_dim": "nlon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 1,
+            "original_units": "1",
+            "cmip6_variable": "ph",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "thetao": {
+            "cell_measures": "area: areacello volume: volcello",
+            "cell_methods": "area: mean where sea time: mean",
+            "comment": "Diagnostic should be contributed even for models using conservative temperature as prognostic field.",
+            "description": "Diagnostic should be contributed even for models using conservative temperature as prognostic field.",
+            "frequency": "mon",
+            "id": "thetao",
+            "long_name": "Sea Water Potential Temperature",
+            "mipTable": "Omon",
+            "out_name": "thetao",
+            "prov": "Omon ((isd.003))",
+            "realm": "ocean",
+            "standard_name": "sea_water_potential_temperature",
+            "time": "time",
+            "time_label": "time-mean",
+            "time_title": "Temporal mean",
+            "title": "Sea Water Potential Temperature",
+            "type": "real",
+            "units": "degC",
+            "variable_id": "thetao",
+            "source_dataset": "cmip6_historical",
+            "model": "CESM2",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "nlat",
+            "x_dim": "nlon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 1,
+            "original_units": "degC",
+            "cmip6_variable": "thetao",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "so": {
+            "cell_measures": "area: areacello volume: volcello",
+            "cell_methods": "area: mean where sea time: mean",
+            "comment": "Sea water salinity is the salt content of sea water, often on the Practical Salinity Scale of 1978. However, the unqualified term 'salinity' is generic and does not necessarily imply any particular method of calculation. The units of salinity are dimensionless and the units attribute should normally be given as 1e-3 or 0.001 i.e. parts per thousand. ",
+            "description": "Sea water salinity is the salt content of sea water, often on the Practical Salinity Scale of 1978. However, the unqualified term 'salinity' is generic and does not necessarily imply any particular method of calculation. The units of salinity are dimensionless and the units attribute should normally be given as 1e-3 or 0.001 i.e. parts per thousand. ",
+            "frequency": "mon",
+            "id": "so",
+            "long_name": "Sea Water Salinity",
+            "mipTable": "Omon",
+            "out_name": "so",
+            "prov": "Omon ((isd.003))",
+            "realm": "ocean",
+            "standard_name": "sea_water_salinity",
+            "time": "time",
+            "time_label": "time-mean",
+            "time_title": "Temporal mean",
+            "title": "Sea Water Salinity",
+            "type": "real",
+            "units": "0.001",
+            "variable_id": "so",
+            "source_dataset": "cmip6_historical",
+            "model": "CESM2",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "nlat",
+            "x_dim": "nlon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 1,
+            "original_units": "0.001",
+            "cmip6_variable": "so",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          }
+        },
+        "GFDL-ESM4": {
+          "dissic": {
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "units": "mol m-3",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "standard_name": "mole_concentration_of_dissolved_inorganic_carbon_in_sea_water",
+            "interp_method": "conserve_order1",
+            "original_name": "dissic",
+            "comment": "Model data on the 1x1 grid includes values in all cells for which any ocean exists on the native grid. For mapping purposes, we recommend using a land mask such as World Ocean Atlas to cover these areas of partial land.  For calculating approximate integrals, we recommend multiplying by cell volume (volcello).",
+            "source_dataset": "cmip6_historical",
+            "model": "GFDL-ESM4",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "regular",
+            "y_dim": "lat",
+            "x_dim": "lon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 9,
+            "original_units": "mol m-3",
+            "cmip6_variable": "dissic",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "talk": {
+            "long_name": "Total Alkalinity",
+            "units": "mol m-3",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "standard_name": "sea_water_alkalinity_expressed_as_mole_equivalent",
+            "interp_method": "conserve_order1",
+            "original_name": "talk",
+            "comment": "Model data on the 1x1 grid includes values in all cells for which any ocean exists on the native grid. For mapping purposes, we recommend using a land mask such as World Ocean Atlas to cover these areas of partial land.  For calculating approximate integrals, we recommend multiplying by cell volume (volcello).",
+            "source_dataset": "cmip6_historical",
+            "model": "GFDL-ESM4",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "regular",
+            "y_dim": "lat",
+            "x_dim": "lon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 9,
+            "original_units": "mol m-3",
+            "cmip6_variable": "talk",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "ph": {
+            "long_name": "pH",
+            "units": "1",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "standard_name": "sea_water_ph_reported_on_total_scale",
+            "interp_method": "conserve_order1",
+            "original_name": "ph",
+            "comment": "Model data on the 1x1 grid includes values in all cells for which any ocean exists on the native grid. For mapping purposes, we recommend using a land mask such as World Ocean Atlas to cover these areas of partial land.  For calculating approximate integrals, we recommend multiplying by cell volume (volcello).",
+            "source_dataset": "cmip6_historical",
+            "model": "GFDL-ESM4",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "regular",
+            "y_dim": "lat",
+            "x_dim": "lon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 9,
+            "original_units": "1",
+            "cmip6_variable": "ph",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "thetao": {
+            "long_name": "Sea Water Potential Temperature",
+            "units": "degC",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "standard_name": "sea_water_potential_temperature",
+            "interp_method": "conserve_order1",
+            "original_name": "thetao",
+            "comment": "Model data on the 1x1 grid includes values in all cells for which any ocean exists on the native grid. For mapping purposes, we recommend using a land mask such as World Ocean Atlas to cover these areas of partial land.  For calculating approximate integrals, we recommend multiplying by cell volume (volcello).",
+            "source_dataset": "cmip6_historical",
+            "model": "GFDL-ESM4",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "regular",
+            "y_dim": "lat",
+            "x_dim": "lon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 9,
+            "original_units": "degC",
+            "cmip6_variable": "thetao",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "so": {
+            "long_name": "Sea Water Salinity",
+            "units": "0.001",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "standard_name": "sea_water_salinity",
+            "interp_method": "conserve_order1",
+            "original_name": "so",
+            "comment": "Model data on the 1x1 grid includes values in all cells for which any ocean exists on the native grid. For mapping purposes, we recommend using a land mask such as World Ocean Atlas to cover these areas of partial land.  For calculating approximate integrals, we recommend multiplying by cell volume (volcello).",
+            "source_dataset": "cmip6_historical",
+            "model": "GFDL-ESM4",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "regular",
+            "y_dim": "lat",
+            "x_dim": "lon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 9,
+            "original_units": "0.001",
+            "cmip6_variable": "so",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "dissic": {
+            "standard_name": "mole_concentration_of_dissolved_inorganic_carbon_in_sea_water",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "comment": "Dissolved inorganic carbon (CO3+HCO3+H2CO3) concentration",
+            "units": "mol m-3",
+            "original_name": "dissic",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "history": "2019-09-11T14:22:31Z altered by CMOR: replaced missing value flag (-9e+33) and corresponding data with standard missing value (1e+20).",
+            "source_dataset": "cmip6_historical",
+            "model": "MPI-ESM1-2-LR",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "j",
+            "x_dim": "i",
+            "lat_coord": "latitude",
+            "lon_coord": "longitude",
+            "n_source_files": 9,
+            "original_units": "mol m-3",
+            "cmip6_variable": "dissic",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "talk": {
+            "standard_name": "sea_water_alkalinity_expressed_as_mole_equivalent",
+            "long_name": "Total Alkalinity",
+            "comment": "total alkalinity equivalent concentration (including carbonate, nitrogen, silicate, and borate components)",
+            "units": "mol m-3",
+            "original_name": "talk",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "history": "2019-09-11T14:22:31Z altered by CMOR: replaced missing value flag (-9e+33) and corresponding data with standard missing value (1e+20).",
+            "source_dataset": "cmip6_historical",
+            "model": "MPI-ESM1-2-LR",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "j",
+            "x_dim": "i",
+            "lat_coord": "latitude",
+            "lon_coord": "longitude",
+            "n_source_files": 9,
+            "original_units": "mol m-3",
+            "cmip6_variable": "talk",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "ph": {
+            "standard_name": "sea_water_ph_reported_on_total_scale",
+            "long_name": "pH",
+            "comment": "negative log of hydrogen ion concentration with the concentration expressed as mol H kg-1.",
+            "units": "1",
+            "original_name": "ph",
+            "original_units": "1",
+            "history": "2019-09-12T18:54:45Z altered by CMOR: Converted units from '1.0' to '1'. 2019-09-12T18:54:45Z altered by CMOR: replaced missing value flag (-9e+33) and corresponding data with standard missing value (1e+20).",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "source_dataset": "cmip6_historical",
+            "model": "MPI-ESM1-2-LR",
+            "experiment": "historical",
+            "variant_label": "r10i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "j",
+            "x_dim": "i",
+            "lat_coord": "latitude",
+            "lon_coord": "longitude",
+            "n_source_files": 9,
+            "cmip6_variable": "ph",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "thetao": {
+            "standard_name": "sea_water_potential_temperature",
+            "long_name": "Sea Water Potential Temperature",
+            "comment": "Diagnostic should be contributed even for models using conservative temperature as prognostic field.",
+            "units": "degC",
+            "original_name": "thetao",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "history": "2019-09-11T14:21:40Z altered by CMOR: replaced missing value flag (-9e+33) and corresponding data with standard missing value (1e+20).",
+            "source_dataset": "cmip6_historical",
+            "model": "MPI-ESM1-2-LR",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "j",
+            "x_dim": "i",
+            "lat_coord": "latitude",
+            "lon_coord": "longitude",
+            "n_source_files": 9,
+            "original_units": "degC",
+            "cmip6_variable": "thetao",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "so": {
+            "standard_name": "sea_water_salinity",
+            "long_name": "Sea Water Salinity",
+            "comment": "Sea water salinity is the salt content of sea water, often on the Practical Salinity Scale of 1978. However, the unqualified term 'salinity' is generic and does not necessarily imply any particular method of calculation. The units of salinity are dimensionless and the units attribute should normally be given as 1e-3 or 0.001 i.e. parts per thousand.",
+            "units": "0.001",
+            "original_name": "so",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "history": "2019-09-11T14:21:41Z altered by CMOR: replaced missing value flag (-9e+33) and corresponding data with standard missing value (1e+20).",
+            "source_dataset": "cmip6_historical",
+            "model": "MPI-ESM1-2-LR",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "j",
+            "x_dim": "i",
+            "lat_coord": "latitude",
+            "lon_coord": "longitude",
+            "n_source_files": 9,
+            "original_units": "0.001",
+            "cmip6_variable": "so",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          }
+        }
+      },
+      "state_hist": {
+        "CESM2": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 5,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 614400,
+            "n_valid": 427248,
+            "min": 1.103945255279541,
+            "max": 3.1308724880218506,
+            "mean": 2.0399010181427,
+            "std": 0.09541668742895126
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 5,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 614400,
+            "n_valid": 427248,
+            "min": -1.8939483165740967,
+            "max": 31.544042587280273,
+            "mean": 17.07503890991211,
+            "std": 11.36268138885498
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 5,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 614400,
+            "n_valid": 427248,
+            "min": 6.9535088539123535,
+            "max": 46.49533462524414,
+            "mean": 34.22345733642578,
+            "std": 1.8137766122817993
+          }
+        },
+        "GFDL-ESM4": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 4,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 259200,
+            "n_valid": 177141,
+            "min": 0.34474924206733704,
+            "max": 3.2734639644622803,
+            "mean": 2.104180097579956,
+            "std": 0.12476099282503128
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 4,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 259200,
+            "n_valid": 177141,
+            "min": -1.8371630907058716,
+            "max": 31.843929290771484,
+            "mean": 13.264357566833496,
+            "std": 11.12669849395752
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 4,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 259200,
+            "n_valid": 177141,
+            "min": 0.010000086389482021,
+            "max": 64.50492858886719,
+            "mean": 34.11558151245117,
+            "std": 2.578942060470581
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 5,
+              "j": 220,
+              "i": 254
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 279400,
+            "n_valid": 180525,
+            "min": 0.3544301688671112,
+            "max": 2.846572160720825,
+            "mean": 2.04705548286438,
+            "std": 0.09885082393884659
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 5,
+              "j": 220,
+              "i": 254
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 279400,
+            "n_valid": 180525,
+            "min": -1.89993417263031,
+            "max": 31.696826934814453,
+            "mean": 9.46122932434082,
+            "std": 9.863212585449219
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 5,
+              "j": 220,
+              "i": 254
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 279400,
+            "n_valid": 180525,
+            "min": 4.799846172332764,
+            "max": 50.49125289916992,
+            "mean": 34.01871109008789,
+            "std": 1.8238301277160645
+          }
+        }
+      },
+      "attrs_hist": {
+        "CESM2": {
+          "dissic": {
+            "cell_measures": "area: areacello volume: volcello",
+            "cell_methods": "area: mean where sea time: mean",
+            "comment": "Dissolved inorganic carbon (CO3+HCO3+H2CO3) concentration",
+            "description": "Dissolved inorganic carbon (CO3+HCO3+H2CO3) concentration",
+            "frequency": "mon",
+            "id": "dissic",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "mipTable": "Omon",
+            "out_name": "dissic",
+            "prov": "Omon ((isd.003))",
+            "realm": "ocnBgchem",
+            "standard_name": "mole_concentration_of_dissolved_inorganic_carbon_in_sea_water",
+            "time": "time",
+            "time_label": "time-mean",
+            "time_title": "Temporal mean",
+            "title": "Dissolved Inorganic Carbon Concentration",
+            "type": "real",
+            "units": "mol m-3",
+            "variable_id": "dissic",
+            "source_dataset": "cmip6_historical",
+            "model": "CESM2",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "nlat",
+            "x_dim": "nlon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 1,
+            "original_units": "mol m-3",
+            "cmip6_variable": "dissic",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "thetao": {
+            "cell_measures": "area: areacello volume: volcello",
+            "cell_methods": "area: mean where sea time: mean",
+            "comment": "Diagnostic should be contributed even for models using conservative temperature as prognostic field.",
+            "description": "Diagnostic should be contributed even for models using conservative temperature as prognostic field.",
+            "frequency": "mon",
+            "id": "thetao",
+            "long_name": "Sea Water Potential Temperature",
+            "mipTable": "Omon",
+            "out_name": "thetao",
+            "prov": "Omon ((isd.003))",
+            "realm": "ocean",
+            "standard_name": "sea_water_potential_temperature",
+            "time": "time",
+            "time_label": "time-mean",
+            "time_title": "Temporal mean",
+            "title": "Sea Water Potential Temperature",
+            "type": "real",
+            "units": "degC",
+            "variable_id": "thetao",
+            "source_dataset": "cmip6_historical",
+            "model": "CESM2",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "nlat",
+            "x_dim": "nlon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 1,
+            "original_units": "degC",
+            "cmip6_variable": "thetao",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "so": {
+            "cell_measures": "area: areacello volume: volcello",
+            "cell_methods": "area: mean where sea time: mean",
+            "comment": "Sea water salinity is the salt content of sea water, often on the Practical Salinity Scale of 1978. However, the unqualified term 'salinity' is generic and does not necessarily imply any particular method of calculation. The units of salinity are dimensionless and the units attribute should normally be given as 1e-3 or 0.001 i.e. parts per thousand. ",
+            "description": "Sea water salinity is the salt content of sea water, often on the Practical Salinity Scale of 1978. However, the unqualified term 'salinity' is generic and does not necessarily imply any particular method of calculation. The units of salinity are dimensionless and the units attribute should normally be given as 1e-3 or 0.001 i.e. parts per thousand. ",
+            "frequency": "mon",
+            "id": "so",
+            "long_name": "Sea Water Salinity",
+            "mipTable": "Omon",
+            "out_name": "so",
+            "prov": "Omon ((isd.003))",
+            "realm": "ocean",
+            "standard_name": "sea_water_salinity",
+            "time": "time",
+            "time_label": "time-mean",
+            "time_title": "Temporal mean",
+            "title": "Sea Water Salinity",
+            "type": "real",
+            "units": "0.001",
+            "variable_id": "so",
+            "source_dataset": "cmip6_historical",
+            "model": "CESM2",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "nlat",
+            "x_dim": "nlon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 1,
+            "original_units": "0.001",
+            "cmip6_variable": "so",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          }
+        },
+        "GFDL-ESM4": {
+          "dissic": {
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "units": "mol m-3",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "standard_name": "mole_concentration_of_dissolved_inorganic_carbon_in_sea_water",
+            "interp_method": "conserve_order1",
+            "original_name": "dissic",
+            "comment": "Model data on the 1x1 grid includes values in all cells for which any ocean exists on the native grid. For mapping purposes, we recommend using a land mask such as World Ocean Atlas to cover these areas of partial land.  For calculating approximate integrals, we recommend multiplying by cell volume (volcello).",
+            "source_dataset": "cmip6_historical",
+            "model": "GFDL-ESM4",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "regular",
+            "y_dim": "lat",
+            "x_dim": "lon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 9,
+            "original_units": "mol m-3",
+            "cmip6_variable": "dissic",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "thetao": {
+            "long_name": "Sea Water Potential Temperature",
+            "units": "degC",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "standard_name": "sea_water_potential_temperature",
+            "interp_method": "conserve_order1",
+            "original_name": "thetao",
+            "comment": "Model data on the 1x1 grid includes values in all cells for which any ocean exists on the native grid. For mapping purposes, we recommend using a land mask such as World Ocean Atlas to cover these areas of partial land.  For calculating approximate integrals, we recommend multiplying by cell volume (volcello).",
+            "source_dataset": "cmip6_historical",
+            "model": "GFDL-ESM4",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "regular",
+            "y_dim": "lat",
+            "x_dim": "lon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 9,
+            "original_units": "degC",
+            "cmip6_variable": "thetao",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "so": {
+            "long_name": "Sea Water Salinity",
+            "units": "0.001",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "standard_name": "sea_water_salinity",
+            "interp_method": "conserve_order1",
+            "original_name": "so",
+            "comment": "Model data on the 1x1 grid includes values in all cells for which any ocean exists on the native grid. For mapping purposes, we recommend using a land mask such as World Ocean Atlas to cover these areas of partial land.  For calculating approximate integrals, we recommend multiplying by cell volume (volcello).",
+            "source_dataset": "cmip6_historical",
+            "model": "GFDL-ESM4",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "regular",
+            "y_dim": "lat",
+            "x_dim": "lon",
+            "lat_coord": "lat",
+            "lon_coord": "lon",
+            "n_source_files": 9,
+            "original_units": "0.001",
+            "cmip6_variable": "so",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "dissic": {
+            "standard_name": "mole_concentration_of_dissolved_inorganic_carbon_in_sea_water",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "comment": "Dissolved inorganic carbon (CO3+HCO3+H2CO3) concentration",
+            "units": "mol m-3",
+            "original_name": "dissic",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "history": "2019-09-11T14:22:31Z altered by CMOR: replaced missing value flag (-9e+33) and corresponding data with standard missing value (1e+20).",
+            "source_dataset": "cmip6_historical",
+            "model": "MPI-ESM1-2-LR",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "j",
+            "x_dim": "i",
+            "lat_coord": "latitude",
+            "lon_coord": "longitude",
+            "n_source_files": 9,
+            "original_units": "mol m-3",
+            "cmip6_variable": "dissic",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "thetao": {
+            "standard_name": "sea_water_potential_temperature",
+            "long_name": "Sea Water Potential Temperature",
+            "comment": "Diagnostic should be contributed even for models using conservative temperature as prognostic field.",
+            "units": "degC",
+            "original_name": "thetao",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "history": "2019-09-11T14:21:40Z altered by CMOR: replaced missing value flag (-9e+33) and corresponding data with standard missing value (1e+20).",
+            "source_dataset": "cmip6_historical",
+            "model": "MPI-ESM1-2-LR",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "j",
+            "x_dim": "i",
+            "lat_coord": "latitude",
+            "lon_coord": "longitude",
+            "n_source_files": 9,
+            "original_units": "degC",
+            "cmip6_variable": "thetao",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          },
+          "so": {
+            "standard_name": "sea_water_salinity",
+            "long_name": "Sea Water Salinity",
+            "comment": "Sea water salinity is the salt content of sea water, often on the Practical Salinity Scale of 1978. However, the unqualified term 'salinity' is generic and does not necessarily imply any particular method of calculation. The units of salinity are dimensionless and the units attribute should normally be given as 1e-3 or 0.001 i.e. parts per thousand.",
+            "units": "0.001",
+            "original_name": "so",
+            "cell_methods": "area: mean where sea time: mean",
+            "cell_measures": "area: areacello volume: volcello",
+            "history": "2019-09-11T14:21:41Z altered by CMOR: replaced missing value flag (-9e+33) and corresponding data with standard missing value (1e+20).",
+            "source_dataset": "cmip6_historical",
+            "model": "MPI-ESM1-2-LR",
+            "experiment": "historical",
+            "variant_label": "r1i1p1f1",
+            "grid_type": "curvilinear",
+            "y_dim": "j",
+            "x_dim": "i",
+            "lat_coord": "latitude",
+            "lon_coord": "longitude",
+            "n_source_files": 9,
+            "original_units": "0.001",
+            "cmip6_variable": "so",
+            "grid_point": "tracer",
+            "dataset_notes": "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1. | In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory. | CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof. | so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+          }
+        }
+      },
+      "grid_provenance": {
+        "CESM2": {
+          "area_source": "areacello published by cmip6_historical",
+          "volume_source": "volcello published by cmip6_historical"
+        },
+        "GFDL-ESM4": {
+          "area_source": "areacello published by cmip6_historical",
+          "volume_source": "volcello published by cmip6_historical"
+        },
+        "MPI-ESM1-2-LR": {
+          "area_source": "areacello published by cmip6_historical",
+          "volume_source": "volcello published by cmip6_historical"
+        }
+      },
+      "dic_kg": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 60,
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC",
+          "source_dataset": "cmip6_historical",
+          "size": 7372800,
+          "n_valid": 4247539,
+          "min": 1114.175689931429,
+          "max": 3386.850912648863,
+          "mean": 2152.75293913398,
+          "std": 131.4939488590128
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 35,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC",
+          "source_dataset": "cmip6_historical",
+          "size": 2268000,
+          "n_valid": 1212999,
+          "min": 346.9529042326125,
+          "max": 3157.670703051717,
+          "mean": 2184.414857095282,
+          "std": 104.43841337059823
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 40,
+            "j": 220,
+            "i": 254
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC",
+          "source_dataset": "cmip6_historical",
+          "size": 2235200,
+          "n_valid": 1080353,
+          "min": 311.31044152683506,
+          "max": 2770.443541573808,
+          "mean": 2089.051633693231,
+          "std": 105.3618305988535
+        }
+      },
+      "talk_kg": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 60,
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "umol kg-1",
+          "long_name": "Total alkalinity",
+          "source_dataset": "cmip6_historical",
+          "size": 7372800,
+          "n_valid": 4247539,
+          "min": 1231.2788285845263,
+          "max": 4539.67223463365,
+          "mean": 2297.36726320722,
+          "std": 74.066013677725
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 35,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Total alkalinity",
+          "source_dataset": "cmip6_historical",
+          "size": 2268000,
+          "n_valid": 1212999,
+          "min": 384.00225315471863,
+          "max": 4227.71754333219,
+          "mean": 2336.7279768550043,
+          "std": 73.04831636488026
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 40,
+            "j": 220,
+            "i": 254
+          },
+          "units": "umol kg-1",
+          "long_name": "Total alkalinity",
+          "source_dataset": "cmip6_historical",
+          "size": 2235200,
+          "n_valid": 1080353,
+          "min": 293.4754262698297,
+          "max": 3187.4480221965946,
+          "mean": 2239.3950256839767,
+          "std": 77.45858035226829
+        }
+      },
+      "ph_kg": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 60,
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "1",
+          "long_name": "pH (total scale, in situ)",
+          "source_dataset": "cmip6_historical",
+          "size": 7372800,
+          "n_valid": 4247539,
+          "min": 7.086112976074219,
+          "max": 8.945194244384766,
+          "mean": 7.899064540863037,
+          "std": 0.20404152572155
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 35,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "pH (total scale, in situ)",
+          "source_dataset": "cmip6_historical",
+          "size": 2268000,
+          "n_valid": 1212999,
+          "min": 7.27360725402832,
+          "max": 9.926178932189941,
+          "mean": 7.944672584533691,
+          "std": 0.15632633864879608
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 40,
+            "j": 220,
+            "i": 254
+          },
+          "units": "1",
+          "long_name": "pH (total scale, in situ)",
+          "source_dataset": "cmip6_historical",
+          "size": 2235200,
+          "n_valid": 1080353,
+          "min": 6.8458991050720215,
+          "max": 8.229844093322754,
+          "mean": 7.97658634185791,
+          "std": 0.15298721194267273
+        }
+      },
+      "dic_hist_kg": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 5,
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC",
+          "source_dataset": "cmip6_historical",
+          "size": 614400,
+          "n_valid": 427248,
+          "min": 1093.2776947540196,
+          "max": 3080.223411465845,
+          "mean": 1991.1621430403886,
+          "std": 89.637576907629
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 4,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC",
+          "source_dataset": "cmip6_historical",
+          "size": 259200,
+          "n_valid": 177141,
+          "min": 344.7512401128838,
+          "max": 3130.5820885489074,
+          "mean": 2052.398977221038,
+          "std": 118.81500474509248
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 5,
+            "j": 220,
+            "i": 254
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC",
+          "source_dataset": "cmip6_historical",
+          "size": 279400,
+          "n_valid": 180525,
+          "min": 353.05060731654066,
+          "max": 2748.2717995069056,
+          "mean": 1995.2551375652433,
+          "std": 93.89444638626453
+        }
+      },
+      "density_note": {
+        "CESM2": "cell-by-cell in-situ density (sigma computed with TEOS-10, ref_pressure=None, +1000); umol kg-1 = mmol m-3 * 1000 / rho",
+        "GFDL-ESM4": "cell-by-cell in-situ density (sigma computed with TEOS-10, ref_pressure=None, +1000); umol kg-1 = mmol m-3 * 1000 / rho",
+        "MPI-ESM1-2-LR": "cell-by-cell in-situ density (sigma computed with TEOS-10, ref_pressure=None, +1000); umol kg-1 = mmol m-3 * 1000 / rho"
+      },
+      "glodap_tco2": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 33,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "micro-mol kg-1",
+        "long_name": "moles of dissolved inorganic carbon per unit mass in seawater",
+        "source_dataset": "glodap",
+        "size": 2138400,
+        "n_valid": 1103356,
+        "min": 1019.1619873046875,
+        "max": 2402.477294921875,
+        "mean": 2181.71025090623,
+        "std": 105.46550860707693
+      },
+      "glodap_talk": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 33,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "micro-mol kg-1",
+        "long_name": "seawater alkalinity expressed as mole equivalent per unit mass",
+        "source_dataset": "glodap",
+        "size": 2138400,
+        "n_valid": 1101785,
+        "min": 1069.45556640625,
+        "max": 2659.830810546875,
+        "mean": 2324.9228543747768,
+        "std": 53.49204578692571
+      },
+      "glodap_ph": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 33,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "",
+        "long_name": "seawater ph reported on total scale at in situ temperature and pressure",
+        "source_dataset": "glodap",
+        "size": 2138400,
+        "n_valid": 1101821,
+        "min": 7.426542282104492,
+        "max": 8.522977828979492,
+        "mean": 7.930877682557368,
+        "std": 0.14905358069576602
+      },
+      "DIC_mean": {
+        "CESM2": 1996.6481691017216,
+        "GFDL-ESM4": 2059.1754314056225,
+        "MPI-ESM1-2-LR": 1974.456596398784,
+        "GLODAP": 2035.7069775902141
+      },
+      "TALK_mean": {
+        "CESM2": 2264.0076520694806,
+        "GFDL-ESM4": 2335.6679866693266,
+        "MPI-ESM1-2-LR": 2217.8791626319726,
+        "GLODAP": 2304.4642034693966
+      },
+      "PH_mean": {
+        "CESM2": 8.079532623291016,
+        "GFDL-ESM4": 8.088338851928711,
+        "MPI-ESM1-2-LR": 8.05854320526123,
+        "GLODAP": 8.080084485218075
+      },
+      "DIC_diff": {
+        "CESM2": -39.05880848849256,
+        "GFDL-ESM4": 23.46845381540834,
+        "MPI-ESM1-2-LR": -61.25038119143005
+      },
+      "TALK_diff": {
+        "CESM2": -40.45655139991595,
+        "GFDL-ESM4": 31.203783199930058,
+        "MPI-ESM1-2-LR": -86.585040837424
+      },
+      "PH_diff": {
+        "CESM2": -0.0005518619270592495,
+        "GFDL-ESM4": 0.008254366710636063,
+        "MPI-ESM1-2-LR": -0.021541279956844406
+      },
+      "dic_map": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC 0-50 m",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 42576,
+          "min": 1244.8582812879656,
+          "max": 3094.0185797362533,
+          "mean": 2012.2165642684074,
+          "std": 85.28247823340551
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC 0-50 m",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 44564,
+          "min": 347.0126232722023,
+          "max": 3154.940708778929,
+          "mean": 2062.369191527166,
+          "std": 131.93625545627108
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC 0-50 m",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 42713,
+          "min": 321.7156122491479,
+          "max": 2631.2146755720646,
+          "mean": 1979.6980667353978,
+          "std": 101.04900767735838
+        }
+      },
+      "glodap_map": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "umol kg-1",
+        "long_name": "DIC 0-50 m",
+        "source_dataset": "glodap",
+        "size": 64800,
+        "n_valid": 41977,
+        "min": 1019.1619873046875,
+        "max": 2313.45703125,
+        "mean": 2052.1406669062444,
+        "std": 78.4216382686179
+      },
+      "comparison_mask": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "long_name": "cells covered by every field in the comparison",
+        "source_dataset": "glodap",
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "map_metrics": {
+        "CESM2": {
+          "bias": -36.52506825103314,
+          "mae": 40.517371040682335,
+          "rmse": 59.82535106474823,
+          "centered_rmse": 47.38134674402726,
+          "max_abs_error": 885.0093203205686,
+          "max_abs_error_at": {
+            "lat": 62.5,
+            "lon": 20.5
+          },
+          "std_data": 84.2095290426542,
+          "std_reference": 73.29793002818812,
+          "std_ratio": 1.14886640059644,
+          "mean_data": 1997.5091996670349,
+          "mean_reference": 2034.0342679180671,
+          "n_valid": 41227,
+          "weighting": "area: computed from glodap cell centres (the product publishes no cell bounds)",
+          "difference": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "umol kg-1",
+            "long_name": "DIC 0-50 m",
+            "source_dataset": "glodap",
+            "size": 64800,
+            "n_valid": 41227,
+            "min": -885.0093203205686,
+            "max": 844.5507950783422,
+            "mean": -38.30264232591833,
+            "std": 50.21575788102266
+          }
+        },
+        "GFDL-ESM4": {
+          "bias": 25.27504324910725,
+          "mae": 37.206602864082015,
+          "rmse": 64.94170939673036,
+          "centered_rmse": 59.821382532712605,
+          "max_abs_error": 1770.0652287578184,
+          "max_abs_error_at": {
+            "lat": 62.5,
+            "lon": 20.5
+          },
+          "std_data": 82.07118941221896,
+          "std_reference": 73.29793002818812,
+          "std_ratio": 1.1196931397743008,
+          "mean_data": 2059.309311167175,
+          "mean_reference": 2034.0342679180671,
+          "n_valid": 41227,
+          "weighting": "area: computed from glodap cell centres (the product publishes no cell bounds)",
+          "difference": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "umol kg-1",
+            "long_name": "DIC 0-50 m",
+            "source_dataset": "glodap",
+            "size": 64800,
+            "n_valid": 41227,
+            "min": -1770.0652287578184,
+            "max": 723.5500694617147,
+            "mean": 18.563042509029493,
+            "std": 68.66578118171932
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "bias": -59.37317104338894,
+          "mae": 61.262269418282315,
+          "rmse": 83.08277218142337,
+          "centered_rmse": 58.11689593915677,
+          "max_abs_error": 1729.4114645521388,
+          "max_abs_error_at": {
+            "lat": 64.5,
+            "lon": 21.5
+          },
+          "std_data": 84.20099854775845,
+          "std_reference": 73.29793002818812,
+          "std_ratio": 1.1487500194804594,
+          "mean_data": 1974.6610968746786,
+          "mean_reference": 2034.0342679180671,
+          "n_valid": 41227,
+          "weighting": "area: computed from glodap cell centres (the product publishes no cell bounds)",
+          "difference": {
+            "type": "DataArray",
+            "dims": {
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "umol kg-1",
+            "long_name": "DIC 0-50 m",
+            "source_dataset": "glodap",
+            "size": 64800,
+            "n_valid": 41227,
+            "min": -1729.4114645521388,
+            "max": 613.7210675188587,
+            "mean": -70.37176842699718,
+            "std": 69.04474063696861
+          }
+        }
+      },
+      "map_corr": {
+        "CESM2": {
+          "correlation": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Area-weighted pattern correlation (pearson)",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 0.8277870456097298,
+            "max": 0.8277870456097298,
+            "mean": 0.8277870456097298,
+            "std": 0.0,
+            "values": 0.827787
+          },
+          "pvalue": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Two-tailed p-value assuming independent samples",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "values": 0.0
+          },
+          "pvalue_unadjusted": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Two-tailed p-value assuming independent samples",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "values": 0.0
+          },
+          "n_samples": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Number of cells common to both fields",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 41227.0,
+            "max": 41227.0,
+            "mean": 41227.0,
+            "std": 0.0,
+            "values": 41227
+          },
+          "n_effective": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Effective number of independent samples",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 41227.0,
+            "max": 41227.0,
+            "mean": 41227.0,
+            "std": 0.0,
+            "values": 41227.0
+          }
+        },
+        "GFDL-ESM4": {
+          "correlation": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Area-weighted pattern correlation (pearson)",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 0.7089567446483572,
+            "max": 0.7089567446483572,
+            "mean": 0.7089567446483572,
+            "std": 0.0,
+            "values": 0.708957
+          },
+          "pvalue": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Two-tailed p-value assuming independent samples",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "values": 0.0
+          },
+          "pvalue_unadjusted": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Two-tailed p-value assuming independent samples",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "values": 0.0
+          },
+          "n_samples": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Number of cells common to both fields",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 41227.0,
+            "max": 41227.0,
+            "mean": 41227.0,
+            "std": 0.0,
+            "values": 41227
+          },
+          "n_effective": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Effective number of independent samples",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 41227.0,
+            "max": 41227.0,
+            "mean": 41227.0,
+            "std": 0.0,
+            "values": 41227.0
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "correlation": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Area-weighted pattern correlation (pearson)",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 0.7359993525884698,
+            "max": 0.7359993525884698,
+            "mean": 0.7359993525884698,
+            "std": 0.0,
+            "values": 0.735999
+          },
+          "pvalue": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Two-tailed p-value assuming independent samples",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "values": 0.0
+          },
+          "pvalue_unadjusted": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Two-tailed p-value assuming independent samples",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "values": 0.0
+          },
+          "n_samples": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Number of cells common to both fields",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 41227.0,
+            "max": 41227.0,
+            "mean": 41227.0,
+            "std": 0.0,
+            "values": 41227
+          },
+          "n_effective": {
+            "type": "DataArray",
+            "dims": {},
+            "long_name": "Effective number of independent samples",
+            "source_dataset": "glodap",
+            "size": 1,
+            "n_valid": 1,
+            "min": 41227.0,
+            "max": 41227.0,
+            "mean": 41227.0,
+            "std": 0.0,
+            "values": 41227.0
+          }
+        }
+      },
+      "bias_maps": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC 0-50 m",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 41227,
+          "min": -885.0093203205686,
+          "max": 844.5507950783422,
+          "mean": -38.30264232591833,
+          "std": 50.21575788102266
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC 0-50 m",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 41227,
+          "min": -1770.0652287578184,
+          "max": 723.5500694617147,
+          "mean": 18.563042509029493,
+          "std": 68.66578118171932
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC 0-50 m",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 41227,
+          "min": -1729.4114645521388,
+          "max": 613.7210675188587,
+          "mean": -70.37176842699718,
+          "std": 69.04474063696861
+        }
+      },
+      "target_depths": [
+        0.0,
+        100.0,
+        500.0,
+        1000.0,
+        2000.0
+      ],
+      "glodap_prof": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 5,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "micro-mol kg-1",
+        "long_name": "moles of dissolved inorganic carbon per unit mass in seawater",
+        "source_dataset": "glodap",
+        "size": 324000,
+        "n_valid": 186209,
+        "min": 1019.1619873046875,
+        "max": 2402.477294921875,
+        "mean": 2165.144358228964,
+        "std": 112.10704901143171
+      },
+      "dic_prof": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 5,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC",
+          "source_dataset": "glodap",
+          "size": 324000,
+          "n_valid": 190933,
+          "min": 1244.0755728650142,
+          "max": 3358.3473958249265,
+          "mean": 2140.3075777083154,
+          "std": 137.3489879344061
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 5,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC",
+          "source_dataset": "glodap",
+          "size": 324000,
+          "n_valid": 200717,
+          "min": 346.9529042326125,
+          "max": 3152.4391125399134,
+          "mean": 2167.2057929112316,
+          "std": 117.03167709823859
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 5,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "DIC",
+          "source_dataset": "glodap",
+          "size": 324000,
+          "n_valid": 191820,
+          "min": 316.70837655575656,
+          "max": 2681.3999065378616,
+          "mean": 2087.284851136674,
+          "std": 134.36905605124983
+        }
+      },
+      "profile_bias": {
+        "CESM2": {
+          "0.0": -28.58184950969906,
+          "100.0": -45.94779469361602,
+          "500.0": -12.48551054881646,
+          "1000.0": 2.101801384653744,
+          "2000.0": -2.365506205746173
+        },
+        "GFDL-ESM4": {
+          "0.0": 28.98291638260966,
+          "100.0": 19.363631261345308,
+          "500.0": -10.952017198152836,
+          "1000.0": -0.8474012901815363,
+          "2000.0": -11.398556732482954
+        },
+        "MPI-ESM1-2-LR": {
+          "0.0": -58.158166624457614,
+          "100.0": -59.36013706097246,
+          "500.0": -77.80167741174326,
+          "1000.0": -66.57659594561635,
+          "2000.0": -60.98173756462447
+        }
+      },
+      "profile_ncells": {
+        "CESM2": {
+          "0.0": 40921,
+          "100.0": 38318,
+          "500.0": 36370,
+          "1000.0": 35727,
+          "2000.0": 33041
+        },
+        "GFDL-ESM4": {
+          "0.0": 41301,
+          "100.0": 38534,
+          "500.0": 36561,
+          "1000.0": 35975,
+          "2000.0": 33795
+        },
+        "MPI-ESM1-2-LR": {
+          "0.0": 40828,
+          "100.0": 38355,
+          "500.0": 36294,
+          "1000.0": 35688,
+          "2000.0": 33109
+        }
+      },
+      "DIC_hist_mean": {
+        "CESM2": 1987.4304022313863,
+        "GFDL-ESM4": 2046.6965584595287,
+        "MPI-ESM1-2-LR": 1963.6079655433107
+      },
+      "period_change": {
+        "CESM2": 9.217766870335254,
+        "GFDL-ESM4": 12.478872946093816,
+        "MPI-ESM1-2-LR": 10.848630855473402
+      },
+      "change_to_bias": {
+        "CESM2": -0.23599713424568436,
+        "GFDL-ESM4": 0.5317296590668766,
+        "MPI-ESM1-2-LR": -0.17711940145429342
+      },
+      "summary": {
+        "DIC_mean": {
+          "CESM2": 1996.6481691017216,
+          "GFDL-ESM4": 2059.1754314056225,
+          "MPI-ESM1-2-LR": 1974.456596398784,
+          "GLODAP": 2035.7069775902141
+        },
+        "DIC_diff": {
+          "CESM2": -39.05880848849256,
+          "GFDL-ESM4": 23.46845381540834,
+          "MPI-ESM1-2-LR": -61.25038119143005
+        },
+        "TALK_mean": {
+          "CESM2": 2264.0076520694806,
+          "GFDL-ESM4": 2335.6679866693266,
+          "MPI-ESM1-2-LR": 2217.8791626319726,
+          "GLODAP": 2304.4642034693966
+        },
+        "TALK_diff": {
+          "CESM2": -40.45655139991595,
+          "GFDL-ESM4": 31.203783199930058,
+          "MPI-ESM1-2-LR": -86.585040837424
+        },
+        "PH_mean": {
+          "CESM2": 8.079532623291016,
+          "GFDL-ESM4": 8.088338851928711,
+          "MPI-ESM1-2-LR": 8.05854320526123,
+          "GLODAP": 8.080084485218075
+        },
+        "PH_diff": {
+          "CESM2": -0.0005518619270592495,
+          "GFDL-ESM4": 0.008254366710636063,
+          "MPI-ESM1-2-LR": -0.021541279956844406
+        },
+        "map_bias": {
+          "CESM2": -36.52506825103314,
+          "GFDL-ESM4": 25.27504324910725,
+          "MPI-ESM1-2-LR": -59.37317104338894
+        },
+        "map_rmse": {
+          "CESM2": 59.82535106474823,
+          "GFDL-ESM4": 64.94170939673036,
+          "MPI-ESM1-2-LR": 83.08277218142337
+        },
+        "map_corr": {
+          "CESM2": 0.8277870456097298,
+          "GFDL-ESM4": 0.7089567446483572,
+          "MPI-ESM1-2-LR": 0.7359993525884698
+        },
+        "map_n_valid": {
+          "CESM2": 41227,
+          "GFDL-ESM4": 41227,
+          "MPI-ESM1-2-LR": 41227
+        },
+        "map_mean_model": {
+          "CESM2": 1997.5091996670349,
+          "GFDL-ESM4": 2059.309311167175,
+          "MPI-ESM1-2-LR": 1974.6610968746786
+        },
+        "map_mean_glodap": {
+          "CESM2": 2034.0342679180671,
+          "GFDL-ESM4": 2034.0342679180671,
+          "MPI-ESM1-2-LR": 2034.0342679180671
+        },
+        "n_mask_cells": 41227,
+        "profile_bias": {
+          "CESM2": {
+            "0.0": -28.58184950969906,
+            "100.0": -45.94779469361602,
+            "500.0": -12.48551054881646,
+            "1000.0": 2.101801384653744,
+            "2000.0": -2.365506205746173
+          },
+          "GFDL-ESM4": {
+            "0.0": 28.98291638260966,
+            "100.0": 19.363631261345308,
+            "500.0": -10.952017198152836,
+            "1000.0": -0.8474012901815363,
+            "2000.0": -11.398556732482954
+          },
+          "MPI-ESM1-2-LR": {
+            "0.0": -58.158166624457614,
+            "100.0": -59.36013706097246,
+            "500.0": -77.80167741174326,
+            "1000.0": -66.57659594561635,
+            "2000.0": -60.98173756462447
+          }
+        },
+        "profile_ncells": {
+          "CESM2": {
+            "0.0": 40921,
+            "100.0": 38318,
+            "500.0": 36370,
+            "1000.0": 35727,
+            "2000.0": 33041
+          },
+          "GFDL-ESM4": {
+            "0.0": 41301,
+            "100.0": 38534,
+            "500.0": 36561,
+            "1000.0": 35975,
+            "2000.0": 33795
+          },
+          "MPI-ESM1-2-LR": {
+            "0.0": 40828,
+            "100.0": 38355,
+            "500.0": 36294,
+            "1000.0": 35688,
+            "2000.0": 33109
+          }
+        },
+        "period_change": {
+          "CESM2": 9.217766870335254,
+          "GFDL-ESM4": 12.478872946093816,
+          "MPI-ESM1-2-LR": 10.848630855473402
+        },
+        "change_to_bias": {
+          "CESM2": -0.23599713424568436,
+          "GFDL-ESM4": 0.5317296590668766,
+          "MPI-ESM1-2-LR": -0.17711940145429342
+        },
+        "density_note": {
+          "CESM2": "cell-by-cell in-situ density (sigma computed with TEOS-10, ref_pressure=None, +1000); umol kg-1 = mmol m-3 * 1000 / rho",
+          "GFDL-ESM4": "cell-by-cell in-situ density (sigma computed with TEOS-10, ref_pressure=None, +1000); umol kg-1 = mmol m-3 * 1000 / rho",
+          "MPI-ESM1-2-LR": "cell-by-cell in-situ density (sigma computed with TEOS-10, ref_pressure=None, +1000); umol kg-1 = mmol m-3 * 1000 / rho"
+        },
+        "grid_provenance": {
+          "CESM2": {
+            "area_source": "areacello published by cmip6_historical",
+            "volume_source": "volcello published by cmip6_historical"
+          },
+          "GFDL-ESM4": {
+            "area_source": "areacello published by cmip6_historical",
+            "volume_source": "volcello published by cmip6_historical"
+          },
+          "MPI-ESM1-2-LR": {
+            "area_source": "areacello published by cmip6_historical",
+            "volume_source": "volcello published by cmip6_historical"
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_full_20261020/T8_deepseek-flash_20261021_011942/turn01/figures/visualization_T8_deepseek-flash_20261021_011942_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_full_20261020/T8_deepseek-flash_20261021_011942/turn01/figures/visualization_T8_deepseek-flash_20261021_011942_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Please provide a clear scientific summary inside <solution></solution> tags.
+
+Describe the methodology strictly from the <executed_code> above, never by inferring it from variable
+names: the baseline period, the source of any climatology, the weighting, the units, the region and
+time range, the range of lags — all of it must match the tools and arguments the code actually
+called. Do not report a step the code did not take. Where a variable name in the observation is
+ambiguous, the code decides what it means.
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
+4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, tool choice, computation and visualization attempts
+3. Suggestions for how to reformulate the query
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+## 1. What was done (as executed)
+
+**Data.** Monthly CMIP6 `historical` output from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR: `dissic`, `talk`, `ph`, `thetao`, `so` for calendar year 2002 (averaged over the 12 monthly values into one annual-mean state), plus `dissic`, `thetao`, `so` for 1971-01 to 2000-12 (loaded with `depth_range=[0,50]` and averaged over time into one 1971–2000 mean state). Grid weights were taken from each model's own published `areacello` and `volcello` (`area_source`/`volume_source` = "… published by cmip6_historical" for all three models; the code never used `thkcello`/`masscello`/`rhozero`).
+
+**Reference.** `load_climatology_data(dataset="glodap")` for `TCO2`, `TAlk` and `pHtsinsitutp` — GLODAPv2.2016b mapped climatology, 33 standard levels, no time dimension. Model `ph` (total scale, in situ) was compared only with `pHtsinsitutp`; pH was not rescaled.
+
+**Units.** Model `dissic`/`talk` are mol m⁻³. They were converted with `transform_unit` to mmol m⁻³ and then divided by a cell-by-cell absolute in-situ density, ρ = `compute_potential_density_anomaly(thetao, so, ref_pressure=None)` + 1000, to give µmol kg⁻¹. Density assumption recorded for all three models: *"cell-by-cell in-situ density (sigma computed with TEOS-10, ref_pressure=None, +1000); umol kg⁻¹ = mmol m⁻³ × 1000 / ρ"*. `so` was used as loaded, without rescaling (its "0.001" units string was not applied as a multiplier).
+
+**Weighting.** Depth-spanning means (all 0–50 m means) used `compute_basic_stat(op="volume_weighted_mean")` restricted to the levels each column has in 0–50 m; horizontal metrics used area weighting on the GLODAP 1° grid. No unweighted `mean()` over (y, x) was taken. Native-grid and regridded numbers are reported separately below.
+
+## 2. Direct answer
+
+**No single model wins everywhere, but CESM2 is the best overall reproduction of the observed carbon system.** It has by far the smallest pH error (−0.001), the smallest alkalinity error of the two low-bias models in relative terms and the best spatial pattern of surface DIC (r = 0.828, RMSE 60 µmol kg⁻¹). GFDL-ESM4 is closest on the surface DIC and alkalinity *inventory* (+23 and +31 µmol kg⁻¹ vs GLODAP) but has the worst spatial pattern (r = 0.709) and a larger pH error (+0.008). MPI-ESM1-2-LR is worst on every carbon metric (DIC −61, TAlk −87 µmol kg⁻¹, pH −0.022, RMSE 83 µmol kg⁻¹, r = 0.736).
+
+**Sign consistency: yes.** Each model's three errors have the same sign — CESM2 DIC/TAlk/pH all negative, GFDL-ESM4 all positive, MPI-ESM1-2-LR all negative — the physically expected behaviour for a carbon system coupled through carbonate chemistry (low DIC + low TAlk ⇒ low pH).
+
+## 3. Key numbers
+
+### 3.1 Global 0–50 m means (each source on its own native grid, volume-weighted; µmol kg⁻¹ / pH)
+
+| Source | DIC | Δ vs GLODAP | TAlk | Δ vs GLODAP | pH | Δ vs GLODAP |
+|---|---|---|---|---|---|---|
+| CESM2 | 1997 | −39 | 2264 | −40 | 8.080 | −0.001 |
+| GFDL-ESM4 | 2059 | +23 | 2336 | +31 | 8.088 | +0.008 |
+| MPI-ESM1-2-LR | 1974 | −61 | 2218 | −87 | 8.059 | −0.022 |
+| GLODAP | 2036 | — | 2304 | — | 8.080 | — |
+
+These averages each cover that source's *own* valid 0–50 m cells (a different set per source), so they are not directly the same as the shared-mask biases below.
+
+### 3.2 0–50 m DIC map, conservative regrid to the GLODAP 1° grid, single shared mask (41 227 cells, `ocean_only=False`)
+
+| Model | Mean bias (µmol kg⁻¹) | RMSE (µmol kg⁻¹) | Spatial correlation |
+|---|---|---|---|
+| CESM2 | −37 | 60 | 0.828 |
+| GFDL-ESM4 | +25 | 65 | 0.709 |
+| MPI-ESM1-2-LR | −59 | 83 | 0.736 |
+
+On this mask the model means are 1997.5, 2059.3 and 1974.7 vs a GLODAP mean of 2034.0 µmol kg⁻¹; the biases (−36.5, +25.3, −59.4) are close to, but not identical with, the native-grid differences of §3.1.
+
+### 3.3 Vertical profile of DIC bias (model − GLODAP, area-weighted on the 1° grid, both defined)
+
+| Depth | CESM2 | GFDL-ESM4 | MPI-ESM1-2-LR | cells (CESM2/GFDL/MPI) |
+|---|---|---|---|---|
+| 0 m | −29 | +29 | −58 | 40 921 / 41 301 / 40 828 |
+| 100 m | −46 | +19 | −59 | 38 318 / 38 534 / 38 355 |
+| 500 m | −12 | −11 | −78 | 36 370 / 36 561 / 36 294 |
+| 1000 m | +2 | −1 | −67 | 35 727 / 35 975 / 35 688 |
+| 2000 m | −2 | −11 | −61 | 33 041 / 33 795 / 33 109 |
+
+CESM2's and GFDL-ESM4's biases converge to near zero below ~500 m (a near-cancellation of the surface offset by the deeper ocean), whereas MPI-ESM1-2-LR carries a persistent ≈ −60 to −80 µmol kg⁻¹ low bias over the whole water column — a whole-ocean carbon inventory deficit, not a surface-only problem.
+
+### 3.4 Anthropogenic change and the bias/change ratio
+
+| Model | 2002 minus 1971–2000 (0–50 m DIC, native grid) | Ratio to the step-5 DIC bias |
+|---|---|---|
+| CESM2 | +9 µmol kg⁻¹ | −0.24 |
+| GFDL-ESM4 | +12 µmol kg⁻¹ | +0.53 |
+| MPI-ESM1-2-LR | +11 µmol kg⁻¹ | −0.18 |
+
+**Implication for reading the bias.** In every model the 1971–2000 → 2002 change (+9 to +12 µmol kg⁻¹) is only 18–53 % of the magnitude of that model's DIC bias against GLODAP. The bias is therefore *larger* than the entire accumulated anthropogenic DIC signal of the last three decades of the 20th century: it cannot be interpreted as a timing/lag error (i.e. a model simply "running a few years ahead or behind" the observations), because that would require a temporal offset of roughly two to five decades. The DIC offsets are genuine systematic model field errors (inventory, saturation state and/or biological/ventilation parameterisations), not drift artefacts. The sign of the ratio also differs between models, so no common phase offset can reconcile them with GLODAP.
+
+## 4. Figures
+
+**Figure 1** — three panels in one row (one per model) of the 0–50 m DIC bias (model − GLODAP) on the 41 227-cell shared GLODAP-grid mask, drawn with a single diverging `RdBu_r` colour scale centred on zero and shared across all three panels, symmetric and clipped at the pooled 98th percentile of |bias| so the large high-latitude outliers do not flatten the open-ocean pattern; one common colourbar labelled in µmol kg⁻¹. Each title carries that model's map bias, RMSE and correlation. The intended reading is the *spatial structure* of the surface carbon error under a common scale and a common cell set.
+
+**Figure 2** — a single panel showing the vertical profile of the global mean DIC bias: depth on the vertical axis increasing downward, bias in µmol kg⁻¹ on the horizontal axis, one line per model with markers at 0, 100, 500, 1000 and 2000 m and a vertical zero reference line. It is designed to show how each model's bias is distributed through the water column rather than at the surface only.
+
+## 5. Insights and caveats
+
+- The three models bracket the observation on the surface carbon inventory: GFDL-ESM4 is high (+23 DIC, +31 TAlk), CESM2 mildly low (−39, −40), MPI-ESM1-2-LR strongly low (−61, −87). Because DIC and TAlk errors travel together, the DIC/TAlk *difference* (the carbonate-system buffer) is better preserved than the absolute inventory.
+- pH is a much more forgiving diagnostic: despite ±40–90 µmol kg⁻¹ DIC/TAlk errors, CESM2's surface pH is within 0.001 of GLODAP and even MPI-ESM1-2-LR's is only 0.022 low — consistent with pH being set by the DIC/TAlk ratio rather than by either absolute quantity. Ranking models on pH alone would therefore be misleading.
+- Interpretation of the pH result depends on the model's carbonate constants. The code compared the models' own reported `ph` on the total scale in situ, but the CESM2 metadata as loaded does not document which carbonate dissociation constants its `ph` diagnostic uses — this is an **unverified assumption** and should be flagged when attributing CESM2's near-zero pH difference to model skill; the same caveat applies to GFDL-ESM4 and MPI-ESM1-2-LR.
+- Provenance caveat: the loaded attributes show MPI-ESM1-2-LR `ph` comes from variant `r10i1p1f1`, whereas its `dissic`/`talk`/`thetao`/`so` come from `r1i1p1f1`; the MPI pH comparison is therefore not a strictly single-member, single-trajectory comparison of the carbon system, and its pH error should be read with that in mind. CESM2 and GFDL-ESM4 are internally `r1i1p1f1` throughout.
+- The 0–50 m global means and the map/profile metrics rest on different cell sets (native valid cells vs the shared GLODAP-grid mask, `ocean_only=False` because the reference is GLODAP, not WOA23); the model-minus-GLODAP difference of §3.1 and the shared-mask bias of §3.2 differ by 1–2 µmol kg⁻¹ and must not be quoted interchangeably.
+- GLODAPv2 has no time dimension, so its single TCO2/TAlk/pH climatology is the fixed reference against which each model's 2002 annual mean is scored; a 2002 model state is being compared with a multi-decadal observational composite, which is part of why the near-zero deep biases of CESM2 and GFDL-ESM4 should not be over-interpreted as exact skill.
+</solution>

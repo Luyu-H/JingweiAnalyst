@@ -1,0 +1,763 @@
+# exchange 5: fix_compute_iter2
+# elapsed: 21.2 s
+
+===== SYSTEM =====
+You are a code debugging expert.
+
+===== USER =====
+The following compute code failed to execute:
+
+<failed_code>
+# Computation code only
+
+dataset = "cmip6_historical"
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+time_range = ["1971-01", "2000-12"]
+target_months = [3, 9]
+month_names = {3: "March", 9: "September"}
+
+results = {}
+diff_maps_native = {}
+pair_fields_native = {}
+scatter_inputs = {}
+extremes = {}
+display_maps = []
+
+for model in models:
+    # Load monthly model data on native grid
+    thetao = load_regular_data(
+        dataset=dataset,
+        variable="thetao",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+    so = load_regular_data(
+        dataset=dataset,
+        variable="so",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+    mlotst = load_regular_data(
+        dataset=dataset,
+        variable="mlotst",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+
+    # Ensure temperature metadata reflects potential temperature for TEOS-10 route
+    thetao = thetao.assign_attrs(**{**thetao.attrs, "temperature_type": "potential"})
+
+    # Load grid metadata requested in the plan
+    volumes = load_volumes_for_cmip6(
+        dataset=dataset,
+        model=model,
+        depth_range=[float(thetao.depth.min()), float(thetao.depth.max())],
+        variable="thetao",
+    )
+    levels, bounds = load_depth_levels(
+        dataset=dataset,
+        model=model,
+        variable="thetao",
+    )
+
+    # Use shallowest model level as reference depth
+    ref_depth = float(np.asarray(levels)[0])
+
+    # Offline mixed layer depth from monthly thetao and so on native grid
+    mld_offline = compute_mixed_layer_depth(
+        temp_data=thetao,
+        sal_data=so,
+        ref_depth=ref_depth,
+        method="density",
+        density_threshold=0.03,
+        temperature_type="potential",
+    ).assign_attrs(units="m", long_name=f"{model} offline mixed layer depth")
+
+    results[model] = {}
+    diff_maps_native[model] = {}
+    pair_fields_native[model] = {}
+    scatter_inputs[model] = {}
+    extremes[model] = {}
+
+    # Total ocean area from published mlotst mask on native grid
+    mlotst_any = mlotst.isel(time=0)
+    total_ocean_area = compute_basic_stat(
+        mlotst_any.where(np.isfinite(mlotst_any)),
+        op="area_weighted_mean",
+        dim=["lat", "lon"],
+    )
+    area_field = xr.ones_like(mlotst_any).where(np.isfinite(mlotst_any))
+    total_ocean_area_amount = compute_exceedance_fraction(
+        area_field,
+        threshold=0.5,
+        comparison="greater",
+        dim=["lat", "lon"],
+        weighting="area",
+        reference=0.0,
+    )["total_amount"]
+    total_ocean_area_amount = float(total_ocean_area_amount.compute())
+
+    for month in target_months:
+        month_label = month_names[month]
+
+        # Extract all instances of the target month
+        off_m = mld_offline.where(mld_offline["time"].dt.month == month, drop=True)
+        pub_m = mlotst.where(mlotst["time"].dt.month == month, drop=True)
+
+        # Strict shared mask: keep only cells valid in both fields for all 30 same-calendar months
+        shared_all30 = (off_m.notnull() & pub_m.notnull()).all(dim="time")
+
+        off_m_shared = off_m.where(shared_all30)
+        pub_m_shared = pub_m.where(shared_all30)
+
+        # 1971-2000 climatologies as plain mean over the 30 monthly values
+        off_clim = compute_basic_stat(off_m_shared, op="mean", dim="time").assign_attrs(units="m")
+        pub_clim = compute_basic_stat(pub_m_shared, op="mean", dim="time").assign_attrs(units="m")
+
+        # Native-grid difference map for all reported metrics
+        diff = (off_clim - pub_clim).assign_attrs(
+            units="m",
+            long_name=f"{model} {month_label} offline MLD minus mlotst",
+        )
+
+        # Metrics on native grid, area weighted
+        metrics = compute_difference_metrics(
+            data=off_clim,
+            reference=pub_clim,
+            dim=["lat", "lon"],
+            weighting="area",
+        )
+
+        bias = float(metrics["bias"].compute())
+        rmsd = float(metrics["rmse"].compute())
+
+        corr = analyze_correlation(
+            var1=off_clim,
+            var2=pub_clim,
+            dim=["lat", "lon"],
+            method="pearson",
+            weighting="area",
+        )
+        spatial_corr = float(corr["correlation"].compute())
+
+        exc = compute_exceedance_fraction(
+            data=diff,
+            threshold=20.0,
+            comparison="abs_greater",
+            dim=["lat", "lon"],
+            weighting="area",
+            reference=0.0,
+        )
+        frac_gt20 = float(exc["fraction_percent"].compute())
+        valid_area_amount = float(exc["total_amount"].compute())
+        valid_area_pct = 100.0 * valid_area_amount / total_ocean_area_amount
+
+        # Regional concentration of disagreement
+        pos_ext = locate_extreme(diff, op="max")
+        neg_ext = locate_extreme(diff, op="min")
+        abs_ext = locate_extreme(diff, op="abs_max")
+
+        # Materialize all quantities that will be reported or plotted
+        off_clim_c = off_clim.compute()
+        pub_clim_c = pub_clim.compute()
+        diff_c = diff.compute()
+        mask_c = shared_all30.compute()
+
+        results[model][month] = {
+            "month_name": month_label,
+            "bias_m": round(bias, 1),
+            "rmsd_m": round(rmsd, 1),
+            "corr": round(spatial_corr, 3),
+            "area_absdiff_gt20_percent": round(frac_gt20, 1),
+            "valid_area_percent_of_ocean": round(valid_area_pct, 1),
+        }
+
+        diff_maps_native[model][month] = diff_c
+        pair_fields_native[model][month] = {
+            "offline_mld": off_clim_c,
+            "mlotst": pub_clim_c,
+            "shared_mask": mask_c,
+        }
+        scatter_inputs[model][month] = {
+            "x_offline": off_clim_c.values.ravel(),
+            "y_mlotst": pub_clim_c.values.ravel(),
+        }
+        extremes[model][month] = {
+            "max_positive": pos_ext,
+            "max_negative": neg_ext,
+            "max_abs": abs_ext,
+        }
+
+        # Regrid for display only
+        diff_display = regrid_horizontal(diff_c, target="woa23", method="bilinear")
+        diff_maps_native[model][f"{month}_display"] = diff_display.compute()
+        display_maps.append(diff_maps_native[model][f"{month}_display"].values.ravel())
+
+# Ranking criterion: lowest mean of normalized RMSD rank, |bias| rank, highest correlation rank,
+# and lowest exceedance-area rank across March and September.
+ranking_scores = []
+for model in models:
+    rmsd_mean = np.mean([results[model][m]["rmsd_m"] for m in target_months])
+    abias_mean = np.mean([abs(results[model][m]["bias_m"]) for m in target_months])
+    corr_mean = np.mean([results[model][m]["corr"] for m in target_months])
+    exc_mean = np.mean([results[model][m]["area_absdiff_gt20_percent"] for m in target_months])
+    ranking_scores.append(
+        {
+            "model": model,
+            "rmsd_mean": rmsd_mean,
+            "abias_mean": abias_mean,
+            "corr_mean": corr_mean,
+            "exc_mean": exc_mean,
+        }
+    )
+
+rank_df = pd.DataFrame(ranking_scores).set_index("model")
+rank_df["r_rmsd"] = rank_df["rmsd_mean"].rank(ascending=True, method="min")
+rank_df["r_abias"] = rank_df["abias_mean"].rank(ascending=True, method="min")
+rank_df["r_corr"] = rank_df["corr_mean"].rank(ascending=False, method="min")
+rank_df["r_exc"] = rank_df["exc_mean"].rank(ascending=True, method="min")
+rank_df["consistency_score"] = rank_df[["r_rmsd", "r_abias", "r_corr", "r_exc"]].mean(axis=1)
+ranking = rank_df.sort_values(["consistency_score", "r_rmsd", "r_corr"]).index.tolist()
+
+# Compact summary table
+summary_rows = []
+for model in models:
+    for month in target_months:
+        rr = results[model][month]
+        summary_rows.append(
+            {
+                "model": model,
+                "month": rr["month_name"],
+                "mean_diff_m": rr["bias_m"],
+                "rmsd_m": rr["rmsd_m"],
+                "spatial_r": rr["corr"],
+                "area_|diff|>20m_%": rr["area_absdiff_gt20_percent"],
+                "valid_area_%_of_ocean": rr["valid_area_percent_of_ocean"],
+            }
+        )
+summary_table = pd.DataFrame(summary_rows)
+
+ranking_criterion = (
+    "Models ranked by the mean of four native-grid March/September ranks: lower RMSD, "
+    "lower absolute bias, higher spatial Pearson correlation, and lower area fraction with "
+    "|offline MLD - mlotst| > 20 m."
+)
+
+diagnostic_note = (
+    "Offline MLD and published mlotst are not expected to agree exactly because published mlotst "
+    "is based on the model top level and a displaced-parcel density test at local pressure, and "
+    "is typically archived as a monthly mean of instantaneous MLDs, whereas the offline operator "
+    "is computed from monthly mean thetao/so profiles using a sigma-threshold crossing depth "
+    "interpolated between vertical levels. This commonly makes the offline estimate systematically "
+    "shallower and can amplify disagreement in deep winter mixed-layer regions and frontal zones."
+)
+</failed_code>
+
+<error_info>
+Error Type: AttributeError
+Error Message: 'float' object has no attribute 'compute'
+
+
+Traceback:
+Traceback (most recent call last):
+  File "/home/lorraine/projects/2025-jingwei_QA_GMD/src/models/agent_with_tools.py", line 721, in _safe_execute_tool
+    exec(code, sandbox_globals)
+  File "<string>", line 91, in <module>
+AttributeError: 'float' object has no attribute 'compute'
+
+</error_info>
+
+Original task: Check whether a mixed layer depth (MLD) computed from each CMIP6 model's own temperature and salinity reproduces the mlotst field that the same model publishes. This is an internal consistency test: both quantities come from the same simulation, so any disagreement is a property of the diagnostic, not of the model's physics.
+
+Data to use:
+- CMIP6 historical `thetao`, `so` and `mlotst` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12.
+- Each model's own published cell areas (areacello).
+
+Expected numerical results, comparing the 1971-2000 March and September climatologies of the operator MLD with those of the published mlotst, for each of the six model-and-month combinations. The operator MLD is the mixed layer depth computed offline from the model's own thetao and so with the density criterion that defines mlotst, the crossing depth interpolated between the bracketing levels. For each model and calendar month, both climatologies cover only the cells where both fields are defined in all 30 instances of that month (the 30 Marches, or the 30 Septembers):
+- The mean difference, operator MLD minus mlotst, in metres to 1 decimal place.
+- The root-mean-square difference, in metres to 1 decimal place.
+- The spatial Pearson correlation between the two fields, to 3 decimal places.
+- The percentage of the area where both fields are defined on which the absolute difference exceeds 20 m, to 1 decimal place, and the area where both fields are defined as a percentage of the model's total ocean area, to 1 decimal place.
+- The ranking of the three models from most to least internally consistent, with the criterion used, the regions where the disagreement concentrates, and why the operator and mlotst are not expected to agree exactly.
+
+Expected visualizations:
+- Figure 1, a 3-by-2 panel of global maps of operator MLD minus mlotst, rows CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, columns March and September, all six panels drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only) with one shared diverging colour scale centred on zero.
+- Figure 2, a 3-by-2 panel of scatter plots in the same layout, operator MLD on the x axis against mlotst on the y axis, one point per ocean cell, with logarithmic axes of identical range and ticks in every panel, a dashed y = x reference line, and each panel annotated with its bias, root-mean-square difference and correlation.
+
+Variables already present in the namespace (name -> summary of its contents); use them
+as they are:
+{
+  "selected_datasets": [
+    "cmip6_historical"
+  ],
+  "selected_data": "cmip6_historical"
+}
+
+Available tools and their specifications:
+{
+  "load_regular_data": {
+    "description": "Load a rectangular subset of a time series dataset.\nThis is the entry point for any question about change over time \u2014 trends, variability, scenario projections \u2014 and for the published index series (cpc_indices), which have a time axis but no grid. Give the window you need: reading a global field and slicing it afterwards is slower and, on a curvilinear model grid, wrong, because index dimensions cannot be sliced by latitude and longitude. A window crossing the dateline is handled, and comes back on a continuous longitude axis.\nThe result stays lazy, so a large request is cheap until it is reduced.",
+    "args": {
+      "dataset": "str, required. The dataset id, from the registry of available datasets.",
+      "variable": "str, required. The variable's short name in that dataset. For an index dataset it names the region the series is published for, e.g. 'NINO3.4'; leave it out for an index that is defined on its own domain rather than on a region box.",
+      "model": "str, required for multi-model datasets. Which model to read.",
+      "product": "str, required for a dataset that publishes several series of the same quantity. Which one to read; the registry lists each product with its baseline period. Default is the dataset's operational series.",
+      "field": "str, optional, default 'anomaly' where it applies. Which published field to read: 'anomaly' for the departure from the baseline climatology, or 'total' for the absolute value.",
+      "time_range": "list[str, str], optional. Continuous window as ['start', 'end'] in ISO 8601, e.g. ['1990-01', '2014-12']. Default is the whole record.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward. Levels are selected by their centre. Default is every level.",
+      "lat_range": "list[float, float], optional. [min, max] in degrees North.",
+      "lon_range": "list[float, float], optional. [min, max] in degrees East, in either the 0-360 or the -180-180 convention; a window crossing the dateline is handled.",
+      "chunk_time": "int, optional, default 12. Chunk size along time for lazy reading."
+    },
+    "returns": "xr.DataArray on the dataset's own grid, with units and the provenance attributes that let the weighting and derived-quantity tools find the right cell areas, volumes and layer thicknesses. On a regular grid the dimensions are (time, depth, lat, lon); on a curvilinear model grid they are the model's index dimensions with 2-D latitude and longitude coordinates, trimmed to the requested box. An index dataset comes back with 'time' alone and no spatial dimensions."
+  },
+  "load_volumes_for_cmip6": {
+    "description": "Load the volume of each grid cell of a model in cubic metres.\nYou usually do NOT need this to take a volume-weighted average, which assembles the right volumes itself. Reach for it to report the volume of a region, to turn a per-cubic-metre quantity into a total, or to weight something by hand.\nA model's own published cell volumes are used where they exist; otherwise volumes are rebuilt from cell areas and layer thicknesses.",
+    "args": {
+      "dataset": "str, required. The experiment's dataset id.",
+      "model": "str, required. Which model's grid to describe.",
+      "time_range": "list[str, str], optional. ['start', 'end'] in ISO 8601. Only accepted for a model that publishes a time-varying cell volume; for a fixed field it is an error.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward.",
+      "lat_range": "list[float, float], optional. [min, max] in degrees North.",
+      "lon_range": "list[float, float], optional. [min, max] in degrees East, either convention.",
+      "variable": "str, optional, default 'thetao'. Only consulted when the volumes have to be rebuilt: it says which variable's vertical grid to use."
+    },
+    "returns": "xr.DataArray of cell volumes in m3, masked to ocean, on the model's own grid and matching what the loaders return for it. Where a model publishes its cell volume monthly the result keeps a time axis; reduce over time, or pass a time_range, before using it as a static weight. attrs['volume_source'] records whether the volumes are the model's own or were rebuilt."
+  },
+  "load_depth_levels": {
+    "description": "Load a dataset's depth levels and the boundaries of each layer, in metres.\nYou usually do NOT need this to average or integrate over depth, which applies the correct layer thicknesses itself. Reach for it when you want the level definitions themselves \u2014 to report which depths a dataset resolves, to check whether two products share a vertical grid, or to weight something by hand.\nVertical grids are not shared between products, and within a product they can differ by variable and by time slice, so say which you mean.",
+    "args": {
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward. Levels are selected by their CENTRE and their layers returned whole, so the column covered reaches past the range asked for; check the returned bounds and report those.",
+      "dataset": "str, optional, default the shared observational climatology grid. Which dataset's vertical grid to read.",
+      "model": "str, required when the dataset has several models.",
+      "variable": "str, optional. Which variable's vertical grid to read, since levels can differ by variable within a product.",
+      "time_slice": "str, optional, default 'annual'. Which time slice's vertical axis to read, for climatologies whose monthly and seasonal fields are shallower than the annual one.",
+      "period": "str, optional. Which climate normal to read the axis from."
+    },
+    "returns": "tuple (levels, bounds): the level centres in metres, and the upper and lower boundary of each layer as an (n, 2) array. Layer thickness is the difference between the two."
+  },
+  "compute_potential_density_anomaly": {
+    "description": "Compute density anomaly (sigma) from temperature and practical salinity using TEOS-10.\nIt is referenced either to a fixed pressure or to each cell's own pressure, which gives the in-situ density.\nThe result is an ANOMALY (roughly 25-35 kg/m3) and carries the metadata that every tool taking a density argument reads. Hand it over unchanged: those tools add the 1000 themselves when they need an absolute density, so adding it here makes them do it twice.\nIn-situ and potential temperature take different routes to Conservative Temperature; which one was supplied is read from its metadata and recorded in the result.",
+    "args": {
+      "temp_data": "xr.DataArray, required. Temperature in degrees Celsius, in-situ or potential, with a 'depth' coordinate in metres.",
+      "sal_data": "xr.DataArray, required. Practical salinity (PSS-78), on the same dimensions as temp_data.",
+      "ref_pressure": "float or None, optional, default 0. Reference pressure in dbar: 0 gives sigma0, 2000 sigma2, 4000 sigma4. Pass None for the in-situ density anomaly, evaluated at each cell's own pressure.",
+      "temperature_type": "str, optional, default 'auto'. Whether temp_data is 'in_situ' or 'potential' temperature; 'auto' reads it from the metadata."
+    },
+    "returns": "xr.DataArray of sigma in kg/m3, i.e. density minus 1000, on the input's coordinates. attrs record the reference pressure and which temperature convention was detected."
+  },
+  "compute_mixed_layer_depth": {
+    "description": "Compute mixed layer depth from a density or temperature threshold.\nThe MLD is the depth at which potential density (a sigma0 difference), or temperature, first departs from its value at the reference depth `ref_depth` by more than the threshold. The crossing depth is interpolated between the bracketing levels rather than snapped to one, because these vertical grids are coarse where mixed layers sit.\nThe criterion is applied to whatever profiles it is given, one per time step: a field of monthly means gives the MLD of each monthly-mean profile.\nCOLUMNS THAT NEVER REACH THE THRESHOLD come back missing.",
+    "args": {
+      "temp_data": "xr.DataArray, required. Temperature in degrees Celsius with a 'depth' coordinate in metres.",
+      "sal_data": "xr.DataArray, required. Practical salinity (PSS-78) on identical dimensions.",
+      "ref_depth": "float, optional, default 10.0. The near-surface reference depth in metres.",
+      "method": "str, optional, default 'density'. 'density' uses the density threshold, 'temperature' the temperature threshold, 'both' takes whichever is shallower.",
+      "density_threshold": "float, optional, default 0.03. Density difference in kg/m3 defining the base of the mixed layer.",
+      "temp_threshold": "float, optional, default 0.2. Temperature difference in degrees Celsius, for the temperature criterion.",
+      "temperature_type": "str, optional, default 'auto'. Whether temp_data is in-situ or potential temperature; 'auto' reads it from the metadata."
+    },
+    "returns": "xr.DataArray of mixed layer depth in metres on all non-depth dimensions of the input, interpolated between levels. Missing where the threshold is never reached \u2014 a column mixed all the way down, or one with no data."
+  },
+  "temporal_aggregate": {
+    "description": "Aggregate a time series in time: a DAY-WEIGHTED long-term mean, or annual, seasonal or climatological-monthly values, or a running window.\nThis is the only tool that weights by month length; compute_basic_stat does not weight in time. Means are weighted by the number of days in each month in the dataset's own calendar, with each cell's weights masked to the months it has data, so a cell missing at every step stays missing. Model time axes are stamped on Gregorian month starts, but the model's own calendar is recorded on the time coordinate ('source_calendar') and is the one used: a 365-day model's February counts 28 days in every year. Weighting applies to op='mean' only; a median, minimum, maximum or standard deviation is taken over the steps as they are.\nOnly a field with a real time axis can be aggregated; a climatology has none.",
+    "args": {
+      "data": "xr.DataArray, required. A field with a 'time' dimension.",
+      "freq": "str, optional, default 'year'. What to aggregate to:\n- 'mean': ONE field for the whole window, the time dimension removed: the mean state of the period. compute_basic_stat(op='mean', dim='time') instead gives every step the same weight.\n- 'year': one value per calendar year.\n- 'season': one value per seasonal period (see season_convention).\n- 'climatology': one value per calendar month, across all years.\n- 'rolling': a running window that SMOOTHS the series instead of collapsing it \u2014 the time axis keeps every step, and each value is the statistic over the `window` steps around it.",
+      "op": "str, optional, default 'mean'. 'mean' (day-weighted), 'median', 'min', 'max' or 'std'.",
+      "season_convention": "str, optional, default 'meteorological'. Which three months each season covers: 'meteorological' gives DJF/MAM/JJA/SON; 'woa' gives the calendar quarters JFM/AMJ/JAS/OND, on which the WOA23 seasonal fields are built.",
+      "window": "int, required for freq='rolling', ignored otherwise. Number of time steps in the window, in the units of the time axis. An odd window is centred exactly; an even one leans one step towards the past.",
+      "center": "bool, optional, default True, freq='rolling' only. Place each window's value at its middle step, keeping the smoothed series in phase with the original. False places it at the last step, which is what an index computed from data already in hand does, and shifts every feature later by half a window."
+    },
+    "returns": "xr.DataArray, aggregated in time.\n- 'mean': the 'time' dimension is gone and a single field is left, carrying the window it covers in attrs['time_mean_period'] and the number of steps it averaged. attrs ['incomplete_periods'] lists any year the window does not cover in full, which tilts a long-term mean towards the seasons those years contribute.\n- 'year': the time axis becomes an integer 'year' coordinate. attrs['incomplete_periods'] lists any year not covered by a full 12 months, which biases a trend if left in.\n- 'season': one entry per seasonal period, with 'season' and 'year' coordinates attached; a December-starting season is labelled by the year holding its January.\n- 'climatology': a 'month' coordinate (1-12) with month names attached.\n- 'rolling': the time axis is unchanged in length and labels, with the ends left missing where no complete window covers them. The running mean is unweighted, because a running window is a filter over a fixed number of steps rather than a time average."
+  },
+  "compute_difference_metrics": {
+    "description": "Measure how far one field is from another: bias, RMSE, the largest single departure and where it happens.\nEvery metric is computed in one pass over the elements the two fields share, so all of them describe the same sample.\nOver the horizontal the metrics are area-weighted by default; along time they are unweighted. The weights come from the grid the fields are on, so two fields on different grids must be put on a common one first.\nThe correlation is not included: use analyze_correlation.",
+    "args": {
+      "data": "xr.DataArray, required. The field being assessed. The sign of the bias follows it: bias = mean(data - reference).",
+      "reference": "xr.DataArray, required. What it is measured against. The two are intersected first, so a longer series or a wider region is trimmed to the overlap rather than broadcast.",
+      "dim": "str or list[str], optional. Dimension(s) to reduce. Default None, every shared dimension, giving one number per metric. Pass the horizontal pair for a per-time-step RMSE, or 'time' for a per-cell map.",
+      "weighting": "str, optional, default 'auto'. 'auto' weights by cell area when the horizontal dimensions are among those reduced and leaves everything else unweighted; 'area' insists on it and fails if the grid cannot be identified; 'none' weights every element equally."
+    },
+    "returns": "dict. Scalars come back as floats, a partial reduction as xr.DataArray on the dimensions left over.\n'bias': mean(data - reference), the systematic offset.\n'mae', 'rmse': mean absolute error and root mean square error.\n'centered_rmse': RMSE with the bias removed, i.e. the disagreement in pattern alone. rmse^2 = bias^2 + centered_rmse^2, so the two together say whether a field is merely offset or actually shaped differently.\n'max_abs_error' and 'max_abs_error_at': the largest single departure and the coordinates where it occurs; the location is None when the reduction leaves dimensions behind.\n'std_data', 'std_reference', 'std_ratio': the two spreads over the same sample and their ratio \u2014 above 1 the field varies too much, below 1 too little.\n'mean_data', 'mean_reference': the weighted means over the shared sample, the two numbers the bias came from.\n'n_valid', 'weighting': the sample size and what the weights were.\n'difference': the field data - reference itself, on the shared sample and carrying the grid identity, ready to map or to pass to compute_exceedance_fraction."
+  },
+  "compute_basic_stat": {
+    "description": "Reduce a field along chosen dimensions with one basic statistic, weighted in space but never in time.\nOver a time axis every step counts the same, whatever its length; temporal_aggregate is the tool that weights by month length.\nThe weighted operators take their weights from the grid the data came from, so the field must still be on its original grid and levels \u2014 subsetting is fine, regridding or averaging over depth beforehand is not.",
+    "args": {
+      "data": "xr.DataArray, required. Input field.",
+      "op": "str, required. The statistic to apply:\n- 'mean', 'median', 'min', 'max', 'sum', 'count' (non-missing elements), 'std' (standard deviation about the mean, ddof=0). These are unweighted.\n- 'area_weighted_mean' for a horizontal average, weighting each cell by its area.\n- 'volume_weighted_mean' for an average over dimensions that include depth, weighting each cell by its volume.\n- 'argmax'/'argmin' return WHERE the extreme falls rather than what it is: the coordinate label at which it occurs, one per remaining column. They reduce a single dimension. For the one extreme of a whole field, use locate_extreme.",
+      "dim": "str or list of str, optional. Dimension(s) to reduce. If None, every dimension is reduced. A weighted mean must include the dimensions its weights vary along: the horizontal pair for 'area_weighted_mean', and 'depth' for 'volume_weighted_mean'. On a curvilinear grid you may write ['lat', 'lon'] and they are mapped to the model's index dimensions."
+    },
+    "returns": "xr.DataArray with the reduced dimension(s) removed. For 'argmax'/'argmin' the values are coordinate labels rather than data values. A weighted result records in attrs which weights were used."
+  },
+  "compute_exceedance_fraction": {
+    "description": "Measure what proportion of a domain lies beyond a threshold, by area, by volume or by count.\nMissing data are left out of the numerator and the denominator, and each cell is weighted by its area or volume on the grid the field is on.\nEvery comparison is applied to the deviation from `reference`, which is zero unless set. Writing d = x - reference, the four are: 'greater' d > threshold, 'less' d < threshold, 'abs_greater' |d| > threshold, 'abs_less' |d| < threshold. So 'abs_less' with reference=16 and threshold=2 is the band 14 < x < 18, while 'abs_greater' with the same numbers is everything outside it. The inequalities are STRICT, and the test actually used is returned in 'criterion'.\nIt answers a different question from its neighbours: detect_outliers asks whether a value is unusual against a distribution, detect_threshold_events asks whether a threshold was held long enough to count as an episode, and this asks how much of the domain is beyond it.",
+    "args": {
+      "data": "xr.DataArray, required. The field to test \u2014 a difference, an anomaly, a concentration, an index. It must still carry the attrs its loader set if the weights are to be found.",
+      "threshold": "float, required. The distance from the reference that counts, in the field's own units. It must not be negative; for a one-sided test below a value use comparison='less'.",
+      "comparison": "str, optional, default 'abs_greater'. Which side counts, applied to x - reference as above. 'abs_greater' for a discrepancy, where an error of either sign matters; 'abs_less' for the share that agrees to within a tolerance, or that falls inside a band; 'greater' and 'less' for a one-sided physical criterion.",
+      "dim": "str or list[str], optional. Dimension(s) the proportion is taken over. Default None, every dimension, giving one number. Pass the horizontal pair for an area fraction at each time step, or 'time' for the fraction of the record at each cell.",
+      "weighting": "str, optional, default 'auto'. 'auto' weights by cell area when the horizontal dimensions are reduced, by cell volume when depth is among them too, and counts elements equally otherwise \u2014 which is what a fraction of time steps wants. 'area', 'volume' and 'none' force the choice.",
+      "reference": "float, optional, default 0.0. The value the comparison is taken against, in the field's own units, so the threshold measures a departure from it. Use it for a band around a physical constant; leave it at zero when the field is already a difference or an anomaly."
+    },
+    "returns": "dict:\n'fraction_percent' and 'fraction': the answer, in percent and as a proportion. A float when everything is reduced, otherwise a DataArray on the dimensions left over.\n'exceeding_amount', 'total_amount': the weighted amounts behind the fraction \u2014 square metres for area weighting, cubic metres for volume, a count of elements when unweighted.\n'n_exceeding', 'n_valid': element counts, with missing data already excluded.\n'mask': the test as a field of 1 where the criterion is met, 0 where it is not and NaN where there is no data \u2014 ready to stipple over a map.\n'weighting', 'criterion': what the weights were, and the exact test with its numbers filled in."
+  },
+  "analyze_correlation": {
+    "description": "Correlate two fields, with optional lead-lag analysis and significance testing.\nAlong time the p-value uses an effective sample size estimated from the lag-1 autocorrelations of the two series; the uncorrected value is returned alongside.\ndetrend=True removes a straight line from both series before correlating. weighting='area' weights each cell by its area in a correlation across the horizontal dimensions.",
+    "args": {
+      "var1": "xr.DataArray, required. The first field.",
+      "var2": "xr.DataArray, required. The second field, aligned with the first.",
+      "dim": "str or list[str], optional, default 'time'. Dimension(s) to correlate over: 'time' for a temporal correlation at each cell, the horizontal pair for a pattern correlation between two maps. On a curvilinear grid you may write ['lat', 'lon'].",
+      "method": "str, optional, default 'pearson'. 'pearson' for a linear relationship, 'spearman' to correlate ranks, which detects a monotonic but non-linear relationship and resists outliers.",
+      "lag": "int, optional, default 0. Time lag in steps for lead-lag analysis. Positive means var2 leads var1; negative means var1 leads var2. Requires 'time' among the correlation dimensions.",
+      "detrend": "bool, optional, default False. Remove a least-squares straight line from both series before correlating.",
+      "min_periods": "int, optional, default 10. Minimum number of valid pairs required.",
+      "weighting": "str, optional, default 'none'. 'area' weights each cell by its area, for a pattern correlation. It applies only over the horizontal dimensions, only to 'pearson', and not with a lag or with detrending; the weights come from the grid the fields are on, so put them on a common grid first."
+    },
+    "returns": "dict of xr.DataArray, each shaped by the dimensions not correlated over:\n'correlation': the coefficient, -1 to 1.\n'pvalue': two-tailed. Along time it is corrected for serial correlation; across space it is not.\n'pvalue_unadjusted': the naive value assuming every sample is independent.\n'n_samples': valid data pairs.\n'n_effective': independent samples after accounting for autocorrelation."
+  },
+  "locate_extreme": {
+    "description": "Find the single largest or smallest value in a field and say where it is.\nSearching across more than one axis at a time is the point: compute_basic_stat with op='max' returns the value and loses the position, and op='argmax' returns a position along one axis and so gives one answer per column. This returns one point, with every coordinate that locates it.\nOn a curvilinear grid the index pair says nothing about where on Earth the extreme sits, so the latitude and longitude of that cell are read off and reported alongside.",
+    "args": {
+      "data": "xr.DataArray, required. Any field. Missing values are ignored rather than competing for the extreme.",
+      "op": "str, optional, default 'max'. 'max' for the largest value, 'min' for the smallest, 'abs_max' for the one furthest from zero in either direction \u2014 the one to use on a difference or an anomaly, where a large negative departure matters as much as a positive one. 'abs_max' reports the value with its original sign.",
+      "dim": "str or list[str], optional. The dimensions to search over. Default None, every dimension. A subset is only accepted when it covers every dimension the field has; for a per-column answer use compute_basic_stat with op='argmax'."
+    },
+    "returns": "dict:\n'value' (float): the extreme value, with its original sign.\n'coordinates' (dict): every coordinate that locates it \u2014 latitude and longitude in degrees, depth in metres, time as 'YYYY-MM'. This is what to quote.\n'indices' (dict): the integer position along each searched dimension, for selecting the same point out of another array.\n'ties' (int): how many cells hold that same value. More than 1 means the field is flat at its extreme, and the position reported is only the first of several.\n'n_valid' (int) and 'description' (str): how many values were searched, and the answer as a sentence."
+  },
+  "regrid_horizontal": {
+    "description": "Put a field on another horizontal grid so two products can be compared cell by cell.\nRegrid the GLOBAL field and subset afterwards. 'conservative' reads the source grid's geometry from the dataset's own file, which describes the whole grid, so a curvilinear field already cut to a box can no longer be located on it and is refused; 'bilinear' works from the field's own 2-D coordinates and does accept one.\nHorizontal vector components (uo, vo, umo, vmo) of CESM2 and MPI-ESM1-2-LR are refused.\nThe result carries the target grid's identity, so later weighting uses the target's cell areas.",
+    "args": {
+      "data": "xr.DataArray, required. The field to move, on a regular or a curvilinear grid. Other dimensions (time, depth) pass through untouched. It must still carry the attrs its loader set, which is how its own grid is identified.",
+      "target": "str or xr.DataArray, optional, default 'woa23'. The grid to move onto: a registered observational grid by name ('woa23', '1deg', 'glodap', 'seanoe_mld', 'ersst'), or a DataArray on a regular grid to use as a template. The target must be rectilinear.",
+      "method": "str, optional, default 'conservative'. 'conservative' area-averages the source cells that overlap each target cell, conserving the field's area integral; it needs the source grid's corner mesh. 'bilinear' interpolates between cell centres and needs no corner mesh. 'nearest_s2d' copies the nearest source cell. 'patch' is a higher-order smooth interpolation.",
+      "skipna": "bool, optional, default True. Ignore missing cells instead of letting them spread. Land is missing in every ocean field, so with skipna=False every coastal target cell comes back empty.",
+      "na_thres": "float, optional, default 0.5. How much of a target cell may be missing before the cell itself is set to NaN, from 0 (any missing source data empties it) to 1 (keep it if any valid data contributes)."
+    },
+    "returns": "xr.DataArray on the target grid, with ('lat', 'lon') in place of the source's horizontal dimensions and everything else unchanged. Missing data stays missing. attrs record the method and the source grid, and carry the TARGET grid's identity so later weighting uses the target's areas."
+  },
+  "load_climatology_data": {
+    "description": "Load a subset of an observational climatology.\nThis is the entry point for a mean state, a seasonal cycle or a vertical structure, and for the reference field a model is evaluated against. A climatology is already an average over many years, so it has no time axis to take a trend along.",
+    "args": {
+      "dataset": "str, required. The climatology's dataset id.",
+      "variable": "str, required for most datasets. The variable name that dataset uses; common aliases are accepted.",
+      "time_slice": "str, optional, default 'annual'. 'annual' for a single all-year field, which reaches the deepest levels; 'monthly' for twelve fields, adding a 'month' dimension; 'seasonal' for four, adding a 'season' dimension. The monthly and seasonal fields are shallower than the annual one.",
+      "months": "list[int], optional. Select particular months from a monthly climatology, e.g. [1, 2, 12].",
+      "period": "str, optional. Which climate normal to read, where the variable offers more than one.",
+      "field": "str, optional. Which statistical field to read, where the product publishes several (the objectively analysed value, the raw mean, the standard deviation, the number of observations). Default is the analysed value.",
+      "version": "str, optional. Product version, where more than one exists.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward.",
+      "lat_range": "list[float, float], optional. [min, max] in degrees North.",
+      "lon_range": "list[float, float], optional. [min, max] in degrees East, either convention; a window crossing the dateline is handled."
+    },
+    "returns": "xr.DataArray with dimensions (depth, lat, lon), plus 'month' or 'season' for the corresponding slices, carrying units and the provenance attributes the weighting tools need."
+  },
+  "load_data_with_geolocator": {
+    "description": "Load data for a NAMED geographic region instead of a coordinate box, using Natural Earth boundaries.\nUse it when the question names a sea, a bay or an ocean: the outline is more faithful than any box, and no coordinates have to be guessed. For a region that is not in the supported list, fall back to a loader with explicit ranges. To split a field you already have by ocean basin, use select_basin instead \u2014 this tool masks while reading, so it only works on a stored variable.",
+    "args": {
+      "dataset": "str, required. The dataset id to read from.",
+      "variable": "str, required for most datasets. The variable name that dataset uses.",
+      "model": "str, required for multi-model datasets.",
+      "geofeature": "str, optional, default 'water_body'. Which kind of boundary to use: 'water_body', 'country', 'state' or 'continent'. Ocean analysis almost always wants 'water_body'.",
+      "loc_name": "str or list[str], required. Name(s) of the region, case-sensitive, from the supported list below. Pass a list to merge several regions into one field for a single calculation; make separate calls when they are to be compared.\nSupported water bodies: ['Arctic Ocean', 'SOUTHERN OCEAN', 'North Atlantic Ocean', 'North Pacific Ocean', 'South Pacific Ocean', 'INDIAN OCEAN', 'South Atlantic Ocean', 'Black Sea', 'Philippine Sea', 'Great Barrier Reef', 'Tasman Sea', 'Bay of Bengal', 'South China Sea', 'Arabian Sea', 'Beaufort Sea', 'Caribbean Sea', 'Gulf of Mexico', 'Labrador Sea', 'Hudson Bay', 'Caspian Sea', 'Baffin Bay', 'Gulf of Alaska', 'Red Sea', 'Sea of Okhotsk', 'Weddell Sea', 'Persian Gulf', 'Celebes Sea', 'Sulu Sea', 'Norwegian Sea', 'Greenland Sea', 'Banda Sea', 'Luzon Strait', 'Bay of Biscay', 'Mozambique Channel', 'Gulf of Guinea', 'Scotia Sea', 'Baltic Sea', 'Barents Sea', 'North Sea', 'Bristol Channel', 'Inner Seas', 'Irish Sea', 'Java Sea', 'Andaman Sea', 'Yellow Sea', 'East China Sea', 'Chukchi Sea', 'Bah\u00eda de Campeche', 'Arafura Sea', 'Timor Sea', 'Gulf of Thailand', 'Laccadive Sea', 'Bellingshausen Sea', 'Amundsen Sea', 'Davis Strait', 'Kara Sea', 'Laptev Sea', 'Drake Passage', 'Great Australian Bight', 'Gulf of Aden', 'Gulf of Oman', 'Tyrrhenian Sea', 'White Sea', 'Sea of Azov', 'James Bay', 'Gulf of Carpentaria', 'Golfo de California', 'Hudson Strait', 'Gulf of Finland', 'English Channel', 'Gulf of Honduras', 'Golfe du Lion', 'Gulf of Bothnia', 'Adriatic Sea', 'Straits of Florida', 'Bay of Plenty', 'The North Western Passages', 'Queen Charlotte Sound', 'Ionian Sea', 'Gulf of Saint Lawrence', 'Molucca Sea', 'Bismarck Sea', 'Solomon Sea', 'Gulf of Tonkin', 'Bay of Fundy', 'R\u00edo de la Plata', 'Strait of Malacca', 'Strait of Singapore', 'Makassar Strait', 'Ceram Sea', 'Inner Sea', 'Taiwan Strait', 'Cook Inlet', 'Bristol Bay', 'Melville Bay', 'Gulf of Maine', 'Chesapeake Bay', 'Strait of Gibraltar', 'Golfo San Jorge', 'Balearic Sea', 'Aegean Sea', 'Gulf of Mannar', 'Shelikhova Gulf', 'Bo Hai', 'Gulf of Kutch', 'Golfo de Panam\u00e1', 'Amundsen Gulf', 'Viscount Melville Sound', 'Ungava Bay', 'Yucatan Channel', 'Bering Sea', 'East Siberian Sea', 'Lincoln Sea', 'Bass Strait', 'Franklin Bay', 'Dixon Entrance', \"M'Clure Strait\", 'Boca Grande', 'Ba\u00eda de Maraj\u00f3', 'Golfo San Mat\u00edas', 'Golfo Corcovado', 'Wrigley Gulf', 'Sulzberger Bay', 'Ronne Entrance', 'Bransfield Strait', 'McMurdo Sound', 'Ba\u00eda de S\u00e3o Marcos', 'Cumberland Sound', 'Frobisher Bay', 'Disko Bay', 'Hamilton Inlet', 'Storfjorden', 'Vestfjorden', 'Skagerrak', 'Karskiye Strait', \"Vil'kitskogo Strait\", 'Sognefjorden', 'Trondheimsfjorden', 'Kattegat', 'Gulf of Khambh\u00e4t', 'Palk Strait', 'Kronotskiy Gulf', 'Uda Bay', 'Uchiura Bay', 'Tsugaru Strait', 'Tatar Strait', 'Shark Bay', 'Gulf of Gab\u00e8s', 'Mackenzie Bay', 'Norton Sound', 'Kotzebue Sound', 'Gulf of Boothia', 'Kane Basin', 'Foxe Basin', 'Golfo de Tehuantepec', 'Golfo de Guayaquil', 'Gulf of Masira', 'Gulf of Yana', 'Dmitriy Laptev Strait', 'La P\u00e9rouse Strait', 'East Korea Bay', 'Qiongzhou Strait', 'Cook Strait', 'Torres Strait', 'Geographe Bay', 'Gulf of Papua', 'Gulf of Olen\u2018k', 'Gulf of Riga', 'Waddenzee', 'Gulf of Sidra', 'Sea of Crete', 'Ligurian Sea', 'Alboran Sea', 'Bight of Benin', 'Bight of Biafra', 'Strait of Belle Isle', 'Prince William Sound', 'Estrecho de Magellanes', 'Bah\u00eda Blanca', 'Golfo de Penas', 'Bah\u00eda Grande', 'Marguerite Bay', 'Prydz Bay', 'Vincennes Bay', 'Porpoise Bay', 'Davis Sea', 'L\u00fctzow-Holm Bay', 'Antongila Bay', 'Hangzhou Bay', 'Karaginskiy Gulf', 'Gulf of Kamchatka', 'Bosporus', 'Bab el Mandeb', 'Gulf St. Vincent', 'Golfo de Urab\u00e1', 'Baia de Maputo', 'St. Helena Bay', 'Boknafjorden', 'Joseph Bonaparte Gulf', 'Gulf of Martaban', 'Gulf of Sakhalin', 'Kangertittivaq', 'Saint Lawrence River', 'Chaun Bay', 'Khatanga Gulf', 'Garabogaz Bay', 'Gulf of Suez', 'Gulf of Ob', 'Yenisey Gulf', 'Dardanelles', 'Sea of Marmara', 'Gulf of Aqaba', 'Lago de Maracaibo', 'Denmark Strait', 'Massachusetts Bay', 'Delaware Bay', 'Long Island Sound', 'Albemarle Sound', 'Pamlico Sound', 'Smith Sound', 'Queen Charlotte Strait', 'Baird Inlet', 'Husky Lakes', 'Lake Pontchartrain', 'Stettiner Haff', 'Darnley Bay', 'Prince of Wales Strait', 'Minto Inlet', 'Richard Collinson Inlet', 'Prince ALbert Sound', 'Liddon Gulf', 'Wynniatt Bay', 'Hadley Bay', 'Bathurst Inlet', 'Goldsmith Channel', 'Sherman Basin', 'Wager Bay', 'Fury and Hecla Strait', 'Jones Sound', 'Eclipse Sound', 'Hall Basin', 'Uummannaq Fjord', 'Peacock Sound', 'George VI Sound', 'Seno de Skyring', 'Seno Otway', 'Bay In\u00fatil', 'Lagoa dos Patos', 'Amazon River', \"Bras d'Or Lake\", 'Kaliningrad', 'Matochkin Shar Strait', 'Ozero Mogotoyevo', 'Guba Gusinaya', 'Bali Sea', 'Davao Gulf', 'Halmahera Sea', 'Selat Bali', 'Gulf of Tomini', 'Flores Sea', 'Sibuyan Sea', 'Selat Dampier', 'Gulf of Buli', 'Gulf of Kau', 'Bohol Sea', 'Surigao Strait', 'Ragay Gulf', 'Samar Sea', 'Tayabas Bay', 'Leyte Gulf', 'Visayan Sea', 'Savu Sea', 'Hecate Strait', 'Cordova Bay', 'Murchison Sound', 'Robeson Channel', 'Kennedy Channel', 'Canal Perigoso', 'Canal do Sul', 'Canal do Norte', '\u00d8resund', 'Mecklenburger Bucht', 'Sargasso Sea', 'San Francisco Bay', 'Monterey Bay', 'Yangtze River', 'Columbia River', 'Salish Sea', \"Gulf of Anadyr'\", 'Mediterranean Sea', 'Ross Sea', 'Coral Sea', 'Sea of Japan', 'Korea Strait']",
+      "time_range": "list[str, str], optional. Time series datasets only: ['start', 'end'] in ISO 8601.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward.",
+      "time_slice": "str, optional, default 'annual'. Climatologies only: 'annual', 'monthly' or 'seasonal'.",
+      "months": "list[int], optional. Select particular months from a monthly climatology.",
+      "period": "str, optional. Which climate normal to read.",
+      "field": "str, optional. Which statistical field to read.",
+      "version": "str, optional. Product version, where more than one exists."
+    },
+    "returns": "xr.DataArray with the dimensions the dataset would otherwise return and cells outside the region set to NaN. A regular grid keeps its full coordinates; a curvilinear grid keeps its index dimensions and is trimmed to the region's bounding block. Average it with an area-weighted mean, which picks the right cell areas for the grid on its own."
+  },
+  "transform_unit": {
+    "description": "Convert a field from one unit to another within the same physical category.\nBetween the two molar bases, per unit MASS (umol kg-1) and per unit VOLUME (mol m-3), the conversion goes through seawater density: a constant (the default) or a density field, applied cell by cell.\nPass a density field EXACTLY as compute_potential_density_anomaly returned it. Do not add 1000 to make it absolute first: whether the array is an anomaly or an absolute density is read from its own long_name BEFORE its magnitude, so a pre-converted field still labelled 'anomaly' has 1000 added a second time and every converted value comes out about half its true size.",
+    "args": {
+      "data": "xr.DataArray, required. The field to convert.",
+      "from_unit": "str, required, case-insensitive. The unit the data is in; passing the array's own 'units' attribute works, including the variant spellings different products use. Recognised categories: temperature ('degC', 'K'), concentration per mass ('umol/kg', 'mmol/kg'), concentration per volume ('mol m-3', 'mmol/m3', 'umol/L'), dimensionless ('1', 'psu', ''), length ('m', 'cm'), velocity ('m/s', 'cm/s', 'mm/s').",
+      "to_unit": "str, required. The target unit, in any of the same spellings. It must belong to the same category as from_unit.",
+      "density": "float or xr.DataArray, optional, default 1.025. Seawater density, used only between the mass and volume bases. A float is read as kg/L. A DataArray is aligned cell by cell, so each cell converts at its own density; both an absolute density and a density anomaly (sigma) are understood, decided from the array's metadata and magnitude and reported back in the result."
+    },
+    "returns": "xr.DataArray with converted values and its 'units' attribute updated. attrs record 'original_units' and, for a mass/volume conversion, 'density_assumption' \u2014 whether a constant or a field was used, and how it was interpreted."
+  }
+}
+
+Fix this one compute block only, and output the corrected, complete version inside
+<execute></execute> tags.
+Focus on:
+1. Fixing the specific error mentioned above
+2. Taking variable names from the list of available variables above; use what is already there instead of reloading the data or recomputing a quantity that exists
+3. Using correct syntax, function signatures and library functions
+
+
+===== RESPONSE =====
+<execute>
+# Computation code only
+
+dataset = selected_data
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+time_range = ["1971-01", "2000-12"]
+target_months = [3, 9]
+month_names = {3: "March", 9: "September"}
+
+results = {}
+diff_maps_native = {}
+pair_fields_native = {}
+scatter_inputs = {}
+extremes = {}
+display_maps = []
+
+for model in models:
+    # Load monthly model data on native grid
+    thetao = load_regular_data(
+        dataset=dataset,
+        variable="thetao",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+    so = load_regular_data(
+        dataset=dataset,
+        variable="so",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+    mlotst = load_regular_data(
+        dataset=dataset,
+        variable="mlotst",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+
+    # Ensure temperature metadata reflects potential temperature for TEOS-10 route
+    thetao = thetao.assign_attrs(**{**thetao.attrs, "temperature_type": "potential"})
+
+    # Load grid metadata requested in the plan
+    volumes = load_volumes_for_cmip6(
+        dataset=dataset,
+        model=model,
+        depth_range=[float(thetao.depth.min()), float(thetao.depth.max())],
+        variable="thetao",
+    )
+    levels, bounds = load_depth_levels(
+        dataset=dataset,
+        model=model,
+        variable="thetao",
+    )
+
+    # Use shallowest model level as reference depth
+    ref_depth = float(np.asarray(levels)[0])
+
+    # Offline mixed layer depth from monthly thetao and so on native grid
+    mld_offline = compute_mixed_layer_depth(
+        temp_data=thetao,
+        sal_data=so,
+        ref_depth=ref_depth,
+        method="density",
+        density_threshold=0.03,
+        temperature_type="potential",
+    ).assign_attrs(units="m", long_name=f"{model} offline mixed layer depth")
+
+    results[model] = {}
+    diff_maps_native[model] = {}
+    pair_fields_native[model] = {}
+    scatter_inputs[model] = {}
+    extremes[model] = {}
+
+    # Total ocean area from published mlotst mask on native grid
+    mlotst_any = mlotst.isel(time=0)
+    total_ocean_area = compute_basic_stat(
+        mlotst_any.where(np.isfinite(mlotst_any)),
+        op="area_weighted_mean",
+        dim=["lat", "lon"],
+    )
+    area_field = xr.ones_like(mlotst_any).where(np.isfinite(mlotst_any))
+    total_ocean_area_amount = compute_exceedance_fraction(
+        area_field,
+        threshold=0.5,
+        comparison="greater",
+        dim=["lat", "lon"],
+        weighting="area",
+        reference=0.0,
+    )["total_amount"]
+    if hasattr(total_ocean_area_amount, "compute"):
+        total_ocean_area_amount = total_ocean_area_amount.compute()
+    total_ocean_area_amount = float(total_ocean_area_amount)
+
+    for month in target_months:
+        month_label = month_names[month]
+
+        # Extract all instances of the target month
+        off_m = mld_offline.where(mld_offline["time"].dt.month == month, drop=True)
+        pub_m = mlotst.where(mlotst["time"].dt.month == month, drop=True)
+
+        # Strict shared mask: keep only cells valid in both fields for all 30 same-calendar months
+        shared_all30 = (off_m.notnull() & pub_m.notnull()).all(dim="time")
+
+        off_m_shared = off_m.where(shared_all30)
+        pub_m_shared = pub_m.where(shared_all30)
+
+        # 1971-2000 climatologies as plain mean over the 30 monthly values
+        off_clim = compute_basic_stat(off_m_shared, op="mean", dim="time").assign_attrs(units="m")
+        pub_clim = compute_basic_stat(pub_m_shared, op="mean", dim="time").assign_attrs(units="m")
+
+        # Native-grid difference map for all reported metrics
+        diff = (off_clim - pub_clim).assign_attrs(
+            units="m",
+            long_name=f"{model} {month_label} offline MLD minus mlotst",
+        )
+
+        # Metrics on native grid, area weighted
+        metrics = compute_difference_metrics(
+            data=off_clim,
+            reference=pub_clim,
+            dim=["lat", "lon"],
+            weighting="area",
+        )
+
+        bias = metrics["bias"]
+        if hasattr(bias, "compute"):
+            bias = bias.compute()
+        bias = float(bias)
+
+        rmsd = metrics["rmse"]
+        if hasattr(rmsd, "compute"):
+            rmsd = rmsd.compute()
+        rmsd = float(rmsd)
+
+        corr = analyze_correlation(
+            var1=off_clim,
+            var2=pub_clim,
+            dim=["lat", "lon"],
+            method="pearson",
+            weighting="area",
+        )
+        spatial_corr = corr["correlation"]
+        if hasattr(spatial_corr, "compute"):
+            spatial_corr = spatial_corr.compute()
+        spatial_corr = float(spatial_corr)
+
+        exc = compute_exceedance_fraction(
+            data=diff,
+            threshold=20.0,
+            comparison="abs_greater",
+            dim=["lat", "lon"],
+            weighting="area",
+            reference=0.0,
+        )
+        frac_gt20 = exc["fraction_percent"]
+        if hasattr(frac_gt20, "compute"):
+            frac_gt20 = frac_gt20.compute()
+        frac_gt20 = float(frac_gt20)
+
+        valid_area_amount = exc["total_amount"]
+        if hasattr(valid_area_amount, "compute"):
+            valid_area_amount = valid_area_amount.compute()
+        valid_area_amount = float(valid_area_amount)
+        valid_area_pct = 100.0 * valid_area_amount / total_ocean_area_amount
+
+        # Regional concentration of disagreement
+        pos_ext = locate_extreme(diff, op="max")
+        neg_ext = locate_extreme(diff, op="min")
+        abs_ext = locate_extreme(diff, op="abs_max")
+
+        # Materialize all quantities that will be reported or plotted
+        off_clim_c = off_clim.compute() if hasattr(off_clim, "compute") else off_clim
+        pub_clim_c = pub_clim.compute() if hasattr(pub_clim, "compute") else pub_clim
+        diff_c = diff.compute() if hasattr(diff, "compute") else diff
+        mask_c = shared_all30.compute() if hasattr(shared_all30, "compute") else shared_all30
+
+        results[model][month] = {
+            "month_name": month_label,
+            "bias_m": round(bias, 1),
+            "rmsd_m": round(rmsd, 1),
+            "corr": round(spatial_corr, 3),
+            "area_absdiff_gt20_percent": round(frac_gt20, 1),
+            "valid_area_percent_of_ocean": round(valid_area_pct, 1),
+        }
+
+        diff_maps_native[model][month] = diff_c
+        pair_fields_native[model][month] = {
+            "offline_mld": off_clim_c,
+            "mlotst": pub_clim_c,
+            "shared_mask": mask_c,
+        }
+        scatter_inputs[model][month] = {
+            "x_offline": off_clim_c.values.ravel(),
+            "y_mlotst": pub_clim_c.values.ravel(),
+        }
+        extremes[model][month] = {
+            "max_positive": pos_ext,
+            "max_negative": neg_ext,
+            "max_abs": abs_ext,
+        }
+
+        # Regrid for display only
+        diff_display = regrid_horizontal(diff_c, target="woa23", method="bilinear")
+        diff_maps_native[model][f"{month}_display"] = diff_display.compute() if hasattr(diff_display, "compute") else diff_display
+        display_maps.append(diff_maps_native[model][f"{month}_display"].values.ravel())
+
+# Ranking criterion: lowest mean of normalized RMSD rank, |bias| rank, highest correlation rank,
+# and lowest exceedance-area rank across March and September.
+ranking_scores = []
+for model in models:
+    rmsd_mean = np.mean([results[model][m]["rmsd_m"] for m in target_months])
+    abias_mean = np.mean([abs(results[model][m]["bias_m"]) for m in target_months])
+    corr_mean = np.mean([results[model][m]["corr"] for m in target_months])
+    exc_mean = np.mean([results[model][m]["area_absdiff_gt20_percent"] for m in target_months])
+    ranking_scores.append(
+        {
+            "model": model,
+            "rmsd_mean": rmsd_mean,
+            "abias_mean": abias_mean,
+            "corr_mean": corr_mean,
+            "exc_mean": exc_mean,
+        }
+    )
+
+rank_df = pd.DataFrame(ranking_scores).set_index("model")
+rank_df["r_rmsd"] = rank_df["rmsd_mean"].rank(ascending=True, method="min")
+rank_df["r_abias"] = rank_df["abias_mean"].rank(ascending=True, method="min")
+rank_df["r_corr"] = rank_df["corr_mean"].rank(ascending=False, method="min")
+rank_df["r_exc"] = rank_df["exc_mean"].rank(ascending=True, method="min")
+rank_df["consistency_score"] = rank_df[["r_rmsd", "r_abias", "r_corr", "r_exc"]].mean(axis=1)
+ranking = rank_df.sort_values(["consistency_score", "r_rmsd", "r_corr"]).index.tolist()
+
+# Compact summary table
+summary_rows = []
+for model in models:
+    for month in target_months:
+        rr = results[model][month]
+        summary_rows.append(
+            {
+                "model": model,
+                "month": rr["month_name"],
+                "mean_diff_m": rr["bias_m"],
+                "rmsd_m": rr["rmsd_m"],
+                "spatial_r": rr["corr"],
+                "area_|diff|>20m_%": rr["area_absdiff_gt20_percent"],
+                "valid_area_%_of_ocean": rr["valid_area_percent_of_ocean"],
+            }
+        )
+summary_table = pd.DataFrame(summary_rows)
+
+ranking_criterion = (
+    "Models ranked by the mean of four native-grid March/September ranks: lower RMSD, "
+    "lower absolute bias, higher spatial Pearson correlation, and lower area fraction with "
+    "|offline MLD - mlotst| > 20 m."
+)
+
+diagnostic_note = (
+    "Offline MLD and published mlotst are not expected to agree exactly because published mlotst "
+    "is based on the model top level and a displaced-parcel density test at local pressure, and "
+    "is typically archived as a monthly mean of instantaneous MLDs, whereas the offline operator "
+    "is computed from monthly mean thetao/so profiles using a sigma-threshold crossing depth "
+    "interpolated between vertical levels. This commonly makes the offline estimate systematically "
+    "shallower and can amplify disagreement in deep winter mixed-layer regions and frontal zones."
+)
+</execute>

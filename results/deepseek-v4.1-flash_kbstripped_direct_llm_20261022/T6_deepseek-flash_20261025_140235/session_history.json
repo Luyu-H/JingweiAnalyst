@@ -1,0 +1,1370 @@
+{
+  "session_id": "T6_deepseek-flash_20261025_140235",
+  "total_turns": 1,
+  "max_turns": 10,
+  "history": [
+    {
+      "session_id": "T6_deepseek-flash_20261025_140235",
+      "user_query": "Assess the nitracline depth simulated by three CMIP6 models against the WOA23 observed nitrate climatology, globally and by ocean basin.\n\nData to use:\n- CMIP6 historical `no3` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12, each on its own native grid with its own areacello.\n- WOA23 nitrate, the all-time-periods annual climatology, objectively analysed, on the 1-degree grid.\n- The WOA23 land-sea mask (landsea_01, ocean is value > 1) and basin mask (basinmask_01).\n\nThe nitracline is the depth of the maximum vertical gradient of nitrate concentration, searched over the levels within the top 1000 m only (the gradient at the deepest of these still uses the level just below 1000 m, so load the profile below 1000 m).\n\nExpected numerical results:\n- The global mean nitracline depth of each model (1971-2000 climatology) and of WOA23, in metres to the nearest whole metre, and each model's difference from WOA23.\n- The mean nitracline depth in the Pacific, Atlantic and Indian Oceans (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded) for each of the four sources, in metres to the nearest whole metre, and each model's difference from WOA23 in each basin.\n- For each model, the spatial Pearson correlation with WOA23 to 3 decimal places and the RMSE in metres to 1 decimal place, on the WOA23 1-degree grid.\n- Which model reproduces the observed nitracline best, and whether each model reproduces the observed ordering of nitracline depth across the three basins.\n\nExpected visualizations:\n- Figure 1, a 2-by-2 panel of global maps of nitracline depth for the three models and WOA23, all four on one shared sequential colour scale on which deeper is visually heavier.\n- Figure 2, a 4-panel longitude-depth section of nitrate concentration through the equatorial Pacific averaged over 2S-2N, in the order WOA23, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, covering 120E to 80W and the top 1000 m with depth increasing downward, all four panels on one shared colour scale in the same concentration unit, and each panel's own nitracline depth overlaid as a line.",
+      "language": "en",
+      "turn_number": 1,
+      "bundle_path": "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T6_deepseek-flash_20261025_140235/turn01",
+      "selected_tools": [],
+      "knowledge": null,
+      "generated_code": "```python\n<compute>\nimport os\nimport glob\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\nimport matplotlib.pyplot as plt\nfrom scipy.spatial import cKDTree\nfrom scipy.stats import binned_statistic\n\n# ---------------------------------------------------------------------------\n# Helper functions\n# ---------------------------------------------------------------------------\ndef read_woa_msk(path):\n    \"\"\"Read a WOA .msk ASCII table, skipping header/comment lines.\"\"\"\n    rows = []\n    with open(path, 'r', errors='ignore') as f:\n        for line in f:\n            s = line.strip()\n            if not s or s.startswith('#'):\n                continue\n            parts = s.split()\n            if len(parts) < 2:\n                continue\n            try:\n                lat = float(parts[0])\n                lon = float(parts[1])\n            except ValueError:\n                continue\n            vals = []\n            for p in parts[2:]:\n                try:\n                    vals.append(float(p))\n                except ValueError:\n                    vals.append(np.nan)\n            rows.append((lat, lon, vals))\n    return rows\n\n\ndef compute_nitracline(no3, depth):\n    \"\"\"\n    Nitracline = depth of maximum vertical nitrate gradient in the top 1000 m.\n    The gradient at the deepest level <= 1000 m uses the level just below.\n    no3 : array with last dimension = depth\n    depth : 1-D array of depths (positive down)\n    Returns array of nitracline depths with shape no3.shape[:-1].\n    \"\"\"\n    no3 = np.asarray(no3, dtype=float)\n    depth = np.asarray(depth, dtype=float)\n    if depth[0] > depth[-1]:\n        depth = depth[::-1]\n        no3 = no3[..., ::-1]\n\n    dno3 = np.diff(no3, axis=-1)\n    dz = np.diff(depth)\n    grad = dno3 / dz\n    mid_depth = 0.5 * (depth[1:] + depth[:-1])\n\n    # only search gradients whose upper level is within the top 1000 m\n    valid = depth[:-1] <= 1000.0\n    grad_valid = grad[..., valid]\n    mid_valid = mid_depth[valid]\n\n    if grad_valid.shape[-1] == 0:\n        return np.full(no3.shape[:-1], np.nan)\n\n    grad_filled = np.where(np.isfinite(grad_valid), grad_valid, -np.inf)\n    idx = np.argmax(grad_filled, axis=-1)\n    out = np.take(mid_valid, idx)\n    all_invalid = np.all(grad_filled == -np.inf, axis=-1)\n    out = np.where(all_invalid, np.nan, out)\n    return out\n\n\ndef regrid_to_woa(model_lat2d, model_lon2d, model_data, woa_lat, woa_lon, max_dist=2.5):\n    \"\"\"\n    Nearest-neighbour regridding from a (possibly curvilinear) model grid to the\n    WOA 1-degree grid.  Only finite model values are used.\n    \"\"\"\n    valid = np.isfinite(model_data)\n    if not np.any(valid):\n        return np.full((len(woa_lat), len(woa_lon)), np.nan)\n\n    pts = np.column_stack([model_lat2d[valid], (model_lon2d[valid] % 360)])\n    vals = model_data[valid]\n\n    # periodic copies in longitude\n    pts_ext = np.vstack([pts, pts + [0, 360], pts - [0, 360]])\n    vals_ext = np.tile(vals, 3)\n\n    tree = cKDTree(pts_ext)\n    woa_lon360 = woa_lon % 360\n    woa_lat2d, woa_lon2d = np.meshgrid(woa_lat, woa_lon360, indexing='ij')\n    query_pts = np.column_stack([woa_lat2d.ravel(), woa_lon2d.ravel()])\n    dist, idx = tree.query(query_pts, k=1)\n\n    out = vals_ext[idx].reshape(len(woa_lat), len(woa_lon)).astype(float)\n    out[dist.reshape(len(woa_lat), len(woa_lon)) > max_dist] = np.nan\n    return out\n\n\ndef area_weighted_mean(data, mask, lat):\n    \"\"\"Area-weighted mean over a 2-D field on a regular lat-lon grid.\"\"\"\n    w = np.cos(np.deg2rad(lat))[:, None] * np.ones((1, data.shape[1]))\n    valid = mask & np.isfinite(data)\n    if not np.any(valid):\n        return np.nan\n    return np.sum(data[valid] * w[valid]) / np.sum(w[valid])\n\n\ndef compute_section(no3_np, lat2d, lon2d, depth, lon_bins, lat_min=-2, lat_max=2):\n    \"\"\"\n    Build a longitude-depth section averaged over a latitude band.\n    no3_np : (ny, nx, nlev)\n    Returns (nlev, nlon_bins)\n    \"\"\"\n    nlev = len(depth)\n    nbin = len(lon_bins) - 1\n    section = np.full((nlev, nbin), np.nan)\n    lats = lat2d.ravel()\n    lons = lon2d.ravel() % 360\n    lat_mask = (lats >= lat_min) & (lats <= lat_max)\n\n    for k in range(nlev):\n        vals = no3_np[..., k].ravel()\n        mask = lat_mask & np.isfinite(vals)\n        if np.any(mask):\n            stat, _, _ = binned_statistic(\n                lons[mask], vals[mask], statistic='mean', bins=lon_bins\n            )\n            section[k, :] = stat\n    return section\n\n\n# ---------------------------------------------------------------------------\n# WOA23 nitrate and masks\n# ---------------------------------------------------------------------------\nwoa_root = '/data1/lorraine-20419/ocean_data/WOA23'\nwoa_nc = os.path.join(woa_root, 'climatology/nitrate/all_time_periods/woa23_all_n00_01.nc')\nwoa_ds = xr.open_dataset(woa_nc, decode_times=False)\n\n# locate the objective-analysis nitrate field\nwoa_var = None\nfor v in woa_ds.data_vars:\n    if 'n' in v.lower() and 'an' in v.lower():\n        woa_var = v\n        break\nif woa_var is None:\n    for v in woa_ds.data_vars:\n        if woa_ds[v].ndim == 4:\n            woa_var = v\n            break\nif woa_var is None:\n    woa_var = list(woa_ds.data_vars)[0]\n\nwoa_no3_da = woa_ds[woa_var]\nif 'time' in woa_no3_da.dims:\n    woa_no3_da = woa_no3_da.isel(time=0)\nwoa_no3_da = woa_no3_da.squeeze()\n\nwoa_depth = woa_ds['depth'].values.astype(float)\nwoa_lat = woa_ds['lat'].values.astype(float)\nwoa_lon = woa_ds['lon'].values.astype(float)\n\n# (lat, lon, depth)\nwoa_no3 = woa_no3_da.transpose('lat', 'lon', 'depth').values.astype(float)\nnitracline_woa = compute_nitracline(woa_no3, woa_depth)\n\n# land-sea mask\nlandsea_path = os.path.join(woa_root, 'masks/landsea_01.msk')\nlandsea_rows = read_woa_msk(landsea_path)\nlandsea = np.full((180, 360), np.nan)\nfor lat, lon, vals in landsea_rows:\n    i = int(round(lat + 89.5))\n    j = int(round(lon + 179.5))\n    if 0 <= i < 180 and 0 <= j < 360:\n        landsea[i, j] = vals[0]\nocean_mask = landsea > 1\n\n# basin mask\nbasin_path = os.path.join(woa_root, 'masks/basinmask_01.msk')\nbasin_rows = read_woa_msk(basin_path)\nnlev_basin = 102\nbasin3d = np.full((nlev_basin, 180, 360), np.nan)\nfor lat, lon, vals in basin_rows:\n    i = int(round(lat + 89.5))\n    j = int(round(lon + 179.5))\n    if 0 <= i < 180 and 0 <= j < 360:\n        for k, v in enumerate(vals):\n            if k < nlev_basin:\n                basin3d[k, i, j] = v\n\n# surface basin code (first valid level)\nbasin_map = np.full((180, 360), np.nan)\nhas_valid = np.any(np.isfinite(basin3d), axis=0)\nfirst_valid = np.argmax(np.isfinite(basin3d), axis=0)\nfor i in range(180):\n    for j in range(360):\n        if has_valid[i, j]:\n            basin_map[i, j] = basin3d[first_valid[i, j], i, j]\n\n# Fold marginal seas into parent oceans.\n# WOA13 codes: 1 Atlantic, 2 Pacific, 3 Indian, 4 Med, 5 Baltic, 6 Black Sea,\n# 7 Red Sea, 8 Persian Gulf, 9 Hudson Bay, 10 Southern, 11 Arctic.\nbasin_group = np.zeros((180, 360), dtype=int)\nfor code in [1, 4, 5, 6, 9]:\n    basin_group[basin_map == code] = 1      # Atlantic\nbasin_group[basin_map == 2] = 2             # Pacific\nfor code in [3, 7, 8]:\n    basin_group[basin_map == code] = 3      # Indian\n# 10 and 11 remain 0 (excluded)\n\n# ---------------------------------------------------------------------------\n# CMIP6 historical no3, 1971-2000\n# ---------------------------------------------------------------------------\ncmip_root = '/data1/lorraine-20419/benchmark_cmip6/historical'\nmodels = ['CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\nmodel_meta = {\n    'CESM2':        {'y_dim': 'nlat', 'x_dim': 'nlon', 'depth_coord': 'lev', 'depth_scale': 0.01},\n    'GFDL-ESM4':    {'y_dim': 'lat',  'x_dim': 'lon',  'depth_coord': 'lev', 'depth_scale': 1.0},\n    'MPI-ESM1-2-LR':{'y_dim': 'j',    'x_dim': 'i',    'depth_coord': 'lev', 'depth_scale': 1.0},\n}\n\nnitracline_models = {}\nmodel_no3_np = {}\nmodel_lats = {}\nmodel_lons = {}\nmodel_depths = {}\n\nfor model in models:\n    model_dir = os.path.join(cmip_root, model, 'no3')\n    files = sorted(glob.glob(os.path.join(model_dir, '*.nc')))\n    if not files:\n        raise FileNotFoundError(f'No no3 files for {model} in {model_dir}')\n\n    # keep only the ensemble member that actually appears in the filenames\n    base = os.path.basename(files[0])\n    parts = base.split('_')\n    variant = parts[4] if len(parts) > 4 else None\n    if variant:\n        files = [f for f in files if variant in os.path.basename(f)]\n\n    ds = xr.open_mfdataset(\n        files, combine='by_coords', use_cftime=True, decode_times=True,\n        chunks={'time': 12}\n    )\n    years = ds.time.dt.year\n    time_mask = (years >= 1971) & (years <= 2000)\n    ds_sel = ds.isel(time=time_mask)\n\n    no3_da = ds_sel['no3'].mean('time').compute()\n\n    lev = ds_sel[model_meta[model]['depth_coord']].values.astype(float)\n    depth = lev * model_meta[model]['depth_scale']\n    model_depths[model] = depth\n\n    y_dim = model_meta[model]['y_dim']\n    x_dim = model_meta[model]['x_dim']\n    lat_da = ds_sel[y_dim]\n    lon_da = ds_sel[x_dim]\n\n    if lat_da.ndim == 1:\n        lon2d, lat2d = np.meshgrid(lon_da.values, lat_da.values)\n    else:\n        lat2d = lat_da.values\n        lon2d = lon_da.values\n\n    # (ny, nx, nlev)\n    no3_np = no3_da.transpose(y_dim, x_dim, 'lev').values.astype(float)\n    model_no3_np[model] = no3_np\n    model_lats[model] = lat2d\n    model_lons[model] = lon2d\n\n    nitracline_native = compute_nitracline(no3_np, depth)\n    nitracline_models[model] = regrid_to_woa(\n        lat2d, lon2d, nitracline_native, woa_lat, woa_lon\n    )\n\n    ds.close()\n\n# ---------------------------------------------------------------------------\n# Global and basin statistics\n# ---------------------------------------------------------------------------\nbasin_names = {1: 'Atlantic', 2: 'Pacific', 3: 'Indian'}\nresults = {}\n\n# WOA\nresults['WOA23'] = {'global': area_weighted_mean(nitracline_woa, ocean_mask, woa_lat)}\nbasin_means_woa = {}\nfor bg, name in basin_names.items():\n    mask = (basin_group == bg) & ocean_mask\n    basin_means_woa[name] = area_weighted_mean(nitracline_woa, mask, woa_lat)\nresults['WOA23']['basins'] = basin_means_woa\n\n# models\nfor model in models:\n    results[model] = {\n        'global': area_weighted_mean(nitracline_models[model], ocean_mask, woa_lat)\n    }\n    basin_means = {}\n    for bg, name in basin_names.items():\n        mask = (basin_group == bg) & ocean_mask\n        basin_means[name] = area_weighted_mean(nitracline_models[model], mask, woa_lat)\n    results[model]['basins'] = basin_means\n\n# differences from WOA\nfor model in models:\n    results[model]['global_diff'] = results[model]['global'] - results['WOA23']['global']\n    for name in basin_names.values():\n        results[model][f'{name}_diff'] = (\n            results[model]['basins'][name] - results['WOA23']['basins'][name]\n        )\n\n# spatial correlation and RMSE against WOA on the WOA 1-degree grid\ncorr_rmse = {}\nfor model in models:\n    valid = ocean_mask & np.isfinite(nitracline_woa) & np.isfinite(nitracline_models[model])\n    x = nitracline_woa[valid]\n    y = nitracline_models[model][valid]\n    if x.size > 1:\n        corr = float(np.corrcoef(x, y)[0, 1])\n        rmse = float(np.sqrt(np.mean((x - y) ** 2)))\n    else:\n        corr, rmse = np.nan, np.nan\n    corr_rmse[model] = {'corr': corr, 'rmse': rmse}\n\n# observed and modelled basin ordering (deepest first)\nwoa_basin_order = sorted(basin_names.values(), key=lambda n: results['WOA23']['basins'][n], reverse=True)\nmodel_basin_orders = {}\nfor model in models:\n    model_basin_orders[model] = sorted(\n        basin_names.values(), key=lambda n: results[model]['basins'][n], reverse=True\n    )\n\n# ---------------------------------------------------------------------------\n# Longitude-depth sections through the equatorial Pacific (2S-2N)\n# ---------------------------------------------------------------------------\nlon_bins = np.arange(120, 281, 1)          # 120E to 80W\nlon_centers = 0.5 * (lon_bins[:-1] + lon_bins[1:])\n\nsections = {}\n# WOA\nwoa_lon2d, woa_lat2d = np.meshgrid(woa_lon, woa_lat)\nsections['WOA23'] = compute_section(woa_no3, woa_lat2d, woa_lon2d, woa_depth, lon_bins)\n\n# CMIP6\nfor model in models:\n    sections[model] = compute_section(\n        model_no3_np[model], model_lats[model], model_lons[model],\n        model_depths[model], lon_bins\n    )\n\n# Convert CMIP6 mol m-3 to umol kg-1 (reference density 1025 kg m-3).\n# WOA is already in umol kg-1.\nsections_umol = {'WOA23': sections['WOA23']}\nfor model in models:\n    sections_umol[model] = sections[model] * 1.0e6 / 1025.0\n\n# Nitracline line for each section (computed from the section's own profile)\nnitracline_lines = {}\nfor key in ['WOA23'] + models:\n    depth = woa_depth if key == 'WOA23' else model_depths[key]\n    nitracline_lines[key] = compute_nitracline(sections[key].T, depth)\n\n# ---------------------------------------------------------------------------\n# Report-ready rounded values\n# ---------------------------------------------------------------------------\nsummary = {}\nfor key in ['WOA23'] + models:\n    summary[key] = {\n        'global_m': round(float(results[key]['global']), 0),\n        'basins_m': {n: round(float(results[key]['basins'][n]), 0) for n in basin_names.values()},\n    }\n    if key != 'WOA23':\n        summary[key]['global_diff_m'] = round(float(results[key]['global_diff']), 0)\n        summary[key]['basin_diff_m'] = {\n            n: round(float(results[key][f'{n}_diff']), 0) for n in basin_names.values()\n        }\n        summary[key]['corr'] = round(corr_rmse[key]['corr'], 3)\n        summary[key]['rmse_m'] = round(corr_rmse[key]['rmse'], 1)\n</compute>\n```\n\n```python\n<visualize>\n# ---------------------------------------------------------------------------\n# Figure 1: global maps of nitracline depth\n# ---------------------------------------------------------------------------\nfig1, axes1 = plt.subplots(2, 2, figsize=(14, 10))\nmap_fields = {\n    'WOA23': nitracline_woa,\n    'CESM2': nitracline_models['CESM2'],\n    'GFDL-ESM4': nitracline_models['GFDL-ESM4'],\n    'MPI-ESM1-2-LR': nitracline_models['MPI-ESM1-2-LR'],\n}\nmap_titles = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\n\nall_map_vals = []\nfor f in map_fields.values():\n    v = f[np.isfinite(f)]\n    if v.size:\n        all_map_vals.append(v)\nall_map_vals = np.concatenate(all_map_vals)\nvmin_map = np.nanpercentile(all_map_vals, 2)\nvmax_map = np.nanpercentile(all_map_vals, 98)\ncmap_map = 'YlGnBu'   # deeper -> darker/heavier\n\nfor ax, key, title in zip(axes1.ravel(), map_fields.keys(), map_titles):\n    field = np.where(ocean_mask, map_fields[key], np.nan)\n    pcm = ax.pcolormesh(\n        woa_lon, woa_lat, field,\n        cmap=cmap_map, vmin=vmin_map, vmax=vmax_map, shading='auto'\n    )\n    ax.set_title(title)\n    ax.set_xlabel('Longitude')\n    ax.set_ylabel('Latitude')\n    ax.set_xlim(-180, 180)\n    ax.set_ylim(-90, 90)\n    ax.set_facecolor('lightgray')\n\nfig1.colorbar(\n    pcm, ax=axes1, orientation='horizontal', fraction=0.05, pad=0.05,\n    label='Nitracline depth (m)'\n)\n\n# ---------------------------------------------------------------------------\n# Figure 2: equatorial Pacific longitude-depth nitrate sections\n# ---------------------------------------------------------------------------\nfig2, axes2 = plt.subplots(4, 1, figsize=(14, 16), sharex=True)\nsec_keys = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\nsec_titles = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\n\nall_sec_vals = []\nfor key in sec_keys:\n    depth = woa_depth if key == 'WOA23' else model_depths[key]\n    sec = sections_umol[key]\n    mask = depth <= 1000\n    vals = sec[mask, :]\n    vals = vals[np.isfinite(vals)]\n    if vals.size:\n        all_sec_vals.append(vals)\nall_sec_vals = np.concatenate(all_sec_vals)\nvmin_sec = 0.0\nvmax_sec = float(np.nanpercentile(all_sec_vals, 99))\ncmap_sec = 'viridis'\n\nfor ax, key, title in zip(axes2, sec_keys, sec_titles):\n    depth = woa_depth if key == 'WOA23' else model_depths[key]\n    mask = depth <= 1000\n    sec_plot = sections_umol[key][mask, :]\n    depth_plot = depth[mask]\n\n    pcm2 = ax.pcolormesh(\n        lon_centers, depth_plot, sec_plot,\n        cmap=cmap_sec, vmin=vmin_sec, vmax=vmax_sec, shading='auto'\n    )\n    ax.plot(lon_centers, nitracline_lines[key], color='red', linewidth=1.5, label='Nitracline')\n    ax.set_title(title)\n    ax.set_ylabel('Depth (m)')\n    ax.invert_yaxis()\n    ax.set_xlim(120, 280)\n    ax.set_ylim(1000, 0)\n    ax.legend(loc='lower right')\n\naxes2[-1].set_xlabel('Longitude')\naxes2[-1].set_xticks([120, 160, 200, 240, 280])\naxes2[-1].set_xticklabels(['120E', '160E', '180', '160W', '120W', '80W'])\n\nfig2.colorbar(\n    pcm2, ax=axes2, orientation='horizontal', fraction=0.05, pad=0.05,\n    label='Nitrate (µmol kg⁻¹)'\n)\n</visualize>\n```",
+      "compute_iterations": [
+        {
+          "iteration": 1,
+          "code": "import os\nimport glob\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\nimport matplotlib.pyplot as plt\nfrom scipy.spatial import cKDTree\nfrom scipy.stats import binned_statistic\n\n# ---------------------------------------------------------------------------\n# Helper functions\n# ---------------------------------------------------------------------------\ndef read_woa_msk(path):\n    \"\"\"Read a WOA .msk ASCII table, skipping header/comment lines.\"\"\"\n    rows = []\n    with open(path, 'r', errors='ignore') as f:\n        for line in f:\n            s = line.strip()\n            if not s or s.startswith('#'):\n                continue\n            parts = s.split()\n            if len(parts) < 2:\n                continue\n            try:\n                lat = float(parts[0])\n                lon = float(parts[1])\n            except ValueError:\n                continue\n            vals = []\n            for p in parts[2:]:\n                try:\n                    vals.append(float(p))\n                except ValueError:\n                    vals.append(np.nan)\n            rows.append((lat, lon, vals))\n    return rows\n\n\ndef compute_nitracline(no3, depth):\n    \"\"\"\n    Nitracline = depth of maximum vertical nitrate gradient in the top 1000 m.\n    The gradient at the deepest level <= 1000 m uses the level just below.\n    no3 : array with last dimension = depth\n    depth : 1-D array of depths (positive down)\n    Returns array of nitracline depths with shape no3.shape[:-1].\n    \"\"\"\n    no3 = np.asarray(no3, dtype=float)\n    depth = np.asarray(depth, dtype=float)\n    if depth[0] > depth[-1]:\n        depth = depth[::-1]\n        no3 = no3[..., ::-1]\n\n    dno3 = np.diff(no3, axis=-1)\n    dz = np.diff(depth)\n    grad = dno3 / dz\n    mid_depth = 0.5 * (depth[1:] + depth[:-1])\n\n    # only search gradients whose upper level is within the top 1000 m\n    valid = depth[:-1] <= 1000.0\n    grad_valid = grad[..., valid]\n    mid_valid = mid_depth[valid]\n\n    if grad_valid.shape[-1] == 0:\n        return np.full(no3.shape[:-1], np.nan)\n\n    grad_filled = np.where(np.isfinite(grad_valid), grad_valid, -np.inf)\n    idx = np.argmax(grad_filled, axis=-1)\n    out = np.take(mid_valid, idx)\n    all_invalid = np.all(grad_filled == -np.inf, axis=-1)\n    out = np.where(all_invalid, np.nan, out)\n    return out\n\n\ndef regrid_to_woa(model_lat2d, model_lon2d, model_data, woa_lat, woa_lon, max_dist=2.5):\n    \"\"\"\n    Nearest-neighbour regridding from a (possibly curvilinear) model grid to the\n    WOA 1-degree grid.  Only finite model values are used.\n    \"\"\"\n    valid = np.isfinite(model_data)\n    if not np.any(valid):\n        return np.full((len(woa_lat), len(woa_lon)), np.nan)\n\n    pts = np.column_stack([model_lat2d[valid], (model_lon2d[valid] % 360)])\n    vals = model_data[valid]\n\n    # periodic copies in longitude\n    pts_ext = np.vstack([pts, pts + [0, 360], pts - [0, 360]])\n    vals_ext = np.tile(vals, 3)\n\n    tree = cKDTree(pts_ext)\n    woa_lon360 = woa_lon % 360\n    woa_lat2d, woa_lon2d = np.meshgrid(woa_lat, woa_lon360, indexing='ij')\n    query_pts = np.column_stack([woa_lat2d.ravel(), woa_lon2d.ravel()])\n    dist, idx = tree.query(query_pts, k=1)\n\n    out = vals_ext[idx].reshape(len(woa_lat), len(woa_lon)).astype(float)\n    out[dist.reshape(len(woa_lat), len(woa_lon)) > max_dist] = np.nan\n    return out\n\n\ndef area_weighted_mean(data, mask, lat):\n    \"\"\"Area-weighted mean over a 2-D field on a regular lat-lon grid.\"\"\"\n    w = np.cos(np.deg2rad(lat))[:, None] * np.ones((1, data.shape[1]))\n    valid = mask & np.isfinite(data)\n    if not np.any(valid):\n        return np.nan\n    return np.sum(data[valid] * w[valid]) / np.sum(w[valid])\n\n\ndef compute_section(no3_np, lat2d, lon2d, depth, lon_bins, lat_min=-2, lat_max=2):\n    \"\"\"\n    Build a longitude-depth section averaged over a latitude band.\n    no3_np : (ny, nx, nlev)\n    Returns (nlev, nlon_bins)\n    \"\"\"\n    nlev = len(depth)\n    nbin = len(lon_bins) - 1\n    section = np.full((nlev, nbin), np.nan)\n    lats = lat2d.ravel()\n    lons = lon2d.ravel() % 360\n    lat_mask = (lats >= lat_min) & (lats <= lat_max)\n\n    for k in range(nlev):\n        vals = no3_np[..., k].ravel()\n        mask = lat_mask & np.isfinite(vals)\n        if np.any(mask):\n            stat, _, _ = binned_statistic(\n                lons[mask], vals[mask], statistic='mean', bins=lon_bins\n            )\n            section[k, :] = stat\n    return section\n\n\n# ---------------------------------------------------------------------------\n# WOA23 nitrate and masks\n# ---------------------------------------------------------------------------\nwoa_root = '/data1/lorraine-20419/ocean_data/WOA23'\nwoa_nc = os.path.join(woa_root, 'climatology/nitrate/all_time_periods/woa23_all_n00_01.nc')\nwoa_ds = xr.open_dataset(woa_nc, decode_times=False)\n\n# locate the objective-analysis nitrate field\nwoa_var = None\nfor v in woa_ds.data_vars:\n    if 'n' in v.lower() and 'an' in v.lower():\n        woa_var = v\n        break\nif woa_var is None:\n    for v in woa_ds.data_vars:\n        if woa_ds[v].ndim == 4:\n            woa_var = v\n            break\nif woa_var is None:\n    woa_var = list(woa_ds.data_vars)[0]\n\nwoa_no3_da = woa_ds[woa_var]\nif 'time' in woa_no3_da.dims:\n    woa_no3_da = woa_no3_da.isel(time=0)\nwoa_no3_da = woa_no3_da.squeeze()\n\nwoa_depth = woa_ds['depth'].values.astype(float)\nwoa_lat = woa_ds['lat'].values.astype(float)\nwoa_lon = woa_ds['lon'].values.astype(float)\n\n# (lat, lon, depth)\nwoa_no3 = woa_no3_da.transpose('lat', 'lon', 'depth').values.astype(float)\nnitracline_woa = compute_nitracline(woa_no3, woa_depth)\n\n# land-sea mask\nlandsea_path = os.path.join(woa_root, 'masks/landsea_01.msk')\nlandsea_rows = read_woa_msk(landsea_path)\nlandsea = np.full((180, 360), np.nan)\nfor lat, lon, vals in landsea_rows:\n    i = int(round(lat + 89.5))\n    j = int(round(lon + 179.5))\n    if 0 <= i < 180 and 0 <= j < 360:\n        landsea[i, j] = vals[0]\nocean_mask = landsea > 1\n\n# basin mask\nbasin_path = os.path.join(woa_root, 'masks/basinmask_01.msk')\nbasin_rows = read_woa_msk(basin_path)\nnlev_basin = 102\nbasin3d = np.full((nlev_basin, 180, 360), np.nan)\nfor lat, lon, vals in basin_rows:\n    i = int(round(lat + 89.5))\n    j = int(round(lon + 179.5))\n    if 0 <= i < 180 and 0 <= j < 360:\n        for k, v in enumerate(vals):\n            if k < nlev_basin:\n                basin3d[k, i, j] = v\n\n# surface basin code (first valid level)\nbasin_map = np.full((180, 360), np.nan)\nhas_valid = np.any(np.isfinite(basin3d), axis=0)\nfirst_valid = np.argmax(np.isfinite(basin3d), axis=0)\nfor i in range(180):\n    for j in range(360):\n        if has_valid[i, j]:\n            basin_map[i, j] = basin3d[first_valid[i, j], i, j]\n\n# Fold marginal seas into parent oceans.\n# WOA13 codes: 1 Atlantic, 2 Pacific, 3 Indian, 4 Med, 5 Baltic, 6 Black Sea,\n# 7 Red Sea, 8 Persian Gulf, 9 Hudson Bay, 10 Southern, 11 Arctic.\nbasin_group = np.zeros((180, 360), dtype=int)\nfor code in [1, 4, 5, 6, 9]:\n    basin_group[basin_map == code] = 1      # Atlantic\nbasin_group[basin_map == 2] = 2             # Pacific\nfor code in [3, 7, 8]:\n    basin_group[basin_map == code] = 3      # Indian\n# 10 and 11 remain 0 (excluded)\n\n# ---------------------------------------------------------------------------\n# CMIP6 historical no3, 1971-2000\n# ---------------------------------------------------------------------------\ncmip_root = '/data1/lorraine-20419/benchmark_cmip6/historical'\nmodels = ['CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\nmodel_meta = {\n    'CESM2':        {'y_dim': 'nlat', 'x_dim': 'nlon', 'depth_coord': 'lev', 'depth_scale': 0.01},\n    'GFDL-ESM4':    {'y_dim': 'lat',  'x_dim': 'lon',  'depth_coord': 'lev', 'depth_scale': 1.0},\n    'MPI-ESM1-2-LR':{'y_dim': 'j',    'x_dim': 'i',    'depth_coord': 'lev', 'depth_scale': 1.0},\n}\n\nnitracline_models = {}\nmodel_no3_np = {}\nmodel_lats = {}\nmodel_lons = {}\nmodel_depths = {}\n\nfor model in models:\n    model_dir = os.path.join(cmip_root, model, 'no3')\n    files = sorted(glob.glob(os.path.join(model_dir, '*.nc')))\n    if not files:\n        raise FileNotFoundError(f'No no3 files for {model} in {model_dir}')\n\n    # keep only the ensemble member that actually appears in the filenames\n    base = os.path.basename(files[0])\n    parts = base.split('_')\n    variant = parts[4] if len(parts) > 4 else None\n    if variant:\n        files = [f for f in files if variant in os.path.basename(f)]\n\n    ds = xr.open_mfdataset(\n        files, combine='by_coords', use_cftime=True, decode_times=True,\n        chunks={'time': 12}\n    )\n    years = ds.time.dt.year\n    time_mask = (years >= 1971) & (years <= 2000)\n    ds_sel = ds.isel(time=time_mask)\n\n    no3_da = ds_sel['no3'].mean('time').compute()\n\n    lev = ds_sel[model_meta[model]['depth_coord']].values.astype(float)\n    depth = lev * model_meta[model]['depth_scale']\n    model_depths[model] = depth\n\n    y_dim = model_meta[model]['y_dim']\n    x_dim = model_meta[model]['x_dim']\n    lat_da = ds_sel[y_dim]\n    lon_da = ds_sel[x_dim]\n\n    if lat_da.ndim == 1:\n        lon2d, lat2d = np.meshgrid(lon_da.values, lat_da.values)\n    else:\n        lat2d = lat_da.values\n        lon2d = lon_da.values\n\n    # (ny, nx, nlev)\n    no3_np = no3_da.transpose(y_dim, x_dim, 'lev').values.astype(float)\n    model_no3_np[model] = no3_np\n    model_lats[model] = lat2d\n    model_lons[model] = lon2d\n\n    nitracline_native = compute_nitracline(no3_np, depth)\n    nitracline_models[model] = regrid_to_woa(\n        lat2d, lon2d, nitracline_native, woa_lat, woa_lon\n    )\n\n    ds.close()\n\n# ---------------------------------------------------------------------------\n# Global and basin statistics\n# ---------------------------------------------------------------------------\nbasin_names = {1: 'Atlantic', 2: 'Pacific', 3: 'Indian'}\nresults = {}\n\n# WOA\nresults['WOA23'] = {'global': area_weighted_mean(nitracline_woa, ocean_mask, woa_lat)}\nbasin_means_woa = {}\nfor bg, name in basin_names.items():\n    mask = (basin_group == bg) & ocean_mask\n    basin_means_woa[name] = area_weighted_mean(nitracline_woa, mask, woa_lat)\nresults['WOA23']['basins'] = basin_means_woa\n\n# models\nfor model in models:\n    results[model] = {\n        'global': area_weighted_mean(nitracline_models[model], ocean_mask, woa_lat)\n    }\n    basin_means = {}\n    for bg, name in basin_names.items():\n        mask = (basin_group == bg) & ocean_mask\n        basin_means[name] = area_weighted_mean(nitracline_models[model], mask, woa_lat)\n    results[model]['basins'] = basin_means\n\n# differences from WOA\nfor model in models:\n    results[model]['global_diff'] = results[model]['global'] - results['WOA23']['global']\n    for name in basin_names.values():\n        results[model][f'{name}_diff'] = (\n            results[model]['basins'][name] - results['WOA23']['basins'][name]\n        )\n\n# spatial correlation and RMSE against WOA on the WOA 1-degree grid\ncorr_rmse = {}\nfor model in models:\n    valid = ocean_mask & np.isfinite(nitracline_woa) & np.isfinite(nitracline_models[model])\n    x = nitracline_woa[valid]\n    y = nitracline_models[model][valid]\n    if x.size > 1:\n        corr = float(np.corrcoef(x, y)[0, 1])\n        rmse = float(np.sqrt(np.mean((x - y) ** 2)))\n    else:\n        corr, rmse = np.nan, np.nan\n    corr_rmse[model] = {'corr': corr, 'rmse': rmse}\n\n# observed and modelled basin ordering (deepest first)\nwoa_basin_order = sorted(basin_names.values(), key=lambda n: results['WOA23']['basins'][n], reverse=True)\nmodel_basin_orders = {}\nfor model in models:\n    model_basin_orders[model] = sorted(\n        basin_names.values(), key=lambda n: results[model]['basins'][n], reverse=True\n    )\n\n# ---------------------------------------------------------------------------\n# Longitude-depth sections through the equatorial Pacific (2S-2N)\n# ---------------------------------------------------------------------------\nlon_bins = np.arange(120, 281, 1)          # 120E to 80W\nlon_centers = 0.5 * (lon_bins[:-1] + lon_bins[1:])\n\nsections = {}\n# WOA\nwoa_lon2d, woa_lat2d = np.meshgrid(woa_lon, woa_lat)\nsections['WOA23'] = compute_section(woa_no3, woa_lat2d, woa_lon2d, woa_depth, lon_bins)\n\n# CMIP6\nfor model in models:\n    sections[model] = compute_section(\n        model_no3_np[model], model_lats[model], model_lons[model],\n        model_depths[model], lon_bins\n    )\n\n# Convert CMIP6 mol m-3 to umol kg-1 (reference density 1025 kg m-3).\n# WOA is already in umol kg-1.\nsections_umol = {'WOA23': sections['WOA23']}\nfor model in models:\n    sections_umol[model] = sections[model] * 1.0e6 / 1025.0\n\n# Nitracline line for each section (computed from the section's own profile)\nnitracline_lines = {}\nfor key in ['WOA23'] + models:\n    depth = woa_depth if key == 'WOA23' else model_depths[key]\n    nitracline_lines[key] = compute_nitracline(sections[key].T, depth)\n\n# ---------------------------------------------------------------------------\n# Report-ready rounded values\n# ---------------------------------------------------------------------------\nsummary = {}\nfor key in ['WOA23'] + models:\n    summary[key] = {\n        'global_m': round(float(results[key]['global']), 0),\n        'basins_m': {n: round(float(results[key]['basins'][n]), 0) for n in basin_names.values()},\n    }\n    if key != 'WOA23':\n        summary[key]['global_diff_m'] = round(float(results[key]['global_diff']), 0)\n        summary[key]['basin_diff_m'] = {\n            n: round(float(results[key][f'{n}_diff']), 0) for n in basin_names.values()\n        }\n        summary[key]['corr'] = round(corr_rmse[key]['corr'], 3)\n        summary[key]['rmse_m'] = round(corr_rmse[key]['rmse'], 1)",
+          "success": true,
+          "materialized_results": {
+            "materialized": 0,
+            "kept_lazy": [
+              "ds_sel (4332 MB)",
+              "ds (23824 MB)"
+            ]
+          },
+          "output": {
+            "woa_root": "/data1/lorraine-20419/ocean_data/WOA23",
+            "woa_nc": "/data1/lorraine-20419/ocean_data/WOA23/climatology/nitrate/all_time_periods/woa23_all_n00_01.nc",
+            "woa_ds": {
+              "crs": {
+                "type": "DataArray",
+                "dims": {},
+                "size": 1,
+                "n_valid": 1,
+                "min": -2147483647.0,
+                "max": -2147483647.0,
+                "mean": -2147483647.0,
+                "std": 0.0,
+                "values": -2147483647
+              },
+              "lat_bnds": {
+                "type": "DataArray",
+                "dims": {
+                  "lat": 180,
+                  "nbounds": 2
+                },
+                "size": 360,
+                "n_valid": 360,
+                "min": -90.0,
+                "max": 90.0,
+                "mean": 0.0,
+                "std": 51.96312713623047
+              },
+              "lon_bnds": {
+                "type": "DataArray",
+                "dims": {
+                  "lon": 360,
+                  "nbounds": 2
+                },
+                "size": 720,
+                "n_valid": 720,
+                "min": -180.0,
+                "max": 180.0,
+                "mean": 0.0,
+                "std": 103.9238510131836
+              },
+              "depth_bnds": {
+                "type": "DataArray",
+                "dims": {
+                  "depth": 102,
+                  "nbounds": 2
+                },
+                "size": 204,
+                "n_valid": 204,
+                "min": 0.0,
+                "max": 5500.0,
+                "mean": 1738.2353515625,
+                "std": 1683.3563232421875
+              },
+              "climatology_bounds": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 1,
+                  "nbounds": 2
+                },
+                "size": 2,
+                "n_valid": 2,
+                "min": 3552.0,
+                "max": 4248.0,
+                "mean": 3900.0,
+                "std": 348.0,
+                "values": [
+                  [
+                    3552.0,
+                    4248.0
+                  ]
+                ]
+              },
+              "n_an": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 1,
+                  "depth": 102,
+                  "lat": 180,
+                  "lon": 360
+                },
+                "units": "micromoles_per_kilogram",
+                "long_name": "Objectively analyzed mean fields for moles_of_nitrate_per_unit_mass_in_sea_water at standard depth levels.",
+                "size": 6609600,
+                "n_valid": 3305010,
+                "min": 0.0,
+                "max": 49.30696105957031,
+                "mean": 22.99764060974121,
+                "std": 13.058621406555176
+              },
+              "n_mn": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 1,
+                  "depth": 102,
+                  "lat": 180,
+                  "lon": 360
+                },
+                "units": "micromoles_per_kilogram",
+                "long_name": "Average of all unflagged interpolated values at each standard depth level for moles_of_nitrate_per_unit_mass_in_sea_water in each grid-square which contain at least one measurement.",
+                "size": 6609600,
+                "n_valid": 962205,
+                "min": -0.08208775520324707,
+                "max": 49.98048782348633,
+                "mean": 20.601438522338867,
+                "std": 13.521270751953125
+              },
+              "n_dd": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 1,
+                  "depth": 102,
+                  "lat": 180,
+                  "lon": 360
+                },
+                "units": "1",
+                "long_name": "The number of observations of moles_of_nitrate_per_unit_mass_in_sea_water in each grid-square at each standard depth level.",
+                "size": 6609600,
+                "n_valid": 3305010,
+                "min": 0.0,
+                "max": 4979.0,
+                "mean": 1.4650939028928809,
+                "std": 15.577214663096669
+              },
+              "n_sd": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 1,
+                  "depth": 102,
+                  "lat": 180,
+                  "lon": 360
+                },
+                "units": "micromoles_per_kilogram",
+                "long_name": "The standard deviation about the statistical mean of moles_of_nitrate_per_unit_mass_in_sea_water in each grid-square at each standard depth level.",
+                "size": 6609600,
+                "n_valid": 951642,
+                "min": 0.0,
+                "max": 21.606632232666016,
+                "mean": 0.5533989667892456,
+                "std": 1.0704376697540283
+              },
+              "n_se": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 1,
+                  "depth": 102,
+                  "lat": 180,
+                  "lon": 360
+                },
+                "units": "micromoles_per_kilogram",
+                "long_name": "The standard error about the statistical mean of moles_of_nitrate_per_unit_mass_in_sea_water in each grid-square at each standard depth level.",
+                "size": 6609600,
+                "n_valid": 951642,
+                "min": 0.0,
+                "max": 11.363293647766113,
+                "mean": 0.25748682022094727,
+                "std": 0.5109283328056335
+              },
+              "n_oa": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 1,
+                  "depth": 102,
+                  "lat": 180,
+                  "lon": 360
+                },
+                "units": "micromoles_per_kilogram",
+                "long_name": "statistical mean value minus the objectively analyzed mean value for moles_of_nitrate_per_unit_mass_in_sea_water.",
+                "size": 6609600,
+                "n_valid": 962205,
+                "min": -34.18672180175781,
+                "max": 23.13459014892578,
+                "mean": -0.06401032209396362,
+                "std": 1.728775143623352
+              },
+              "n_gp": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 1,
+                  "depth": 102,
+                  "lat": 180,
+                  "lon": 360
+                },
+                "units": "1",
+                "long_name": "The number of grid-squares within the smallest radius of influence around each grid-square which contain a statistical mean for moles_of_nitrate_per_unit_mass_in_sea_water.",
+                "size": 6609600,
+                "n_valid": 3305010,
+                "min": 0.0,
+                "max": 184.0,
+                "mean": 22.04685220317034,
+                "std": 20.08440639915409
+              },
+              "n_sea": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 1,
+                  "depth": 102,
+                  "lat": 180,
+                  "lon": 360
+                },
+                "units": "micromoles_per_kilogram",
+                "long_name": "The standard error about the objectively analyzed data of moles_of_nitrate_per_unit_mass_in_sea_water defined in Levitus et al. (2012) GRL.",
+                "size": 6609600,
+                "n_valid": 3279341,
+                "min": 0.0,
+                "max": 7.244609832763672,
+                "mean": 0.07377403229475021,
+                "std": 0.13326752185821533
+              }
+            },
+            "woa_var": "n_an",
+            "woa_no3_da": {
+              "type": "DataArray",
+              "dims": {
+                "depth": 102,
+                "lat": 180,
+                "lon": 360
+              },
+              "units": "micromoles_per_kilogram",
+              "long_name": "Objectively analyzed mean fields for moles_of_nitrate_per_unit_mass_in_sea_water at standard depth levels.",
+              "size": 6609600,
+              "n_valid": 3305010,
+              "min": 0.0,
+              "max": 49.30696105957031,
+              "mean": 22.99764060974121,
+              "std": 13.058621406555176
+            },
+            "woa_depth": {
+              "type": "ndarray",
+              "shape": [
+                102
+              ],
+              "size": 102,
+              "n_valid": 102,
+              "min": 0.0,
+              "max": 5500.0,
+              "mean": 1738.235294117647,
+              "std": 1683.6734242538364
+            },
+            "woa_lat": {
+              "type": "ndarray",
+              "shape": [
+                180
+              ],
+              "size": 180,
+              "n_valid": 180,
+              "min": -89.5,
+              "max": 89.5,
+              "mean": 0.0,
+              "std": 51.96072234550504
+            },
+            "woa_lon": {
+              "type": "ndarray",
+              "shape": [
+                360
+              ],
+              "size": 360,
+              "n_valid": 360,
+              "min": -179.5,
+              "max": 179.5,
+              "mean": 0.0,
+              "std": 103.92264751567228
+            },
+            "woa_no3": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360,
+                102
+              ],
+              "size": 6609600,
+              "n_valid": 3305010,
+              "min": 0.0,
+              "max": 49.30696105957031,
+              "mean": 22.99764005786831,
+              "std": 13.058622407504448
+            },
+            "nitracline_woa": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 41071,
+              "min": 2.5,
+              "max": 1025.0,
+              "mean": 138.03060553675343,
+              "std": 162.0441234983024
+            },
+            "landsea_path": "/data1/lorraine-20419/ocean_data/WOA23/masks/landsea_01.msk",
+            "landsea_rows": [],
+            "landsea": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 0
+            },
+            "ocean_mask": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            },
+            "basin_path": "/data1/lorraine-20419/ocean_data/WOA23/masks/basinmask_01.msk",
+            "basin_rows": [],
+            "nlev_basin": 102,
+            "basin3d": {
+              "type": "ndarray",
+              "shape": [
+                102,
+                180,
+                360
+              ],
+              "size": 6609600,
+              "n_valid": 0
+            },
+            "basin_map": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 0
+            },
+            "has_valid": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "values": [
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False",
+                "False"
+              ]
+            },
+            "first_valid": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 64800,
+              "min": 0.0,
+              "max": 0.0,
+              "mean": 0.0,
+              "std": 0.0
+            },
+            "basin_group": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 64800,
+              "min": 0.0,
+              "max": 0.0,
+              "mean": 0.0,
+              "std": 0.0
+            },
+            "cmip_root": "/data1/lorraine-20419/benchmark_cmip6/historical",
+            "models": [
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR"
+            ],
+            "model_meta": {
+              "CESM2": {
+                "y_dim": "nlat",
+                "x_dim": "nlon",
+                "depth_coord": "lev",
+                "depth_scale": 0.01
+              },
+              "GFDL-ESM4": {
+                "y_dim": "lat",
+                "x_dim": "lon",
+                "depth_coord": "lev",
+                "depth_scale": 1.0
+              },
+              "MPI-ESM1-2-LR": {
+                "y_dim": "j",
+                "x_dim": "i",
+                "depth_coord": "lev",
+                "depth_scale": 1.0
+              }
+            },
+            "nitracline_models": {
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 24367,
+                "min": 10.0,
+                "max": 673.21294921875,
+                "mean": 149.07795972981197,
+                "std": 95.36900400881406
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 49464,
+                "min": 6.25,
+                "max": 950.0,
+                "mean": 104.9240230268478,
+                "std": 119.39239173188273
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 16570,
+                "min": 11.5,
+                "max": 522.5,
+                "mean": 28.273551599275798,
+                "std": 20.067156970151956
+              }
+            },
+            "model_no3_np": {
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  384,
+                  320,
+                  60
+                ],
+                "size": 7372800,
+                "n_valid": 4247539,
+                "min": -0.001273881527595222,
+                "max": 0.04892340674996376,
+                "mean": 0.018317505630743715,
+                "std": 0.01133702224505722
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360,
+                  35
+                ],
+                "size": 2268000,
+                "n_valid": 1212999,
+                "min": 8.969871601038903e-07,
+                "max": 0.26076066493988037,
+                "mean": 0.021571950277808657,
+                "std": 0.012767657538580054
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  220,
+                  256,
+                  40
+                ],
+                "size": 2252800,
+                "n_valid": 1089671,
+                "min": 1.5780724424985237e-05,
+                "max": 0.07711939513683319,
+                "mean": 0.01718690348334705,
+                "std": 0.009833686217539507
+              }
+            },
+            "model_lats": {
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  384,
+                  320
+                ],
+                "size": 122880,
+                "n_valid": 122880,
+                "min": 1.0,
+                "max": 384.0,
+                "mean": 192.5,
+                "std": 110.85087580468937
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 64800,
+                "min": -89.5,
+                "max": 89.5,
+                "mean": 0.0,
+                "std": 51.96072234550504
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  220,
+                  256
+                ],
+                "size": 56320,
+                "n_valid": 56320,
+                "min": 0.0,
+                "max": 219.0,
+                "mean": 109.5,
+                "std": 63.50787352761861
+              }
+            },
+            "model_lons": {
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  384,
+                  320
+                ],
+                "size": 122880,
+                "n_valid": 122880,
+                "min": 1.0,
+                "max": 320.0,
+                "mean": 160.5,
+                "std": 92.37559201434111
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 64800,
+                "min": 0.5,
+                "max": 359.50000000000006,
+                "mean": 180.0,
+                "std": 103.92264751567228
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  220,
+                  256
+                ],
+                "size": 56320,
+                "n_valid": 56320,
+                "min": 0.0,
+                "max": 255.0,
+                "mean": 127.5,
+                "std": 73.90027063549903
+              }
+            },
+            "model_depths": {
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  60
+                ],
+                "size": 60,
+                "n_valid": 60,
+                "min": 5.0,
+                "max": 5375.0,
+                "mean": 1216.5627050781252,
+                "std": 1543.0631914862215
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  35
+                ],
+                "size": 35,
+                "n_valid": 35,
+                "min": 2.5,
+                "max": 6500.0,
+                "mean": 1631.0,
+                "std": 1882.9664049427056,
+                "values": [
+                  2.5,
+                  10.0,
+                  20.0,
+                  32.5,
+                  51.25,
+                  75.0,
+                  100.0,
+                  125.0,
+                  156.25,
+                  200.0,
+                  250.0,
+                  312.5,
+                  400.0,
+                  500.0,
+                  600.0,
+                  700.0,
+                  800.0,
+                  900.0,
+                  1000.0,
+                  1100.0,
+                  1200.0,
+                  1300.0,
+                  1400.0,
+                  1537.5,
+                  1750.0,
+                  2062.5,
+                  2500.0,
+                  3000.0,
+                  3500.0,
+                  4000.0,
+                  4500.0,
+                  5000.0,
+                  5500.0,
+                  6000.0,
+                  6500.0
+                ]
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  40
+                ],
+                "size": 40,
+                "n_valid": 40,
+                "min": 6.0,
+                "max": 5720.0,
+                "mean": 1378.925,
+                "std": 1571.0682136288672,
+                "values": [
+                  6.0,
+                  17.0,
+                  27.0,
+                  37.0,
+                  47.0,
+                  57.0,
+                  68.5,
+                  82.5,
+                  100.0,
+                  122.5,
+                  150.0,
+                  182.5,
+                  220.0,
+                  262.5,
+                  310.0,
+                  362.5,
+                  420.0,
+                  485.0,
+                  560.0,
+                  645.0,
+                  740.0,
+                  845.0,
+                  960.0,
+                  1085.0,
+                  1220.0,
+                  1365.0,
+                  1525.0,
+                  1700.0,
+                  1885.0,
+                  2080.0,
+                  2290.0,
+                  2525.0,
+                  2785.0,
+                  3070.0,
+                  3395.0,
+                  3770.0,
+                  4195.0,
+                  4670.0,
+                  5170.0,
+                  5720.0
+                ]
+              }
+            },
+            "basin_names": {
+              "1": "Atlantic",
+              "2": "Pacific",
+              "3": "Indian"
+            },
+            "results": {
+              "WOA23": {
+                "global": NaN,
+                "basins": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                }
+              },
+              "CESM2": {
+                "global": NaN,
+                "basins": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                },
+                "global_diff": NaN,
+                "Atlantic_diff": NaN,
+                "Pacific_diff": NaN,
+                "Indian_diff": NaN
+              },
+              "GFDL-ESM4": {
+                "global": NaN,
+                "basins": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                },
+                "global_diff": NaN,
+                "Atlantic_diff": NaN,
+                "Pacific_diff": NaN,
+                "Indian_diff": NaN
+              },
+              "MPI-ESM1-2-LR": {
+                "global": NaN,
+                "basins": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                },
+                "global_diff": NaN,
+                "Atlantic_diff": NaN,
+                "Pacific_diff": NaN,
+                "Indian_diff": NaN
+              }
+            },
+            "basin_means_woa": {
+              "Atlantic": NaN,
+              "Pacific": NaN,
+              "Indian": NaN
+            },
+            "corr_rmse": {
+              "CESM2": {
+                "corr": NaN,
+                "rmse": NaN
+              },
+              "GFDL-ESM4": {
+                "corr": NaN,
+                "rmse": NaN
+              },
+              "MPI-ESM1-2-LR": {
+                "corr": NaN,
+                "rmse": NaN
+              }
+            },
+            "woa_basin_order": [
+              "Atlantic",
+              "Pacific",
+              "Indian"
+            ],
+            "model_basin_orders": {
+              "CESM2": [
+                "Atlantic",
+                "Pacific",
+                "Indian"
+              ],
+              "GFDL-ESM4": [
+                "Atlantic",
+                "Pacific",
+                "Indian"
+              ],
+              "MPI-ESM1-2-LR": [
+                "Atlantic",
+                "Pacific",
+                "Indian"
+              ]
+            },
+            "lon_bins": {
+              "type": "ndarray",
+              "shape": [
+                161
+              ],
+              "size": 161,
+              "n_valid": 161,
+              "min": 120.0,
+              "max": 280.0,
+              "mean": 200.0,
+              "std": 46.475800154489
+            },
+            "lon_centers": {
+              "type": "ndarray",
+              "shape": [
+                160
+              ],
+              "size": 160,
+              "n_valid": 160,
+              "min": 120.5,
+              "max": 279.5,
+              "mean": 200.0,
+              "std": 46.18711941656461
+            },
+            "sections": {
+              "WOA23": {
+                "type": "ndarray",
+                "shape": [
+                  102,
+                  160
+                ],
+                "size": 16320,
+                "n_valid": 14245,
+                "min": 0.03489695908501744,
+                "max": 43.08572006225586,
+                "mean": 28.006411169415355,
+                "std": 13.921342880937853
+              },
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  60,
+                  160
+                ],
+                "size": 9600,
+                "n_valid": 0
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  35,
+                  160
+                ],
+                "size": 5600,
+                "n_valid": 4941,
+                "min": 1.8135710661226767e-05,
+                "max": 0.04311908781528473,
+                "mean": 0.026327476454633503,
+                "std": 0.013191066942302059
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  40,
+                  160
+                ],
+                "size": 6400,
+                "n_valid": 132,
+                "min": 0.004467098042368889,
+                "max": 0.01230300310999155,
+                "mean": 0.008088176681970557,
+                "std": 0.0022662863687391514
+              }
+            },
+            "woa_lon2d": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 64800,
+              "min": -179.5,
+              "max": 179.5,
+              "mean": 0.0,
+              "std": 103.92264751567228
+            },
+            "woa_lat2d": {
+              "type": "ndarray",
+              "shape": [
+                180,
+                360
+              ],
+              "size": 64800,
+              "n_valid": 64800,
+              "min": -89.5,
+              "max": 89.5,
+              "mean": 0.0,
+              "std": 51.96072234550504
+            },
+            "sections_umol": {
+              "WOA23": {
+                "type": "ndarray",
+                "shape": [
+                  102,
+                  160
+                ],
+                "size": 16320,
+                "n_valid": 14245,
+                "min": 0.03489695908501744,
+                "max": 43.08572006225586,
+                "mean": 28.006411169415355,
+                "std": 13.921342880937853
+              },
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  60,
+                  160
+                ],
+                "size": 9600,
+                "n_valid": 0
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  35,
+                  160
+                ],
+                "size": 5600,
+                "n_valid": 4941,
+                "min": 0.017693376254855384,
+                "max": 42.06740274661925,
+                "mean": 25.685342882569273,
+                "std": 12.869333602245911
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  40,
+                  160
+                ],
+                "size": 6400,
+                "n_valid": 132,
+                "min": 4.358144431579404,
+                "max": 12.00292986340639,
+                "mean": 7.890904079971275,
+                "std": 2.2110110914528307
+              }
+            },
+            "nitracline_lines": {
+              "WOA23": {
+                "type": "ndarray",
+                "shape": [
+                  160
+                ],
+                "size": 160,
+                "n_valid": 160,
+                "min": 32.5,
+                "max": 287.5,
+                "mean": 122.84375,
+                "std": 73.19093581815648
+              },
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  160
+                ],
+                "size": 160,
+                "n_valid": 0
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  160
+                ],
+                "size": 160,
+                "n_valid": 160,
+                "min": 15.0,
+                "max": 225.0,
+                "mean": 117.6796875,
+                "std": 66.47126918048762
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  160
+                ],
+                "size": 160,
+                "n_valid": 11,
+                "min": 11.5,
+                "max": 136.25,
+                "mean": 45.13636363636363,
+                "std": 31.959733834574713
+              }
+            },
+            "summary": {
+              "WOA23": {
+                "global_m": NaN,
+                "basins_m": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                }
+              },
+              "CESM2": {
+                "global_m": NaN,
+                "basins_m": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                },
+                "global_diff_m": NaN,
+                "basin_diff_m": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                },
+                "corr": NaN,
+                "rmse_m": NaN
+              },
+              "GFDL-ESM4": {
+                "global_m": NaN,
+                "basins_m": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                },
+                "global_diff_m": NaN,
+                "basin_diff_m": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                },
+                "corr": NaN,
+                "rmse_m": NaN
+              },
+              "MPI-ESM1-2-LR": {
+                "global_m": NaN,
+                "basins_m": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                },
+                "global_diff_m": NaN,
+                "basin_diff_m": {
+                  "Atlantic": NaN,
+                  "Pacific": NaN,
+                  "Indian": NaN
+                },
+                "corr": NaN,
+                "rmse_m": NaN
+              }
+            }
+          },
+          "omitted_loop_variables": [
+            "base",
+            "basin_means",
+            "bg",
+            "code",
+            "corr",
+            "depth",
+            "ds",
+            "ds_sel",
+            "files",
+            "i",
+            "j",
+            "key",
+            "lat2d",
+            "lat_da",
+            "lev",
+            "lon2d",
+            "lon_da",
+            "mask",
+            "model",
+            "model_dir",
+            "name",
+            "nitracline_native",
+            "no3_da",
+            "no3_np",
+            "parts",
+            "rmse",
+            "time_mask",
+            "v",
+            "valid",
+            "variant",
+            "x",
+            "x_dim",
+            "y",
+            "y_dim",
+            "years"
+          ]
+        }
+      ],
+      "visualization_iterations": [
+        {
+          "iteration": 1,
+          "code": "# ---------------------------------------------------------------------------\n# Figure 1: global maps of nitracline depth\n# ---------------------------------------------------------------------------\nfig1, axes1 = plt.subplots(2, 2, figsize=(14, 10))\nmap_fields = {\n    'WOA23': nitracline_woa,\n    'CESM2': nitracline_models['CESM2'],\n    'GFDL-ESM4': nitracline_models['GFDL-ESM4'],\n    'MPI-ESM1-2-LR': nitracline_models['MPI-ESM1-2-LR'],\n}\nmap_titles = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\n\nall_map_vals = []\nfor f in map_fields.values():\n    v = f[np.isfinite(f)]\n    if v.size:\n        all_map_vals.append(v)\nall_map_vals = np.concatenate(all_map_vals)\nvmin_map = np.nanpercentile(all_map_vals, 2)\nvmax_map = np.nanpercentile(all_map_vals, 98)\ncmap_map = 'YlGnBu'   # deeper -> darker/heavier\n\nfor ax, key, title in zip(axes1.ravel(), map_fields.keys(), map_titles):\n    field = np.where(ocean_mask, map_fields[key], np.nan)\n    pcm = ax.pcolormesh(\n        woa_lon, woa_lat, field,\n        cmap=cmap_map, vmin=vmin_map, vmax=vmax_map, shading='auto'\n    )\n    ax.set_title(title)\n    ax.set_xlabel('Longitude')\n    ax.set_ylabel('Latitude')\n    ax.set_xlim(-180, 180)\n    ax.set_ylim(-90, 90)\n    ax.set_facecolor('lightgray')\n\nfig1.colorbar(\n    pcm, ax=axes1, orientation='horizontal', fraction=0.05, pad=0.05,\n    label='Nitracline depth (m)'\n)\n\n# ---------------------------------------------------------------------------\n# Figure 2: equatorial Pacific longitude-depth nitrate sections\n# ---------------------------------------------------------------------------\nfig2, axes2 = plt.subplots(4, 1, figsize=(14, 16), sharex=True)\nsec_keys = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\nsec_titles = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\n\nall_sec_vals = []\nfor key in sec_keys:\n    depth = woa_depth if key == 'WOA23' else model_depths[key]\n    sec = sections_umol[key]\n    mask = depth <= 1000\n    vals = sec[mask, :]\n    vals = vals[np.isfinite(vals)]\n    if vals.size:\n        all_sec_vals.append(vals)\nall_sec_vals = np.concatenate(all_sec_vals)\nvmin_sec = 0.0\nvmax_sec = float(np.nanpercentile(all_sec_vals, 99))\ncmap_sec = 'viridis'\n\nfor ax, key, title in zip(axes2, sec_keys, sec_titles):\n    depth = woa_depth if key == 'WOA23' else model_depths[key]\n    mask = depth <= 1000\n    sec_plot = sections_umol[key][mask, :]\n    depth_plot = depth[mask]\n\n    pcm2 = ax.pcolormesh(\n        lon_centers, depth_plot, sec_plot,\n        cmap=cmap_sec, vmin=vmin_sec, vmax=vmax_sec, shading='auto'\n    )\n    ax.plot(lon_centers, nitracline_lines[key], color='red', linewidth=1.5, label='Nitracline')\n    ax.set_title(title)\n    ax.set_ylabel('Depth (m)')\n    ax.invert_yaxis()\n    ax.set_xlim(120, 280)\n    ax.set_ylim(1000, 0)\n    ax.legend(loc='lower right')\n\naxes2[-1].set_xlabel('Longitude')\naxes2[-1].set_xticks([120, 160, 200, 240, 280])\naxes2[-1].set_xticklabels(['120E', '160E', '180', '160W', '120W', '80W'])\n\nfig2.colorbar(\n    pcm2, ax=axes2, orientation='horizontal', fraction=0.05, pad=0.05,\n    label='Nitrate (µmol kg⁻¹)'\n)",
+          "success": false,
+          "error": "The number of FixedLocator locations (5), usually from a call to set_ticks, does not match the number of labels (6).",
+          "error_type": "ValueError",
+          "traceback": "Traceback (most recent call last):\n  File \"/home/lorraine/projects/2025-jingwei_QA_GMD/src/models/agent_with_tools.py\", line 721, in _safe_execute_tool\n    exec(code, sandbox_globals)\n  File \"<string>\", line 82, in <module>\n  File \"/home/lorraine/miniconda3/envs/jingwei_QA/lib/python3.11/site-packages/matplotlib/axes/_base.py\", line 74, in wrapper\n    return get_method(self)(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/lorraine/miniconda3/envs/jingwei_QA/lib/python3.11/site-packages/matplotlib/axis.py\", line 2106, in set_ticklabels\n    raise ValueError(\nValueError: The number of FixedLocator locations (5), usually from a call to set_ticks, does not match the number of labels (6).\n"
+        },
+        {
+          "iteration": 2,
+          "code": "# ---------------------------------------------------------------------------\n# Figure 1: global maps of nitracline depth\n# ---------------------------------------------------------------------------\nfig1, axes1 = plt.subplots(2, 2, figsize=(14, 10))\nmap_fields = {\n    'WOA23': nitracline_woa,\n    'CESM2': nitracline_models['CESM2'],\n    'GFDL-ESM4': nitracline_models['GFDL-ESM4'],\n    'MPI-ESM1-2-LR': nitracline_models['MPI-ESM1-2-LR'],\n}\nmap_titles = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\n\nall_map_vals = []\nfor f in map_fields.values():\n    v = f[np.isfinite(f)]\n    if v.size:\n        all_map_vals.append(v)\nall_map_vals = np.concatenate(all_map_vals)\nvmin_map = np.nanpercentile(all_map_vals, 2)\nvmax_map = np.nanpercentile(all_map_vals, 98)\ncmap_map = 'YlGnBu'   # deeper -> darker/heavier\n\nfor ax, key, title in zip(axes1.ravel(), map_fields.keys(), map_titles):\n    field = np.where(ocean_mask, map_fields[key], np.nan)\n    pcm = ax.pcolormesh(\n        woa_lon, woa_lat, field,\n        cmap=cmap_map, vmin=vmin_map, vmax=vmax_map, shading='auto'\n    )\n    ax.set_title(title)\n    ax.set_xlabel('Longitude')\n    ax.set_ylabel('Latitude')\n    ax.set_xlim(-180, 180)\n    ax.set_ylim(-90, 90)\n    ax.set_facecolor('lightgray')\n\nfig1.colorbar(\n    pcm, ax=axes1, orientation='horizontal', fraction=0.05, pad=0.05,\n    label='Nitracline depth (m)'\n)\n\n# ---------------------------------------------------------------------------\n# Figure 2: equatorial Pacific longitude-depth nitrate sections\n# ---------------------------------------------------------------------------\nfig2, axes2 = plt.subplots(4, 1, figsize=(14, 16), sharex=True)\nsec_keys = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\nsec_titles = ['WOA23', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']\n\nall_sec_vals = []\nfor key in sec_keys:\n    depth = woa_depth if key == 'WOA23' else model_depths[key]\n    sec = sections_umol[key]\n    mask = depth <= 1000\n    vals = sec[mask, :]\n    vals = vals[np.isfinite(vals)]\n    if vals.size:\n        all_sec_vals.append(vals)\nall_sec_vals = np.concatenate(all_sec_vals)\nvmin_sec = 0.0\nvmax_sec = float(np.nanpercentile(all_sec_vals, 99))\ncmap_sec = 'viridis'\n\nfor ax, key, title in zip(axes2, sec_keys, sec_titles):\n    depth = woa_depth if key == 'WOA23' else model_depths[key]\n    mask = depth <= 1000\n    sec_plot = sections_umol[key][mask, :]\n    depth_plot = depth[mask]\n\n    pcm2 = ax.pcolormesh(\n        lon_centers, depth_plot, sec_plot,\n        cmap=cmap_sec, vmin=vmin_sec, vmax=vmax_sec, shading='auto'\n    )\n    ax.plot(lon_centers, nitracline_lines[key], color='red', linewidth=1.5, label='Nitracline')\n    ax.set_title(title)\n    ax.set_ylabel('Depth (m)')\n    ax.invert_yaxis()\n    ax.set_xlim(120, 280)\n    ax.set_ylim(1000, 0)\n    ax.legend(loc='lower right')\n\naxes2[-1].set_xlabel('Longitude')\naxes2[-1].set_xticks([120, 160, 180, 200, 240, 280])\naxes2[-1].set_xticklabels(['120E', '160E', '180', '160W', '120W', '80W'])\n\nfig2.colorbar(\n    pcm2, ax=axes2, orientation='horizontal', fraction=0.05, pad=0.05,\n    label='Nitrate (µmol kg⁻¹)'\n)",
+          "success": true,
+          "output": {
+            "fig1": "Figure(1400x1000)",
+            "axes1": {
+              "type": "ndarray",
+              "shape": [
+                2,
+                2
+              ],
+              "size": 4,
+              "values": [
+                "Axes(0.125,0.565;0.352273x0.315)",
+                "Axes(0.547727,0.565;0.352273x0.315)",
+                "Axes(0.125,0.187;0.352273x0.315)",
+                "Axes(0.547727,0.187;0.352273x0.315)"
+              ]
+            },
+            "map_fields": {
+              "WOA23": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 41071,
+                "min": 2.5,
+                "max": 1025.0,
+                "mean": 138.03060553675343,
+                "std": 162.0441234983024
+              },
+              "CESM2": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 24367,
+                "min": 10.0,
+                "max": 673.21294921875,
+                "mean": 149.07795972981197,
+                "std": 95.36900400881406
+              },
+              "GFDL-ESM4": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 49464,
+                "min": 6.25,
+                "max": 950.0,
+                "mean": 104.9240230268478,
+                "std": 119.39239173188273
+              },
+              "MPI-ESM1-2-LR": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 16570,
+                "min": 11.5,
+                "max": 522.5,
+                "mean": 28.273551599275798,
+                "std": 20.067156970151956
+              }
+            },
+            "map_titles": [
+              "WOA23",
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR"
+            ],
+            "all_map_vals": {
+              "type": "ndarray",
+              "shape": [
+                131472
+              ],
+              "size": 131472,
+              "n_valid": 131472,
+              "min": 2.5,
+              "max": 1025.0,
+              "mean": 113.78918910289892,
+              "std": 129.10473899102763
+            },
+            "vmin_map": 6.25,
+            "vmax_map": 550.0,
+            "cmap_map": "YlGnBu",
+            "fig2": "Figure(1400x1600)",
+            "axes2": {
+              "type": "ndarray",
+              "shape": [
+                4
+              ],
+              "size": 4,
+              "values": [
+                "Axes(0.125,0.729348;0.775x0.150652)",
+                "Axes(0.125,0.548565;0.775x0.150652)",
+                "Axes(0.125,0.367783;0.775x0.150652)",
+                "Axes(0.125,0.187;0.775x0.150652)"
+              ]
+            },
+            "sec_keys": [
+              "WOA23",
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR"
+            ],
+            "sec_titles": [
+              "WOA23",
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR"
+            ],
+            "all_sec_vals": {
+              "type": "ndarray",
+              "shape": [
+                10674
+              ],
+              "size": 10674,
+              "n_valid": 10674,
+              "min": 0.017693376254855384,
+              "max": 43.08572006225586,
+              "mean": 19.010256082498056,
+              "std": 13.590711563614231
+            },
+            "vmin_sec": 0.0,
+            "vmax_sec": 40.36291933059693,
+            "cmap_sec": "viridis"
+          },
+          "omitted_loop_variables": [
+            "ax",
+            "depth_plot",
+            "f",
+            "field",
+            "pcm",
+            "pcm2",
+            "sec",
+            "sec_plot",
+            "title",
+            "vals"
+          ]
+        }
+      ],
+      "visualization_paths": [
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T6_deepseek-flash_20261025_140235/turn01/figures/visualization_T6_deepseek-flash_20261025_140235_turn1_1.png",
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T6_deepseek-flash_20261025_140235/turn01/figures/visualization_T6_deepseek-flash_20261025_140235_turn1_2.png"
+      ],
+      "selected_data": {
+        "name": [
+          "cmip6_historical"
+        ],
+        "path": [
+          "/data1/lorraine-20419/benchmark_cmip6/historical"
+        ],
+        "how": "inferred from the root directories the executed code names"
+      },
+      "observation": "[\n  {\n    \"type\": \"computation\",\n    \"status\": \"success\",\n    \"results\": {\n      \"woa_root\": \"/data1/lorraine-20419/ocean_data/WOA23\",\n      \"woa_nc\": \"/data1/lorraine-20419/ocean_data/WOA23/climatology/nitrate/all_time_periods/woa23_all_n00_01.nc\",\n      \"woa_ds\": {\n        \"crs\": {\n          \"type\": \"DataArray\",\n          \"dims\": {},\n          \"size\": 1,\n          \"n_valid\": 1,\n          \"min\": -2147483647.0,\n          \"max\": -2147483647.0,\n          \"mean\": -2147483647.0,\n          \"std\": 0.0,\n          \"values\": -2147483647\n        },\n        \"lat_bnds\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"lat\": 180,\n            \"nbounds\": 2\n          },\n          \"size\": 360,\n          \"n_valid\": 360,\n          \"min\": -90.0,\n          \"max\": 90.0,\n          \"mean\": 0.0,\n          \"std\": 51.96312713623047\n        },\n        \"lon_bnds\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"lon\": 360,\n            \"nbounds\": 2\n          },\n          \"size\": 720,\n          \"n_valid\": 720,\n          \"min\": -180.0,\n          \"max\": 180.0,\n          \"mean\": 0.0,\n          \"std\": 103.9238510131836\n        },\n        \"depth_bnds\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"depth\": 102,\n            \"nbounds\": 2\n          },\n          \"size\": 204,\n          \"n_valid\": 204,\n          \"min\": 0.0,\n          \"max\": 5500.0,\n          \"mean\": 1738.2353515625,\n          \"std\": 1683.3563232421875\n        },\n        \"climatology_bounds\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 1,\n            \"nbounds\": 2\n          },\n          \"size\": 2,\n          \"n_valid\": 2,\n          \"min\": 3552.0,\n          \"max\": 4248.0,\n          \"mean\": 3900.0,\n          \"std\": 348.0,\n          \"values\": [\n            [\n              3552.0,\n              4248.0\n            ]\n          ]\n        },\n        \"n_an\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 1,\n            \"depth\": 102,\n            \"lat\": 180,\n            \"lon\": 360\n          },\n          \"units\": \"micromoles_per_kilogram\",\n          \"long_name\": \"Objectively analyzed mean fields for moles_of_nitrate_per_unit_mass_in_sea_water at standard depth levels.\",\n          \"size\": 6609600,\n          \"n_valid\": 3305010,\n          \"min\": 0.0,\n          \"max\": 49.30696105957031,\n          \"mean\": 22.99764060974121,\n          \"std\": 13.058621406555176\n        },\n        \"n_mn\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 1,\n            \"depth\": 102,\n            \"lat\": 180,\n            \"lon\": 360\n          },\n          \"units\": \"micromoles_per_kilogram\",\n          \"long_name\": \"Average of all unflagged interpolated values at each standard depth level for moles_of_nitrate_per_unit_mass_in_sea_water in each grid-square which contain at least one measurement.\",\n          \"size\": 6609600,\n          \"n_valid\": 962205,\n          \"min\": -0.08208775520324707,\n          \"max\": 49.98048782348633,\n          \"mean\": 20.601438522338867,\n          \"std\": 13.521270751953125\n        },\n        \"n_dd\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 1,\n            \"depth\": 102,\n            \"lat\": 180,\n            \"lon\": 360\n          },\n          \"units\": \"1\",\n          \"long_name\": \"The number of observations of moles_of_nitrate_per_unit_mass_in_sea_water in each grid-square at each standard depth level.\",\n          \"size\": 6609600,\n          \"n_valid\": 3305010,\n          \"min\": 0.0,\n          \"max\": 4979.0,\n          \"mean\": 1.4650939028928809,\n          \"std\": 15.577214663096669\n        },\n        \"n_sd\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 1,\n            \"depth\": 102,\n            \"lat\": 180,\n            \"lon\": 360\n          },\n          \"units\": \"micromoles_per_kilogram\",\n          \"long_name\": \"The standard deviation about the statistical mean of moles_of_nitrate_per_unit_mass_in_sea_water in each grid-square at each standard depth level.\",\n          \"size\": 6609600,\n          \"n_valid\": 951642,\n          \"min\": 0.0,\n          \"max\": 21.606632232666016,\n          \"mean\": 0.5533989667892456,\n          \"std\": 1.0704376697540283\n        },\n        \"n_se\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 1,\n            \"depth\": 102,\n            \"lat\": 180,\n            \"lon\": 360\n          },\n          \"units\": \"micromoles_per_kilogram\",\n          \"long_name\": \"The standard error about the statistical mean of moles_of_nitrate_per_unit_mass_in_sea_water in each grid-square at each standard depth level.\",\n          \"size\": 6609600,\n          \"n_valid\": 951642,\n          \"min\": 0.0,\n          \"max\": 11.363293647766113,\n          \"mean\": 0.25748682022094727,\n          \"std\": 0.5109283328056335\n        },\n        \"n_oa\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 1,\n            \"depth\": 102,\n            \"lat\": 180,\n            \"lon\": 360\n          },\n          \"units\": \"micromoles_per_kilogram\",\n          \"long_name\": \"statistical mean value minus the objectively analyzed mean value for moles_of_nitrate_per_unit_mass_in_sea_water.\",\n          \"size\": 6609600,\n          \"n_valid\": 962205,\n          \"min\": -34.18672180175781,\n          \"max\": 23.13459014892578,\n          \"mean\": -0.06401032209396362,\n          \"std\": 1.728775143623352\n        },\n        \"n_gp\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 1,\n            \"depth\": 102,\n            \"lat\": 180,\n            \"lon\": 360\n          },\n          \"units\": \"1\",\n          \"long_name\": \"The number of grid-squares within the smallest radius of influence around each grid-square which contain a statistical mean for moles_of_nitrate_per_unit_mass_in_sea_water.\",\n          \"size\": 6609600,\n          \"n_valid\": 3305010,\n          \"min\": 0.0,\n          \"max\": 184.0,\n          \"mean\": 22.04685220317034,\n          \"std\": 20.08440639915409\n        },\n        \"n_sea\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 1,\n            \"depth\": 102,\n            \"lat\": 180,\n            \"lon\": 360\n          },\n          \"units\": \"micromoles_per_kilogram\",\n          \"long_name\": \"The standard error about the objectively analyzed data of moles_of_nitrate_per_unit_mass_in_sea_water defined in Levitus et al. (2012) GRL.\",\n          \"size\": 6609600,\n          \"n_valid\": 3279341,\n          \"min\": 0.0,\n          \"max\": 7.244609832763672,\n          \"mean\": 0.07377403229475021,\n          \"std\": 0.13326752185821533\n        }\n      },\n      \"woa_var\": \"n_an\",\n      \"woa_no3_da\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"depth\": 102,\n          \"lat\": 180,\n          \"lon\": 360\n        },\n        \"units\": \"micromoles_per_kilogram\",\n        \"long_name\": \"Objectively analyzed mean fields for moles_of_nitrate_per_unit_mass_in_sea_water at standard depth levels.\",\n        \"size\": 6609600,\n        \"n_valid\": 3305010,\n        \"min\": 0.0,\n        \"max\": 49.30696105957031,\n        \"mean\": 22.99764060974121,\n        \"std\": 13.058621406555176\n      },\n      \"woa_depth\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          102\n        ],\n        \"size\": 102,\n        \"n_valid\": 102,\n        \"min\": 0.0,\n        \"max\": 5500.0,\n        \"mean\": 1738.235294117647,\n        \"std\": 1683.6734242538364\n      },\n      \"woa_lat\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180\n        ],\n        \"size\": 180,\n        \"n_valid\": 180,\n        \"min\": -89.5,\n        \"max\": 89.5,\n        \"mean\": 0.0,\n        \"std\": 51.96072234550504\n      },\n      \"woa_lon\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          360\n        ],\n        \"size\": 360,\n        \"n_valid\": 360,\n        \"min\": -179.5,\n        \"max\": 179.5,\n        \"mean\": 0.0,\n        \"std\": 103.92264751567228\n      },\n      \"woa_no3\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360,\n          102\n        ],\n        \"size\": 6609600,\n        \"n_valid\": 3305010,\n        \"min\": 0.0,\n        \"max\": 49.30696105957031,\n        \"mean\": 22.99764005786831,\n        \"std\": 13.058622407504448\n      },\n      \"nitracline_woa\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 41071,\n        \"min\": 2.5,\n        \"max\": 1025.0,\n        \"mean\": 138.03060553675343,\n        \"std\": 162.0441234983024\n      },\n      \"landsea_path\": \"/data1/lorraine-20419/ocean_data/WOA23/masks/landsea_01.msk\",\n      \"landsea_rows\": [],\n      \"landsea\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 0\n      },\n      \"ocean_mask\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"values\": [\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\"\n        ]\n      },\n      \"basin_path\": \"/data1/lorraine-20419/ocean_data/WOA23/masks/basinmask_01.msk\",\n      \"basin_rows\": [],\n      \"nlev_basin\": 102,\n      \"basin3d\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          102,\n          180,\n          360\n        ],\n        \"size\": 6609600,\n        \"n_valid\": 0\n      },\n      \"basin_map\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 0\n      },\n      \"has_valid\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"values\": [\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\",\n          \"False\"\n        ]\n      },\n      \"first_valid\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 64800,\n        \"min\": 0.0,\n        \"max\": 0.0,\n        \"mean\": 0.0,\n        \"std\": 0.0\n      },\n      \"basin_group\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 64800,\n        \"min\": 0.0,\n        \"max\": 0.0,\n        \"mean\": 0.0,\n        \"std\": 0.0\n      },\n      \"cmip_root\": \"/data1/lorraine-20419/benchmark_cmip6/historical\",\n      \"models\": [\n        \"CESM2\",\n        \"GFDL-ESM4\",\n        \"MPI-ESM1-2-LR\"\n      ],\n      \"model_meta\": {\n        \"CESM2\": {\n          \"y_dim\": \"nlat\",\n          \"x_dim\": \"nlon\",\n          \"depth_coord\": \"lev\",\n          \"depth_scale\": 0.01\n        },\n        \"GFDL-ESM4\": {\n          \"y_dim\": \"lat\",\n          \"x_dim\": \"lon\",\n          \"depth_coord\": \"lev\",\n          \"depth_scale\": 1.0\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"y_dim\": \"j\",\n          \"x_dim\": \"i\",\n          \"depth_coord\": \"lev\",\n          \"depth_scale\": 1.0\n        }\n      },\n      \"nitracline_models\": {\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 24367,\n          \"min\": 10.0,\n          \"max\": 673.21294921875,\n          \"mean\": 149.07795972981197,\n          \"std\": 95.36900400881406\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 49464,\n          \"min\": 6.25,\n          \"max\": 950.0,\n          \"mean\": 104.9240230268478,\n          \"std\": 119.39239173188273\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 16570,\n          \"min\": 11.5,\n          \"max\": 522.5,\n          \"mean\": 28.273551599275798,\n          \"std\": 20.067156970151956\n        }\n      },\n      \"model_no3_np\": {\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            384,\n            320,\n            60\n          ],\n          \"size\": 7372800,\n          \"n_valid\": 4247539,\n          \"min\": -0.001273881527595222,\n          \"max\": 0.04892340674996376,\n          \"mean\": 0.018317505630743715,\n          \"std\": 0.01133702224505722\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360,\n            35\n          ],\n          \"size\": 2268000,\n          \"n_valid\": 1212999,\n          \"min\": 8.969871601038903e-07,\n          \"max\": 0.26076066493988037,\n          \"mean\": 0.021571950277808657,\n          \"std\": 0.012767657538580054\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            220,\n            256,\n            40\n          ],\n          \"size\": 2252800,\n          \"n_valid\": 1089671,\n          \"min\": 1.5780724424985237e-05,\n          \"max\": 0.07711939513683319,\n          \"mean\": 0.01718690348334705,\n          \"std\": 0.009833686217539507\n        }\n      },\n      \"model_lats\": {\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            384,\n            320\n          ],\n          \"size\": 122880,\n          \"n_valid\": 122880,\n          \"min\": 1.0,\n          \"max\": 384.0,\n          \"mean\": 192.5,\n          \"std\": 110.85087580468937\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 64800,\n          \"min\": -89.5,\n          \"max\": 89.5,\n          \"mean\": 0.0,\n          \"std\": 51.96072234550504\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            220,\n            256\n          ],\n          \"size\": 56320,\n          \"n_valid\": 56320,\n          \"min\": 0.0,\n          \"max\": 219.0,\n          \"mean\": 109.5,\n          \"std\": 63.50787352761861\n        }\n      },\n      \"model_lons\": {\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            384,\n            320\n          ],\n          \"size\": 122880,\n          \"n_valid\": 122880,\n          \"min\": 1.0,\n          \"max\": 320.0,\n          \"mean\": 160.5,\n          \"std\": 92.37559201434111\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 64800,\n          \"min\": 0.5,\n          \"max\": 359.50000000000006,\n          \"mean\": 180.0,\n          \"std\": 103.92264751567228\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            220,\n            256\n          ],\n          \"size\": 56320,\n          \"n_valid\": 56320,\n          \"min\": 0.0,\n          \"max\": 255.0,\n          \"mean\": 127.5,\n          \"std\": 73.90027063549903\n        }\n      },\n      \"model_depths\": {\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            60\n          ],\n          \"size\": 60,\n          \"n_valid\": 60,\n          \"min\": 5.0,\n          \"max\": 5375.0,\n          \"mean\": 1216.5627050781252,\n          \"std\": 1543.0631914862215\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            35\n          ],\n          \"size\": 35,\n          \"n_valid\": 35,\n          \"min\": 2.5,\n          \"max\": 6500.0,\n          \"mean\": 1631.0,\n          \"std\": 1882.9664049427056,\n          \"values\": [\n            2.5,\n            10.0,\n            20.0,\n            32.5,\n            51.25,\n            75.0,\n            100.0,\n            125.0,\n            156.25,\n            200.0,\n            250.0,\n            312.5,\n            400.0,\n            500.0,\n            600.0,\n            700.0,\n            800.0,\n            900.0,\n            1000.0,\n            1100.0,\n            1200.0,\n            1300.0,\n            1400.0,\n            1537.5,\n            1750.0,\n            2062.5,\n            2500.0,\n            3000.0,\n            3500.0,\n            4000.0,\n            4500.0,\n            5000.0,\n            5500.0,\n            6000.0,\n            6500.0\n          ]\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            40\n          ],\n          \"size\": 40,\n          \"n_valid\": 40,\n          \"min\": 6.0,\n          \"max\": 5720.0,\n          \"mean\": 1378.925,\n          \"std\": 1571.0682136288672,\n          \"values\": [\n            6.0,\n            17.0,\n            27.0,\n            37.0,\n            47.0,\n            57.0,\n            68.5,\n            82.5,\n            100.0,\n            122.5,\n            150.0,\n            182.5,\n            220.0,\n            262.5,\n            310.0,\n            362.5,\n            420.0,\n            485.0,\n            560.0,\n            645.0,\n            740.0,\n            845.0,\n            960.0,\n            1085.0,\n            1220.0,\n            1365.0,\n            1525.0,\n            1700.0,\n            1885.0,\n            2080.0,\n            2290.0,\n            2525.0,\n            2785.0,\n            3070.0,\n            3395.0,\n            3770.0,\n            4195.0,\n            4670.0,\n            5170.0,\n            5720.0\n          ]\n        }\n      },\n      \"basin_names\": {\n        \"1\": \"Atlantic\",\n        \"2\": \"Pacific\",\n        \"3\": \"Indian\"\n      },\n      \"results\": {\n        \"WOA23\": {\n          \"global\": NaN,\n          \"basins\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          }\n        },\n        \"CESM2\": {\n          \"global\": NaN,\n          \"basins\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          },\n          \"global_diff\": NaN,\n          \"Atlantic_diff\": NaN,\n          \"Pacific_diff\": NaN,\n          \"Indian_diff\": NaN\n        },\n        \"GFDL-ESM4\": {\n          \"global\": NaN,\n          \"basins\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          },\n          \"global_diff\": NaN,\n          \"Atlantic_diff\": NaN,\n          \"Pacific_diff\": NaN,\n          \"Indian_diff\": NaN\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"global\": NaN,\n          \"basins\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          },\n          \"global_diff\": NaN,\n          \"Atlantic_diff\": NaN,\n          \"Pacific_diff\": NaN,\n          \"Indian_diff\": NaN\n        }\n      },\n      \"basin_means_woa\": {\n        \"Atlantic\": NaN,\n        \"Pacific\": NaN,\n        \"Indian\": NaN\n      },\n      \"corr_rmse\": {\n        \"CESM2\": {\n          \"corr\": NaN,\n          \"rmse\": NaN\n        },\n        \"GFDL-ESM4\": {\n          \"corr\": NaN,\n          \"rmse\": NaN\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"corr\": NaN,\n          \"rmse\": NaN\n        }\n      },\n      \"woa_basin_order\": [\n        \"Atlantic\",\n        \"Pacific\",\n        \"Indian\"\n      ],\n      \"model_basin_orders\": {\n        \"CESM2\": [\n          \"Atlantic\",\n          \"Pacific\",\n          \"Indian\"\n        ],\n        \"GFDL-ESM4\": [\n          \"Atlantic\",\n          \"Pacific\",\n          \"Indian\"\n        ],\n        \"MPI-ESM1-2-LR\": [\n          \"Atlantic\",\n          \"Pacific\",\n          \"Indian\"\n        ]\n      },\n      \"lon_bins\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          161\n        ],\n        \"size\": 161,\n        \"n_valid\": 161,\n        \"min\": 120.0,\n        \"max\": 280.0,\n        \"mean\": 200.0,\n        \"std\": 46.475800154489\n      },\n      \"lon_centers\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          160\n        ],\n        \"size\": 160,\n        \"n_valid\": 160,\n        \"min\": 120.5,\n        \"max\": 279.5,\n        \"mean\": 200.0,\n        \"std\": 46.18711941656461\n      },\n      \"sections\": {\n        \"WOA23\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            102,\n            160\n          ],\n          \"size\": 16320,\n          \"n_valid\": 14245,\n          \"min\": 0.03489695908501744,\n          \"max\": 43.08572006225586,\n          \"mean\": 28.006411169415355,\n          \"std\": 13.921342880937853\n        },\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            60,\n            160\n          ],\n          \"size\": 9600,\n          \"n_valid\": 0\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            35,\n            160\n          ],\n          \"size\": 5600,\n          \"n_valid\": 4941,\n          \"min\": 1.8135710661226767e-05,\n          \"max\": 0.04311908781528473,\n          \"mean\": 0.026327476454633503,\n          \"std\": 0.013191066942302059\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            40,\n            160\n          ],\n          \"size\": 6400,\n          \"n_valid\": 132,\n          \"min\": 0.004467098042368889,\n          \"max\": 0.01230300310999155,\n          \"mean\": 0.008088176681970557,\n          \"std\": 0.0022662863687391514\n        }\n      },\n      \"woa_lon2d\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 64800,\n        \"min\": -179.5,\n        \"max\": 179.5,\n        \"mean\": 0.0,\n        \"std\": 103.92264751567228\n      },\n      \"woa_lat2d\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180,\n          360\n        ],\n        \"size\": 64800,\n        \"n_valid\": 64800,\n        \"min\": -89.5,\n        \"max\": 89.5,\n        \"mean\": 0.0,\n        \"std\": 51.96072234550504\n      },\n      \"sections_umol\": {\n        \"WOA23\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            102,\n            160\n          ],\n          \"size\": 16320,\n          \"n_valid\": 14245,\n          \"min\": 0.03489695908501744,\n          \"max\": 43.08572006225586,\n          \"mean\": 28.006411169415355,\n          \"std\": 13.921342880937853\n        },\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            60,\n            160\n          ],\n          \"size\": 9600,\n          \"n_valid\": 0\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            35,\n            160\n          ],\n          \"size\": 5600,\n          \"n_valid\": 4941,\n          \"min\": 0.017693376254855384,\n          \"max\": 42.06740274661925,\n          \"mean\": 25.685342882569273,\n          \"std\": 12.869333602245911\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            40,\n            160\n          ],\n          \"size\": 6400,\n          \"n_valid\": 132,\n          \"min\": 4.358144431579404,\n          \"max\": 12.00292986340639,\n          \"mean\": 7.890904079971275,\n          \"std\": 2.2110110914528307\n        }\n      },\n      \"nitracline_lines\": {\n        \"WOA23\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            160\n          ],\n          \"size\": 160,\n          \"n_valid\": 160,\n          \"min\": 32.5,\n          \"max\": 287.5,\n          \"mean\": 122.84375,\n          \"std\": 73.19093581815648\n        },\n        \"CESM2\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            160\n          ],\n          \"size\": 160,\n          \"n_valid\": 0\n        },\n        \"GFDL-ESM4\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            160\n          ],\n          \"size\": 160,\n          \"n_valid\": 160,\n          \"min\": 15.0,\n          \"max\": 225.0,\n          \"mean\": 117.6796875,\n          \"std\": 66.47126918048762\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            160\n          ],\n          \"size\": 160,\n          \"n_valid\": 11,\n          \"min\": 11.5,\n          \"max\": 136.25,\n          \"mean\": 45.13636363636363,\n          \"std\": 31.959733834574713\n        }\n      },\n      \"summary\": {\n        \"WOA23\": {\n          \"global_m\": NaN,\n          \"basins_m\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          }\n        },\n        \"CESM2\": {\n          \"global_m\": NaN,\n          \"basins_m\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          },\n          \"global_diff_m\": NaN,\n          \"basin_diff_m\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          },\n          \"corr\": NaN,\n          \"rmse_m\": NaN\n        },\n        \"GFDL-ESM4\": {\n          \"global_m\": NaN,\n          \"basins_m\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          },\n          \"global_diff_m\": NaN,\n          \"basin_diff_m\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          },\n          \"corr\": NaN,\n          \"rmse_m\": NaN\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"global_m\": NaN,\n          \"basins_m\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          },\n          \"global_diff_m\": NaN,\n          \"basin_diff_m\": {\n            \"Atlantic\": NaN,\n            \"Pacific\": NaN,\n            \"Indian\": NaN\n          },\n          \"corr\": NaN,\n          \"rmse_m\": NaN\n        }\n      }\n    }\n  },\n  {\n    \"type\": \"visualization\",\n    \"status\": \"success\",\n    \"paths\": [\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T6_deepseek-flash_20261025_140235/turn01/figures/visualization_T6_deepseek-flash_20261025_140235_turn1_1.png\",\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T6_deepseek-flash_20261025_140235/turn01/figures/visualization_T6_deepseek-flash_20261025_140235_turn1_2.png\"\n    ]\n  }\n]",
+      "solution": "<solution>\n\n## Bottom line\n\nThe run reports `status: success`, but **the assessment itself did not succeed**. Every quantity the question asks for — global and basin-mean nitracline depths, model-minus-WOA23 differences, spatial correlation, RMSE, basin ordering — came back as `NaN` in the results object. Two independent bugs in the script are responsible, and both must be fixed before any of the requested numbers exist:\n\n1. **The WOA23 mask files were never parsed.** `landsea_rows` and `basin_rows` are both empty lists, so `landsea` has `n_valid = 0`, `ocean_mask` is `False` everywhere, `basin_map` is entirely `NaN`, and `basin_group` is `0` everywhere. Because `area_weighted_mean()` requires a non-empty valid mask, it returns `NaN` for every basin of every source; likewise `corr_rmse` finds zero valid grid cells and returns `NaN`.\n2. **Two of the three model grids were built from index coordinates, not geographic coordinates.** For CESM2, `model_lats`/`model_lons` came out as 1…384 and 1…320 (the `nlat`/`nlon` index variables), and for MPI-ESM1-2-LR as 0…219 and 0…255 (the `j`/`i` indices). Only GFDL-ESM4 has true coordinates (−89.5…89.5, 0.5…359.5). Consequently the nearest-neighbour regridding for CESM2 and MPI matched nonsense positions, and the equatorial-Pacific section is empty for CESM2 (`sections['CESM2'].n_valid = 0`) and has only 132 valid cells out of 6400 for MPI (a spurious strip rather than a section).\n\n## What the numbers that *do* exist show — and why they cannot be used\n\nThe only finite fields are the raw, unmasked, unweighted nitracline arrays after regridding:\n\n| Source | n valid (of 64 800) | min (m) | max (m) | mean (m) |\n|---|---|---|---|---|\n| WOA23 | 41 071 | 2.5 | 1 025 | 138.0 |\n| CESM2 | 24 367 | 10.0 | 673.2 | 149.1 |\n| GFDL-ESM4 | 49 464 | 6.3 | 950.0 | 104.9 |\n| MPI-ESM1-2-LR | 16 570 | 11.5 | 522.5 | **28.3** |\n\nThese are *not* the requested statistics: they are not area-weighted, not restricted to the WOA ocean mask, and they are computed on a regridded grid whose coordinates are wrong for two models. The MPI value (global-mean nitracline at ~28 m, versus 138 m observed) is a clear artefact — a nitracline that shallow everywhere is physically implausible for the oligotrophic subtropics and reflects the broken index-coordinate regridding rather than a model bias. The WOA field itself looks sane (mean 138 m, maximum 1025 m, consistent with the deepest searched gradient being centred between the 1000 m and 1100 m levels, as specified).\n\nBecause the masks are empty, I cannot report:\n- global means or any model-minus-WOA difference (all `NaN`);\n- Pacific/Atlantic/Indian means or differences (all `NaN`);\n- correlation to 3 d.p. or RMSE to 1 d.p. (all `NaN`);\n- the observed basin ordering or any model's reproduction of it — the lists returned (`['Atlantic','Pacific','Indian']` for all four sources) are simply the alphabetical default produced by sorting `NaN` values, not a physical result.\n\nThere is therefore **no defensible answer to \"which model reproduces the observed nitracline best\"**: with no correlation or RMSE against observations, and with two of the three model fields geometrically corrupted, no ranking can be supported.\n\n## The figures\n\nBoth figures were written to disk, but neither is a valid assessment figure.\n\n- **Figure 1 (2×2 nitracline maps)** — the four panels use one shared `YlGnBu` scale (2nd–98th percentile of the pooled values), deeper = darker, which is the requested convention. However, the land mask applied is `ocean_mask`, which is `False` everywhere, so no land masking is drawn: the WOA panel shows only where the climatology has data, and the CESM2/MPI panels show fields placed at wrong geographic positions. Only the GFDL-ESM4 panel is on a trustworthy grid.\n- **Figure 2 (equatorial Pacific sections, 2°S–2°N, 120°E–80°W, 0–1000 m, depth increasing downward)** — the WOA23 and GFDL-ESM4 panels are populated (WOA 14 245 valid cells; GFDL 4 941), share a 0–99th-percentile `viridis` scale in µmol kg⁻¹, and each carries its own red nitracline line (WOA mean along the section 123 m, GFDL 118 m — closely comparable). The CESM2 panel is **completely blank** (0 valid cells, no nitracline line), and the MPI panel contains only a small spurious fragment (132 cells, nitracline defined at only 11 of 160 longitudes, mean 45 m). Note also that the model sections were converted from mol m⁻³ to µmol kg⁻¹ by a fixed factor 10⁶/1025; that is a reasonable approximation but is not an in-situ density conversion, so a small density-dependent bias remains in the model panels relative to WOA.\n\n## What needs fixing to actually answer the question\n\n1. **Read the masks correctly.** Inspect `landsea_01.msk` and `basinmask_01.msk` directly (they may be binary, fixed-width, or differently headed than the `#`-comment ASCII assumed by `read_woa_msk`, which silently returned zero rows without raising). A robust fallback is to define the ocean mask from the WOA nitrate field itself (`np.isfinite(woa_no3[...,0])`), and to take the basin codes from the mask's NetCDF equivalent or a known WOA13 basin-code array. Add explicit assertions (`assert ocean_mask.sum() > 30000`, `assert set(np.unique(basin_group)) == {0,1,2,3}`) so a silent mask failure cannot recur. Marginal-sea folding should then be re-verified against the WOA code list (1 Atlantic, 2 Pacific, 3 Indian; 4–6, 9 → Atlantic; 7–8 → Indian; 10 Southern and 11 Arctic excluded).\n2. **Use the real 2-D/1-D geographic coordinates** for CESM2 and MPI-ESM1-2-LR (the `lat`/`lon` or `nav_lat`/`nav_lon`/`latitude`/`longitude` variables), not `nlat`/`nlon`/`j`/`i`. Then re-do the native-grid nitracline computation and the regridding; the section extraction will follow automatically (a 2°S–2°N band should contain several model rows and yield a continuous longitude–depth field).\n3. **Weight with each model's own `areacello`** (as the task specifies) rather than `cos(lat)` on the WOA grid, or at minimum document the approximation; this matters most for the strongly non-uniform CESM2 grid.\n4. Optionally convert model nitrate with in-situ density (`rho = ` EOS-80/TEOS-10 from the models' theta and salinity) so the Figure 2 shared colour scale is strictly comparable between models and WOA.\n5. Re-run and report only after `summary`, `corr_rmse` and `model_basin_orders` contain finite values; the basin-ordering test should compare ranks of finite means, not `NaN` sorts.\n\nUntil steps 1 and 2 are done, the honest answer is that the simulated nitracline depth of CESM2, GFDL-ESM4 and MPI-ESM1-2-LR has **not** been successfully assessed against WOA23 in this run.\n\n</solution>",
+      "timestamp": "2026-10-25T14:08:21.376930"
+    }
+  ]
+}

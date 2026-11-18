@@ -1,0 +1,194 @@
+# exchange 3: planning
+# elapsed: 73.5 s
+
+===== SYSTEM =====
+You are an oceanographic data analysis assistant with conversation history support.
+
+
+
+Available tools: none. There are no project functions in this setting; the analysis code opens
+the datasets' raw files itself with numpy, pandas and xarray.
+
+Available datasets:
+{
+  "woa23": {
+    "description": "[climatology] World Ocean Atlas 2023 (NOAA/NCEI) 1.00 degree objectively analysed climatology. Temperature and salinity come on two climate normals, 1971-2000 and 1991-2020; oxygen, apparent oxygen utilization and percent oxygen saturation each provide both a 1971-2000 normal (the default) and a 1965-2022 all-period (all) composite; nutrients provide only the 1965-2022 all-period composite. Variables: apparent_oxygen_utilization, nitrate, oxygen, percent_oxygen_saturation, phosphate, salinity, silicate, temperature."
+  },
+  "glodap": {
+    "description": "[climatology] GLODAPv2 global ocean carbon chemistry mapped climatology (DIVA objective analysis), built from 1972-2013 input data. No time dimension, 33 standard depth levels. Variables: Cant, NO3, OmegaA, OmegaC, PI_TCO2, PO4, TAlk, TCO2, oxygen, pHts25p0, pHtsinsitutp, salinity, silicate, temperature. Climatology period 1972-2013."
+  },
+  "seanoe_mld": {
+    "description": "[climatology] Global ocean mixed layer depth (MLD) monthly climatology from the LOPS laboratory. The criterion is a potential density increase of 0.03 kg/m3 relative to the reference depth. Based on a month-by-month objective analysis of 1970-2021 Argo and WOD profiles. Variables: mask, mld_dr003, n_obs. Climatology period 1970-2021."
+  },
+  "ersst": {
+    "description": "[timeseries] NOAA Extended Reconstructed SST v5 (in situ observations only), monthly mean, 1854 to present. Surface only, no vertical dimension. Variables: sst."
+  },
+  "cpc_indices": {
+    "description": "[index] NOAA monthly climate indices. The four Nino products are CPC ENSO monitoring indices, giving regional mean SST and its anomaly in degC. The PDO product is a NOAA NCEI pattern index and is dimensionless; it is kept here so the monthly indices live together, despite the dataset id naming CPC. Products: ersst5_81-10, ersst5_91-20, oisst, oni, pdo."
+  },
+  "cmip6_historical": {
+    "description": "[timeseries] CMIP6 historical (all-forcing historical simulation) ocean component, Omon monthly frequency plus Ofx fixed fields. Three models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 1850-01 to 2014-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  },
+  "cmip6_ssp245": {
+    "description": "[timeseries] CMIP6 ScenarioMIP ssp245 (SSP2-4.5, concentration-driven). Grid and coordinate definitions are the same as historical; they differ in time range, variant label and variable coverage. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 2015-01 to 2100-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  }
+}
+
+Domain knowledge retrieved for this question (grouped by [fragment-id] (severity)):
+<domain_knowledge>
+[cmip6-bgc-units-per-volume] (must)
+- Convert `o2` (mol m-3) to µmol kg-1 with the in-situ density (`compute_potential_density_anomaly` with `ref_pressure=None`; `transform_unit`'s constant surface default errs ~1% in the deep ocean and fresh polar water) before applying the 20 and 60 µmol kg-1 thresholds, and state the `attrs['density_assumption']` used.
+- Inventories: integrate the native mol m-3 field with `convert_concentration_to_content` (Σ c · volcello, no density); feeding it a µmol kg-1 field applies the constant default and biases by ~1%.
+
+[monthly-means-are-time-averages] (must)
+- f(monthly mean) ≠ mean of f: oxygen-threshold volumes and AOU from monthly means depend on order; state whether the diagnostic was formed first or the mean state first (WOA is a climatology, so average-then-diagnose is the like-for-like choice).
+- Average a period with `temporal_aggregate` (day weights in the model calendar); plain `compute_basic_stat(op='mean', dim='time')` weights months equally and is not a time average.
+
+[cmip6-o2sat-and-derived-oxygen] (should)
+- `identify_oxygen_minimum_zone` and any threshold comparison evaluate in the field's own units, so a mol m-3 `o2` field must be converted first or the whole ocean is flagged as below the threshold.
+- WOA23 percent saturation and AOU rest on the WOA convention/pressure assumptions, not the OMIP (Garcia & Gordon 1992, 0.20946 O2 mole fraction, `P_a/P⁰_a`) recipe; treat model–WOA AOU or %sat differences as including a definitional component.
+
+[missing-values-and-land-cells] (should)
+- Read 1e20 as NaN (default xarray decoding); a value near 1e20 in output is an unmasked fill. Build each field's valid mask from the field itself — masks differ between variables of the same model — and mask the weights (volcello/areacello) to the same cells.
+- Use `compute_exceedance_fraction` for the below-threshold volumes: it keeps missing cells out of both numerator and denominator.
+
+[cmip6-static-grid-fields] (should)
+- The archive has no `thkcello`/`masscello`: take column thickness as volcello/areacello (`cell_thickness_like`), not the `lev_bnds` difference, which fails at partial bottom cells (14% of GFDL-ESM4 cells differ >1%).
+- Use `deptho` (model bathymetry) or the field's own fill pattern, not external topography, to decide whether a level is above the sea floor.
+
+[omip-native-grid-vs-regridded] (should)
+- Compute every number (OMZ volumes, basin volumes, inventory, max thickness) on each source's native grid with its own weights; regrid to the WOA 1° grid only for the Figure 1/2 maps, and build one shared mask before cell-by-cell statistics.
+- Do not vertically interpolate for OMZ thickness: integrate thickness on the original levels (`regrid_vertical` would change layer-integrated quantities); interpolation to fixed depths is for comparison only.
+
+[omip-weighted-means-and-integrals] (should)
+- Volume-weight every mean and integral: OMZ volume is Σ volcello over valid cells below the threshold (a share of volume, not of cells); Pacific/Indian/Atlantic volumes apply the basin mask on the model's own grid.
+- For a map-wide statistic (RMSE, bias, pattern correlation against WOA) weight by area: `compute_difference_metrics` does by default, `analyze_correlation` needs `weighting='area'`.
+</domain_knowledge>
+
+Data selection rules:
+1. <selected_data> must contain dataset IDs exactly as listed above (e.g. woa23, cmip6_historical).
+   Never put a file path there, and never invent a name. One dataset ID holds many variables, and
+   CMIP6 also holds several models; those are chosen in the next step, not here.
+2. Long-term trends, interannual variability and scenario projections need a timeseries dataset
+   (cmip6_historical, cmip6_ssp245, ersst). Mean state, seasonal cycle and vertical structure need a
+   climatology (woa23, glodap, seanoe_mld). A question about the ENSO monitoring index itself needs
+   cpc_indices.
+3. Select several datasets, comma-separated, when the question compares a model against observations
+   or needs variables that live in different products.
+4. Reading data: there are no loading functions. The code step opens the raw files of the datasets
+   you select and is shown where they live and how they are laid out; plan the reading as part of
+   the steps.
+5. Regional and global means are area- or volume-weighted, never plain averages over lat/lon: plan
+   where the weights come from (for CMIP6, the model's own areacello / volcello fixed fields).
+
+How to write the plan:
+1. Write the plan as numbered steps, each naming the datasets, variables and models it needs.
+   End it with an "Other notes:" section, one line each, holding only the caveats the answer must
+   state.
+2. Add no computational constraint of your own. Every definition, weighting, mask, threshold,
+   interpolation, filter or correction a step applies must come from the question or from what is
+   given above (the dataset descriptions, and any domain knowledge); do not devise one that
+   none of them states (an extra mask, a partial-layer weighting, a screening threshold).
+3. There are no project tools to call: plan every step as an operation the code performs on the raw
+   data with the standard libraries (numpy, pandas, xarray).
+4. Do not round intermediate values: later steps use the unrounded results of earlier ones, and a
+   value is rounded only where it is reported, to the precision the question asks for.
+5. The steps, any notes under them and Other notes all go inside the <plan> tags; nothing outside them
+   is passed on to the later steps.
+
+How to use the domain knowledge:
+1. Priority: definitions and procedures the user states explicitly in the question come first, the
+   dataset descriptions second, the knowledge fragments last. Use the fragments to settle
+   choices the question leaves open and to find the caveats that must be stated. When a fragment
+   conflicts with what the question prescribes, follow the question and record the difference under
+   Other notes so the answer can explain it.
+2. Under the step where a piece of knowledge FIRST matters, add one line "- Note [fragment-id]: ..."
+   carrying what to do (the formula, threshold, unit conversion or check). Each
+   fragment gets exactly ONE such note line in the whole plan, under a step or under Other notes, not
+   both. A later step that also depends on it names "[fragment-id]" inline in its own text, with no
+   further note line and no restatement - the next stage reads the whole plan. Do not copy the
+   knowledge text into the plan.
+3. Other notes also hold the differences between the question's definition and the protocol; a line
+   that comes from a fragment takes the form "- [fragment-id] ...".
+4. Cite every fragment of severity must at least once, in a step or under Other notes. Fragments of
+   severity should or info that end up unused may be left out.
+5. The notes may name functions of this project in backticks (`compute_basic_stat`,
+   `load_regular_data`, ...). None of them exists in this setting: read such a name as the operation
+   it stands for, and plan that operation on the raw data.
+
+Analyze the user's question and select appropriate data. Follow this format strictly:
+<plan>numbered steps: the datasets, variables and models each step needs, with the knowledge notes under each step, then Other notes</plan>
+<selected_data>comma-separated list of dataset IDs you will use</selected_data>
+
+IMPORTANT: Your response MUST contain all required XML tags, and tags must be properly closed.
+
+
+===== USER =====
+User question: Assess the global oxygen minimum zones (OMZ) simulated by CMIP6 models against the WOA23 observed climatology, and quantify how they change under the ssp245 scenario.
+
+Data to use:
+- CMIP6 historical `o2`, `thetao` and `so` from GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12. CESM2 publishes no `o2` for the historical experiment.
+- CMIP6 ssp245 `o2`, `thetao` and `so` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 2071-01 to 2100-12.
+- Each model's own volcello, areacello and deptho.
+- WOA23 oxygen, percent oxygen saturation and apparent oxygen utilization, on the 1971-2000 climate normal.
+- The WOA23 land-sea mask (landsea_01) and basin mask (basinmask_01).
+
+Oxygen concentrations and OMZ thresholds are in micromoles per kilogram.
+
+Expected numerical results, for the six source-and-experiment combinations (WOA23; GFDL-ESM4 and MPI-ESM1-2-LR historical 1971-2000; CESM2, GFDL-ESM4 and MPI-ESM1-2-LR ssp245 2071-2100) where applicable:
+- The total volume of water with oxygen strictly below 20 micromoles per kilogram, and separately strictly below 60, in units of 1e15 cubic metres to 3 significant figures.
+- At the 60 threshold, the maximum OMZ thickness (summed thickness of the water below the threshold in a column) in metres to 1 decimal place, with its latitude and longitude to 2 decimal places.
+- For GFDL-ESM4 and MPI-ESM1-2-LR, the percentage change in OMZ volume from historical to ssp245 at both thresholds, to 2 decimal places, positive for an expanding OMZ.
+- The total dissolved oxygen inventory of the global ocean in moles, to 3 significant figures, for GFDL-ESM4 and MPI-ESM1-2-LR historical and all three models for ssp245.
+- At the 60 threshold, the OMZ volume in the Pacific, Indian and Atlantic Oceans (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded) for WOA23 and the two historical models, in units of 1e15 cubic metres to 3 significant figures.
+- For WOA23, the mean apparent oxygen utilization (micromoles per kilogram) and percent oxygen saturation within the OMZ at the 60 threshold, each to 1 decimal place, and what they imply about whether the zone is set by respiration or by poor ventilation.
+- Which model reproduces the observed OMZ volume better, and whether the two models agree on the sign and size of the scenario change.
+
+Expected visualizations:
+- Figure 1, three global maps in one row of the historical OMZ thickness at the 60 threshold for GFDL-ESM4, MPI-ESM1-2-LR and WOA23, on one shared sequential colour scale in metres.
+- Figure 2, three global maps in one row: the change in OMZ thickness at the 60 threshold (ssp245 2071-2100 minus historical 1971-2000) for GFDL-ESM4 and MPI-ESM1-2-LR on one shared diverging colour scale centred on zero, and CESM2's ssp245 OMZ thickness on its own sequential scale, labelled to show that no change can be formed for CESM2.
+
+Now output your reasoning and selections.
+
+===== RESPONSE =====
+<plan>
+1. Open the WOA23 raw files for oxygen, percent_oxygen_saturation, apparent_oxygen_utilization, landsea_01 and basinmask_01. Use the WOA23 oxygen product and its 1971-2000 normal where that normal exists; where the dataset exposes only the all-period oxygen composite, use that field and record the difference in Other notes. Decode 1e20 as NaN, apply landsea_01 as the WOA ocean mask, average the monthly climatology to an annual climatology with day weights, and build WOA cell geometry from the 1° spherical cell area and layer thickness from the depth-coordinate bounds on the WOA native levels.
+- Note [monthly-means-are-time-averages]: average the monthly fields to the period with day weights before forming oxygen thresholds; WOA is a climatology, so use average-then-diagnose, not diagnose-monthly-then-average.
+
+2. Open CMIP6 historical o2, thetao and so for GFDL-ESM4 and MPI-ESM1-2-LR, monthly 1971-01 to 2000-12, and ssp245 o2, thetao and so for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly 2071-01 to 2100-12. Open each model's own volcello, areacello and deptho. Decode 1e20 as NaN, and build each field's valid ocean mask from the field itself.
+- Note [missing-values-and-land-cells]: read 1e20 as NaN; masks differ between variables of the same model, so build each field's valid mask from the field itself and mask volcello/areacello to the same cells; keep missing cells out of both numerator and denominator in any below-threshold fraction.
+
+3. For each model and period, use the model calendar and day weights to form period-mean thetao, so and o2. Keep the native o2 in mol m-3 for inventory calculations, and derive all threshold diagnostics from the period-mean converted fields. [monthly-means-are-time-averages]
+
+4. Convert model o2 from mol m-3 to micromoles per kilogram using in-situ density computed from the period-mean thetao and so on the model's native levels, with potential density anomaly evaluated at the in-situ pressure (`ref_pressure=None`). Use converted o2 = o2_native × 1e6 / rho. Record and state the density_assumption used. Do not use a constant surface-density default for this conversion. Keep the native mol m-3 o2 separately for the inventory.
+- Note [cmip6-bgc-units-per-volume]: convert with in-situ density before applying the 20 and 60 micromoles per kilogram thresholds and state the density_assumption; for inventories integrate the native mol m-3 field as Σ c·volcello with no density factor.
+
+5. For WOA23 and each available model-period (WOA23; GFDL-ESM4 and MPI-ESM1-2-LR historical; CESM2, GFDL-ESM4 and MPI-ESM1-2-LR ssp245), compute the total OMZ volume at strictly below 20 and strictly below 60 micromoles per kilogram by summing cell volume (WOA cell volume or model volcello) over valid cells satisfying the threshold. Report in 1e15 m3 to 3 significant figures, keeping unrounded values for later changes.
+- Note [omip-weighted-means-and-integrals]: OMZ volume is Σ volcello over valid below-threshold cells, a share of volume rather than a count of cells; volume-weight every mean and integral.
+- Note [cmip6-o2sat-and-derived-oxygen]: evaluate oxygen thresholds in the field's own units, so use the converted model o2 field before flagging OMZ cells; WOA percent saturation and AOU rest on the WOA convention and pressure assumptions, so model-WOA AOU or percent-saturation differences include a definitional component.
+
+6. Compute the maximum OMZ thickness at the 60 threshold for each source-period: in each column, sum the thickness of levels whose period-mean o2 is strictly below 60. For CMIP6 use cell thickness = volcello / areacello on the native levels; for WOA use depth-coordinate layer thickness on its native levels. Find the maximum thickness and its latitude/longitude, reporting metres to 1 decimal place and latitude/longitude to 2 decimal places.
+- Note [cmip6-static-grid-fields]: there is no thkcello or masscello; use volcello/areacello for column thickness, not lev_bnds differences, which fail at partial bottom cells; use deptho or the field's own fill pattern for sea-floor decisions.
+- Note [omip-native-grid-vs-regridded]: compute thickness on each source's native levels and do not vertically interpolate for OMZ thickness; regrid only the map fields later, and build one shared mask before cell-by-cell map comparisons.
+
+7. Compute basin-resolved OMZ volumes at the 60 threshold for WOA23, GFDL-ESM4 historical and MPI-ESM1-2-LR historical. Apply the WOA23 basinmask_01: retain Pacific, Indian and Atlantic, fold marginal seas into their parent ocean, and exclude the Southern and Arctic Oceans. On WOA use its native cell volumes. For each model, map the categorical WOA basin mask to the model's own native grid by nearest neighbour without smoothing, then sum model volcello over valid below-60 cells in each basin. Report in 1e15 m3 to 3 significant figures. [omip-weighted-means-and-integrals; omip-native-grid-vs-regridded]
+
+8. For WOA23, define the OMZ by oxygen strictly below 60 micromoles per kilogram, then compute the volume-weighted mean apparent_oxygen_utilization and percent_oxygen_saturation within those cells using WOA cell volumes and each variable's valid mask. Report AOU in micromoles per kilogram and percent saturation to 1 decimal place, and use the pair to interpret whether the zone is consistent with respiration-driven oxygen loss or poor ventilation. [cmip6-o2sat-and-derived-oxygen]
+
+9. Compute the global dissolved oxygen inventory for GFDL-ESM4 and MPI-ESM1-2-LR historical and for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR ssp245 by summing native o2 [mol m-3] × volcello [m3] over valid ocean cells on each native grid, using the period-mean fields. Report moles to 3 significant figures. [cmip6-bgc-units-per-volume]
+
+10. For GFDL-ESM4 and MPI-ESM1-2-LR, compute the historical-to-ssp245 percentage change in OMZ volume at both the 20 and 60 thresholds as 100 × (V_ssp245 − V_historical) / V_historical using unrounded volumes; positive means an expanding OMZ. Report to 2 decimal places. CESM2 cannot enter this calculation because it has no historical o2.
+
+11. Compare the WOA23, GFDL-ESM4 historical and MPI-ESM1-2-LR historical OMZ volumes at both thresholds, and the 60-threshold basin volumes, to identify which model reproduces the observed total OMZ volume better. Compare the two available models' scenario changes in sign and size using the unrounded changes.
+
+12. Build Figure 1: three global maps in one row of historical OMZ thickness at the 60 threshold for GFDL-ESM4, MPI-ESM1-2-LR and WOA23. Compute thickness on each native grid, then regrid the model thickness fields to the WOA 1° grid only for plotting; use WOA landsea_01 for land masking and one shared sequential colour scale in metres.
+
+13. Build Figure 2: three global maps in one row. For GFDL-ESM4 and MPI-ESM1-2-LR, compute the change in 60-threshold OMZ thickness as ssp245 2071-2100 minus historical 1971-2000 on the native grid, then regrid the difference to the WOA 1° grid for plotting; use one shared diverging colour scale centred on zero for these two panels. For CESM2, plot its ssp245 60-threshold OMZ thickness on its own sequential colour scale, labelled to show that no historical o2 is available and therefore no change can be formed. [omip-native-grid-vs-regridded]
+
+Other notes:
+- WOA23 oxygen, percent oxygen saturation and AOU are published as a single all-period composite in this dataset, not as a separate 1971-2000 oxygen normal; the WOA oxygen climatology used here is therefore the all-period oxygen composite, even though the question requested the 1971-2000 normal.
+- CESM2 has no historical o2, so no CESM2 historical OMZ volume, historical OMZ thickness, historical inventory, basin comparison or historical-to-ssp245 change is possible; only its ssp245 fields are used.
+- Model threshold volumes and thicknesses are average-then-diagnose from period-mean fields; the density assumption used for the model oxygen conversion is the one computed in step 4.
+- The WOA23 basin mask is categorical and is mapped to each model grid by nearest neighbour; this defines the model basin boundaries as closely as the WOA mask allows, while WOA-native basin volumes use the mask directly.
+</plan>
+<selected_data>woa23, cmip6_historical, cmip6_ssp245</selected_data>

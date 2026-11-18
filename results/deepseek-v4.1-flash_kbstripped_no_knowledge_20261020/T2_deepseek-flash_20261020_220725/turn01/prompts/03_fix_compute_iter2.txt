@@ -1,0 +1,624 @@
+# exchange 3: fix_compute_iter2
+# elapsed: 15.9 s
+
+===== SYSTEM =====
+You are a code debugging expert.
+
+===== USER =====
+The following compute code failed to execute:
+
+<failed_code>
+# Load raw ERSSTv5 SST for the Nino 3.4 region
+sst_nino34 = load_regular_data(
+    dataset="ersst",
+    variable="sst",
+    time_range=["1950-01", "2023-12"],
+    lat_range=[-5.0, 5.0],
+    lon_range=[-170.0, -120.0],
+)
+
+# Reconstruct the Nino 3.4 anomaly relative to 1991-2020
+anom_9120 = compute_anomaly_vs_own_climatology(
+    data=sst_nino34,
+    freq="month",
+    base_period=["1991-01", "2020-12"],
+    method="subtract",
+)
+recon_9120 = compute_basic_stat(
+    data=anom_9120,
+    op="area_weighted_mean",
+    dim=["lat", "lon"],
+).compute()
+recon_9120.name = "RECON_9120"
+
+# Same reconstruction relative to 1981-2010
+anom_8110 = compute_anomaly_vs_own_climatology(
+    data=sst_nino34,
+    freq="month",
+    base_period=["1981-01", "2010-12"],
+    method="subtract",
+)
+recon_8110 = compute_basic_stat(
+    data=anom_8110,
+    op="area_weighted_mean",
+    dim=["lat", "lon"],
+).compute()
+recon_8110.name = "RECON_8110"
+
+# CPC published Nino 3.4 anomaly series
+cpc_9120 = load_regular_data(
+    dataset="cpc_indices",
+    variable="NINO3.4",
+    product="ersst5_91-20",
+    time_range=["1950-01", "2023-12"],
+).compute()
+cpc_9120.name = "CPC_9120"
+
+cpc_8110 = load_regular_data(
+    dataset="cpc_indices",
+    variable="NINO3.4",
+    product="ersst5_81-10",
+    time_range=["1950-01", "2023-12"],
+).compute()
+cpc_8110.name = "CPC_8110"
+
+# CPC ONI (already a 3-month running index)
+oni = load_regular_data(
+    dataset="cpc_indices",
+    variable="NINO3.4",
+    product="oni",
+    time_range=["1950-01", "2023-12"],
+).compute()
+oni.name = "ONI"
+
+# Correlation and error metrics against CPC 1991-2020
+corr_result = analyze_correlation(
+    var1=recon_9120,
+    var2=cpc_9120,
+    dim="time",
+    method="pearson",
+)
+pearson_r = float(corr_result["correlation"].compute())
+pearson_r_rounded = round(pearson_r, 6)
+
+diff_metrics = compute_difference_metrics(
+    data=recon_9120,
+    reference=cpc_9120,
+    dim="time",
+    weighting="none",
+)
+rmse = float(diff_metrics["rmse"].compute())
+rmse_rounded = round(rmse, 4)
+max_abs_error = float(diff_metrics["max_abs_error"].compute())
+max_abs_error_rounded = round(max_abs_error, 4)
+
+diff_series = diff_metrics["difference"].compute()
+abs_diff_series = np.abs(diff_series)
+max_idx = int(abs_diff_series.argmax(dim="time").compute())
+max_time = pd.Timestamp(diff_series["time"].isel(time=max_idx).values)
+max_year = int(max_time.year)
+max_month = int(max_time.month)
+
+# 3-month centred running mean and event detection
+run3_recon = temporal_aggregate(
+    data=recon_9120,
+    freq="rolling",
+    op="mean",
+    window=3,
+    center=True,
+).compute()
+run3_recon.name = "RECON_9120_3mo"
+
+elnino_recon = detect_threshold_events(
+    data=run3_recon,
+    threshold=0.5,
+    direction="above",
+    min_duration=5,
+)
+lanina_recon = detect_threshold_events(
+    data=run3_recon,
+    threshold=-0.5,
+    direction="below",
+    min_duration=5,
+)
+
+n_elnino_recon = int(len(elnino_recon))
+n_lanina_recon = int(len(lanina_recon))
+
+elnino_recon_top = elnino_recon.sort_values("peak_value", ascending=False).head(3).copy()
+elnino_recon_top["peak_time"] = pd.to_datetime(elnino_recon_top["peak_time"])
+elnino_recon_top["peak_year"] = elnino_recon_top["peak_time"].dt.year
+elnino_recon_top["peak_month"] = elnino_recon_top["peak_time"].dt.month
+recon_top3 = elnino_recon_top[["peak_year", "peak_month", "peak_value"]].copy()
+recon_top3["peak_value"] = recon_top3["peak_value"].round(2)
+recon_top3 = recon_top3.rename(
+    columns={"peak_year": "year", "peak_month": "month", "peak_value": "peak_degC"}
+).reset_index(drop=True)
+
+# ONI event detection under the identical criterion
+elnino_oni = detect_threshold_events(
+    data=oni,
+    threshold=0.5,
+    direction="above",
+    min_duration=5,
+)
+n_elnino_oni = int(len(elnino_oni))
+
+elnino_oni_top = elnino_oni.sort_values("peak_value", ascending=False).head(3).copy()
+elnino_oni_top["peak_time"] = pd.to_datetime(elnino_oni_top["peak_time"])
+elnino_oni_top["peak_year"] = elnino_oni_top["peak_time"].dt.year
+elnino_oni_top["peak_month"] = elnino_oni_top["peak_time"].dt.month
+oni_top3 = elnino_oni_top[["peak_year", "peak_month", "peak_value"]].copy()
+oni_top3["peak_value"] = oni_top3["peak_value"].round(2)
+oni_top3 = oni_top3.rename(
+    columns={"peak_year": "year", "peak_month": "month", "peak_value": "peak_degC"}
+).reset_index(drop=True)
+
+# Baseline offsets over 1950-01 to 2020-12
+recon_8110_2020 = recon_8110.sel(time=slice("1950-01", "2020-12"))
+recon_9120_2020 = recon_9120.sel(time=slice("1950-01", "2020-12"))
+offset_recon_metrics = compute_difference_metrics(
+    data=recon_8110_2020,
+    reference=recon_9120_2020,
+    dim="time",
+    weighting="none",
+)
+recon_baseline_offset = float(offset_recon_metrics["bias"].compute())
+recon_baseline_offset_rounded = round(recon_baseline_offset, 3)
+
+cpc_8110_2020 = cpc_8110.sel(time=slice("1950-01", "2020-12"))
+cpc_9120_2020 = cpc_9120.sel(time=slice("1950-01", "2020-12"))
+offset_cpc_metrics = compute_difference_metrics(
+    data=cpc_8110_2020,
+    reference=cpc_9120_2020,
+    dim="time",
+    weighting="none",
+)
+cpc_baseline_offset = float(offset_cpc_metrics["bias"].compute())
+cpc_baseline_offset_rounded = round(cpc_baseline_offset, 3)
+
+offset_difference = recon_baseline_offset - cpc_baseline_offset
+offset_difference_rounded = round(offset_difference, 3)
+abs_offset_difference_rounded = round(abs(offset_difference), 3)
+
+explanation = (
+    "RECON and CPC/ONI El Nino counts can differ because CPC's published index uses "
+    "its own product version, quality control, baseline, and spatial averaging; small "
+    "differences near the +0.5 degC threshold or near the 5-season duration can move "
+    "a run in or out of the event set."
+)
+
+print(f"Pearson correlation (RECON_9120 vs CPC 1991-2020): {pearson_r_rounded:.6f}")
+print(f"RMSE: {rmse_rounded:.4f} degC")
+print(
+    f"Largest absolute deviation: {max_abs_error_rounded:.4f} degC "
+    f"at {max_year}-{max_month:02d}"
+)
+print(f"RECON_9120 El Nino events (>= +0.5 degC, >=5 seasons): {n_elnino_recon}")
+print(recon_top3.to_string(index=False))
+print(f"RECON_9120 La Nina events (<= -0.5 degC, >=5 seasons): {n_lanina_recon}")
+print(f"CPC ONI El Nino events (>= +0.5 degC, >=5 seasons): {n_elnino_oni}")
+print(oni_top3.to_string(index=False))
+print(explanation)
+print(
+    f"Reconstructed baseline offset (RECON_8110 - RECON_9120, 1950-2020): "
+    f"{recon_baseline_offset_rounded:.3f} degC"
+)
+print(
+    f"Published baseline offset (CPC 1981-2010 - CPC 1991-2020, 1950-2020): "
+    f"{cpc_baseline_offset_rounded:.3f} degC"
+)
+print(
+    f"Offset difference (reconstructed - published): "
+    f"{offset_difference_rounded:.3f} degC (abs {abs_offset_difference_rounded:.3f} degC)"
+)
+</failed_code>
+
+<error_info>
+Error Type: AttributeError
+Error Message: 'float' object has no attribute 'compute'
+
+
+Traceback:
+Traceback (most recent call last):
+  File "/home/lorraine/projects/2025-jingwei_QA_GMD/src/models/agent_with_tools.py", line 717, in _safe_execute_tool
+    exec(code, sandbox_globals)
+  File "<string>", line 80, in <module>
+AttributeError: 'float' object has no attribute 'compute'
+
+</error_info>
+
+Original task: Rebuild the Nino 3.4 index from the raw ERSSTv5 sea surface temperature field and check it against the series NOAA/CPC publishes, then use the same code to reproduce the offset between CPC's two baseline periods.
+
+Data to use:
+- ERSSTv5 monthly SST, 1950-01 to 2023-12, on its native 2-degree grid.
+- The CPC monthly Nino index on the 1991-2020 baseline (`ersst5_91-20`), Nino 3.4 anomaly column: the main reference.
+- The CPC monthly Nino index on the 1981-2010 baseline (`ersst5_81-10`), Nino 3.4 anomaly column: the control.
+- The CPC ONI series (`oni`), the official 3-month running index.
+
+Expected numerical results:
+- RECON_9120, the monthly Nino 3.4 index reconstructed from ERSSTv5 as the SST anomaly over 5S-5N, 170W-120W relative to a 1991-2020 monthly climatology, 1950-01 to 2023-12. Against the CPC 1991-2020 Nino 3.4 anomaly over that window, report the Pearson correlation to 6 decimal places, the RMSE in degrees Celsius to 4 decimal places, and the largest absolute deviation in degrees Celsius to 4 decimal places with the year and month at which it occurs.
+- The number of El Nino events in RECON_9120 over 1950-2023 under the operational ONI criterion (at least 5 consecutive overlapping 3-month seasons, i.e. values of the 3-month centred running mean, at or above +0.5 degrees Celsius), and the three events with the highest peak values, each with the year and month of its peak and its peak value in degrees Celsius to 2 decimal places.
+- The same count and the same three largest peaks for the CPC ONI series under the identical criterion, with an explanation of why the two counts differ.
+- The mean baseline offset of the reconstruction, RECON_8110 (the same index relative to the 1981-2010 baseline) minus RECON_9120, as the unweighted mean over the months of 1950-01 to 2020-12, in degrees Celsius to 3 decimal places.
+- The mean published baseline offset, CPC 1981-2010 minus CPC 1991-2020 Nino 3.4 anomaly, as the unweighted mean over the same months, in degrees Celsius to 3 decimal places, and how closely it agrees with the reconstructed offset.
+
+Expected visualizations:
+- Figure 1, a two-row figure sharing a time axis over 1950-2023. The upper row overlays the RECON_9120 and CPC 1991-2020 monthly anomalies, the 3-month running mean, the +0.5 and -0.5 degrees Celsius thresholds, and shading between the threshold and the running-mean curve, warm during detected El Nino events and cool during detected La Nina events (at least 5 consecutive seasons at or below -0.5 degrees Celsius). The lower row shows RECON_9120 minus CPC on its own vertical scale. Label both vertical axes in degrees Celsius.
+- Figure 2, a square scatter plot of RECON_9120 (y) against the CPC 1991-2020 series (x), one point per month, with identical axis ranges and ticks, a 1:1 reference line, and the correlation and RMSE annotated.
+
+Variables already present in the namespace (name -> summary of its contents); use them
+as they are:
+{
+  "selected_datasets": [
+    "ersst",
+    "cpc_indices"
+  ]
+}
+
+Available tools and their specifications:
+{
+  "load_regular_data": {
+    "description": "Load a rectangular subset of a time series dataset.\nThis is the entry point for any question about change over time \u2014 trends, variability, scenario projections \u2014 and for the published index series (cpc_indices), which have a time axis but no grid. Give the window you need: reading a global field and slicing it afterwards is slower and, on a curvilinear model grid, wrong, because index dimensions cannot be sliced by latitude and longitude. A window crossing the dateline is handled, and comes back on a continuous longitude axis.\nThe result stays lazy, so a large request is cheap until it is reduced.",
+    "args": {
+      "dataset": "str, required. The dataset id, from the registry of available datasets.",
+      "variable": "str, required. The variable's short name in that dataset. For an index dataset it names the region the series is published for, e.g. 'NINO3.4'; leave it out for an index that is defined on its own domain rather than on a region box.",
+      "model": "str, required for multi-model datasets. Which model to read.",
+      "product": "str, required for a dataset that publishes several series of the same quantity. Which one to read; the registry lists each product with its baseline period. Default is the dataset's operational series.",
+      "field": "str, optional, default 'anomaly' where it applies. Which published field to read: 'anomaly' for the departure from the baseline climatology, or 'total' for the absolute value.",
+      "time_range": "list[str, str], optional. Continuous window as ['start', 'end'] in ISO 8601, e.g. ['1990-01', '2014-12']. Default is the whole record.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward. Levels are selected by their centre. Default is every level.",
+      "lat_range": "list[float, float], optional. [min, max] in degrees North.",
+      "lon_range": "list[float, float], optional. [min, max] in degrees East, in either the 0-360 or the -180-180 convention; a window crossing the dateline is handled.",
+      "chunk_time": "int, optional, default 12. Chunk size along time for lazy reading."
+    },
+    "returns": "xr.DataArray on the dataset's own grid, with units and the provenance attributes that let the weighting and derived-quantity tools find the right cell areas, volumes and layer thicknesses. On a regular grid the dimensions are (time, depth, lat, lon); on a curvilinear model grid they are the model's index dimensions with 2-D latitude and longitude coordinates, trimmed to the requested box. An index dataset comes back with 'time' alone and no spatial dimensions."
+  },
+  "compute_anomaly_vs_own_climatology": {
+    "description": "Remove a field's own climatology, leaving its variability about its own mean state.\nEach time step is matched to the mean of its own calendar month, season or of the whole record, computed from the same field over the baseline period given (base_period), so the field's own mean state is removed. Its sibling compute_anomaly_vs_woa23 subtracts the observed climatology instead.\nIt works on any grid and any product, including a series that is already an area average with no spatial dimensions left.",
+    "args": {
+      "data": "xr.DataArray, required. A field or series with a 'time' dimension.",
+      "freq": "str, optional, default 'month'. What each step is matched against: 'month' (the climatology of its own calendar month, removing the seasonal cycle), 'season' (the meteorological DJF/MAM/JJA/SON), or 'year' (a single long-term mean, leaving the seasonal cycle in place).",
+      "base_period": "list[str, str], optional. The baseline window as ['start', 'end']. The climatology is computed over this window only and subtracted from every step of the series, including those outside it. Default None: the whole record is the baseline.",
+      "method": "str, optional, default 'subtract'. 'subtract' gives the anomaly in the data's units; 'ratio' gives it as a percentage of the climatology, which is refused for quantities without a true zero."
+    },
+    "returns": "xr.DataArray of anomalies on the input's own grid and time axis. attrs record the exact baseline window and how many years stand behind each climatological value."
+  },
+  "compute_basic_stat": {
+    "description": "Reduce a field along chosen dimensions with one basic statistic, weighted in space but never in time.\nOver a time axis every step counts the same, whatever its length; temporal_aggregate is the tool that weights by month length.\nThe weighted operators take their weights from the grid the data came from, so the field must still be on its original grid and levels \u2014 subsetting is fine, regridding or averaging over depth beforehand is not.",
+    "args": {
+      "data": "xr.DataArray, required. Input field.",
+      "op": "str, required. The statistic to apply:\n- 'mean', 'median', 'min', 'max', 'sum', 'count' (non-missing elements), 'std' (standard deviation about the mean, ddof=0). These are unweighted.\n- 'area_weighted_mean' for a horizontal average, weighting each cell by its area.\n- 'volume_weighted_mean' for an average over dimensions that include depth, weighting each cell by its volume.\n- 'argmax'/'argmin' return WHERE the extreme falls rather than what it is: the coordinate label at which it occurs, one per remaining column. They reduce a single dimension. For the one extreme of a whole field, use locate_extreme.",
+      "dim": "str or list of str, optional. Dimension(s) to reduce. If None, every dimension is reduced. A weighted mean must include the dimensions its weights vary along: the horizontal pair for 'area_weighted_mean', and 'depth' for 'volume_weighted_mean'. On a curvilinear grid you may write ['lat', 'lon'] and they are mapped to the model's index dimensions."
+    },
+    "returns": "xr.DataArray with the reduced dimension(s) removed. For 'argmax'/'argmin' the values are coordinate labels rather than data values. A weighted result records in attrs which weights were used."
+  },
+  "temporal_aggregate": {
+    "description": "Aggregate a time series in time: a DAY-WEIGHTED long-term mean, or annual, seasonal or climatological-monthly values, or a running window.\nThis is the only tool that weights by month length; compute_basic_stat does not weight in time. Means are weighted by the number of days in each month in the dataset's own calendar, with each cell's weights masked to the months it has data, so a cell missing at every step stays missing. Model time axes are stamped on Gregorian month starts, but the model's own calendar is recorded on the time coordinate ('source_calendar') and is the one used: a 365-day model's February counts 28 days in every year. Weighting applies to op='mean' only; a median, minimum, maximum or standard deviation is taken over the steps as they are.\nOnly a field with a real time axis can be aggregated; a climatology has none.",
+    "args": {
+      "data": "xr.DataArray, required. A field with a 'time' dimension.",
+      "freq": "str, optional, default 'year'. What to aggregate to:\n- 'mean': ONE field for the whole window, the time dimension removed: the mean state of the period. compute_basic_stat(op='mean', dim='time') instead gives every step the same weight.\n- 'year': one value per calendar year.\n- 'season': one value per seasonal period (see season_convention).\n- 'climatology': one value per calendar month, across all years.\n- 'rolling': a running window that SMOOTHS the series instead of collapsing it \u2014 the time axis keeps every step, and each value is the statistic over the `window` steps around it.",
+      "op": "str, optional, default 'mean'. 'mean' (day-weighted), 'median', 'min', 'max' or 'std'.",
+      "season_convention": "str, optional, default 'meteorological'. Which three months each season covers: 'meteorological' gives DJF/MAM/JJA/SON; 'woa' gives the calendar quarters JFM/AMJ/JAS/OND, on which the WOA23 seasonal fields are built.",
+      "window": "int, required for freq='rolling', ignored otherwise. Number of time steps in the window, in the units of the time axis. An odd window is centred exactly; an even one leans one step towards the past.",
+      "center": "bool, optional, default True, freq='rolling' only. Place each window's value at its middle step, keeping the smoothed series in phase with the original. False places it at the last step, which is what an index computed from data already in hand does, and shifts every feature later by half a window."
+    },
+    "returns": "xr.DataArray, aggregated in time.\n- 'mean': the 'time' dimension is gone and a single field is left, carrying the window it covers in attrs['time_mean_period'] and the number of steps it averaged. attrs ['incomplete_periods'] lists any year the window does not cover in full, which tilts a long-term mean towards the seasons those years contribute.\n- 'year': the time axis becomes an integer 'year' coordinate. attrs['incomplete_periods'] lists any year not covered by a full 12 months, which biases a trend if left in.\n- 'season': one entry per seasonal period, with 'season' and 'year' coordinates attached; a December-starting season is labelled by the year holding its January.\n- 'climatology': a 'month' coordinate (1-12) with month names attached.\n- 'rolling': the time axis is unchanged in length and labels, with the ends left missing where no complete window covers them. The running mean is unweighted, because a running window is a filter over a fixed number of steps rather than a time average."
+  },
+  "analyze_correlation": {
+    "description": "Correlate two fields, with optional lead-lag analysis and significance testing.\nAlong time the p-value uses an effective sample size estimated from the lag-1 autocorrelations of the two series; the uncorrected value is returned alongside.\ndetrend=True removes a straight line from both series before correlating. weighting='area' weights each cell by its area in a correlation across the horizontal dimensions.",
+    "args": {
+      "var1": "xr.DataArray, required. The first field.",
+      "var2": "xr.DataArray, required. The second field, aligned with the first.",
+      "dim": "str or list[str], optional, default 'time'. Dimension(s) to correlate over: 'time' for a temporal correlation at each cell, the horizontal pair for a pattern correlation between two maps. On a curvilinear grid you may write ['lat', 'lon'].",
+      "method": "str, optional, default 'pearson'. 'pearson' for a linear relationship, 'spearman' to correlate ranks, which detects a monotonic but non-linear relationship and resists outliers.",
+      "lag": "int, optional, default 0. Time lag in steps for lead-lag analysis. Positive means var2 leads var1; negative means var1 leads var2. Requires 'time' among the correlation dimensions.",
+      "detrend": "bool, optional, default False. Remove a least-squares straight line from both series before correlating.",
+      "min_periods": "int, optional, default 10. Minimum number of valid pairs required.",
+      "weighting": "str, optional, default 'none'. 'area' weights each cell by its area, for a pattern correlation. It applies only over the horizontal dimensions, only to 'pearson', and not with a lag or with detrending; the weights come from the grid the fields are on, so put them on a common grid first."
+    },
+    "returns": "dict of xr.DataArray, each shaped by the dimensions not correlated over:\n'correlation': the coefficient, -1 to 1.\n'pvalue': two-tailed. Along time it is corrected for serial correlation; across space it is not.\n'pvalue_unadjusted': the naive value assuming every sample is independent.\n'n_samples': valid data pairs.\n'n_effective': independent samples after accounting for autocorrelation."
+  },
+  "compute_difference_metrics": {
+    "description": "Measure how far one field is from another: bias, RMSE, the largest single departure and where it happens.\nEvery metric is computed in one pass over the elements the two fields share, so all of them describe the same sample.\nOver the horizontal the metrics are area-weighted by default; along time they are unweighted. The weights come from the grid the fields are on, so two fields on different grids must be put on a common one first.\nThe correlation is not included: use analyze_correlation.",
+    "args": {
+      "data": "xr.DataArray, required. The field being assessed. The sign of the bias follows it: bias = mean(data - reference).",
+      "reference": "xr.DataArray, required. What it is measured against. The two are intersected first, so a longer series or a wider region is trimmed to the overlap rather than broadcast.",
+      "dim": "str or list[str], optional. Dimension(s) to reduce. Default None, every shared dimension, giving one number per metric. Pass the horizontal pair for a per-time-step RMSE, or 'time' for a per-cell map.",
+      "weighting": "str, optional, default 'auto'. 'auto' weights by cell area when the horizontal dimensions are among those reduced and leaves everything else unweighted; 'area' insists on it and fails if the grid cannot be identified; 'none' weights every element equally."
+    },
+    "returns": "dict. Scalars come back as floats, a partial reduction as xr.DataArray on the dimensions left over.\n'bias': mean(data - reference), the systematic offset.\n'mae', 'rmse': mean absolute error and root mean square error.\n'centered_rmse': RMSE with the bias removed, i.e. the disagreement in pattern alone. rmse^2 = bias^2 + centered_rmse^2, so the two together say whether a field is merely offset or actually shaped differently.\n'max_abs_error' and 'max_abs_error_at': the largest single departure and the coordinates where it occurs; the location is None when the reduction leaves dimensions behind.\n'std_data', 'std_reference', 'std_ratio': the two spreads over the same sample and their ratio \u2014 above 1 the field varies too much, below 1 too little.\n'mean_data', 'mean_reference': the weighted means over the shared sample, the two numbers the bias came from.\n'n_valid', 'weighting': the sample size and what the weights were.\n'difference': the field data - reference itself, on the shared sample and carrying the grid identity, ready to map or to pass to compute_exceedance_fraction."
+  },
+  "detect_threshold_events": {
+    "description": "Find the episodes in a series that cross a threshold and stay across it, and report each one's timing, duration and peak.\nA run counts as an event only when it lasts at least min_duration consecutive steps.\nMissing values break a run rather than being skipped over, so a gap cannot join two separate episodes into one.",
+    "args": {
+      "data": "xr.DataArray, required. A one-dimensional series such as an index or a regional mean. Reduce a field to a series first; a threshold applied to a whole map does not define an event.",
+      "threshold": "float, required. The value to be crossed, in the series' own units, with the sign that matches `direction`.",
+      "direction": "str, optional, default 'above'. 'above' keeps runs at or above the threshold, 'below' keeps runs at or below it.",
+      "min_duration": "int, optional, default 5. How many consecutive steps the series must stay across the threshold to count as an event. 1 returns every run, however brief."
+    },
+    "returns": "pandas.DataFrame, one row per event in chronological order, with columns 'start', 'end', 'duration' (steps), 'peak_value' (the most extreme value reached), 'peak_time' and 'mean_value'. A run already across the threshold at the first valid step starts there, so its 'start' is the edge of the record, not a crossing; the same holds for an 'end' at the last valid step. An empty frame means no run met the criterion. To rank by intensity, sort on the absolute peak. DataFrame.attrs records the criterion used."
+  },
+  "load_climatology_data": {
+    "description": "Load a subset of an observational climatology.\nThis is the entry point for a mean state, a seasonal cycle or a vertical structure, and for the reference field a model is evaluated against. A climatology is already an average over many years, so it has no time axis to take a trend along.",
+    "args": {
+      "dataset": "str, required. The climatology's dataset id.",
+      "variable": "str, required for most datasets. The variable name that dataset uses; common aliases are accepted.",
+      "time_slice": "str, optional, default 'annual'. 'annual' for a single all-year field, which reaches the deepest levels; 'monthly' for twelve fields, adding a 'month' dimension; 'seasonal' for four, adding a 'season' dimension. The monthly and seasonal fields are shallower than the annual one.",
+      "months": "list[int], optional. Select particular months from a monthly climatology, e.g. [1, 2, 12].",
+      "period": "str, optional. Which climate normal to read, where the variable offers more than one.",
+      "field": "str, optional. Which statistical field to read, where the product publishes several (the objectively analysed value, the raw mean, the standard deviation, the number of observations). Default is the analysed value.",
+      "version": "str, optional. Product version, where more than one exists.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward.",
+      "lat_range": "list[float, float], optional. [min, max] in degrees North.",
+      "lon_range": "list[float, float], optional. [min, max] in degrees East, either convention; a window crossing the dateline is handled."
+    },
+    "returns": "xr.DataArray with dimensions (depth, lat, lon), plus 'month' or 'season' for the corresponding slices, carrying units and the provenance attributes the weighting tools need."
+  },
+  "load_data_with_geolocator": {
+    "description": "Load data for a NAMED geographic region instead of a coordinate box, using Natural Earth boundaries.\nUse it when the question names a sea, a bay or an ocean: the outline is more faithful than any box, and no coordinates have to be guessed. For a region that is not in the supported list, fall back to a loader with explicit ranges. To split a field you already have by ocean basin, use select_basin instead \u2014 this tool masks while reading, so it only works on a stored variable.",
+    "args": {
+      "dataset": "str, required. The dataset id to read from.",
+      "variable": "str, required for most datasets. The variable name that dataset uses.",
+      "model": "str, required for multi-model datasets.",
+      "geofeature": "str, optional, default 'water_body'. Which kind of boundary to use: 'water_body', 'country', 'state' or 'continent'. Ocean analysis almost always wants 'water_body'.",
+      "loc_name": "str or list[str], required. Name(s) of the region, case-sensitive, from the supported list below. Pass a list to merge several regions into one field for a single calculation; make separate calls when they are to be compared.\nSupported water bodies: ['Arctic Ocean', 'SOUTHERN OCEAN', 'North Atlantic Ocean', 'North Pacific Ocean', 'South Pacific Ocean', 'INDIAN OCEAN', 'South Atlantic Ocean', 'Black Sea', 'Philippine Sea', 'Great Barrier Reef', 'Tasman Sea', 'Bay of Bengal', 'South China Sea', 'Arabian Sea', 'Beaufort Sea', 'Caribbean Sea', 'Gulf of Mexico', 'Labrador Sea', 'Hudson Bay', 'Caspian Sea', 'Baffin Bay', 'Gulf of Alaska', 'Red Sea', 'Sea of Okhotsk', 'Weddell Sea', 'Persian Gulf', 'Celebes Sea', 'Sulu Sea', 'Norwegian Sea', 'Greenland Sea', 'Banda Sea', 'Luzon Strait', 'Bay of Biscay', 'Mozambique Channel', 'Gulf of Guinea', 'Scotia Sea', 'Baltic Sea', 'Barents Sea', 'North Sea', 'Bristol Channel', 'Inner Seas', 'Irish Sea', 'Java Sea', 'Andaman Sea', 'Yellow Sea', 'East China Sea', 'Chukchi Sea', 'Bah\u00eda de Campeche', 'Arafura Sea', 'Timor Sea', 'Gulf of Thailand', 'Laccadive Sea', 'Bellingshausen Sea', 'Amundsen Sea', 'Davis Strait', 'Kara Sea', 'Laptev Sea', 'Drake Passage', 'Great Australian Bight', 'Gulf of Aden', 'Gulf of Oman', 'Tyrrhenian Sea', 'White Sea', 'Sea of Azov', 'James Bay', 'Gulf of Carpentaria', 'Golfo de California', 'Hudson Strait', 'Gulf of Finland', 'English Channel', 'Gulf of Honduras', 'Golfe du Lion', 'Gulf of Bothnia', 'Adriatic Sea', 'Straits of Florida', 'Bay of Plenty', 'The North Western Passages', 'Queen Charlotte Sound', 'Ionian Sea', 'Gulf of Saint Lawrence', 'Molucca Sea', 'Bismarck Sea', 'Solomon Sea', 'Gulf of Tonkin', 'Bay of Fundy', 'R\u00edo de la Plata', 'Strait of Malacca', 'Strait of Singapore', 'Makassar Strait', 'Ceram Sea', 'Inner Sea', 'Taiwan Strait', 'Cook Inlet', 'Bristol Bay', 'Melville Bay', 'Gulf of Maine', 'Chesapeake Bay', 'Strait of Gibraltar', 'Golfo San Jorge', 'Balearic Sea', 'Aegean Sea', 'Gulf of Mannar', 'Shelikhova Gulf', 'Bo Hai', 'Gulf of Kutch', 'Golfo de Panam\u00e1', 'Amundsen Gulf', 'Viscount Melville Sound', 'Ungava Bay', 'Yucatan Channel', 'Bering Sea', 'East Siberian Sea', 'Lincoln Sea', 'Bass Strait', 'Franklin Bay', 'Dixon Entrance', \"M'Clure Strait\", 'Boca Grande', 'Ba\u00eda de Maraj\u00f3', 'Golfo San Mat\u00edas', 'Golfo Corcovado', 'Wrigley Gulf', 'Sulzberger Bay', 'Ronne Entrance', 'Bransfield Strait', 'McMurdo Sound', 'Ba\u00eda de S\u00e3o Marcos', 'Cumberland Sound', 'Frobisher Bay', 'Disko Bay', 'Hamilton Inlet', 'Storfjorden', 'Vestfjorden', 'Skagerrak', 'Karskiye Strait', \"Vil'kitskogo Strait\", 'Sognefjorden', 'Trondheimsfjorden', 'Kattegat', 'Gulf of Khambh\u00e4t', 'Palk Strait', 'Kronotskiy Gulf', 'Uda Bay', 'Uchiura Bay', 'Tsugaru Strait', 'Tatar Strait', 'Shark Bay', 'Gulf of Gab\u00e8s', 'Mackenzie Bay', 'Norton Sound', 'Kotzebue Sound', 'Gulf of Boothia', 'Kane Basin', 'Foxe Basin', 'Golfo de Tehuantepec', 'Golfo de Guayaquil', 'Gulf of Masira', 'Gulf of Yana', 'Dmitriy Laptev Strait', 'La P\u00e9rouse Strait', 'East Korea Bay', 'Qiongzhou Strait', 'Cook Strait', 'Torres Strait', 'Geographe Bay', 'Gulf of Papua', 'Gulf of Olen\u2018k', 'Gulf of Riga', 'Waddenzee', 'Gulf of Sidra', 'Sea of Crete', 'Ligurian Sea', 'Alboran Sea', 'Bight of Benin', 'Bight of Biafra', 'Strait of Belle Isle', 'Prince William Sound', 'Estrecho de Magellanes', 'Bah\u00eda Blanca', 'Golfo de Penas', 'Bah\u00eda Grande', 'Marguerite Bay', 'Prydz Bay', 'Vincennes Bay', 'Porpoise Bay', 'Davis Sea', 'L\u00fctzow-Holm Bay', 'Antongila Bay', 'Hangzhou Bay', 'Karaginskiy Gulf', 'Gulf of Kamchatka', 'Bosporus', 'Bab el Mandeb', 'Gulf St. Vincent', 'Golfo de Urab\u00e1', 'Baia de Maputo', 'St. Helena Bay', 'Boknafjorden', 'Joseph Bonaparte Gulf', 'Gulf of Martaban', 'Gulf of Sakhalin', 'Kangertittivaq', 'Saint Lawrence River', 'Chaun Bay', 'Khatanga Gulf', 'Garabogaz Bay', 'Gulf of Suez', 'Gulf of Ob', 'Yenisey Gulf', 'Dardanelles', 'Sea of Marmara', 'Gulf of Aqaba', 'Lago de Maracaibo', 'Denmark Strait', 'Massachusetts Bay', 'Delaware Bay', 'Long Island Sound', 'Albemarle Sound', 'Pamlico Sound', 'Smith Sound', 'Queen Charlotte Strait', 'Baird Inlet', 'Husky Lakes', 'Lake Pontchartrain', 'Stettiner Haff', 'Darnley Bay', 'Prince of Wales Strait', 'Minto Inlet', 'Richard Collinson Inlet', 'Prince ALbert Sound', 'Liddon Gulf', 'Wynniatt Bay', 'Hadley Bay', 'Bathurst Inlet', 'Goldsmith Channel', 'Sherman Basin', 'Wager Bay', 'Fury and Hecla Strait', 'Jones Sound', 'Eclipse Sound', 'Hall Basin', 'Uummannaq Fjord', 'Peacock Sound', 'George VI Sound', 'Seno de Skyring', 'Seno Otway', 'Bay In\u00fatil', 'Lagoa dos Patos', 'Amazon River', \"Bras d'Or Lake\", 'Kaliningrad', 'Matochkin Shar Strait', 'Ozero Mogotoyevo', 'Guba Gusinaya', 'Bali Sea', 'Davao Gulf', 'Halmahera Sea', 'Selat Bali', 'Gulf of Tomini', 'Flores Sea', 'Sibuyan Sea', 'Selat Dampier', 'Gulf of Buli', 'Gulf of Kau', 'Bohol Sea', 'Surigao Strait', 'Ragay Gulf', 'Samar Sea', 'Tayabas Bay', 'Leyte Gulf', 'Visayan Sea', 'Savu Sea', 'Hecate Strait', 'Cordova Bay', 'Murchison Sound', 'Robeson Channel', 'Kennedy Channel', 'Canal Perigoso', 'Canal do Sul', 'Canal do Norte', '\u00d8resund', 'Mecklenburger Bucht', 'Sargasso Sea', 'San Francisco Bay', 'Monterey Bay', 'Yangtze River', 'Columbia River', 'Salish Sea', \"Gulf of Anadyr'\", 'Mediterranean Sea', 'Ross Sea', 'Coral Sea', 'Sea of Japan', 'Korea Strait']",
+      "time_range": "list[str, str], optional. Time series datasets only: ['start', 'end'] in ISO 8601.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward.",
+      "time_slice": "str, optional, default 'annual'. Climatologies only: 'annual', 'monthly' or 'seasonal'.",
+      "months": "list[int], optional. Select particular months from a monthly climatology.",
+      "period": "str, optional. Which climate normal to read.",
+      "field": "str, optional. Which statistical field to read.",
+      "version": "str, optional. Product version, where more than one exists."
+    },
+    "returns": "xr.DataArray with the dimensions the dataset would otherwise return and cells outside the region set to NaN. A regular grid keeps its full coordinates; a curvilinear grid keeps its index dimensions and is trimmed to the region's bounding block. Average it with an area-weighted mean, which picks the right cell areas for the grid on its own."
+  },
+  "transform_unit": {
+    "description": "Convert a field from one unit to another within the same physical category.\nBetween the two molar bases, per unit MASS (umol kg-1) and per unit VOLUME (mol m-3), the conversion goes through seawater density: a constant (the default) or a density field, applied cell by cell.\nPass a density field EXACTLY as compute_potential_density_anomaly returned it. Do not add 1000 to make it absolute first: whether the array is an anomaly or an absolute density is read from its own long_name BEFORE its magnitude, so a pre-converted field still labelled 'anomaly' has 1000 added a second time and every converted value comes out about half its true size.",
+    "args": {
+      "data": "xr.DataArray, required. The field to convert.",
+      "from_unit": "str, required, case-insensitive. The unit the data is in; passing the array's own 'units' attribute works, including the variant spellings different products use. Recognised categories: temperature ('degC', 'K'), concentration per mass ('umol/kg', 'mmol/kg'), concentration per volume ('mol m-3', 'mmol/m3', 'umol/L'), dimensionless ('1', 'psu', ''), length ('m', 'cm'), velocity ('m/s', 'cm/s', 'mm/s').",
+      "to_unit": "str, required. The target unit, in any of the same spellings. It must belong to the same category as from_unit.",
+      "density": "float or xr.DataArray, optional, default 1.025. Seawater density, used only between the mass and volume bases. A float is read as kg/L. A DataArray is aligned cell by cell, so each cell converts at its own density; both an absolute density and a density anomaly (sigma) are understood, decided from the array's metadata and magnitude and reported back in the result."
+    },
+    "returns": "xr.DataArray with converted values and its 'units' attribute updated. attrs record 'original_units' and, for a mass/volume conversion, 'density_assumption' \u2014 whether a constant or a field was used, and how it was interpreted."
+  }
+}
+
+Fix this one compute block only, and output the corrected, complete version inside
+<execute></execute> tags.
+Focus on:
+1. Fixing the specific error mentioned above
+2. Taking variable names from the list of available variables above; use what is already there instead of reloading the data or recomputing a quantity that exists
+3. Using correct syntax, function signatures and library functions
+
+
+===== RESPONSE =====
+The failure is at `float(diff_metrics["rmse"].compute())`. `compute_difference_metrics` returns **plain floats** for scalar metrics when the reduction leaves no dimensions (as with `dim="time"` on a 1‑D series) — only partial reductions come back as lazy `xr.DataArray`s. The same applies to `max_abs_error` and `bias`. A small helper that accepts either a float or a `DataArray` fixes it and also protects the correlation/argmax conversions.
+
+<execute>
+# Load raw ERSSTv5 SST for the Nino 3.4 region
+sst_nino34 = load_regular_data(
+    dataset="ersst",
+    variable="sst",
+    time_range=["1950-01", "2023-12"],
+    lat_range=[-5.0, 5.0],
+    lon_range=[-170.0, -120.0],
+)
+
+# Reconstruct the Nino 3.4 anomaly relative to 1991-2020
+anom_9120 = compute_anomaly_vs_own_climatology(
+    data=sst_nino34,
+    freq="month",
+    base_period=["1991-01", "2020-12"],
+    method="subtract",
+)
+recon_9120 = compute_basic_stat(
+    data=anom_9120,
+    op="area_weighted_mean",
+    dim=["lat", "lon"],
+).compute()
+recon_9120.name = "RECON_9120"
+
+# Same reconstruction relative to 1981-2010
+anom_8110 = compute_anomaly_vs_own_climatology(
+    data=sst_nino34,
+    freq="month",
+    base_period=["1981-01", "2010-12"],
+    method="subtract",
+)
+recon_8110 = compute_basic_stat(
+    data=anom_8110,
+    op="area_weighted_mean",
+    dim=["lat", "lon"],
+).compute()
+recon_8110.name = "RECON_8110"
+
+# CPC published Nino 3.4 anomaly series
+cpc_9120 = load_regular_data(
+    dataset="cpc_indices",
+    variable="NINO3.4",
+    product="ersst5_91-20",
+    time_range=["1950-01", "2023-12"],
+).compute()
+cpc_9120.name = "CPC_9120"
+
+cpc_8110 = load_regular_data(
+    dataset="cpc_indices",
+    variable="NINO3.4",
+    product="ersst5_81-10",
+    time_range=["1950-01", "2023-12"],
+).compute()
+cpc_8110.name = "CPC_8110"
+
+# CPC ONI (already a 3-month running index)
+oni = load_regular_data(
+    dataset="cpc_indices",
+    variable="NINO3.4",
+    product="oni",
+    time_range=["1950-01", "2023-12"],
+).compute()
+oni.name = "ONI"
+
+
+# Helper: tools return plain floats for full reductions and lazy DataArrays
+# for partial ones -- accept either and hand back a Python scalar.
+def _as_float(value):
+    if hasattr(value, "compute"):
+        value = value.compute()
+    return float(np.asarray(value))
+
+
+def _as_int(value):
+    if hasattr(value, "compute"):
+        value = value.compute()
+    return int(np.asarray(value))
+
+
+# Correlation and error metrics against CPC 1991-2020
+corr_result = analyze_correlation(
+    var1=recon_9120,
+    var2=cpc_9120,
+    dim="time",
+    method="pearson",
+)
+pearson_r = _as_float(corr_result["correlation"])
+pearson_r_rounded = round(pearson_r, 6)
+
+diff_metrics = compute_difference_metrics(
+    data=recon_9120,
+    reference=cpc_9120,
+    dim="time",
+    weighting="none",
+)
+rmse = _as_float(diff_metrics["rmse"])
+rmse_rounded = round(rmse, 4)
+max_abs_error = _as_float(diff_metrics["max_abs_error"])
+max_abs_error_rounded = round(max_abs_error, 4)
+
+diff_series = diff_metrics["difference"].compute()
+abs_diff_series = np.abs(diff_series)
+max_idx = _as_int(abs_diff_series.argmax(dim="time"))
+max_time = pd.Timestamp(diff_series["time"].isel(time=max_idx).values)
+max_year = int(max_time.year)
+max_month = int(max_time.month)
+
+# 3-month centred running mean and event detection
+run3_recon = temporal_aggregate(
+    data=recon_9120,
+    freq="rolling",
+    op="mean",
+    window=3,
+    center=True,
+).compute()
+run3_recon.name = "RECON_9120_3mo"
+
+elnino_recon = detect_threshold_events(
+    data=run3_recon,
+    threshold=0.5,
+    direction="above",
+    min_duration=5,
+)
+lanina_recon = detect_threshold_events(
+    data=run3_recon,
+    threshold=-0.5,
+    direction="below",
+    min_duration=5,
+)
+
+n_elnino_recon = int(len(elnino_recon))
+n_lanina_recon = int(len(lanina_recon))
+
+elnino_recon_top = elnino_recon.sort_values("peak_value", ascending=False).head(3).copy()
+elnino_recon_top["peak_time"] = pd.to_datetime(elnino_recon_top["peak_time"])
+elnino_recon_top["peak_year"] = elnino_recon_top["peak_time"].dt.year
+elnino_recon_top["peak_month"] = elnino_recon_top["peak_time"].dt.month
+recon_top3 = elnino_recon_top[["peak_year", "peak_month", "peak_value"]].copy()
+recon_top3["peak_value"] = recon_top3["peak_value"].round(2)
+recon_top3 = recon_top3.rename(
+    columns={"peak_year": "year", "peak_month": "month", "peak_value": "peak_degC"}
+).reset_index(drop=True)
+
+# ONI event detection under the identical criterion
+elnino_oni = detect_threshold_events(
+    data=oni,
+    threshold=0.5,
+    direction="above",
+    min_duration=5,
+)
+n_elnino_oni = int(len(elnino_oni))
+
+elnino_oni_top = elnino_oni.sort_values("peak_value", ascending=False).head(3).copy()
+elnino_oni_top["peak_time"] = pd.to_datetime(elnino_oni_top["peak_time"])
+elnino_oni_top["peak_year"] = elnino_oni_top["peak_time"].dt.year
+elnino_oni_top["peak_month"] = elnino_oni_top["peak_time"].dt.month
+oni_top3 = elnino_oni_top[["peak_year", "peak_month", "peak_value"]].copy()
+oni_top3["peak_value"] = oni_top3["peak_value"].round(2)
+oni_top3 = oni_top3.rename(
+    columns={"peak_year": "year", "peak_month": "month", "peak_value": "peak_degC"}
+).reset_index(drop=True)
+
+# Baseline offsets over 1950-01 to 2020-12
+recon_8110_2020 = recon_8110.sel(time=slice("1950-01", "2020-12"))
+recon_9120_2020 = recon_9120.sel(time=slice("1950-01", "2020-12"))
+offset_recon_metrics = compute_difference_metrics(
+    data=recon_8110_2020,
+    reference=recon_9120_2020,
+    dim="time",
+    weighting="none",
+)
+recon_baseline_offset = _as_float(offset_recon_metrics["bias"])
+recon_baseline_offset_rounded = round(recon_baseline_offset, 3)
+
+cpc_8110_2020 = cpc_8110.sel(time=slice("1950-01", "2020-12"))
+cpc_9120_2020 = cpc_9120.sel(time=slice("1950-01", "2020-12"))
+offset_cpc_metrics = compute_difference_metrics(
+    data=cpc_8110_2020,
+    reference=cpc_9120_2020,
+    dim="time",
+    weighting="none",
+)
+cpc_baseline_offset = _as_float(offset_cpc_metrics["bias"])
+cpc_baseline_offset_rounded = round(cpc_baseline_offset, 3)
+
+offset_difference = recon_baseline_offset - cpc_baseline_offset
+offset_difference_rounded = round(offset_difference, 3)
+abs_offset_difference_rounded = round(abs(offset_difference), 3)
+
+explanation = (
+    "RECON and CPC/ONI El Nino counts can differ because CPC's published index uses "
+    "its own product version, quality control, baseline, and spatial averaging; small "
+    "differences near the +0.5 degC threshold or near the 5-season duration can move "
+    "a run in or out of the event set."
+)
+
+print(f"Pearson correlation (RECON_9120 vs CPC 1991-2020): {pearson_r_rounded:.6f}")
+print(f"RMSE: {rmse_rounded:.4f} degC")
+print(
+    f"Largest absolute deviation: {max_abs_error_rounded:.4f} degC "
+    f"at {max_year}-{max_month:02d}"
+)
+print(f"RECON_9120 El Nino events (>= +0.5 degC, >=5 seasons): {n_elnino_recon}")
+print(recon_top3.to_string(index=False))
+print(f"RECON_9120 La Nina events (<= -0.5 degC, >=5 seasons): {n_lanina_recon}")
+print(f"CPC ONI El Nino events (>= +0.5 degC, >=5 seasons): {n_elnino_oni}")
+print(oni_top3.to_string(index=False))
+print(explanation)
+print(
+    f"Reconstructed baseline offset (RECON_8110 - RECON_9120, 1950-2020): "
+    f"{recon_baseline_offset_rounded:.3f} degC"
+)
+print(
+    f"Published baseline offset (CPC 1981-2010 - CPC 1991-2020, 1950-2020): "
+    f"{cpc_baseline_offset_rounded:.3f} degC"
+)
+print(
+    f"Offset difference (reconstructed - published): "
+    f"{offset_difference_rounded:.3f} degC (abs {abs_offset_difference_rounded:.3f} degC)"
+)
+</execute>
+
+Key changes:
+- Added `_as_float` / `_as_int` helpers that call `.compute()` only when the object is lazy; `compute_difference_metrics` already returns Python floats for `bias`, `rmse`, `mae`, `max_abs_error` when the reduction removes every dimension.
+- Replaced `float(diff_metrics["rmse"].compute())`, `float(diff_metrics["max_abs_error"].compute())` and both `float(...["bias"].compute())` calls with `_as_float(...)`.
+- Made the correlation and `argmax` conversions robust the same way; `diff_metrics["difference"]` remains a `DataArray` and is still `.compute()`d before plotting/argmax.

@@ -1,0 +1,673 @@
+# exchange 3: solution
+# elapsed: 21.0 s
+
+===== SYSTEM =====
+
+The user's question:
+Assess the ENSO amplitude simulated by three CMIP6 historical runs against ERSSTv5 observations over 1950-01 to 2014-12.
+
+Data to use:
+- CMIP6 historical variable `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1950-01 to 2014-12, each on its own native grid with its own published cell areas.
+- ERSSTv5 monthly SST over the same window, on its native 2-degree grid.
+
+Expected numerical results, based on the monthly Nino 3.4 index of each of the four sources over 1950-01 to 2014-12: the SST anomaly over 5S-5N, 170W-120W, each source relative to a 1950-2014 monthly climatology. Standard deviations are population standard deviations (ddof = 0).
+- For each source, the standard deviation of its Nino 3.4 anomaly over all 780 months, in degrees Celsius to 2 decimal places.
+- For each model, the amplitude bias (model minus ERSSTv5 standard deviation) in degrees Celsius to 2 decimal places and the amplitude ratio (model divided by ERSSTv5) to 2 decimal places, and the ranking of the three models from smallest to largest absolute amplitude bias.
+- For each source, the standard deviation of the anomaly for each of the 12 calendar months, in degrees Celsius to 2 decimal places (48 values).
+- For each source, the calendar month of largest standard deviation and its value, the calendar month of smallest standard deviation, and the largest-to-smallest ratio to 2 decimal places; and whether each model reproduces the observed peak month and strength of seasonal phase locking.
+- For each source, the number and the percentage (to 1 decimal place) of months whose Nino 3.4 anomaly strictly exceeds 1.0 degrees Celsius in absolute value.
+
+Expected visualizations:
+- Figure 1, a line plot of the seasonal cycle of amplitude: calendar month (January to December) on the x axis, standard deviation in degrees Celsius on the y axis, four curves on one axis, the observations visually distinct from the three models, and each curve's peak month marked.
+- Figure 2, four stacked panels sharing one time axis over 1950-2014, in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, each showing that source's Nino 3.4 anomaly series on an identical y-axis range that contains every series, with the +1.0 and -1.0 degrees Celsius levels marked and each panel annotated with its standard deviation and exceedance percentage.
+
+The analysis plan:
+1. Use load_regular_data to load ERSSTv5 monthly `sst` for 1950-01 to 2014-12 on its native 2-degree grid, and separately load CMIP6 historical monthly `tos` for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR over the same window on each model's native grid. Preserve each source's native cell-area information for weighting.
+2. For each of the four sources, use compute_enso_nino_index to form the monthly Nino 3.4 SST anomaly series for 5S-5N, 170W-120W, area-weighted with that source's native cell areas. The anomaly is relative to the 1950-2014 monthly climatology, which is exactly the loaded 780-month window.
+3. For each source, use compute_basic_stat to compute the population standard deviation (`ddof=0`) over all 780 monthly Nino 3.4 anomalies. Keep the unrounded values, then compute model-minus-ERSSTv5 amplitude bias and model/ERSSTv5 amplitude ratio, rank the three models by smallest to largest absolute amplitude bias, and round only for reporting.
+4. For each source, use compute_basic_stat on each calendar-month subset (65 January values, 65 February values, etc.) to compute the 12 population standard deviations (`ddof=0`). Use locate_extreme on each 12-value seasonal-amplitude series to identify the calendar month and value of the maximum and minimum; compute the maximum/minimum ratio. Compare each model's peak month, peak value and ratio with ERSSTv5 to judge whether the observed peak month and seasonal phase-locking strength are reproduced.
+5. For each source, use compute_exceedance_fraction by count twice on the Nino 3.4 anomaly series: once for anomalies > +1.0 degrees Celsius and once for anomalies < -1.0 degrees Celsius. Sum the two counts to get the number of months with |anomaly| > 1.0 degrees Celsius; divide by 780 and multiply by 100 for the percentage, rounded to 1 decimal place at reporting.
+6. Produce Figure 1 as a line plot of calendar month (January to December) versus the 12 seasonal standard deviations for ERSSTv5, CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, with the observation visually distinct and each curve's peak month marked. Produce Figure 2 as four stacked time-series panels in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, sharing a 1950-2014 x axis and an identical y-axis range covering all four anomaly series, with +/-1.0 degrees Celsius reference lines and each panel annotated with its all-month standard deviation and exceedance percentage.
+
+Other notes:
+- All Nino 3.4 anomalies use a 1950-2014 calendar-month climatology and exactly 780 months.
+- Population standard deviations use `ddof=0`; each calendar-month standard deviation is over 65 years.
+- Exceedance is strict |anomaly| > 1.0 degrees Celsius, not >=, and is counted out of 780 months.
+- Nino 3.4 is 5S-5N, 170W-120W; each source is area-weighted on its native grid without regridding.
+- ERSSTv5 is the 2-degree in-situ observational product; CMIP6 historical `tos` are the three named model runs.
+- Report bias, ratio, ranking and all standard deviations after rounding to the requested precision, using unrounded intermediates.
+
+The code that actually ran and produced the results below:
+<executed_code>
+# Computation code only
+
+# Common settings
+time_range = ['1950-01', '2014-12']
+base_period = ['1950-01', '2014-12']
+lat_box = [-10.0, 10.0]
+lon_box = [-180.0, -100.0]
+months = np.arange(1, 13)
+
+sources_order = ['ERSSTv5', 'CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']
+model_names = ['CESM2', 'GFDL-ESM4', 'MPI-ESM1-2-LR']
+
+source_specs = {
+    'ERSSTv5': dict(dataset='ersst', variable='sst'),
+    'CESM2': dict(dataset='cmip6_historical', variable='tos', model='CESM2'),
+    'GFDL-ESM4': dict(dataset='cmip6_historical', variable='tos', model='GFDL-ESM4'),
+    'MPI-ESM1-2-LR': dict(dataset='cmip6_historical', variable='tos', model='MPI-ESM1-2-LR'),
+}
+
+nino_series = {}
+std_all = {}
+seasonal_std = {}
+peak_month = {}
+peak_value = {}
+min_month = {}
+min_value = {}
+season_ratio = {}
+exceed_n_pos = {}
+exceed_n_neg = {}
+exceed_n = {}
+exceed_pct = {}
+
+for src in sources_order:
+    spec = source_specs[src]
+    load_kwargs = dict(
+        dataset=spec['dataset'],
+        variable=spec['variable'],
+        time_range=time_range,
+        lat_range=lat_box,
+        lon_range=lon_box,
+    )
+    if 'model' in spec:
+        load_kwargs['model'] = spec['model']
+
+    field = load_regular_data(**load_kwargs)
+
+    nino = compute_enso_nino_index(
+        data=field,
+        nino_region='nino3.4',
+        anomaly_freq='month',
+        climatology='self',
+        base_period=base_period,
+    ).compute()
+
+    if nino.sizes.get('time', 0) != 780:
+        raise ValueError(f"{src}: expected 780 months, got {nino.sizes.get('time')}")
+
+    nino_series[src] = nino
+
+    # All-month population standard deviation
+    sd_all = compute_basic_stat(nino, op='std', dim='time').compute()
+    std_all[src] = float(sd_all)
+
+    # Calendar-month population standard deviations
+    month_std_values = []
+    for m in months:
+        month_idx = np.where(nino.time.dt.month.values == m)[0]
+        if len(month_idx) != 65:
+            raise ValueError(f"{src}, month {m}: expected 65 values, got {len(month_idx)}")
+        sub = nino.isel(time=month_idx)
+        sd_m = compute_basic_stat(sub, op='std', dim='time').compute()
+        month_std_values.append(float(sd_m))
+
+    seasonal_std[src] = pd.Series(
+        month_std_values,
+        index=pd.Index(months, name='month'),
+        name=src,
+    )
+
+    # Peak and minimum of the seasonal-amplitude cycle
+    seas_da = xr.DataArray(
+        month_std_values,
+        coords={'month': months},
+        dims='month',
+        name=f'{src}_seasonal_std',
+        attrs={'units': 'degC'},
+    )
+    emax = locate_extreme(seas_da, op='max')
+    emin = locate_extreme(seas_da, op='min')
+
+    idx_max = int(emax['indices']['month'])
+    idx_min = int(emin['indices']['month'])
+    peak_month[src] = int(months[idx_max])
+    peak_value[src] = float(emax['value'])
+    min_month[src] = int(months[idx_min])
+    min_value[src] = float(emin['value'])
+    season_ratio[src] = peak_value[src] / min_value[src]
+
+    # Strict exceedance: anomaly > +1 and anomaly < -1
+    ep = compute_exceedance_fraction(
+        nino,
+        threshold=1.0,
+        comparison='greater',
+        reference=0.0,
+        dim='time',
+        weighting='none',
+    )
+    # x < -1 is equivalent to x - (-2) < 1
+    en = compute_exceedance_fraction(
+        nino,
+        threshold=1.0,
+        comparison='less',
+        reference=-2.0,
+        dim='time',
+        weighting='none',
+    )
+    ea = compute_exceedance_fraction(
+        nino,
+        threshold=1.0,
+        comparison='abs_greater',
+        reference=0.0,
+        dim='time',
+        weighting='none',
+    )
+
+    npos = int(ep['n_exceeding'])
+    nneg = int(en['n_exceeding'])
+    nabs = int(ea['n_exceeding'])
+    if npos + nneg != nabs:
+        raise ValueError(f"{src}: exceedance count mismatch: {npos}+{nneg} != {nabs}")
+    if int(ep['n_valid']) != 780 or int(en['n_valid']) != 780:
+        raise ValueError(f"{src}: expected 780 valid values for exceedance")
+
+    exceed_n_pos[src] = npos
+    exceed_n_neg[src] = nneg
+    exceed_n[src] = npos + nneg
+    exceed_pct[src] = (npos + nneg) / 780.0 * 100.0
+
+# Model amplitude comparison against ERSSTv5
+obs_std = std_all['ERSSTv5']
+bias = {m: std_all[m] - obs_std for m in model_names}
+ratio = {m: std_all[m] / obs_std for m in model_names}
+ranking = sorted(model_names, key=lambda m: abs(bias[m]))
+
+report_all_std = pd.Series(
+    {src: std_all[src] for src in sources_order},
+    name='std_all_C',
+)
+
+report_model_comparison = pd.DataFrame({
+    'model': model_names,
+    'std_C': [std_all[m] for m in model_names],
+    'bias_C': [bias[m] for m in model_names],
+    'ratio': [ratio[m] for m in model_names],
+})
+report_model_comparison['abs_bias_C'] = report_model_comparison['bias_C'].abs()
+report_model_comparison['rank_abs_bias'] = report_model_comparison['abs_bias_C'].rank(method='min').astype(int)
+report_model_comparison = report_model_comparison.sort_values('abs_bias_C').reset_index(drop=True)
+ranking = report_model_comparison['model'].tolist()
+
+report_seasonal_std = pd.DataFrame({
+    src: seasonal_std[src] for src in sources_order
+})
+
+report_peaks = pd.DataFrame({
+    'source': sources_order,
+    'peak_month': [peak_month[src] for src in sources_order],
+    'peak_std_C': [peak_value[src] for src in sources_order],
+    'min_month': [min_month[src] for src in sources_order],
+    'min_std_C': [min_value[src] for src in sources_order],
+    'max_min_ratio': [season_ratio[src] for src in sources_order],
+})
+report_peaks['same_peak_month_as_ERSSTv5'] = report_peaks['peak_month'] == peak_month['ERSSTv5']
+report_peaks['ratio_vs_ERSSTv5'] = report_peaks['max_min_ratio'] / season_ratio['ERSSTv5']
+
+report_exceedance = pd.DataFrame({
+    'source': sources_order,
+    'n_gt_plus1': [exceed_n_pos[src] for src in sources_order],
+    'n_lt_minus1': [exceed_n_neg[src] for src in sources_order],
+    'n_abs_gt_1': [exceed_n[src] for src in sources_order],
+    'percent_abs_gt_1': [exceed_pct[src] for src in sources_order],
+})
+
+# Rounded reporting copies
+report_all_std_rounded = report_all_std.round(2)
+
+report_model_comparison_rounded = report_model_comparison.copy()
+report_model_comparison_rounded[['std_C', 'bias_C', 'ratio', 'abs_bias_C']] = (
+    report_model_comparison_rounded[['std_C', 'bias_C', 'ratio', 'abs_bias_C']].round(2)
+)
+
+report_seasonal_std_rounded = report_seasonal_std.round(2)
+
+report_peaks_rounded = report_peaks.copy()
+report_peaks_rounded[['peak_std_C', 'min_std_C', 'max_min_ratio', 'ratio_vs_ERSSTv5']] = (
+    report_peaks_rounded[['peak_std_C', 'min_std_C', 'max_min_ratio', 'ratio_vs_ERSSTv5']].round(2)
+)
+
+report_exceedance_rounded = report_exceedance.copy()
+report_exceedance_rounded['percent_abs_gt_1'] = (
+    report_exceedance_rounded['percent_abs_gt_1'].round(1)
+)
+
+print("All-month Nino3.4 anomaly standard deviation (degC):")
+print(report_all_std_rounded)
+print("\nModel amplitude comparison:")
+print(report_model_comparison_rounded)
+print("\nRanking (smallest to largest absolute amplitude bias):")
+print(ranking)
+print("\nSeasonal (calendar-month) standard deviations (degC):")
+print(report_seasonal_std_rounded)
+print("\nSeasonal amplitude peaks:")
+print(report_peaks_rounded)
+print("\nStrict exceedance of |Nino3.4 anomaly| > 1 degC:")
+print(report_exceedance_rounded)
+
+# --- visualization ---
+# Visualization code only
+
+colors = {
+    'ERSSTv5': 'black',
+    'CESM2': 'tab:blue',
+    'GFDL-ESM4': 'tab:orange',
+    'MPI-ESM1-2-LR': 'tab:green',
+}
+styles = {
+    'ERSSTv5': '-',
+    'CESM2': '--',
+    'GFDL-ESM4': '-.',
+    'MPI-ESM1-2-LR': ':',
+}
+
+# Figure 1: seasonal cycle of Nino3.4 amplitude
+fig1, ax1 = plt.subplots(figsize=(10, 6), constrained_layout=True)
+
+for src in sources_order:
+    ax1.plot(
+        months,
+        seasonal_std[src].values,
+        label=src,
+        color=colors[src],
+        linestyle=styles[src],
+        linewidth=3.0 if src == 'ERSSTv5' else 1.8,
+        marker='o' if src == 'ERSSTv5' else None,
+        markersize=4,
+    )
+    ax1.scatter(
+        peak_month[src],
+        peak_value[src],
+        s=90,
+        facecolors='none',
+        edgecolors=colors[src],
+        linewidths=2.0,
+        zorder=5,
+    )
+
+# Dummy handle to explain the open-circle markers
+ax1.scatter([], [], s=90, facecolors='none', edgecolors='k', linewidths=2.0, label='peak month')
+
+ax1.set_xticks(months)
+ax1.set_xticklabels(['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'])
+ax1.set_xlabel('Calendar month')
+ax1.set_ylabel('Nino3.4 anomaly standard deviation (°C)')
+ax1.set_title('Seasonal cycle of Nino3.4 amplitude, 1950–2014')
+ax1.grid(True, alpha=0.3)
+ax1.legend(title='Source', loc='best')
+
+# Figure 2: stacked Nino3.4 anomaly time series
+fig2, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True, constrained_layout=True)
+
+all_abs = np.concatenate([np.abs(nino_series[src].values) for src in sources_order])
+ymax = float(np.nanmax(all_abs)) + 0.2
+ymax = max(ymax, 1.2)
+
+for ax, src in zip(axes, sources_order):
+    da = nino_series[src]
+    ax.plot(da.time.values, da.values, color=colors[src], linewidth=1.2)
+    ax.axhline(1.0, color='red', linestyle='--', linewidth=0.8)
+    ax.axhline(-1.0, color='red', linestyle='--', linewidth=0.8)
+    ax.axhline(0.0, color='gray', linestyle=':', linewidth=0.6)
+    ax.set_ylim(-ymax, ymax)
+    ax.set_ylabel('Anomaly (°C)')
+    ax.grid(True, alpha=0.3)
+    ax.set_title(
+        f"{src}: σ = {std_all[src]:.2f} °C; "
+        f"|anom| > 1 °C: {exceed_n[src]}/780 months ({exceed_pct[src]:.1f}%)",
+        loc='left',
+        fontsize=10,
+    )
+
+axes[-1].set_xlabel('Year')
+axes[-1].set_xlim(pd.Timestamp('1950-01-01'), pd.Timestamp('2015-01-01'))
+fig2.suptitle('Nino3.4 SST anomaly time series, 1950–2014', fontsize=14)
+</executed_code>
+
+Here are the results of code execution:
+
+Status Summary:
+- Computation: Success
+- Visualization: Generated
+
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "time_range": [
+        "1950-01",
+        "2014-12"
+      ],
+      "base_period": [
+        "1950-01",
+        "2014-12"
+      ],
+      "lat_box": [
+        -10.0,
+        10.0
+      ],
+      "lon_box": [
+        -180.0,
+        -100.0
+      ],
+      "months": {
+        "type": "ndarray",
+        "shape": [
+          12
+        ],
+        "size": 12,
+        "n_valid": 12,
+        "min": 1.0,
+        "max": 12.0,
+        "mean": 6.5,
+        "std": 3.452052529534663,
+        "values": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ]
+      },
+      "sources_order": [
+        "ERSSTv5",
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "model_names": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "source_specs": {
+        "ERSSTv5": {
+          "dataset": "ersst",
+          "variable": "sst"
+        },
+        "CESM2": {
+          "dataset": "cmip6_historical",
+          "variable": "tos",
+          "model": "CESM2"
+        },
+        "GFDL-ESM4": {
+          "dataset": "cmip6_historical",
+          "variable": "tos",
+          "model": "GFDL-ESM4"
+        },
+        "MPI-ESM1-2-LR": {
+          "dataset": "cmip6_historical",
+          "variable": "tos",
+          "model": "MPI-ESM1-2-LR"
+        }
+      },
+      "nino_series": {
+        "ERSSTv5": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780
+          },
+          "units": "degC",
+          "long_name": "NINO3.4 Index",
+          "size": 780,
+          "n_valid": 780,
+          "min": -2.2286890210067147,
+          "max": 2.6279910818483923,
+          "mean": 6.947377575564145e-08,
+          "std": 0.8489861823386783
+        },
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780
+          },
+          "units": "degC",
+          "long_name": "NINO3.4 Index",
+          "size": 780,
+          "n_valid": 780,
+          "min": -3.3769400119781494,
+          "max": 3.3414218425750732,
+          "mean": 0.0,
+          "std": 1.286546230316162
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780
+          },
+          "units": "degC",
+          "long_name": "NINO3.4 Index",
+          "size": 780,
+          "n_valid": 780,
+          "min": -3.1399917602539062,
+          "max": 3.2713751792907715,
+          "mean": -9.781275345233098e-09,
+          "std": 0.9990545511245728
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780
+          },
+          "units": "degC",
+          "long_name": "NINO3.4 Index",
+          "size": 780,
+          "n_valid": 780,
+          "min": -2.1708648204803467,
+          "max": 2.683715343475342,
+          "mean": 0.0,
+          "std": 0.8541293740272522
+        }
+      },
+      "std_all": {
+        "ERSSTv5": 0.8489861823386781,
+        "CESM2": 1.2865461111068726,
+        "GFDL-ESM4": 0.9990545511245728,
+        "MPI-ESM1-2-LR": 0.8541294932365417
+      },
+      "seasonal_std": {
+        "ERSSTv5": "month\n1     1.081391\n2     0.884227\n3     0.670234\n4     0.596382\n5     0.608908\n6     0.613022\n7     0.675795\n8     0.762765\n9     0.849719\n10    0.987064\n11    1.075558\n12    1.120252\nName: ERSSTv5, dtype: float64",
+        "CESM2": "month\n1     1.623649\n2     1.425894\n3     1.196198\n4     1.072110\n5     1.012580\n6     0.942242\n7     0.978472\n8     1.086434\n9     1.242738\n10    1.398661\n11    1.560192\n12    1.620790\nName: CESM2, dtype: float64",
+        "GFDL-ESM4": "month\n1     1.126868\n2     1.059687\n3     0.964063\n4     0.912426\n5     0.840661\n6     0.780579\n7     0.746512\n8     0.853557\n9     0.978319\n10    1.111839\n11    1.211994\n12    1.248413\nName: GFDL-ESM4, dtype: float64",
+        "MPI-ESM1-2-LR": "month\n1     0.956197\n2     0.906990\n3     0.780660\n4     0.824846\n5     0.855594\n6     0.779462\n7     0.711461\n8     0.740754\n9     0.767668\n10    0.863445\n11    0.966959\n12    1.031186\nName: MPI-ESM1-2-LR, dtype: float64"
+      },
+      "peak_month": {
+        "ERSSTv5": 12,
+        "CESM2": 1,
+        "GFDL-ESM4": 12,
+        "MPI-ESM1-2-LR": 12
+      },
+      "peak_value": {
+        "ERSSTv5": 1.1202521426444283,
+        "CESM2": 1.6236494779586792,
+        "GFDL-ESM4": 1.248412847518921,
+        "MPI-ESM1-2-LR": 1.0311859846115112
+      },
+      "min_month": {
+        "ERSSTv5": 4,
+        "CESM2": 6,
+        "GFDL-ESM4": 7,
+        "MPI-ESM1-2-LR": 7
+      },
+      "min_value": {
+        "ERSSTv5": 0.5963815046349229,
+        "CESM2": 0.942241907119751,
+        "GFDL-ESM4": 0.7465123534202576,
+        "MPI-ESM1-2-LR": 0.7114609479904175
+      },
+      "season_ratio": {
+        "ERSSTv5": 1.8784152994989252,
+        "CESM2": 1.7231768887480898,
+        "GFDL-ESM4": 1.6723271112649796,
+        "MPI-ESM1-2-LR": 1.4493922505854813
+      },
+      "exceed_n_pos": {
+        "ERSSTv5": 85,
+        "CESM2": 176,
+        "GFDL-ESM4": 124,
+        "MPI-ESM1-2-LR": 107
+      },
+      "exceed_n_neg": {
+        "ERSSTv5": 85,
+        "CESM2": 184,
+        "GFDL-ESM4": 113,
+        "MPI-ESM1-2-LR": 92
+      },
+      "exceed_n": {
+        "ERSSTv5": 170,
+        "CESM2": 360,
+        "GFDL-ESM4": 237,
+        "MPI-ESM1-2-LR": 199
+      },
+      "exceed_pct": {
+        "ERSSTv5": 21.794871794871796,
+        "CESM2": 46.15384615384615,
+        "GFDL-ESM4": 30.384615384615383,
+        "MPI-ESM1-2-LR": 25.51282051282051
+      },
+      "obs_std": 0.8489861823386781,
+      "bias": {
+        "CESM2": 0.4375599287681945,
+        "GFDL-ESM4": 0.1500683687858947,
+        "MPI-ESM1-2-LR": 0.005143310897863684
+      },
+      "ratio": {
+        "CESM2": 1.5153911075005493,
+        "GFDL-ESM4": 1.176761850672888,
+        "MPI-ESM1-2-LR": 1.006058179749988
+      },
+      "ranking": [
+        "MPI-ESM1-2-LR",
+        "GFDL-ESM4",
+        "CESM2"
+      ],
+      "report_all_std": "ERSSTv5          0.848986\nCESM2            1.286546\nGFDL-ESM4        0.999055\nMPI-ESM1-2-LR    0.854129\nName: std_all_C, dtype: float64",
+      "report_model_comparison": "           model     std_C    bias_C     ratio  abs_bias_C  rank_abs_bias\n0  MPI-ESM1-2-LR  0.854129  0.005143  1.006058    0.005143              1\n1      GFDL-ESM4  0.999055  0.150068  1.176762    0.150068              2\n2          CESM2  1.286546  0.437560  1.515391    0.437560              3",
+      "report_seasonal_std": "        ERSSTv5     CESM2  GFDL-ESM4  MPI-ESM1-2-LR\nmonth                                              \n1      1.081391  1.623649   1.126868       0.956197\n2      0.884227  1.425894   1.059687       0.906990\n3      0.670234  1.196198   0.964063       0.780660\n4      0.596382  1.072110   0.912426       0.824846\n5      0.608908  1.012580   0.840661       0.855594\n6      0.613022  0.942242   0.780579       0.779462\n7      0.675795  0.978472   0.746512       0.711461\n8      0.762765  1.086434   0.853557       0.740754\n9      0.849719  1.242738   0.978319       0.767668\n10     0.987064  1.398661   1.111839       0.863445\n11     1.075558  1.560192   1.211994       0.966959\n12     1.120252  1.620790   1.248413       1.031186",
+      "report_peaks": "          source  peak_month  ...  same_peak_month_as_ERSSTv5  ratio_vs_ERSSTv5\n0        ERSSTv5          12  ...                        True          1.000000\n1          CESM2           1  ...                       False          0.917357\n2      GFDL-ESM4          12  ...                        True          0.890286\n3  MPI-ESM1-2-LR          12  ...                        True          0.771604\n\n[4 rows x 8 columns]",
+      "report_exceedance": "          source  n_gt_plus1  n_lt_minus1  n_abs_gt_1  percent_abs_gt_1\n0        ERSSTv5          85           85         170         21.794872\n1          CESM2         176          184         360         46.153846\n2      GFDL-ESM4         124          113         237         30.384615\n3  MPI-ESM1-2-LR         107           92         199         25.512821",
+      "report_all_std_rounded": "ERSSTv5          0.85\nCESM2            1.29\nGFDL-ESM4        1.00\nMPI-ESM1-2-LR    0.85\nName: std_all_C, dtype: float64",
+      "report_model_comparison_rounded": "           model  std_C  bias_C  ratio  abs_bias_C  rank_abs_bias\n0  MPI-ESM1-2-LR   0.85    0.01   1.01        0.01              1\n1      GFDL-ESM4   1.00    0.15   1.18        0.15              2\n2          CESM2   1.29    0.44   1.52        0.44              3",
+      "report_seasonal_std_rounded": "       ERSSTv5  CESM2  GFDL-ESM4  MPI-ESM1-2-LR\nmonth                                          \n1         1.08   1.62       1.13           0.96\n2         0.88   1.43       1.06           0.91\n3         0.67   1.20       0.96           0.78\n4         0.60   1.07       0.91           0.82\n5         0.61   1.01       0.84           0.86\n6         0.61   0.94       0.78           0.78\n7         0.68   0.98       0.75           0.71\n8         0.76   1.09       0.85           0.74\n9         0.85   1.24       0.98           0.77\n10        0.99   1.40       1.11           0.86\n11        1.08   1.56       1.21           0.97\n12        1.12   1.62       1.25           1.03",
+      "report_peaks_rounded": "          source  peak_month  ...  same_peak_month_as_ERSSTv5  ratio_vs_ERSSTv5\n0        ERSSTv5          12  ...                        True              1.00\n1          CESM2           1  ...                       False              0.92\n2      GFDL-ESM4          12  ...                        True              0.89\n3  MPI-ESM1-2-LR          12  ...                        True              0.77\n\n[4 rows x 8 columns]",
+      "report_exceedance_rounded": "          source  n_gt_plus1  n_lt_minus1  n_abs_gt_1  percent_abs_gt_1\n0        ERSSTv5          85           85         170              21.8\n1          CESM2         176          184         360              46.2\n2      GFDL-ESM4         124          113         237              30.4\n3  MPI-ESM1-2-LR         107           92         199              25.5"
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_no_knowledge_20261020/T1_deepseek-flash_20261025_062117/turn01/figures/visualization_T1_deepseek-flash_20261025_062117_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_no_knowledge_20261020/T1_deepseek-flash_20261025_062117/turn01/figures/visualization_T1_deepseek-flash_20261025_062117_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Please provide a clear scientific summary inside <solution></solution> tags.
+
+Describe the methodology strictly from the <executed_code> above, never by inferring it from variable
+names: the baseline period, the source of any climatology, the weighting, the units, the region and
+time range, the range of lags — all of it must match the tools and arguments the code actually
+called. Do not report a step the code did not take. Where a variable name in the observation is
+ambiguous, the code decides what it means.
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
+4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, tool choice, computation and visualization attempts
+3. Suggestions for how to reformulate the query
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+**Direct answer.** The three CMIP6 historical runs differ substantially in simulated ENSO amplitude. Using the monthly Niño 3.4 anomaly over 1950-01 to 2014-12, ERSSTv5 has a standard deviation of **0.85 °C**. MPI-ESM1-2-LR is closest (**0.85 °C**, bias **+0.01 °C**, ratio **1.01**), GFDL-ESM4 is somewhat high (**1.00 °C**, bias **+0.15 °C**, ratio **1.18**), and CESM2 is strongly high (**1.29 °C**, bias **+0.44 °C**, ratio **1.52**). Ranking by smallest to largest absolute amplitude bias: **MPI-ESM1-2-LR, GFDL-ESM4, CESM2**.
+
+**Methodology actually used.** The analysis loaded ERSSTv5 monthly `sst` via `dataset='ersst'` and CMIP6 historical monthly `tos` via `dataset='cmip6_historical'` for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR. All sources were loaded for **1950-01 to 2014-12** on their native grids, first over latitude **-10 to 10°** and longitude **-180 to -100°**. The Niño 3.4 index was then formed with `compute_enso_nino_index` using `nino_region='nino3.4'`, `anomaly_freq='month'`, `climatology='self'`, and `base_period=['1950-01','2014-12']`, yielding exactly **780** monthly values per source. Anomalies are in **°C** relative to the 1950–2014 calendar-month climatology. No regridding was done by the executed code, and no lag analysis was performed. Standard deviations were computed with `compute_basic_stat(op='std')` over all 780 months and over each calendar-month subset of 65 values; the reported values are the requested population standard deviations. Strict exceedance was counted with `compute_exceedance_fraction`: anomalies **> +1.0 °C**, anomalies **< -1.0 °C**, and checked against an absolute-threshold count.
+
+**All-month Niño 3.4 anomaly standard deviation (1950–2014):**
+
+| Source | Std. dev. (°C) |
+|---|---:|
+| ERSSTv5 | 0.85 |
+| CESM2 | 1.29 |
+| GFDL-ESM4 | 1.00 |
+| MPI-ESM1-2-LR | 0.85 |
+
+**Model amplitude comparison against ERSSTv5:**
+
+| Model | Std. dev. (°C) | Bias, model − ERSSTv5 (°C) | Ratio, model / ERSSTv5 | Rank by absolute bias |
+|---|---:|---:|---:|---:|
+| MPI-ESM1-2-LR | 0.85 | +0.01 | 1.01 | 1 |
+| GFDL-ESM4 | 1.00 | +0.15 | 1.18 | 2 |
+| CESM2 | 1.29 | +0.44 | 1.52 | 3 |
+
+**Calendar-month standard deviations of the Niño 3.4 anomaly (°C):**
+
+| Month | ERSSTv5 | CESM2 | GFDL-ESM4 | MPI-ESM1-2-LR |
+|---|---:|---:|---:|---:|
+| Jan | 1.08 | 1.62 | 1.13 | 0.96 |
+| Feb | 0.88 | 1.43 | 1.06 | 0.91 |
+| Mar | 0.67 | 1.20 | 0.96 | 0.78 |
+| Apr | 0.60 | 1.07 | 0.91 | 0.82 |
+| May | 0.61 | 1.01 | 0.84 | 0.86 |
+| Jun | 0.61 | 0.94 | 0.78 | 0.78 |
+| Jul | 0.68 | 0.98 | 0.75 | 0.71 |
+| Aug | 0.76 | 1.09 | 0.85 | 0.74 |
+| Sep | 0.85 | 1.24 | 0.98 | 0.77 |
+| Oct | 0.99 | 1.40 | 1.11 | 0.86 |
+| Nov | 1.08 | 1.56 | 1.21 | 0.97 |
+| Dec | 1.12 | 1.62 | 1.25 | 1.03 |
+
+**Seasonal amplitude peaks and phase locking:**
+
+| Source | Peak month | Peak std. dev. (°C) | Minimum month | Minimum std. dev. (°C) | Max/min ratio | Reproduces observed peak month? | Ratio vs ERSSTv5 max/min |
+|---|---:|---:|---:|---:|---:|---|---:|
+| ERSSTv5 | Dec | 1.12 | Apr | 0.60 | 1.88 | — | 1.00 |
+| CESM2 | Jan | 1.62 | Jun | 0.94 | 1.72 | No | 0.92 |
+| GFDL-ESM4 | Dec | 1.25 | Jul | 0.75 | 1.67 | Yes | 0.89 |
+| MPI-ESM1-2-LR | Dec | 1.03 | Jul | 0.71 | 1.45 | Yes | 0.77 |
+
+The observed seasonal phase locking peaks in **December** with a max/min ratio of **1.88**. GFDL-ESM4 and MPI-ESM1-2-LR both reproduce the December peak month but with weaker phase-locking strength, ratios **1.67** and **1.45**, respectively. CESM2 peaks in **January** rather than December and has a ratio of **1.72**, so it does not reproduce the observed peak month, though its seasonal contrast is closer to observed than the other two models.
+
+**Strict exceedance of |Niño 3.4 anomaly| > 1.0 °C:**
+
+| Source | Months > +1.0 °C | Months < -1.0 °C | Total | Percentage of 780 months |
+|---|---:|---:|---:|---:|
+| ERSSTv5 | 85 | 85 | 170 | 21.8% |
+| CESM2 | 176 | 184 | 360 | 46.2% |
+| GFDL-ESM4 | 124 | 113 | 237 | 30.4% |
+| MPI-ESM1-2-LR | 107 | 92 | 199 | 25.5% |
+
+All three models exceed the observed frequency of strong Niño 3.4 anomalies. CESM2 has the largest overestimate: **46.2%** of months versus **21.8%** in ERSSTv5. GFDL-ESM4 is intermediate at **30.4%**, and MPI-ESM1-2-LR is closest at **25.5%**, despite having an all-month standard deviation nearly identical to the observations. Thus amplitude in the total standard deviation and the frequency of large excursions are related but not identical diagnostics.
+
+**Visualizations.** Figure 1 is the seasonal-cycle amplitude plot: calendar month January–December on the x-axis and the 12 calendar-month Niño 3.4 standard deviations in °C on the y-axis, with four curves on one axis. ERSSTv5 is visually distinct using a thick black line with markers, while the three models use separate line styles/colors; each curve’s peak month is marked with an open circle. Figure 2 consists of four stacked time-series panels in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, sharing the 1950–2014 time axis. Each panel plots that source’s Niño 3.4 anomaly series on the same y-axis range, includes ±1.0 °C reference lines, and annotates the panel with its all-month standard deviation and strict exceedance percentage/count.
+</solution>

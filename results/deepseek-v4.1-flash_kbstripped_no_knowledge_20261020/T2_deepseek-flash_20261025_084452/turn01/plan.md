@@ -1,0 +1,22 @@
+# Plan
+
+1. Load ERSSTv5 monthly SST (`ersst`, variable `sst`) with `load_regular_data` for 1950-01 to 2023-12 over the Nino 3.4 box 5S-5N, 170W-120W, on the native 2-degree grid. Also load separate ERSSTv5 subsets for 1991-2020 and 1981-2010 over the same box for the two climatologies.
+2. Compute the area-weighted spatial mean SST over the Nino 3.4 box for each month using `compute_basic_stat` with its spatial weighting, reducing latitude and longitude. This gives the full 1950-2023 regional SST series and the two baseline-period regional SST series.
+3. Use `temporal_aggregate` on the 1991-2020 and 1981-2010 regional mean series to compute climatological-monthly values, i.e. 12 monthly climatologies for each baseline.
+4. Subtract the matching calendar-month climatology from the full regional SST series to form RECON_9120 (relative to 1991-2020) and RECON_8110 (relative to 1981-2010). Keep all intermediate values unrounded.
+5. Load CPC indices with `load_regular_data`: product `ersst5_91-20`, Nino 3.4 anomaly column, 1950-2023 as CPC_9120; product `ersst5_81-10`, Nino 3.4 anomaly column, same period as CPC_8110; product `oni`, official 3-month running index, same period as CPC_ONI.
+6. Align RECON_9120 and CPC_9120 over common months 1950-01 to 2023-12. Use `analyze_correlation` for the Pearson correlation to 6 decimal places. Use `compute_difference_metrics` for RMSE to 4 decimal places, the largest absolute deviation to 4 decimal places, and the year/month where that largest deviation occurs.
+7. Use `temporal_aggregate` to compute the 3-month centred running mean of RECON_9120. Use `detect_threshold_events` on this running-mean series with threshold +0.5 degC and retain episodes lasting at least 5 consecutive overlapping 3-month seasons to identify El Nino events. Count them, sort by peak value, and report the three largest peaks with peak year/month and peak value to 2 decimal places. Also detect La Nina events with threshold -0.5 degC and the same 5-season minimum for shading.
+8. Use `detect_threshold_events` on CPC_ONI directly with the same +0.5 degC threshold and 5-season minimum to count El Nino events and report the three largest peaks with year/month and peak value to 2 decimal places. Compare this count with the RECON_9120 count and state why they differ.
+9. Compute the mean baseline offsets over 1950-01 to 2020-12 using `compute_basic_stat` as unweighted time means: mean(RECON_8110 - RECON_9120) and mean(CPC_8110 - CPC_9120). Report each to 3 decimal places and report their difference/agreement.
+10. Build Figure 1 with custom plotting code: two rows sharing a 1950-2023 time axis. Upper row overlays RECON_9120, CPC_9120, the RECON 3-month running mean, +0.5 and -0.5 degC thresholds, with warm shading between the +0.5 threshold and the running mean during detected El Nino events and cool shading between the -0.5 threshold and the running mean during detected La Nina events. Lower row shows RECON_9120 minus CPC_9120 on its own vertical scale. Label both vertical axes in degC.
+11. Build Figure 2 with custom plotting code: square scatter plot of RECON_9120 (y) against CPC_9120 (x), one point per common month, identical axis ranges and ticks, a 1:1 reference line, and the Pearson correlation and RMSE annotated from step 6.
+
+Other notes:
+- Report Pearson correlation to 6 decimal places, RMSE and largest absolute deviation to 4 decimal places, event counts/peaks under the stated ONI criterion, and baseline offsets to 3 decimal places.
+- The ONI criterion used here is at least 5 consecutive overlapping 3-month seasons, using the 3-month centred running mean, at or above +0.5 degC for El Nino and at or below -0.5 degC for La Nina; shorter episodes are excluded.
+- RECON_9120 and RECON_8110 use fixed 1991-2020 and 1981-2010 monthly climatologies respectively, computed from ERSSTv5 over the Nino 3.4 box.
+- CPC ONI is the official 3-month running index with its own base-period and processing choices, so its event count can differ from a fixed-baseline RECON_9120 reconstruction even under the same threshold rule.
+- Baseline offset sign is 1981-2010 minus 1991-2020; a positive offset means the older baseline is cooler than the newer one.
+- The largest-deviation month is the month of maximum absolute RECON_9120 minus CPC_9120, not the signed maximum.
+- Each event peak month is the month of the maximum 3-month running-mean value within that qualifying event.

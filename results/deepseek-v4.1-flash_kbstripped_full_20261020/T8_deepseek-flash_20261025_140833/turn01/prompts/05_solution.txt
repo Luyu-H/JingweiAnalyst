@@ -1,0 +1,2282 @@
+# exchange 5: solution
+# elapsed: 20.7 s
+
+===== SYSTEM =====
+
+The user's question:
+Evaluate the ocean carbon system of three CMIP6 models against the GLODAPv2.2016b mapped climatology: dissolved inorganic carbon, total alkalinity and pH.
+
+Data to use:
+- CMIP6 historical `dissic`, `talk`, `ph`, `thetao` and `so` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, for the calendar year 2002, plus `dissic`, `thetao` and `so` for 1971-2000.
+- Each model's own areacello and volcello.
+- GLODAPv2.2016b mapped climatology: TCO2, TAlk and pH.
+
+Expected numerical results, with the models taken as their 2002 annual mean unless stated otherwise, and model DIC and alkalinity compared in micromoles per kilogram:
+- The global mean over 0-50 m of DIC and of total alkalinity for each model and for GLODAP (for every source one mean over all its 0-50 m cells), in micromoles per kilogram to the nearest whole unit, and each model's difference from GLODAP.
+- The same 0-50 m mean for pH on the total scale, to 3 decimal places, and each model's difference from GLODAP.
+- For the map of 0-50 m mean DIC (each cell's mean over its own 0-50 m levels), compared on the GLODAP 1-degree grid: each model's mean bias and RMSE in micromoles per kilogram to the nearest whole unit, and the spatial correlation to 3 decimal places.
+- For each model, the global mean DIC bias (model minus GLODAP) at 0, 100, 500, 1000 and 2000 m, compared on the GLODAP 1-degree grid and averaged, at each depth, over every cell where that model and GLODAP are both defined at that depth, in micromoles per kilogram to the nearest whole unit.
+- For each model, the period change of the global 0-50 m mean DIC, 2002 minus the 1971-2000 average, in micromoles per kilogram to the nearest whole unit, and its ratio to that model's 0-50 m DIC difference from GLODAP as defined in the first item to 2 decimal places, with what that implies for reading the bias as a model error.
+- Which model reproduces the observed carbon system best, and whether the three models' errors in DIC, alkalinity and pH are consistent in sign.
+
+Expected visualizations:
+- Figure 1, three global maps in one row, one per model, of the 0-50 m DIC bias against GLODAP on the cells of the map comparison, with one diverging colour scale centred on zero shared by all three panels and labelled in micromoles per kilogram.
+- Figure 2, a single panel of the vertical profile of the global mean DIC bias: depth on the vertical axis increasing downward, bias in micromoles per kilogram on the horizontal axis, one line per model, a vertical zero reference line, and the five sampled depths marked.
+
+The analysis plan:
+1. Load the sources. Use `load_regular_data` for `cmip6_historical` with models CESM2, GFDL-ESM4 and MPI-ESM1-2-LR: `dissic`, `talk`, `ph`, `thetao`, `so` monthly for 2002, and `dissic`, `thetao`, `so` monthly for 1971-2000. Use `load_climatology_data` for `glodap` `TCO2`, `TAlk` and `pH` (`pHtsinsitutp`). Load each model’s `areacello` with `load_areas`, `volcello` with `load_volumes_for_cmip6`, and depth levels/layer boundaries with `load_depth_levels`.
+   - Note [missing-values-and-land-cells]: read through xarray so the 1e20 fill becomes NaN; build each field’s valid mask from the field itself and apply that same mask to its weights; a value near 1e20 is an unmasked fill, not a result.
+   - Note [cmip6-carbonate-system-definitions]: `dissic` is total dissolved inorganic carbon, `talk` is total alkalinity with the OMIP terms, and `ph` is in-situ pH on the TOTAL scale; GLODAP `pHtsinsitutp` is also total-scale in-situ pH.
+
+2. Aggregate time and convert units. Use `temporal_aggregate` to form the 2002 annual means of `dissic`, `talk`, `ph`, `thetao`, `so`, and the 1971-2000 day-weighted long-term means of `dissic`, `thetao`, `so` for each model. For model `dissic` and `talk`, compute in-situ density from `thetao`/`so` with `compute_potential_density_anomaly(ref_pressure=None)`, then use `transform_unit` to convert to micromoles per kilogram with that density; record `attrs['density_assumption']`. GLODAP `TCO2`/`TAlk` are already micromoles per kilogram; pH needs no unit conversion.
+   - Note [cmip6-bgc-units-per-volume]: convert model `dissic`/`talk` as µmol kg-1 = mmol m-3 × 1000 / rho using in-situ density from `compute_potential_density_anomaly` with `ref_pressure=None`; do not treat GLODAP values converted by mol m-3 × 1e3 as µmol kg-1 without dividing by density.
+
+3. Compute the 0-50 m global means. For each model and for GLODAP, use `compute_basic_stat` with `op='volume_weighted_mean'` over all 0-50 m cells for DIC/TCO2, TAlk and pH, using each source’s own cell measures (CMIP6 `areacello`/`volcello`; GLODAP area and layer thickness). Form each model-minus-GLODAP difference for DIC, TAlk and pH.
+   - Note [omip-weighted-means-and-integrals]: use `volume_weighted_mean` for means whose dimensions include depth and `area_weighted_mean` for horizontal means; `compute_difference_metrics` weights by area by default and `analyze_correlation` needs `weighting='area'`; a plain lat-lon mean over-weights polar cells.
+   - Note [omip-native-grid-vs-regridded]: compute the global means and the 2002-minus-(1971-2000) DIC change on each model’s own grid with its own cell measures; regrid only for the map comparison using `'conservative'`, state the method, and interpolate the five sampled depths with `regrid_vertical`, not by nearest-level selection.
+
+4. Build the 0-50 m DIC map comparison. For each model and GLODAP, compute the per-cell 0-50 m mean of DIC/TCO2 with `compute_basic_stat(op='volume_weighted_mean')` over depth only. Use `regrid_horizontal` to put each model field on the GLODAP 1-degree grid with `'conservative'`. Use `build_comparison_mask` across the model and GLODAP maps with `ocean_only=False`, and report the mask cell counts. On that common mask, use `compute_difference_metrics` for model-minus-GLODAP mean bias and RMSE, and `analyze_correlation` with `weighting='area'` for spatial correlation.
+   - Note [common-comparison-mask]: put all fields on the GLODAP 1-degree grid and apply one shared mask from `build_comparison_mask` before the map bias/RMSE/correlation; the reference is GLODAP, so pass `ocean_only=False`; report the mask cell counts; the difference of the separately taken per-source 0-50 m means is not this shared-mask map bias; for the vertical profile the stated pairwise depth mask applies and those numbers must not be ranked.
+
+5. Compute the vertical DIC bias profile. For each model 2002 annual mean DIC and GLODAP TCO2, use `regrid_vertical` to interpolate both products to 0, 100, 500, 1000 and 2000 m, following [omip-native-grid-vs-regridded]. Use `regrid_horizontal` to put the model profiles on the GLODAP 1-degree grid with `'conservative'`. At each depth, build the pairwise valid mask where model and GLODAP are both defined, and use `compute_difference_metrics` (area-weighted by default) for the global mean model-minus-GLODAP bias over those cells; retain the values for Figure 2.
+
+6. Compute the DIC period change and ratio. On each model’s native grid with its own cell measures ([omip-native-grid-vs-regridded]), compute the global 0-50 m volume-weighted mean DIC for the 2002 annual mean and for the 1971-2000 long-term mean, then take 2002 minus 1971-2000. Use `compute_ratio` to divide this change by that model’s 0-50 m DIC difference from GLODAP in step 3. Interpret the ratio: a value of order one or larger means the temporal change is comparable to or larger than the bias, so the 2002 bias cannot be read simply as a static model error; a small ratio leaves the bias as the more likely model-error signal.
+
+7. Synthesize. Compare the absolute DIC bias/RMSE/correlation and the TAlk and pH 0-50 m differences across CESM2, GFDL-ESM4 and MPI-ESM1-2-LR; identify the model with the smallest overall carbon-system errors and state whether the signs of the model-minus-GLODAP differences in DIC, TAlk and pH agree across the three models. Keep unrounded intermediate values and round only at reporting.
+
+8. Make Figure 1 from the step 4 bias maps: three panels, one per model, shared diverging colour scale centred on zero, labelled in µmol kg-1. Make Figure 2 from the step 5 profiles: depth downward, bias on the horizontal axis, one line per model, a vertical zero line, and the five sampled depths marked. Plotting is own code because no listed tool covers figures.
+
+Other notes:
+- [cmip6-grid-labels] GFDL-ESM4 is `gr`: its “native” values are already remapped to a 180×360 1-degree archive grid with a regridded land–sea mask, so its budgets are only approximately conservative.
+- The pH comparison is on the total scale in situ; no pH unit conversion is applied.
+- The step 6 ratio contrasts a 2002-minus-1971-2000 temporal change with a 2002-minus-GLODAP bias; it is diagnostic of whether the bias could be period/background related, not proof of cause.
+- Report the common-mask cell counts with Figure 1 and state that the step 3 global 0-50 m means use each source’s own valid cells.
+
+The code that actually ran and produced the results below:
+<executed_code>
+# =============================================================================
+# Ocean carbon system of three CMIP6 models vs GLODAPv2.2016b
+# DIC (dissic / TCO2), total alkalinity (talk / TAlk), pH (ph / pHtsinsitutp)
+# =============================================================================
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+dsid = "cmip6_historical"
+VAR2002 = ["dissic", "talk", "ph", "thetao", "so"]
+VARHIST = ["dissic", "thetao", "so"]
+
+
+def scalar(da):
+    """Materialise a (possibly dask-backed) reduction into a plain float."""
+    return float(np.asarray(da.compute()).squeeze())
+
+
+# -----------------------------------------------------------------------------
+# 1. Load the sources (global fields only: the conservative regridding needs
+#    the full source grid)
+# -----------------------------------------------------------------------------
+raw = {m: {} for m in models}
+for m in models:
+    for v in VAR2002:
+        raw[m][v] = load_regular_data(dataset=dsid, variable=v, model=m,
+                                      time_range=["2002-01", "2002-12"])
+    for v in VARHIST:
+        raw[m]["hist_" + v] = load_regular_data(dataset=dsid, variable=v, model=m,
+                                                time_range=["1971-01", "2000-12"])
+
+# GLODAP mapped climatology (no time axis)
+g_tco2 = load_climatology_data(dataset="glodap", variable="TCO2")
+g_talk = load_climatology_data(dataset="glodap", variable="TAlk")
+g_ph = load_climatology_data(dataset="glodap", variable="pHtsinsitutp")
+
+# -----------------------------------------------------------------------------
+# 2. Time aggregation (2002 annual mean; 1971-2000 day-weighted long-term mean)
+#    and unit conversion of the volume-basis CMIP6 carbon fields to umol/kg.
+# -----------------------------------------------------------------------------
+ann = {m: {} for m in models}
+for m in models:
+    for v in VAR2002:
+        ann[m][v] = temporal_aggregate(raw[m][v], freq="mean", op="mean")
+    for v in VARHIST:
+        ann[m]["hist_" + v] = temporal_aggregate(raw[m]["hist_" + v], freq="mean", op="mean")
+
+for m in models:
+    # in-situ density anomaly from the matching 2002 thetao/so
+    rho02 = compute_potential_density_anomaly(ann[m]["thetao"], ann[m]["so"], ref_pressure=None)
+    ann[m]["rho2002"] = rho02
+    ann[m]["dissic_umol"] = transform_unit(
+        ann[m]["dissic"], from_unit=ann[m]["dissic"].attrs.get("units", "mol m-3"),
+        to_unit="umol/kg", density=rho02)
+    ann[m]["talk_umol"] = transform_unit(
+        ann[m]["talk"], from_unit=ann[m]["talk"].attrs.get("units", "mol m-3"),
+        to_unit="umol/kg", density=rho02)
+    ann[m]["ph"] = ann[m]["ph"]                      # no unit conversion (total scale, in situ)
+
+    # same for the 1971-2000 mean state (used only for the period change)
+    rhoh = compute_potential_density_anomaly(ann[m]["hist_thetao"], ann[m]["hist_so"], ref_pressure=None)
+    ann[m]["hist_rho"] = rhoh
+    ann[m]["hist_dissic_umol"] = transform_unit(
+        ann[m]["hist_dissic"], from_unit=ann[m]["hist_dissic"].attrs.get("units", "mol m-3"),
+        to_unit="umol/kg", density=rhoh)
+    ann[m]["hist_dissic_umol"] = ann[m]["hist_dissic_umol"].assign_attrs(
+        density_assumption=ann[m]["dissic_umol"].attrs.get("density_assumption", "in-situ density field"))
+
+# -----------------------------------------------------------------------------
+# 3. Global 0-50 m means, each source over its own valid cells
+# -----------------------------------------------------------------------------
+DIC_0_50, TALK_0_50, PH_0_50 = {}, {}, {}
+for m in models:
+    DIC_0_50[m] = scalar(compute_basic_stat(ann[m]["dissic_umol"].sel(depth=slice(0, 50)),
+                                            op="volume_weighted_mean"))
+    TALK_0_50[m] = scalar(compute_basic_stat(ann[m]["talk_umol"].sel(depth=slice(0, 50)),
+                                             op="volume_weighted_mean"))
+    PH_0_50[m] = scalar(compute_basic_stat(ann[m]["ph"].sel(depth=slice(0, 50)),
+                                           op="volume_weighted_mean"))
+
+DIC_0_50["GLODAP"] = scalar(compute_basic_stat(g_tco2.sel(depth=slice(0, 50)), op="volume_weighted_mean"))
+TALK_0_50["GLODAP"] = scalar(compute_basic_stat(g_talk.sel(depth=slice(0, 50)), op="volume_weighted_mean"))
+PH_0_50["GLODAP"] = scalar(compute_basic_stat(g_ph.sel(depth=slice(0, 50)), op="volume_weighted_mean"))
+
+DIC_0_50_bias = {m: DIC_0_50[m] - DIC_0_50["GLODAP"] for m in models}
+TALK_0_50_bias = {m: TALK_0_50[m] - TALK_0_50["GLODAP"] for m in models}
+PH_0_50_bias = {m: PH_0_50[m] - PH_0_50["GLODAP"] for m in models}
+
+# -----------------------------------------------------------------------------
+# 4. Map comparison: per-cell 0-50 m mean DIC, regridded conservatively onto the
+#    GLODAP 1-degree grid, one shared mask, then bias / RMSE / spatial pattern
+# -----------------------------------------------------------------------------
+map_nat = {}
+for m in models:
+    map_nat[m] = compute_basic_stat(ann[m]["dissic_umol"].sel(depth=slice(0, 50)),
+                                    op="volume_weighted_mean", dim="depth")
+map_nat["GLODAP"] = compute_basic_stat(g_tco2.sel(depth=slice(0, 50)),
+                                       op="volume_weighted_mean", dim="depth")
+
+map_reg = {}
+for m in models:
+    map_reg[m] = regrid_horizontal(map_nat[m], target="glodap", method="conservative")
+map_reg["GLODAP"] = map_nat["GLODAP"]
+
+common_mask = build_comparison_mask([map_reg[m] for m in models] + [map_reg["GLODAP"]],
+                                    ocean_only=False)
+mask_n = int(common_mask.sum().compute())
+mask_total = int(common_mask.size)
+
+map_metrics = {}
+bias_maps = {}
+for m in models:
+    a = map_reg[m].where(common_mask)
+    b = map_reg["GLODAP"].where(common_mask)
+    dm = compute_difference_metrics(data=a, reference=b, dim=["lat", "lon"])
+    cor = analyze_correlation(a, b, dim=["lat", "lon"], weighting="area")
+    map_metrics[m] = {
+        "bias": float(dm["bias"]),
+        "rmse": float(dm["rmse"]),
+        "centered_rmse": float(dm["centered_rmse"]),
+        "mae": float(dm["mae"]),
+        "std_ratio": float(dm["std_ratio"]),
+        "n_valid": int(dm["n_valid"]),
+        "correlation": float(cor["correlation"].compute()),
+        "pvalue": float(cor["pvalue"].compute()),
+    }
+    bias_maps[m] = (map_reg[m].where(common_mask) - map_reg["GLODAP"].where(common_mask)).compute()
+
+# -----------------------------------------------------------------------------
+# 5. Vertical DIC bias profile on the GLODAP 1-degree grid
+# -----------------------------------------------------------------------------
+profile_depths = [0, 100, 500, 1000, 2000]
+prof = {}
+for m in models:
+    p = regrid_vertical(ann[m]["dissic_umol"], target=profile_depths, method="linear",
+                        fill_surface=True)
+    prof[m] = regrid_horizontal(p, target="glodap", method="conservative")
+prof["GLODAP"] = regrid_vertical(g_tco2, target=profile_depths, method="linear", fill_surface=True)
+
+vert_bias = {m: {} for m in models}
+vert_ncells = {m: {} for m in models}
+for m in models:
+    for d in profile_depths:
+        a = prof[m].sel(depth=d, method="nearest")
+        b = prof["GLODAP"].sel(depth=d, method="nearest")
+        valid = a.notnull() & b.notnull()
+        vert_ncells[m][d] = int(valid.sum().compute())
+        dm = compute_difference_metrics(data=a, reference=b, dim=["lat", "lon"])
+        vert_bias[m][d] = float(dm["bias"])
+
+# -----------------------------------------------------------------------------
+# 6. DIC period change (native grid, own cell measures) and its ratio to the
+#    2002 0-50 m DIC bias
+# -----------------------------------------------------------------------------
+DIC_2002_glob = {}
+DIC_hist_glob = {}
+for m in models:
+    DIC_2002_glob[m] = scalar(compute_basic_stat(ann[m]["dissic_umol"].sel(depth=slice(0, 50)),
+                                                 op="volume_weighted_mean"))
+    DIC_hist_glob[m] = scalar(compute_basic_stat(ann[m]["hist_dissic_umol"].sel(depth=slice(0, 50)),
+                                                 op="volume_weighted_mean"))
+
+DIC_change = {m: DIC_2002_glob[m] - DIC_hist_glob[m] for m in models}
+DIC_change_ratio = {m: DIC_change[m] / DIC_0_50_bias[m] for m in models}
+DIC_change_ratio_via_tool = {
+    m: scalar(compute_ratio(xr.DataArray(DIC_change[m], attrs={"units": "umol/kg"}),
+                            xr.DataArray(DIC_0_50_bias[m], attrs={"units": "umol/kg"})))
+    for m in models
+}
+
+# -----------------------------------------------------------------------------
+# 7. Synthesis: rank models by overall carbon-system error, check sign agreement
+# -----------------------------------------------------------------------------
+def _zrank(values, higher_is_worse=True):
+    order = np.argsort(values)
+    return order
+
+dic_bias_abs = {m: abs(DIC_0_50_bias[m]) for m in models}
+talk_bias_abs = {m: abs(TALK_0_50_bias[m]) for m in models}
+ph_bias_abs = {m: abs(PH_0_50_bias[m]) for m in models}
+rmse_rank = {m: map_metrics[m]["rmse"] for m in models}
+corr_rank = {m: map_metrics[m]["correlation"] for m in models}
+
+# integer rank score (1 = best) summed over the three independent error measures
+def _rank_score(d):
+    order = sorted(d, key=lambda k: d[k])
+    return {k: i + 1 for i, k in enumerate(order)}
+
+score = {m: 0 for m in models}
+for d in (dic_bias_abs, talk_bias_abs, ph_bias_abs, rmse_rank, {m: -corr_rank[m] for m in models}):
+    for k, v in _rank_score(d).items():
+        score[k] += v
+best_model = min(score, key=score.get)
+
+sign_agreement = {
+    "DIC":  (len({np.sign(round(DIC_0_50_bias[m], 6)) for m in models}) == 1,
+             {m: float(np.sign(DIC_0_50_bias[m])) for m in models}),
+    "TAlk": (len({np.sign(round(TALK_0_50_bias[m], 6)) for m in models}) == 1,
+             {m: float(np.sign(TALK_0_50_bias[m])) for m in models}),
+    "pH":   (len({np.sign(round(PH_0_50_bias[m], 6)) for m in models}) == 1,
+             {m: float(np.sign(PH_0_50_bias[m])) for m in models}),
+}
+
+# -----------------------------------------------------------------------------
+# Reporting summary (unrounded intermediates kept above)
+# -----------------------------------------------------------------------------
+summary = {}
+summary["DIC_0_50"] = {k: round(v, 1) for k, v in DIC_0_50.items()}
+summary["TAlk_0_50"] = {k: round(v, 1) for k, v in TALK_0_50.items()}
+summary["pH_0_50"] = {k: round(v, 3) for k, v in PH_0_50.items()}
+summary["DIC_0_50_bias"] = {k: round(v, 1) for k, v in DIC_0_50_bias.items()}
+summary["TAlk_0_50_bias"] = {k: round(v, 1) for k, v in TALK_0_50_bias.items()}
+summary["pH_0_50_bias"] = {k: round(v, 3) for k, v in PH_0_50_bias.items()}
+summary["map_bias"] = {k: round(v["bias"], 1) for k, v in map_metrics.items()}
+summary["map_rmse"] = {k: round(v["rmse"], 1) for k, v in map_metrics.items()}
+summary["map_corr"] = {k: round(v["correlation"], 3) for k, v in map_metrics.items()}
+summary["mask_cells"] = {"kept": mask_n, "total": mask_total}
+summary["vertical_bias"] = {m: {d: round(vert_bias[m][d], 1) for d in profile_depths} for m in models}
+summary["DIC_2002"] = {m: round(DIC_2002_glob[m], 1) for m in models}
+summary["DIC_1971_2000"] = {m: round(DIC_hist_glob[m], 1) for m in models}
+summary["DIC_change"] = {m: round(DIC_change[m], 1) for m in models}
+summary["DIC_change_ratio"] = {m: round(DIC_change_ratio[m], 2) for m in models}
+summary["best_model"] = best_model
+summary["rank_score"] = score
+summary["sign_agreement"] = {k: v[0] for k, v in sign_agreement.items()}
+
+print("=== 0-50 m global means (volume-weighted, each source's own cells) ===")
+print("DIC  (umol/kg):", {k: round(v, 1) for k, v in DIC_0_50.items()})
+print("TAlk (umol/kg):", {k: round(v, 1) for k, v in TALK_0_50.items()})
+print("pH   (total)  :", {k: round(v, 3) for k, v in PH_0_50.items()})
+print("DIC  bias:", {k: round(v, 1) for k, v in DIC_0_50_bias.items()})
+print("TAlk bias:", {k: round(v, 1) for k, v in TALK_0_50_bias.items()})
+print("pH   bias:", {k: round(v, 3) for k, v in PH_0_50_bias.items()})
+print("=== 0-50 m DIC map comparison on GLODAP 1-deg grid ===")
+print("shared mask cells kept:", mask_n, "of", mask_total)
+for m in models:
+    print(m, "bias %.1f  rmse %.1f  r %.3f  n=%d" % (map_metrics[m]["bias"],
+          map_metrics[m]["rmse"], map_metrics[m]["correlation"], map_metrics[m]["n_valid"]))
+print("=== vertical DIC bias profile (umol/kg) ===")
+for m in models:
+    print(m, {d: round(vert_bias[m][d], 1) for d in profile_depths})
+print("=== DIC period change 2002 - 1971/2000 ===")
+for m in models:
+    print(m, "2002 %.1f  hist %.1f  change %.1f  bias %.1f  ratio %.2f" % (
+        DIC_2002_glob[m], DIC_hist_glob[m], DIC_change[m], DIC_0_50_bias[m], DIC_change_ratio[m]))
+print("=== synthesis ===")
+print("rank scores:", score, "-> best:", best_model)
+print("sign agreement:", {k: v[0] for k, v in sign_agreement.items()}, sign_agreement)
+
+# --- visualization ---
+# =============================================================================
+# Figure 1: 0-50 m DIC bias maps (model - GLODAP) on the shared comparison mask
+# =============================================================================
+lon1d = bias_maps[models[0]].lon.values
+lat1d = bias_maps[models[0]].lat.values
+
+pooled = np.concatenate([np.abs(bias_maps[m].values).ravel() for m in models])
+vmax = float(np.nanpercentile(pooled, 98))
+if not np.isfinite(vmax) or vmax == 0:
+    vmax = float(np.nanmax(pooled))
+
+fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.6), constrained_layout=True)
+for ax, m in zip(axes, models):
+    d = bias_maps[m]
+    pm = ax.pcolormesh(lon1d, lat1d, d.values, cmap="RdBu_r",
+                       vmin=-vmax, vmax=vmax, shading="auto")
+    ax.set_facecolor("0.85")
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-80, 90)
+    ax.set_xticks([-180, -120, -60, 0, 60, 120, 180])
+    ax.set_yticks([-60, -30, 0, 30, 60])
+    ax.set_title("%s\nbias %.0f, RMSE %.0f, r = %.3f" % (
+        m, map_metrics[m]["bias"], map_metrics[m]["rmse"], map_metrics[m]["correlation"]),
+        fontsize=10)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+fig.colorbar(pm, ax=axes, label="DIC bias (µmol kg$^{-1}$)", extend="both")
+fig.suptitle("0–50 m DIC bias vs GLODAPv2.2016b (model − GLODAP), shared diverging scale "
+             "clipped at the 98th percentile of |bias|; common mask: %d cells" % mask_n,
+             fontsize=11)
+
+# =============================================================================
+# Figure 2: vertical profile of the global mean DIC bias (model - GLODAP)
+# =============================================================================
+fig2, ax2 = plt.subplots(figsize=(6.4, 5.2), constrained_layout=True)
+markers = {"CESM2": "o", "GFDL-ESM4": "s", "MPI-ESM1-2-LR": "^"}
+for m in models:
+    x = [vert_bias[m][d] for d in profile_depths]
+    ax2.plot(x, profile_depths, marker=markers.get(m, "o"), ms=7, lw=1.8, label=m)
+
+ax2.axvline(0.0, color="k", lw=0.9, ls="--")
+ax2.set_yticks(profile_depths)
+ax2.set_yticklabels([str(d) for d in profile_depths])
+ax2.invert_yaxis()
+ax2.set_xlabel("DIC bias (µmol kg$^{-1}$)")
+ax2.set_ylabel("Depth (m)")
+ax2.set_title("Global mean DIC bias vs GLODAP (model − GLODAP)\non the GLODAP 1° grid, "
+              "pairwise valid cells at each depth", fontsize=10)
+ax2.grid(alpha=0.3)
+ax2.legend(loc="best")
+</executed_code>
+
+Here are the results of code execution:
+
+Status Summary:
+- Computation: Success
+- Visualization: Generated
+
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "models": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "dsid": "cmip6_historical",
+      "VAR2002": [
+        "dissic",
+        "talk",
+        "ph",
+        "thetao",
+        "so"
+      ],
+      "VARHIST": [
+        "dissic",
+        "thetao",
+        "so"
+      ],
+      "raw": {
+        "CESM2": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 88473600,
+            "n_valid": 50970468,
+            "min": 0.6910684108734131,
+            "max": 3.46626353263855,
+            "mean": 2.218221664428711,
+            "std": 0.14489033818244934
+          },
+          "talk": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "mol m-3",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 88473600,
+            "n_valid": 50970468,
+            "min": 0.8534786701202393,
+            "max": 4.657915115356445,
+            "mean": 2.3668813705444336,
+            "std": 0.0838230773806572
+          },
+          "ph": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "1",
+            "long_name": "pH",
+            "source_dataset": "cmip6_historical",
+            "size": 88473600,
+            "n_valid": 50970468,
+            "min": 7.086062431335449,
+            "max": 8.945998191833496,
+            "mean": 7.899063587188721,
+            "std": 0.20436501502990723
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 88473600,
+            "n_valid": 50970468,
+            "min": -2.2228050231933594,
+            "max": 33.48843002319336,
+            "mean": 9.415316581726074,
+            "std": 8.311063766479492
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 88473600,
+            "n_valid": 50970468,
+            "min": 6.945779323577881,
+            "max": 46.68132400512695,
+            "mean": 34.5930290222168,
+            "std": 1.0609101057052612
+          },
+          "hist_dissic": {
+            "type": "DataArray",
+            "dims": {
+              "time": 360,
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2654208000,
+            "n_valid": 1529114040,
+            "min": 0.5907674431800842,
+            "max": 3.516892194747925,
+            "mean": 2.212023973464966,
+            "std": 0.14882837235927582
+          },
+          "hist_thetao": {
+            "type": "DataArray",
+            "dims": {
+              "time": 360,
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 2654208000,
+            "n_valid": 1529114040,
+            "min": -2.653087615966797,
+            "max": 33.87590789794922,
+            "mean": 9.339219093322754,
+            "std": 8.27250862121582
+          },
+          "hist_so": {
+            "type": "DataArray",
+            "dims": {
+              "time": 360,
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2654208000,
+            "n_valid": 1529114040,
+            "min": 6.940155982971191,
+            "max": 48.251068115234375,
+            "mean": 34.60136032104492,
+            "std": 1.0480968952178955
+          }
+        },
+        "GFDL-ESM4": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 27216000,
+            "n_valid": 14555988,
+            "min": 0.30130264163017273,
+            "max": 3.338019609451294,
+            "mean": 2.253709077835083,
+            "std": 0.11683815717697144
+          },
+          "talk": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "mol m-3",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 27216000,
+            "n_valid": 14555988,
+            "min": 0.37533098459243774,
+            "max": 4.532066822052002,
+            "mean": 2.4105494022369385,
+            "std": 0.08052302896976471
+          },
+          "ph": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "1",
+            "long_name": "pH",
+            "source_dataset": "cmip6_historical",
+            "size": 27216000,
+            "n_valid": 14555988,
+            "min": 6.8178277015686035,
+            "max": 10.096755027770996,
+            "mean": 7.944672584533691,
+            "std": 0.15692603588104248
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 27216000,
+            "n_valid": 14555988,
+            "min": -2.1885504722595215,
+            "max": 34.98881912231445,
+            "mean": 6.748224258422852,
+            "std": 7.700338363647461
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 27216000,
+            "n_valid": 14555988,
+            "min": 0.009999999776482582,
+            "max": 66.08390045166016,
+            "mean": 34.585693359375,
+            "std": 1.2699075937271118
+          },
+          "hist_dissic": {
+            "type": "DataArray",
+            "dims": {
+              "time": 360,
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 816480000,
+            "n_valid": 436679640,
+            "min": 0.27914291620254517,
+            "max": 3.3764591217041016,
+            "mean": 2.2477335929870605,
+            "std": 0.12086816132068634
+          },
+          "hist_thetao": {
+            "type": "DataArray",
+            "dims": {
+              "time": 360,
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 816480000,
+            "n_valid": 436679640,
+            "min": -2.2704126834869385,
+            "max": 35.31924057006836,
+            "mean": 6.68389892578125,
+            "std": 7.6282734870910645
+          },
+          "hist_so": {
+            "type": "DataArray",
+            "dims": {
+              "time": 360,
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 816480000,
+            "n_valid": 436679640,
+            "min": 0.009999999776482582,
+            "max": 67.3830795288086,
+            "mean": 34.58905792236328,
+            "std": 1.2596994638442993
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 26822400,
+            "n_valid": 12964236,
+            "min": 0.29644775390625,
+            "max": 3.319403886795044,
+            "mean": 2.1538777351379395,
+            "std": 0.11490806192159653
+          },
+          "talk": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "mol m-3",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 26822400,
+            "n_valid": 12964236,
+            "min": 0.28225117921829224,
+            "max": 3.5141680240631104,
+            "mean": 2.308739185333252,
+            "std": 0.0849180519580841
+          },
+          "ph": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "1",
+            "long_name": "pH",
+            "source_dataset": "cmip6_historical",
+            "size": 26822400,
+            "n_valid": 12964236,
+            "min": 6.845572471618652,
+            "max": 8.448765754699707,
+            "mean": 7.976586818695068,
+            "std": 0.1536344587802887
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 26822400,
+            "n_valid": 12964236,
+            "min": -1.899999976158142,
+            "max": 34.892555236816406,
+            "mean": 6.669051170349121,
+            "std": 6.717454433441162
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "time": 12,
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 26822400,
+            "n_valid": 12964236,
+            "min": 4.119918346405029,
+            "max": 51.428428649902344,
+            "mean": 34.59857177734375,
+            "std": 1.0366472005844116
+          },
+          "hist_dissic": {
+            "type": "DataArray",
+            "dims": {
+              "time": 360,
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 804672000,
+            "n_valid": 388927080,
+            "min": 0.29447388648986816,
+            "max": 3.408155679702759,
+            "mean": 2.1485209465026855,
+            "std": 0.11735957115888596
+          },
+          "hist_thetao": {
+            "type": "DataArray",
+            "dims": {
+              "time": 360,
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 804672000,
+            "n_valid": 388927080,
+            "min": -1.900230884552002,
+            "max": 35.621578216552734,
+            "mean": 6.575679779052734,
+            "std": 6.659833908081055
+          },
+          "hist_so": {
+            "type": "DataArray",
+            "dims": {
+              "time": 360,
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 804672000,
+            "n_valid": 388927080,
+            "min": 4.057476043701172,
+            "max": 52.23035430908203,
+            "mean": 34.604740142822266,
+            "std": 1.0069752931594849
+          }
+        }
+      },
+      "g_tco2": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 33,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "micro-mol kg-1",
+        "long_name": "moles of dissolved inorganic carbon per unit mass in seawater",
+        "source_dataset": "glodap",
+        "size": 2138400,
+        "n_valid": 1103356,
+        "min": 1019.1619873046875,
+        "max": 2402.477294921875,
+        "mean": 2181.71025090623,
+        "std": 105.46550860707693
+      },
+      "g_talk": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 33,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "micro-mol kg-1",
+        "long_name": "seawater alkalinity expressed as mole equivalent per unit mass",
+        "source_dataset": "glodap",
+        "size": 2138400,
+        "n_valid": 1101785,
+        "min": 1069.45556640625,
+        "max": 2659.830810546875,
+        "mean": 2324.9228543747768,
+        "std": 53.49204578692571
+      },
+      "g_ph": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 33,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "",
+        "long_name": "seawater ph reported on total scale at in situ temperature and pressure",
+        "source_dataset": "glodap",
+        "size": 2138400,
+        "n_valid": 1101821,
+        "min": 7.426542282104492,
+        "max": 8.522977828979492,
+        "mean": 7.930877682557368,
+        "std": 0.14905358069576602
+      },
+      "ann": {
+        "CESM2": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 1.1269550677848188,
+            "max": 3.465780870881799,
+            "mean": 2.2182227165447057,
+            "std": 0.144543947174549
+          },
+          "talk": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "mol m-3",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 1.2385176874186894,
+            "max": 4.657225845284658,
+            "mean": 2.366881020608146,
+            "std": 0.08363046885175052
+          },
+          "ph": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "1",
+            "long_name": "pH",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 7.086113067522441,
+            "max": 8.945190233727024,
+            "mean": 7.899063198359869,
+            "std": 0.20404434824493944
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": -1.9294136161673558,
+            "max": 32.12001317690497,
+            "mean": 9.415141644600736,
+            "std": 8.282309379543452
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 6.952861932205828,
+            "max": 45.51283779405568,
+            "mean": 34.59302020827376,
+            "std": 1.0570512498002063
+          },
+          "hist_dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 1.1052144700533724,
+            "max": 3.4834796620503954,
+            "mean": 2.212024175842006,
+            "std": 0.14834310057674915
+          },
+          "hist_thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": -2.1043340358233342,
+            "max": 31.64076078144927,
+            "mean": 9.339077363079276,
+            "std": 8.240318214283281
+          },
+          "hist_so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 6.953538233831049,
+            "max": 46.497392049293,
+            "mean": 34.601355039861694,
+            "std": 1.042590668222725
+          },
+          "rho2002": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "kg/m³",
+            "long_name": "In-situ density anomaly",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 5.073631828664361,
+            "max": 52.384942068416194,
+            "mean": 30.168029977352504,
+            "std": 6.176804523514583
+          },
+          "dissic_umol": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "umol kg-1",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 1112.1600811485403,
+            "max": 3386.8498070007436,
+            "mean": 2152.754082296947,
+            "std": 131.49529473392488
+          },
+          "talk_umol": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "umol kg-1",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 1231.2881943969383,
+            "max": 4539.668173352292,
+            "mean": 2297.366982052028,
+            "std": 74.06837383563733
+          },
+          "hist_rho": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "kg/m³",
+            "long_name": "In-situ density anomaly",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 5.141787612298117,
+            "max": 52.38505992304749,
+            "mean": 30.190007948882453,
+            "std": 6.159508891676749
+          },
+          "hist_dissic_umol": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 60,
+              "nlat": 384,
+              "nlon": 320
+            },
+            "units": "umol kg-1",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 7372800,
+            "n_valid": 4247539,
+            "min": 1094.5170438413754,
+            "max": 3404.146953840897,
+            "mean": 2146.6728851429684,
+            "std": 135.14643687386575
+          }
+        },
+        "GFDL-ESM4": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 0.3470114676919702,
+            "max": 3.3007966668638464,
+            "mean": 2.253707998358376,
+            "std": 0.11627955731069162
+          },
+          "talk": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "mol m-3",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 0.38417195432806667,
+            "max": 4.419656834537036,
+            "mean": 2.410546140364011,
+            "std": 0.0799869307653054
+          },
+          "ph": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "1",
+            "long_name": "pH",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 7.271953450816952,
+            "max": 9.925037958850599,
+            "mean": 7.944674031317272,
+            "std": 0.15632840183349322
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": -1.9135096484667635,
+            "max": 32.74165515638378,
+            "mean": 6.747949851245479,
+            "std": 7.656837023465311
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 0.01000000618602315,
+            "max": 64.4344775578747,
+            "mean": 34.58564968746106,
+            "std": 1.26201666778041
+          },
+          "hist_dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 0.3448012097812679,
+            "max": 3.2732966672557673,
+            "mean": 2.2477319046173982,
+            "std": 0.12009455370062805
+          },
+          "hist_thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": -1.8805054387545477,
+            "max": 31.83850219273676,
+            "mean": 6.68366837243288,
+            "std": 7.579780044268697
+          },
+          "hist_so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 0.010000089621809247,
+            "max": 64.50379824459824,
+            "mean": 34.58901592085967,
+            "std": 1.2486929839387308
+          },
+          "rho2002": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "kg/m³",
+            "long_name": "In-situ density anomaly",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": -3.7012747533730135,
+            "max": 57.303605408184694,
+            "mean": 31.533868086531506,
+            "std": 6.4471963259859395
+          },
+          "dissic_umol": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "umol kg-1",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 347.01261759847966,
+            "max": 3157.605017009135,
+            "mean": 2184.4138195091186,
+            "std": 104.4489651762473
+          },
+          "talk_umol": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "umol kg-1",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 384.0094710091287,
+            "max": 4227.927983050313,
+            "mean": 2336.724669460981,
+            "std": 73.06317575619737
+          },
+          "hist_rho": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "kg/m³",
+            "long_name": "In-situ density anomaly",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": -3.442780934006123,
+            "max": 57.307945266377374,
+            "mean": 31.550922707808155,
+            "std": 6.4303973069498985
+          },
+          "hist_dissic_umol": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 35,
+              "lat": 180,
+              "lon": 360
+            },
+            "units": "umol kg-1",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2268000,
+            "n_valid": 1212999,
+            "min": 344.803121452821,
+            "max": 3130.473443831999,
+            "mean": 2178.5629400583957,
+            "std": 108.02000360695962
+          }
+        },
+        "MPI-ESM1-2-LR": {
+          "dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 0.3122907556899606,
+            "max": 2.889785441960374,
+            "mean": 2.1538760059299404,
+            "std": 0.1143376581766378
+          },
+          "talk": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "mol m-3",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 0.29442054906936543,
+            "max": 3.3005527444081766,
+            "mean": 2.308735607274065,
+            "std": 0.08440503524071188
+          },
+          "ph": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "1",
+            "long_name": "pH",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 6.845897076227893,
+            "max": 8.229808130656203,
+            "mean": 7.976587345453875,
+            "std": 0.15298772948270617
+          },
+          "thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": -1.8999645298474455,
+            "max": 31.335369428869797,
+            "mean": 6.668932847519522,
+            "std": 6.674311686760813
+          },
+          "so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 4.305624074805273,
+            "max": 50.81980320133575,
+            "mean": 34.59852320904532,
+            "std": 1.0273079290682712
+          },
+          "hist_dissic": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "mol m-3",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 0.3543253774967349,
+            "max": 2.889430501792178,
+            "mean": 2.1485192292211095,
+            "std": 0.116525021880156
+          },
+          "hist_thetao": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "degC",
+            "long_name": "Sea Water Potential Temperature",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": -1.8999340074256859,
+            "max": 31.69805163348498,
+            "mean": 6.575592527470895,
+            "std": 6.60412682632889
+          },
+          "hist_so": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "0.001",
+            "long_name": "Sea Water Salinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 4.799399635438872,
+            "max": 50.49068417403793,
+            "mean": 34.604703047632476,
+            "std": 0.9910533286874075
+          },
+          "rho2002": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "kg/m³",
+            "long_name": "In-situ density anomaly",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 3.507225798784816,
+            "max": 53.83112686642903,
+            "mean": 30.904072579942447,
+            "std": 5.578366926896466
+          },
+          "dissic_umol": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "umol kg-1",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 311.199309443317,
+            "max": 2770.444205065658,
+            "mean": 2089.050145529924,
+            "std": 105.36949379095326
+          },
+          "talk_umol": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "umol kg-1",
+            "long_name": "Total Alkalinity",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 293.39155862580736,
+            "max": 3187.4356511822425,
+            "mean": 2239.391579412063,
+            "std": 77.46928056800144
+          },
+          "hist_rho": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "kg/m³",
+            "long_name": "In-situ density anomaly",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 3.9068681312485296,
+            "max": 53.8371970899866,
+            "mean": 30.92666740615702,
+            "std": 5.56026660012775
+          },
+          "hist_dissic_umol": {
+            "type": "DataArray",
+            "dims": {
+              "depth": 40,
+              "j": 220,
+              "i": 254
+            },
+            "units": "umol kg-1",
+            "long_name": "Dissolved Inorganic Carbon Concentration",
+            "source_dataset": "cmip6_historical",
+            "size": 2235200,
+            "n_valid": 1080353,
+            "min": 352.94646221148383,
+            "max": 2770.1036882387216,
+            "mean": 2083.795368010375,
+            "std": 107.3545358236115
+          }
+        }
+      },
+      "DIC_0_50": {
+        "CESM2": 1996.6567412559368,
+        "GFDL-ESM4": 2059.184382079496,
+        "MPI-ESM1-2-LR": 1974.4671580892793,
+        "GLODAP": 2035.7069775902141
+      },
+      "TALK_0_50": {
+        "CESM2": 2264.005786972947,
+        "GFDL-ESM4": 2335.6628771859387,
+        "MPI-ESM1-2-LR": 2217.8702533088685,
+        "GLODAP": 2304.4642034693966
+      },
+      "PH_0_50": {
+        "CESM2": 8.079544654972297,
+        "GFDL-ESM4": 8.08835105257183,
+        "MPI-ESM1-2-LR": 8.058539906917654,
+        "GLODAP": 8.080084485218075
+      },
+      "DIC_0_50_bias": {
+        "CESM2": -39.050236334277315,
+        "GFDL-ESM4": 23.47740448928198,
+        "MPI-ESM1-2-LR": -61.2398195009348
+      },
+      "TALK_0_50_bias": {
+        "CESM2": -40.458416496449445,
+        "GFDL-ESM4": 31.19867371654209,
+        "MPI-ESM1-2-LR": -86.59395016052804
+      },
+      "PH_0_50_bias": {
+        "CESM2": -0.0005398302457777504,
+        "GFDL-ESM4": 0.00826656735375586,
+        "MPI-ESM1-2-LR": -0.021544578300421335
+      },
+      "map_nat": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "cmip6_historical",
+          "size": 122880,
+          "n_valid": 86096,
+          "min": 1242.6317231249927,
+          "max": 3094.5548925330004,
+          "mean": 1998.4201766821636,
+          "std": 89.24489022958166
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "cmip6_historical",
+          "size": 64800,
+          "n_valid": 44564,
+          "min": 347.0728638787711,
+          "max": 3154.8665882898263,
+          "mean": 2062.356288359486,
+          "std": 131.99703966947922
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "j": 220,
+            "i": 254
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "cmip6_historical",
+          "size": 55880,
+          "n_valid": 36502,
+          "min": 318.305797184961,
+          "max": 2736.895708340337,
+          "mean": 2001.4326227205947,
+          "std": 101.69834441422921
+        },
+        "GLODAP": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "micro-mol kg-1",
+          "long_name": "moles of dissolved inorganic carbon per unit mass in seawater",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 41977,
+          "min": 1019.1619873046875,
+          "max": 2313.45703125,
+          "mean": 2052.1406669062444,
+          "std": 78.4216382686179
+        }
+      },
+      "map_reg": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 42576,
+          "min": 1244.8274932646898,
+          "max": 3093.9638208203414,
+          "mean": 2012.2136579609376,
+          "std": 85.30210779838414
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 44564,
+          "min": 347.0728638787711,
+          "max": 3154.8665882898263,
+          "mean": 2062.356288359486,
+          "std": 131.99703966947922
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 42713,
+          "min": 321.64260252483183,
+          "max": 2633.0948533813616,
+          "mean": 1979.7030251092908,
+          "std": 101.09188243728318
+        },
+        "GLODAP": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "micro-mol kg-1",
+          "long_name": "moles of dissolved inorganic carbon per unit mass in seawater",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 41977,
+          "min": 1019.1619873046875,
+          "max": 2313.45703125,
+          "mean": 2052.1406669062444,
+          "std": 78.4216382686179
+        }
+      },
+      "common_mask": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "long_name": "cells covered by every field in the comparison",
+        "source_dataset": "glodap",
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "mask_n": 41227,
+      "mask_total": 64800,
+      "map_metrics": {
+        "CESM2": {
+          "bias": -36.51522888339209,
+          "rmse": 59.81157838966276,
+          "centered_rmse": 47.37154176355527,
+          "mae": 40.501301472450855,
+          "std_ratio": 1.1490597433637477,
+          "n_valid": 41227,
+          "correlation": 0.82791633319617,
+          "pvalue": 0.0
+        },
+        "GFDL-ESM4": {
+          "bias": 25.28427185096421,
+          "rmse": 64.95230635475986,
+          "centered_rmse": 59.82898710298477,
+          "mae": 37.21754027659984,
+          "std_ratio": 1.1201026132169745,
+          "n_valid": 41227,
+          "correlation": 0.7090313722403472,
+          "pvalue": 0.0
+        },
+        "MPI-ESM1-2-LR": {
+          "bias": -59.36246962024324,
+          "rmse": 83.0859243692289,
+          "centered_rmse": 58.132332044009075,
+          "mae": 61.24970932359513,
+          "std_ratio": 1.1491797035598823,
+          "n_valid": 41227,
+          "correlation": 0.7360084421225634,
+          "pvalue": 0.0
+        }
+      },
+      "bias_maps": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 41227,
+          "min": -885.0329389041572,
+          "max": 844.4972622389973,
+          "mean": -38.30286802386458,
+          "std": 50.20586635086384
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 41227,
+          "min": -1770.0866747821617,
+          "max": 723.5584928965852,
+          "mean": 18.56065819112734,
+          "std": 68.68900301077767
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "glodap",
+          "size": 64800,
+          "n_valid": 41227,
+          "min": -1729.4829611149403,
+          "max": 613.7149436444931,
+          "mean": -70.36542592050793,
+          "std": 69.06824436267502
+        }
+      },
+      "profile_depths": [
+        0,
+        100,
+        500,
+        1000,
+        2000
+      ],
+      "prof": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 5,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "glodap",
+          "size": 324000,
+          "n_valid": 190933,
+          "min": 1244.0464135109758,
+          "max": 3358.343779261001,
+          "mean": 2140.301361853825,
+          "std": 137.35936211411195
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 5,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "glodap",
+          "size": 324000,
+          "n_valid": 200717,
+          "min": 347.01261759847966,
+          "max": 3152.357263899714,
+          "mean": 2167.1968419174173,
+          "std": 117.05932294315669
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 5,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "umol kg-1",
+          "long_name": "Dissolved Inorganic Carbon Concentration",
+          "source_dataset": "glodap",
+          "size": 324000,
+          "n_valid": 191820,
+          "min": 316.6045607735318,
+          "max": 2681.3929529243774,
+          "mean": 2087.2783870823873,
+          "std": 134.38885602526085
+        },
+        "GLODAP": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 5,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "micro-mol kg-1",
+          "long_name": "moles of dissolved inorganic carbon per unit mass in seawater",
+          "source_dataset": "glodap",
+          "size": 324000,
+          "n_valid": 186209,
+          "min": 1019.1619873046875,
+          "max": 2402.477294921875,
+          "mean": 2165.144358228964,
+          "std": 112.10704901143171
+        }
+      },
+      "vert_bias": {
+        "CESM2": {
+          "0": -28.57907041977728,
+          "100": -45.95166977456792,
+          "500": -12.484774412126457,
+          "1000": 2.102175837040675,
+          "2000": -2.365895599548244
+        },
+        "GFDL-ESM4": {
+          "0": 28.983757482192324,
+          "100": 19.363143595935234,
+          "500": -10.951840721965286,
+          "1000": -0.8471457192508723,
+          "2000": -11.398441152391978
+        },
+        "MPI-ESM1-2-LR": {
+          "0": -58.15441090774601,
+          "100": -59.3626347208694,
+          "500": -77.80109227224769,
+          "1000": -66.57628372254877,
+          "2000": -60.981410439783026
+        }
+      },
+      "vert_ncells": {
+        "CESM2": {
+          "0": 40921,
+          "100": 38318,
+          "500": 36370,
+          "1000": 35727,
+          "2000": 33041
+        },
+        "GFDL-ESM4": {
+          "0": 41301,
+          "100": 38534,
+          "500": 36561,
+          "1000": 35975,
+          "2000": 33795
+        },
+        "MPI-ESM1-2-LR": {
+          "0": 40828,
+          "100": 38355,
+          "500": 36294,
+          "1000": 35688,
+          "2000": 33109
+        }
+      },
+      "DIC_2002_glob": {
+        "CESM2": 1996.6567412559368,
+        "GFDL-ESM4": 2059.184382079496,
+        "MPI-ESM1-2-LR": 1974.4671580892793
+      },
+      "DIC_hist_glob": {
+        "CESM2": 1987.4318631622173,
+        "GFDL-ESM4": 2046.6998621189446,
+        "MPI-ESM1-2-LR": 1963.617103093413
+      },
+      "DIC_change": {
+        "CESM2": 9.224878093719553,
+        "GFDL-ESM4": 12.484519960551552,
+        "MPI-ESM1-2-LR": 10.85005499586623
+      },
+      "DIC_change_ratio": {
+        "CESM2": -0.2362310438982462,
+        "GFDL-ESM4": 0.5317674688550451,
+        "MPI-ESM1-2-LR": -0.1771732033877175
+      },
+      "DIC_change_ratio_via_tool": {
+        "CESM2": -0.2362310438982462,
+        "GFDL-ESM4": 0.5317674688550451,
+        "MPI-ESM1-2-LR": -0.1771732033877175
+      },
+      "dic_bias_abs": {
+        "CESM2": 39.050236334277315,
+        "GFDL-ESM4": 23.47740448928198,
+        "MPI-ESM1-2-LR": 61.2398195009348
+      },
+      "talk_bias_abs": {
+        "CESM2": 40.458416496449445,
+        "GFDL-ESM4": 31.19867371654209,
+        "MPI-ESM1-2-LR": 86.59395016052804
+      },
+      "ph_bias_abs": {
+        "CESM2": 0.0005398302457777504,
+        "GFDL-ESM4": 0.00826656735375586,
+        "MPI-ESM1-2-LR": 0.021544578300421335
+      },
+      "rmse_rank": {
+        "CESM2": 59.81157838966276,
+        "GFDL-ESM4": 64.95230635475986,
+        "MPI-ESM1-2-LR": 83.0859243692289
+      },
+      "corr_rank": {
+        "CESM2": 0.82791633319617,
+        "GFDL-ESM4": 0.7090313722403472,
+        "MPI-ESM1-2-LR": 0.7360084421225634
+      },
+      "score": {
+        "CESM2": 7,
+        "GFDL-ESM4": 9,
+        "MPI-ESM1-2-LR": 14
+      },
+      "best_model": "CESM2",
+      "sign_agreement": {
+        "DIC": [
+          false,
+          {
+            "CESM2": -1.0,
+            "GFDL-ESM4": 1.0,
+            "MPI-ESM1-2-LR": -1.0
+          }
+        ],
+        "TAlk": [
+          false,
+          {
+            "CESM2": -1.0,
+            "GFDL-ESM4": 1.0,
+            "MPI-ESM1-2-LR": -1.0
+          }
+        ],
+        "pH": [
+          false,
+          {
+            "CESM2": -1.0,
+            "GFDL-ESM4": 1.0,
+            "MPI-ESM1-2-LR": -1.0
+          }
+        ]
+      },
+      "summary": {
+        "DIC_0_50": {
+          "CESM2": 1996.7,
+          "GFDL-ESM4": 2059.2,
+          "MPI-ESM1-2-LR": 1974.5,
+          "GLODAP": 2035.7
+        },
+        "TAlk_0_50": {
+          "CESM2": 2264.0,
+          "GFDL-ESM4": 2335.7,
+          "MPI-ESM1-2-LR": 2217.9,
+          "GLODAP": 2304.5
+        },
+        "pH_0_50": {
+          "CESM2": 8.08,
+          "GFDL-ESM4": 8.088,
+          "MPI-ESM1-2-LR": 8.059,
+          "GLODAP": 8.08
+        },
+        "DIC_0_50_bias": {
+          "CESM2": -39.1,
+          "GFDL-ESM4": 23.5,
+          "MPI-ESM1-2-LR": -61.2
+        },
+        "TAlk_0_50_bias": {
+          "CESM2": -40.5,
+          "GFDL-ESM4": 31.2,
+          "MPI-ESM1-2-LR": -86.6
+        },
+        "pH_0_50_bias": {
+          "CESM2": -0.001,
+          "GFDL-ESM4": 0.008,
+          "MPI-ESM1-2-LR": -0.022
+        },
+        "map_bias": {
+          "CESM2": -36.5,
+          "GFDL-ESM4": 25.3,
+          "MPI-ESM1-2-LR": -59.4
+        },
+        "map_rmse": {
+          "CESM2": 59.8,
+          "GFDL-ESM4": 65.0,
+          "MPI-ESM1-2-LR": 83.1
+        },
+        "map_corr": {
+          "CESM2": 0.828,
+          "GFDL-ESM4": 0.709,
+          "MPI-ESM1-2-LR": 0.736
+        },
+        "mask_cells": {
+          "kept": 41227,
+          "total": 64800
+        },
+        "vertical_bias": {
+          "CESM2": {
+            "0": -28.6,
+            "100": -46.0,
+            "500": -12.5,
+            "1000": 2.1,
+            "2000": -2.4
+          },
+          "GFDL-ESM4": {
+            "0": 29.0,
+            "100": 19.4,
+            "500": -11.0,
+            "1000": -0.8,
+            "2000": -11.4
+          },
+          "MPI-ESM1-2-LR": {
+            "0": -58.2,
+            "100": -59.4,
+            "500": -77.8,
+            "1000": -66.6,
+            "2000": -61.0
+          }
+        },
+        "DIC_2002": {
+          "CESM2": 1996.7,
+          "GFDL-ESM4": 2059.2,
+          "MPI-ESM1-2-LR": 1974.5
+        },
+        "DIC_1971_2000": {
+          "CESM2": 1987.4,
+          "GFDL-ESM4": 2046.7,
+          "MPI-ESM1-2-LR": 1963.6
+        },
+        "DIC_change": {
+          "CESM2": 9.2,
+          "GFDL-ESM4": 12.5,
+          "MPI-ESM1-2-LR": 10.9
+        },
+        "DIC_change_ratio": {
+          "CESM2": -0.24,
+          "GFDL-ESM4": 0.53,
+          "MPI-ESM1-2-LR": -0.18
+        },
+        "best_model": "CESM2",
+        "rank_score": {
+          "CESM2": 7,
+          "GFDL-ESM4": 9,
+          "MPI-ESM1-2-LR": 14
+        },
+        "sign_agreement": {
+          "DIC": false,
+          "TAlk": false,
+          "pH": false
+        }
+      }
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_full_20261020/T8_deepseek-flash_20261025_140833/turn01/figures/visualization_T8_deepseek-flash_20261025_140833_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_full_20261020/T8_deepseek-flash_20261025_140833/turn01/figures/visualization_T8_deepseek-flash_20261025_140833_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Please provide a clear scientific summary inside <solution></solution> tags.
+
+Describe the methodology strictly from the <executed_code> above, never by inferring it from variable
+names: the baseline period, the source of any climatology, the weighting, the units, the region and
+time range, the range of lags — all of it must match the tools and arguments the code actually
+called. Do not report a step the code did not take. Where a variable name in the observation is
+ambiguous, the code decides what it means.
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
+4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, tool choice, computation and visualization attempts
+3. Suggestions for how to reformulate the query
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+
+**1. What was done (as executed)**
+
+Each CMIP6 model (CESM2, GFDL‑ESM4, MPI‑ESM1‑2‑LR) was loaded from `cmip6_historical` with `load_regular_data`: `dissic`, `talk`, `ph`, `thetao`, `so` monthly for calendar year 2002, plus `dissic`, `thetao`, `so` monthly for 1971‑01 to 2000‑12. GLODAPv2.2016b mapped climatology fields `TCO2`, `TAlk` and `pHtsinsitutp` were loaded with `load_climatology_data`. No separate `areacello`, `volcello` or depth‑level files were loaded in the executed code; the weighting was supplied internally by `compute_basic_stat(op="volume_weighted_mean")` (and by `compute_difference_metrics`/`analyze_correlation` area weighting), so all means are volume weighted in the vertical and area weighted in the horizontal.
+
+Time aggregation used `temporal_aggregate(freq="mean", op="mean")` for both the 2002 fields and the 1971–2000 series (the long‑term mean is therefore an unweighted monthly mean over the 360 months, not an explicitly day‑weighted one). Model `dissic` and `talk` (mol m⁻³) were converted to µmol kg⁻¹ with `transform_unit`, using an in‑situ density from `compute_potential_density_anomaly(..., ref_pressure=None)` built from the matching `thetao`/`so`; the density assumption was recorded in `attrs['density_assumption']`. GLODAP `TCO2`/`TAlk` are already µmol kg⁻¹ and GLODAP `pHtsinsitutp` is total‑scale in‑situ pH, so neither was unit‑converted. Fills near 1e20 are handled as NaN by the xarray reading path and masked per field.
+
+**2. 0–50 m global means (each source over its own valid cells)**
+
+| Quantity | CESM2 | GFDL‑ESM4 | MPI‑ESM1‑2‑LR | GLODAP |
+|---|---|---|---|---|
+| DIC (µmol kg⁻¹) | 1997 | 2059 | 1974 | 2036 |
+| DIC bias | −39 | +23 | −61 | — |
+| TAlk (µmol kg⁻¹) | 2264 | 2336 | 2218 | 2304 |
+| TAlk bias | −40 | +31 | −87 | — |
+| pH (total scale) | 8.080 | 8.088 | 8.059 | 8.080 |
+| pH bias | −0.001 | +0.008 | −0.022 | — |
+
+GFDL‑ESM4 has the smallest absolute DIC and TAlk biases at 0–50 m; CESM2 has the smallest pH bias (essentially zero) and MPI‑ESM1‑2‑LR is the poorest on all three.
+
+**3. 0–50 m DIC map comparison (GLODAP 1° grid, one shared mask of 41,227 cells out of 64,800)**
+
+Each per‑cell 0–50 m DIC was formed as a depth volume‑weighted mean, conservatively regridded with `regrid_horizontal(method="conservative")` onto the GLODAP 1° grid, and a single common mask was built with `build_comparison_mask(ocean_only=False)`.
+
+| Model | Mean bias (µmol kg⁻¹) | RMSE (µmol kg⁻¹) | Spatial r |
+|---|---|---|---|
+| CESM2 | −36 | 60 | 0.828 |
+| GFDL‑ESM4 | +25 | 65 | 0.709 |
+| MPI‑ESM1‑2‑LR | −59 | 83 | 0.736 |
+
+These shared‑mask biases differ slightly from the separately taken global‑mean differences (e.g. CESM2 −36 vs −39), as expected because the two averages cover different cells and weightings. Note that GFDL‑ESM4’s “native” values arrive on a 180×360 1° archive grid with a regridded land–sea mask, so its budgets are only approximately conservative.
+
+**4. Vertical DIC bias profile (linear `regrid_vertical` to 0, 100, 500, 1000, 2000 m, then conservative horizontal regrid; pairwise valid cells, ~33,000–41,300 per depth)**
+
+| Depth (m) | CESM2 | GFDL‑ESM4 | MPI‑ESM1‑2‑LR |
+|---|---|---|---|
+| 0 | −29 | +29 | −58 |
+| 100 | −46 | +19 | −59 |
+| 500 | −12 | −11 | −78 |
+| 1000 | +2 | −1 | −67 |
+| 2000 | −2 | −11 | −61 |
+
+CESM2 and GFDL‑ESM4 are strongly biased only in the upper water column and are within ~10 µmol kg⁻¹ below 500 m; MPI‑ESM1‑2‑LR carries a near‑uniform −60 to −80 µmol kg⁻¹ deficit through the whole column.
+
+**5. DIC period change and its ratio to the 2002 bias (native grids, own cell measures)**
+
+| Model | 2002 | 1971–2000 | Change | Bias | Ratio |
+|---|---|---|---|---|---|
+| CESM2 | 1997 | 1987 | +9 | −39 | −0.24 |
+| GFDL‑ESM4 | 2059 | 2047 | +12 | +23 | +0.53 |
+| MPI‑ESM1‑2‑LR | 1974 | 1964 | +11 | −61 | −0.18 |
+
+All three models have a plausible positive anthropogenic DIC increase (~9–12 µmol kg⁻¹ over ~30 years). The ratios (via `compute_ratio`) are all well below one in magnitude, so the 2002‑minus‑1971/2000 change is only ~18–53% of the model–GLODAP bias. The bias therefore cannot be attributed to period/background drift; it remains the more likely model‑error signal. (The ratio is a diagnostic, not a causal proof.)
+
+**6. Which model is best, and are the error signs consistent?**
+
+A rank score summed over five error measures (|DIC| bias, |TAlk| bias, |pH| bias, map RMSE, map correlation) gives CESM2 = 7, GFDL‑ESM4 = 9, MPI‑ESM1‑2‑LR = 14, so **CESM2 reproduces the observed carbon system best overall** — highest spatial correlation (0.828), lowest RMSE (60 µmol kg⁻¹), and a near‑zero pH bias. GFDL‑ESM4 is, however, the best on the plain 0–50 m DIC and TAlk mean biases (−39/+23 vs +23/+31 … GFDL smaller), so the ranking is not unanimous; MPI‑ESM1‑2‑LR is consistently the worst.
+
+**Signs are not consistent across the three models.** For DIC, TAlk and pH alike, CESM2 and MPI‑ESM1‑2‑LR are negative while GFDL‑ESM4 is positive. The three models also show consistent internal sign agreement between DIC and TAlk biases within each model (both negative for CESM2 and MPI, both positive for GFDL), which is the expected carbonate‑system coupling, but the inter‑model sign disagreement means the bias is not a common systematic offset of the CMIP6 generation.
+
+**7. Figures**
+
+- **Figure 1** shows three global maps (one panel per model) of the 0–50 m DIC bias (model − GLODAP) on the shared 1° comparison mask, using a single diverging `RdBu_r` scale centred on zero and clipped at the 98th percentile of pooled |bias|, labelled in µmol kg⁻¹; each panel title reports the shared‑mask bias, RMSE and spatial correlation, and the common‑mask cell count (41,227) is given in the figure title. The intended logic is to reveal where each model’s near‑surface DIC error is geographically concentrated (e.g. high‑latitude and upwelling regimes), given that the global means alone differ by tens of µmol kg⁻¹.
+- **Figure 2** shows the vertical profile of the global mean DIC bias: depth on the vertical axis increasing downward, bias on the horizontal axis, one line per model with distinct markers, a dashed vertical zero reference, and the five sampled depths marked on the axis. Its logic is to separate surface‑intensified errors (CESM2, GFDL‑ESM4) from a depth‑uniform offset (MPI‑ESM1‑2‑LR), which the single 0–50 m number cannot show.
+
+**8. Key caveats observed in the results**
+
+- The 1971–2000 baseline is a plain monthly mean over the 360 loaded months rather than a day‑weighted climatology, and the period change uses 2002 (a single year) versus that 30‑year mean, so a small interannual component is folded into the “change”.
+- DIC and alkalinity conversion depends on the in‑situ density field; GFDL‑ESM4’s density anomaly reaches small negative values in the very fresh surface cells, and GFDL‑ESM4’s DIC minimum (347 µmol kg⁻¹) reflects those near‑zero‑salinity archive cells, which inflate its spread and RMSE relative to its mean bias.
+- The 0–50 m global means (Section 2) and the map bias (Section 3) are deliberately different estimators (own cells vs a shared mask) and should not be interchanged.
+
+</solution>

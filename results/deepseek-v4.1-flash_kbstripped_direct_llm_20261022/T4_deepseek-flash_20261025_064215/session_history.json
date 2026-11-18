@@ -1,0 +1,1685 @@
+{
+  "session_id": "T4_deepseek-flash_20261025_064215",
+  "total_turns": 1,
+  "max_turns": 10,
+  "history": [
+    {
+      "session_id": "T4_deepseek-flash_20261025_064215",
+      "user_query": "Check whether a mixed layer depth (MLD) computed from each CMIP6 model's own temperature and salinity reproduces the mlotst field that the same model publishes. This is an internal consistency test: both quantities come from the same simulation, so any disagreement is a property of the diagnostic, not of the model's physics.\n\nData to use:\n- CMIP6 historical `thetao`, `so` and `mlotst` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1971-01 to 2000-12.\n- Each model's own published cell areas (areacello).\n\nExpected numerical results, comparing the 1971-2000 March and September climatologies of the operator MLD with those of the published mlotst, for each of the six model-and-month combinations. The operator MLD is the mixed layer depth computed offline from the model's own thetao and so with the density criterion that defines mlotst, the crossing depth interpolated between the bracketing levels. For each model and calendar month, both climatologies cover only the cells where both fields are defined in all 30 instances of that month (the 30 Marches, or the 30 Septembers):\n- The mean difference, operator MLD minus mlotst, in metres to 1 decimal place.\n- The root-mean-square difference, in metres to 1 decimal place.\n- The spatial Pearson correlation between the two fields, to 3 decimal places.\n- The percentage of the area where both fields are defined on which the absolute difference exceeds 20 m, to 1 decimal place, and the area where both fields are defined as a percentage of the model's total ocean area, to 1 decimal place.\n- The ranking of the three models from most to least internally consistent, with the criterion used, the regions where the disagreement concentrates, and why the operator and mlotst are not expected to agree exactly.\n\nExpected visualizations:\n- Figure 1, a 3-by-2 panel of global maps of operator MLD minus mlotst, rows CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, columns March and September, all six panels drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only) with one shared diverging colour scale centred on zero.\n- Figure 2, a 3-by-2 panel of scatter plots in the same layout, operator MLD on the x axis against mlotst on the y axis, one point per ocean cell, with logarithmic axes of identical range and ticks in every panel, a dashed y = x reference line, and each panel annotated with its bias, root-mean-square difference and correlation.",
+      "language": "en",
+      "turn_number": 1,
+      "bundle_path": "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T4_deepseek-flash_20261025_064215/turn01",
+      "selected_tools": [],
+      "knowledge": null,
+      "generated_code": "<compute>\nimport os\nimport glob\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\nimport matplotlib.pyplot as plt\n\n# ---------------------------------------------------------------------------\n# Configuration\n# ---------------------------------------------------------------------------\nROOT_HIST = \"/data1/lorraine-20419/benchmark_cmip6/historical\"\nY0, Y1 = 1971, 2000\nMONTHS = [3, 9]\nMONTH_NAMES = {3: \"March\", 9: \"September\"}\nMODELS = [\"CESM2\", \"GFDL-ESM4\", \"MPI-ESM1-2-LR\"]\n\nMETA = {\n    \"CESM2\": dict(y=\"nlat\", x=\"nlon\", lat=\"lat\", lon=\"lon\", depth_scale=0.01),\n    \"GFDL-ESM4\": dict(y=\"lat\", x=\"lon\", lat=\"lat\", lon=\"lon\", depth_scale=1.0),\n    \"MPI-ESM1-2-LR\": dict(y=\"j\", x=\"i\", lat=\"latitude\", lon=\"longitude\", depth_scale=1.0),\n}\n\n# mlotst in CMIP6 is defined with a sigma-theta threshold of 0.03 kg m-3\n# relative to a 10 m reference depth.\nREF_DEPTH = 10.0\nDENSITY_THRESHOLD = 0.03\n\nTARGET_LON = np.arange(-179.5, 180.0, 1.0)\nTARGET_LAT = np.arange(-89.5, 90.0, 1.0)\n\n\n# ---------------------------------------------------------------------------\n# File discovery / opening helpers\n# ---------------------------------------------------------------------------\ndef files_for_variable(model, var):\n    \"\"\"Return {variant: [files]} for a model/variable directory.\"\"\"\n    d = os.path.join(ROOT_HIST, model, var)\n    fs = sorted(glob.glob(os.path.join(d, f\"{var}_*_{model}_historical_*_*.nc\")))\n    by = {}\n    for f in fs:\n        parts = os.path.basename(f).split(\"_\")\n        if len(parts) >= 6:\n            variant = parts[4]\n            by.setdefault(variant, []).append(f)\n    return by\n\n\ndef open_time_files(files):\n    \"\"\"Open one or several monthly CMIP6 files with cftime time decoding.\"\"\"\n    if len(files) == 1:\n        return xr.open_dataset(files[0], use_cftime=True, chunks={\"time\": 1})\n    return xr.open_mfdataset(\n        files, combine=\"by_coords\", use_cftime=True, chunks={\"time\": 1}\n    )\n\n\ndef open_fixed_file(model, var):\n    \"\"\"Open an Ofx fixed field, preferring Ofx and r1i1p1f1 if present.\"\"\"\n    d = os.path.join(ROOT_HIST, model, var)\n    fs = sorted(glob.glob(os.path.join(d, f\"{var}_*_{model}_historical_*.nc\")))\n    fs_ofx = [f for f in fs if \"_Ofx_\" in os.path.basename(f)]\n    if fs_ofx:\n        fs = fs_ofx\n    fs_r1 = [f for f in fs if \"r1i1p1f1\" in os.path.basename(f)]\n    if fs_r1:\n        fs = fs_r1\n    if not fs:\n        raise FileNotFoundError(f\"No file found for {model}/{var}\")\n    return xr.open_dataset(fs[0], use_cftime=True)\n\n\ndef load_area(model):\n    \"\"\"Load the model's ocean-cell areas, masking CESM2 with sftof.\"\"\"\n    y, x = META[model][\"y\"], META[model][\"x\"]\n\n    ds = open_fixed_file(model, \"areacello\")\n    area = ds[\"areacello\"].squeeze().transpose(y, x).values.astype(np.float64)\n    area = np.where(np.isfinite(area), area, 0.0)\n\n    if model == \"CESM2\":\n        ds2 = open_fixed_file(model, \"sftof\")\n        sft = ds2[\"sftof\"].squeeze().transpose(y, x).values.astype(np.float64)\n        area = np.where(sft > 0.0, area, 0.0)\n    else:\n        area = np.where(area > 0.0, area, 0.0)\n\n    return area\n\n\n# ---------------------------------------------------------------------------\n# Density and mixed-layer-depth operator\n# ---------------------------------------------------------------------------\ndef sigma0_from_TS(T, S):\n    \"\"\"\n    EOS-80 potential density anomaly sigma0 (kg m-3), using potential\n    temperature T (degC) and practical salinity S.\n    \"\"\"\n    T = np.asarray(T, dtype=np.float64)\n    S = np.asarray(S, dtype=np.float64)\n\n    # CMIP6 salinity is usually stored as practical-salinity numbers (~35).\n    # Some files may encode it as 0.035 or as 35000; normalise defensively.\n    finite = np.isfinite(S)\n    if np.any(finite):\n        med = np.nanmedian(S)\n        if med < 1.0:\n            S = S * 1000.0\n        elif med > 100.0:\n            S = S / 1000.0\n\n    S = np.where(S < 0.0, np.nan, S)\n\n    rho_w = (\n        999.842594\n        + 6.793952e-2 * T\n        - 9.095290e-3 * T**2\n        + 1.001685e-4 * T**3\n        - 1.120083e-6 * T**4\n        + 6.536332e-9 * T**5\n    )\n    A = (\n        0.824493\n        - 4.0899e-3 * T\n        + 7.6438e-5 * T**2\n        - 8.2467e-7 * T**3\n        + 5.3875e-9 * T**4\n    )\n    B = -5.72466e-3 + 1.0227e-4 * T - 1.6546e-6 * T**2\n    C = 4.8314e-4\n\n    rho = rho_w + A * S + B * S**1.5 + C * S**2\n    return rho - 1000.0\n\n\ndef compute_mld(T, S, depth, ref_depth=REF_DEPTH, threshold=DENSITY_THRESHOLD):\n    \"\"\"\n    Offline mixed layer depth from T/S profiles.\n\n    T, S : shape (lev, ny, nx)\n    depth: 1-D positive-down depth axis in metres\n\n    Returns MLD shape (ny, nx).  The MLD is the first depth at which sigma0\n    exceeds sigma0 at ref_depth by threshold, linearly interpolated between\n    bracketing levels.  If no such crossing exists, the deepest valid level is\n    used.\n    \"\"\"\n    sig = sigma0_from_TS(T, S)\n    L, ny, nx = sig.shape\n\n    depth = np.asarray(depth, dtype=np.float64)\n    if depth[0] > depth[-1]:\n        depth = depth[::-1]\n        sig = sig[::-1]\n\n    valid = np.isfinite(sig)\n    depth3 = depth[:, None, None]\n\n    # sigma at the reference depth, using the nearest valid levels above/below.\n    above_mask = valid & (depth3 <= ref_depth)\n    below_mask = valid & (depth3 >= ref_depth)\n\n    has_above = above_mask.any(axis=0)\n    has_below = below_mask.any(axis=0)\n\n    idx_above = L - 1 - np.argmax(above_mask[::-1, :, :], axis=0)\n    idx_below = np.argmax(below_mask, axis=0)\n\n    idx_above_safe = np.where(has_above, idx_above, 0)\n    idx_below_safe = np.where(has_below, idx_below, 0)\n\n    sig_above = np.take_along_axis(\n        sig, idx_above_safe[None, :, :], axis=0\n    )[0]\n    sig_below = np.take_along_axis(\n        sig, idx_below_safe[None, :, :], axis=0\n    )[0]\n\n    d_above = depth[idx_above_safe]\n    d_below = depth[idx_below_safe]\n\n    denom_ref = d_below - d_above\n    frac_ref = np.where(\n        denom_ref != 0.0, (ref_depth - d_above) / denom_ref, 0.0\n    )\n    sig_both = sig_above + frac_ref * (sig_below - sig_above)\n\n    sig_ref = np.where(\n        has_above & has_below,\n        sig_both,\n        np.where(has_above, sig_above, np.where(has_below, sig_below, np.nan)),\n    )\n\n    delta = sig - sig_ref[None, :, :]\n\n    # First level at or below ref_depth where the threshold is reached.\n    cond = valid & (depth3 >= ref_depth) & (delta >= threshold)\n    has_cross = cond.any(axis=0)\n    j = np.argmax(cond, axis=0)\n\n    # Default for no crossing: deepest valid level.\n    rev_valid = valid[::-1, :, :]\n    has_any = valid.any(axis=0)\n    last_valid = L - 1 - np.argmax(rev_valid, axis=0)\n    bottom_depth = np.where(has_any, depth[last_valid], np.nan)\n    mld = np.array(bottom_depth, dtype=np.float64)\n\n    if np.any(has_cross):\n        jj = np.where(has_cross, j, 0)\n        depth_j = depth[jj]\n        delta_j = np.take_along_axis(delta, jj[None, :, :], axis=0)[0]\n\n        jm1 = np.maximum(jj - 1, 0)\n        depth_jm1 = depth[jm1]\n        delta_jm1 = np.take_along_axis(delta, jm1[None, :, :], axis=0)[0]\n\n        # If the previous level is shallower than the reference depth, the\n        # true lower bracket is the reference depth itself (delta = 0).\n        use_ref = (depth_jm1 < ref_depth) & (depth_j >= ref_depth)\n        depth_jm1 = np.where(use_ref, ref_depth, depth_jm1)\n        delta_jm1 = np.where(use_ref, 0.0, delta_jm1)\n\n        denom = delta_j - delta_jm1\n        with np.errstate(divide=\"ignore\", invalid=\"ignore\"):\n            frac = (threshold - delta_jm1) / denom\n        cross = depth_jm1 + frac * (depth_j - depth_jm1)\n\n        bad = ~np.isfinite(cross)\n        cross = np.where(bad, depth_j, cross)\n        cross = np.where(jj > 0, cross, depth[0])\n        mld = np.where(has_cross, cross, mld)\n\n    return mld\n\n\n# ---------------------------------------------------------------------------\n# Regridding for display only\n# ---------------------------------------------------------------------------\ndef regrid_to_regular(lon2d, lat2d, field, tlon, tlat):\n    \"\"\"Nearest-neighbour regridding to a regular lon/lat display grid.\"\"\"\n    try:\n        from scipy.interpolate import griddata\n\n        pts = np.column_stack((lon2d.ravel(), lat2d.ravel()))\n        vals = field.ravel()\n        good = np.isfinite(vals) & np.isfinite(pts[:, 0]) & np.isfinite(pts[:, 1])\n        if not np.any(good):\n            return np.full((len(tlat), len(tlon)), np.nan)\n\n        lon_grid, lat_grid = np.meshgrid(tlon, tlat)\n        out = griddata(\n            pts[good], vals[good], (lon_grid, lat_grid), method=\"nearest\"\n        )\n        return out\n    except Exception:\n        # Fallback: simple area-of-influence binning.\n        out_sum = np.zeros((len(tlat), len(tlon)), dtype=np.float64)\n        out_cnt = np.zeros_like(out_sum)\n        dlon = tlon[1] - tlon[0]\n        dlat = tlat[1] - tlat[0]\n        ix = np.floor((lon2d - (tlon[0] - dlon / 2.0)) / dlon).astype(int)\n        iy = np.floor((lat2d - (tlat[0] - dlat / 2.0)) / dlat).astype(int)\n        good = (\n            np.isfinite(field)\n            & (ix >= 0)\n            & (ix < len(tlon))\n            & (iy >= 0)\n            & (iy < len(tlat))\n        )\n        np.add.at(out_sum, (iy[good], ix[good]), field[good])\n        np.add.at(out_cnt, (iy[good], ix[good]), 1.0)\n        return np.where(out_cnt > 0.0, out_sum / out_cnt, np.nan)\n\n\ndef coarse_disagreement(lon2d, lat2d, area, diff, mask, lon_step=10.0, lat_step=10.0):\n    \"\"\"Return the top coarse boxes by area fraction with |diff| > 20 m.\"\"\"\n    lon_edges = np.arange(-180.0, 180.0 + lon_step, lon_step)\n    lat_edges = np.arange(-90.0, 90.0 + lat_step, lat_step)\n\n    ix = np.clip(np.digitize(lon2d, lon_edges) - 1, 0, len(lon_edges) - 2)\n    iy = np.clip(np.digitize(lat2d, lat_edges) - 1, 0, len(lat_edges) - 2)\n\n    good = mask & np.isfinite(diff) & np.isfinite(area) & (area > 0.0)\n    bad = good & (np.abs(diff) > 20.0)\n\n    area_valid = np.zeros((len(lat_edges) - 1, len(lon_edges) - 1), dtype=np.float64)\n    area_bad = np.zeros_like(area_valid)\n\n    np.add.at(area_valid, (iy[good], ix[good]), area[good])\n    np.add.at(area_bad, (iy[bad], ix[bad]), area[bad])\n\n    frac = np.where(area_valid > 0.0, 100.0 * area_bad / area_valid, np.nan)\n    idx = np.argwhere(np.isfinite(frac) & (area_valid > 0.0))\n    if idx.size == 0:\n        return pd.DataFrame()\n\n    vals = frac[idx[:, 0], idx[:, 1]]\n    order = np.argsort(vals)[::-1][:5]\n\n    rows = []\n    for o in order:\n        i, j = idx[o]\n        rows.append(\n            dict(\n                lat_min=float(lat_edges[i]),\n                lat_max=float(lat_edges[i + 1]),\n                lon_min=float(lon_edges[j]),\n                lon_max=float(lon_edges[j + 1]),\n                area_fraction_gt20=float(frac[i, j]),\n                area_valid=float(area_valid[i, j]),\n            )\n        )\n    return pd.DataFrame(rows)\n\n\n# ---------------------------------------------------------------------------\n# Main computation\n# ---------------------------------------------------------------------------\nresults = {}\nfig1_src = {}\nfig2_data = {}\nregion_stats = {}\nmodel_variant = {}\n\nfor model in MODELS:\n    by_t = files_for_variable(model, \"thetao\")\n    by_s = files_for_variable(model, \"so\")\n    by_m = files_for_variable(model, \"mlotst\")\n\n    candidates = sorted(set(by_t) & set(by_s) & set(by_m))\n    if not candidates:\n        candidates = sorted(set(by_t) | set(by_s) | set(by_m))\n    if not candidates:\n        raise FileNotFoundError(f\"No historical thetao/so/mlotst files for {model}\")\n\n    variant = \"r1i1p1f1\" if \"r1i1p1f1\" in candidates else candidates[0]\n    model_variant[model] = variant\n\n    ds_t = open_time_files(by_t[variant])\n    ds_s = open_time_files(by_s[variant])\n    ds_ml = open_time_files(by_m[variant])\n\n    y_dim = META[model][\"y\"]\n    x_dim = META[model][\"x\"]\n\n    ny = ds_t.sizes[y_dim]\n    nx = ds_t.sizes[x_dim]\n\n    area = load_area(model)\n    total_ocean_area = float(np.nansum(area))\n\n    # 2-D longitude/latitude for display and region diagnostics.\n    lon_name = META[model][\"lon\"]\n    lat_name = META[model][\"lat\"]\n    lon_coord = ds_t[lon_name].values\n    lat_coord = ds_t[lat_name].values\n    if lon_coord.ndim == 1 and lat_coord.ndim == 1:\n        lon2d, lat2d = np.meshgrid(lon_coord, lat_coord)\n    elif lon_coord.ndim == 2 and lat_coord.ndim == 2:\n        lon2d, lat2d = lon_coord, lat_coord\n    else:\n        lon2d, lat2d = np.meshgrid(np.ravel(lon_coord), np.ravel(lat_coord))\n\n    lon2d = ((lon2d + 180.0) % 360.0) - 180.0\n\n    # Depth axis in metres.\n    lev_da = ds_t[\"lev\"]\n    lev_units = str(lev_da.attrs.get(\"units\", \"\")).lower()\n    lev_vals = lev_da.values.astype(np.float64)\n    if \"cm\" in lev_units:\n        lev_m = lev_vals * 0.01\n    elif lev_units.strip() in {\"m\", \"meter\", \"metre\", \"meters\", \"metres\"}:\n        lev_m = lev_vals * 1.0\n    else:\n        lev_m = lev_vals * META[model][\"depth_scale\"]\n\n    for month in MONTHS:\n        cond_t = (\n            (ds_t.time.dt.year >= Y0)\n            & (ds_t.time.dt.year <= Y1)\n            & (ds_t.time.dt.month == month)\n        )\n        cond_s = (\n            (ds_s.time.dt.year >= Y0)\n            & (ds_s.time.dt.year <= Y1)\n            & (ds_s.time.dt.month == month)\n        )\n        cond_m = (\n            (ds_ml.time.dt.year >= Y0)\n            & (ds_ml.time.dt.year <= Y1)\n            & (ds_ml.time.dt.month == month)\n        )\n\n        ds_t_m = ds_t.sel(time=cond_t)\n        ds_s_m = ds_s.sel(time=cond_s)\n        ds_ml_m = ds_ml.sel(time=cond_m)\n\n        n = ds_t_m.sizes[\"time\"]\n        if ds_s_m.sizes[\"time\"] != n:\n            ds_s_m = ds_s_m.sel(time=ds_t_m.time)\n        if ds_ml_m.sizes[\"time\"] != n:\n            ds_ml_m = ds_ml_m.sel(time=ds_t_m.time)\n\n        sum_op = np.zeros((ny, nx), dtype=np.float64)\n        sum_ml = np.zeros((ny, nx), dtype=np.float64)\n        count = np.zeros((ny, nx), dtype=np.int16)\n\n        for i in range(n):\n            T = (\n                ds_t_m[\"thetao\"]\n                .isel(time=i)\n                .transpose(\"lev\", y_dim, x_dim)\n                .load()\n                .values\n            )\n            S = (\n                ds_s_m[\"so\"]\n                .isel(time=i)\n                .transpose(\"lev\", y_dim, x_dim)\n                .load()\n                .values\n            )\n            ml = (\n                ds_ml_m[\"mlotst\"]\n                .isel(time=i)\n                .transpose(y_dim, x_dim)\n                .load()\n                .values\n            )\n\n            T = np.where(T > 1.0e20, np.nan, T)\n            S = np.where(S > 1.0e20, np.nan, S)\n            ml = np.where(ml > 1.0e20, np.nan, ml)\n\n            mld = compute_mld(T, S, lev_m)\n            valid = np.isfinite(mld) & np.isfinite(ml)\n\n            if np.any(valid):\n                sum_op[valid] += mld[valid]\n                sum_ml[valid] += ml[valid]\n                count[valid] += 1\n\n        valid_all = count == n\n\n        op_clim = np.full((ny, nx), np.nan, dtype=np.float64)\n        ml_clim = np.full((ny, nx), np.nan, dtype=np.float64)\n        op_clim[valid_all] = sum_op[valid_all] / float(n)\n        ml_clim[valid_all] = sum_ml[valid_all] / float(n)\n\n        diff = op_clim - ml_clim\n        mask = valid_all & np.isfinite(op_clim) & np.isfinite(ml_clim)\n\n        x = op_clim[mask]\n        y = ml_clim[mask]\n        a = area[mask]\n\n        if x.size > 0:\n            bias = float(np.mean(x - y))\n            rmsd = float(np.sqrt(np.mean((x - y) ** 2)))\n            corr = float(np.corrcoef(x, y)[0, 1]) if x.size > 1 else np.nan\n\n            area_valid = float(np.sum(a))\n            frac_gt20 = (\n                float(np.sum(a[np.abs(x - y) > 20.0]) / area_valid * 100.0)\n                if area_valid > 0.0\n                else np.nan\n            )\n            frac_valid_area = (\n                float(area_valid / total_ocean_area * 100.0)\n                if total_ocean_area > 0.0\n                else np.nan\n            )\n        else:\n            bias = np.nan\n            rmsd = np.nan\n            corr = np.nan\n            area_valid = 0.0\n            frac_gt20 = np.nan\n            frac_valid_area = np.nan\n\n        results[(model, month)] = dict(\n            model=model,\n            month=month,\n            month_name=MONTH_NAMES[month],\n            bias=bias,\n            rmsd=rmsd,\n            corr=corr,\n            frac_gt20=frac_gt20,\n            frac_valid_area=frac_valid_area,\n            n_cells=int(x.size),\n            area_valid=area_valid,\n            total_ocean_area=total_ocean_area,\n            diff=diff,\n            op_clim=op_clim,\n            ml_clim=ml_clim,\n            x=x,\n            y=y,\n            lon2d=lon2d,\n            lat2d=lat2d,\n            area=area,\n            mask=mask,\n        )\n\n        fig2_data[(model, month)] = (x, y, bias, rmsd, corr)\n        fig1_src[(model, month)] = regrid_to_regular(\n            lon2d, lat2d, diff, TARGET_LON, TARGET_LAT\n        )\n        region_stats[(model, month)] = coarse_disagreement(\n            lon2d, lat2d, area, diff, mask\n        )\n\n# ---------------------------------------------------------------------------\n# Tables / rankings / plotting ranges\n# ---------------------------------------------------------------------------\nrows = []\nfor key, r in results.items():\n    rows.append(\n        {\n            \"model\": r[\"model\"],\n            \"month\": r[\"month\"],\n            \"month_name\": r[\"month_name\"],\n            \"bias_m\": r[\"bias\"],\n            \"rmsd_m\": r[\"rmsd\"],\n            \"corr\": r[\"corr\"],\n            \"area_pct_absdiff_gt20\": r[\"frac_gt20\"],\n            \"valid_area_pct_of_ocean\": r[\"frac_valid_area\"],\n            \"n_cells\": r[\"n_cells\"],\n            \"area_valid_m2\": r[\"area_valid\"],\n            \"total_ocean_area_m2\": r[\"total_ocean_area\"],\n        }\n    )\n\nresults_df = pd.DataFrame(rows).sort_values([\"model\", \"month\"]).reset_index(drop=True)\n\nmodel_rmsd = results_df.groupby(\"model\")[\"rmsd_m\"].mean().sort_values()\nranking = list(model_rmsd.index)\nranking_criterion = \"mean of March and September RMSD (lower is better)\"\n\nall_fig1 = np.concatenate([fig1_src[k].ravel() for k in fig1_src])\nall_fig1 = all_fig1[np.isfinite(all_fig1)]\nif all_fig1.size:\n    fig1_vmax = float(np.nanpercentile(np.abs(all_fig1), 98.0))\nelse:\n    fig1_vmax = 100.0\nif not np.isfinite(fig1_vmax) or fig1_vmax <= 0.0:\n    fig1_vmax = 100.0\n\nall_scatter = np.concatenate(\n    [np.concatenate([fig2_data[k][0], fig2_data[k][1]]) for k in fig2_data]\n)\nall_scatter = all_scatter[np.isfinite(all_scatter) & (all_scatter > 0.0)]\nif all_scatter.size:\n    fig2_lim_min = 10.0 ** np.floor(np.log10(np.nanmin(all_scatter)))\n    fig2_lim_max = 10.0 ** np.ceil(np.log10(np.nanmax(all_scatter)))\nelse:\n    fig2_lim_min, fig2_lim_max = 0.1, 10000.0\n\nfig2_lim_min = max(float(fig2_lim_min), 0.1)\nfig2_lim_max = float(fig2_lim_max)\nif fig2_lim_max <= fig2_lim_min:\n    fig2_lim_max = fig2_lim_min * 10.0\nfig2_lims = (fig2_lim_min, fig2_lim_max)\n\n_tick_candidates = np.array(\n    [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]\n)\nfig2_ticks = [\n    float(t) for t in _tick_candidates if fig2_lims[0] <= t <= fig2_lims[1]\n]\nif len(fig2_ticks) < 2:\n    fig2_ticks = [fig2_lims[0], fig2_lims[1]]\n\nprint(results_df.to_string(index=False))\nprint(\"\\nRanking (most to least internally consistent):\")\nfor i, model in enumerate(ranking, 1):\n    print(f\"{i}. {model}  mean RMSD = {model_rmsd.loc[model]:.1f} m\")\n</compute>\n\n<visualize>\n# Figure 1: operator MLD minus published mlotst, on a common regular map grid.\nfig1, axes1 = plt.subplots(3, 2, figsize=(12, 11), sharex=True, sharey=True)\n\nfor i, model in enumerate(MODELS):\n    for j, month in enumerate(MONTHS):\n        ax = axes1[i, j]\n        data = fig1_src[(model, month)]\n        im = ax.pcolormesh(\n            TARGET_LON,\n            TARGET_LAT,\n            data,\n            cmap=\"RdBu_r\",\n            vmin=-fig1_vmax,\n            vmax=fig1_vmax,\n            shading=\"auto\",\n        )\n        ax.set_xlim(-180, 180)\n        ax.set_ylim(-90, 90)\n        ax.set_xticks([-180, -120, -60, 0, 60, 120, 180])\n        ax.set_yticks([-90, -60, -30, 0, 30, 60, 90])\n        ax.grid(True, linewidth=0.2, alpha=0.4)\n        ax.set_title(f\"{model} — {MONTH_NAMES[month]}\")\n        if i == 2:\n            ax.set_xlabel(\"Longitude\")\n        if j == 0:\n            ax.set_ylabel(\"Latitude\")\n\nfig1.suptitle(\"Operator MLD minus published mlotst (m)\", fontsize=14)\ncbar = fig1.colorbar(\n    im,\n    ax=axes1.ravel().tolist(),\n    orientation=\"horizontal\",\n    fraction=0.04,\n    pad=0.06,\n)\ncbar.set_label(\"Operator MLD - mlotst (m)\")\n\n# Figure 2: operator MLD vs published mlotst scatter, common logarithmic axes.\nfig2, axes2 = plt.subplots(3, 2, figsize=(11, 12), sharex=True, sharey=True)\n\nfor i, model in enumerate(MODELS):\n    for j, month in enumerate(MONTHS):\n        ax = axes2[i, j]\n        x, y, bias, rmsd, corr = fig2_data[(model, month)]\n\n        ax.scatter(x, y, s=1, alpha=0.15, edgecolors=\"none\", rasterized=True)\n        ax.plot(fig2_lims, fig2_lims, \"k--\", linewidth=0.9)\n\n        ax.set_xscale(\"log\")\n        ax.set_yscale(\"log\")\n        ax.set_xlim(fig2_lims)\n        ax.set_ylim(fig2_lims)\n        ax.set_xticks(fig2_ticks)\n        ax.set_yticks(fig2_ticks)\n        ax.set_xticklabels([f\"{t:g}\" for t in fig2_ticks])\n        ax.set_yticklabels([f\"{t:g}\" for t in fig2_ticks])\n        ax.minorticks_off()\n        ax.grid(True, which=\"major\", linewidth=0.2, alpha=0.4)\n\n        ax.set_title(f\"{model} — {MONTH_NAMES[month]}\")\n        ax.text(\n            0.04,\n            0.96,\n            f\"bias = {bias:.1f} m\\nRMSD = {rmsd:.1f} m\\nr = {corr:.3f}\",\n            transform=ax.transAxes,\n            va=\"top\",\n            ha=\"left\",\n            fontsize=8,\n            bbox=dict(boxstyle=\"round\", facecolor=\"white\", alpha=0.8, edgecolor=\"none\"),\n        )\n\n        if i == 2:\n            ax.set_xlabel(\"Operator MLD (m)\")\n        if j == 0:\n            ax.set_ylabel(\"Published mlotst (m)\")\n\nfig2.suptitle(\"Operator MLD vs published mlotst\", fontsize=14)\n</visualize>",
+      "compute_iterations": [
+        {
+          "iteration": 1,
+          "code": "import os\nimport glob\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\nimport matplotlib.pyplot as plt\n\n# ---------------------------------------------------------------------------\n# Configuration\n# ---------------------------------------------------------------------------\nROOT_HIST = \"/data1/lorraine-20419/benchmark_cmip6/historical\"\nY0, Y1 = 1971, 2000\nMONTHS = [3, 9]\nMONTH_NAMES = {3: \"March\", 9: \"September\"}\nMODELS = [\"CESM2\", \"GFDL-ESM4\", \"MPI-ESM1-2-LR\"]\n\nMETA = {\n    \"CESM2\": dict(y=\"nlat\", x=\"nlon\", lat=\"lat\", lon=\"lon\", depth_scale=0.01),\n    \"GFDL-ESM4\": dict(y=\"lat\", x=\"lon\", lat=\"lat\", lon=\"lon\", depth_scale=1.0),\n    \"MPI-ESM1-2-LR\": dict(y=\"j\", x=\"i\", lat=\"latitude\", lon=\"longitude\", depth_scale=1.0),\n}\n\n# mlotst in CMIP6 is defined with a sigma-theta threshold of 0.03 kg m-3\n# relative to a 10 m reference depth.\nREF_DEPTH = 10.0\nDENSITY_THRESHOLD = 0.03\n\nTARGET_LON = np.arange(-179.5, 180.0, 1.0)\nTARGET_LAT = np.arange(-89.5, 90.0, 1.0)\n\n\n# ---------------------------------------------------------------------------\n# File discovery / opening helpers\n# ---------------------------------------------------------------------------\ndef files_for_variable(model, var):\n    \"\"\"Return {variant: [files]} for a model/variable directory.\"\"\"\n    d = os.path.join(ROOT_HIST, model, var)\n    fs = sorted(glob.glob(os.path.join(d, f\"{var}_*_{model}_historical_*_*.nc\")))\n    by = {}\n    for f in fs:\n        parts = os.path.basename(f).split(\"_\")\n        if len(parts) >= 6:\n            variant = parts[4]\n            by.setdefault(variant, []).append(f)\n    return by\n\n\ndef open_time_files(files):\n    \"\"\"Open one or several monthly CMIP6 files with cftime time decoding.\"\"\"\n    if len(files) == 1:\n        return xr.open_dataset(files[0], use_cftime=True, chunks={\"time\": 1})\n    return xr.open_mfdataset(\n        files, combine=\"by_coords\", use_cftime=True, chunks={\"time\": 1}\n    )\n\n\ndef open_fixed_file(model, var):\n    \"\"\"Open an Ofx fixed field, preferring Ofx and r1i1p1f1 if present.\"\"\"\n    d = os.path.join(ROOT_HIST, model, var)\n    fs = sorted(glob.glob(os.path.join(d, f\"{var}_*_{model}_historical_*.nc\")))\n    fs_ofx = [f for f in fs if \"_Ofx_\" in os.path.basename(f)]\n    if fs_ofx:\n        fs = fs_ofx\n    fs_r1 = [f for f in fs if \"r1i1p1f1\" in os.path.basename(f)]\n    if fs_r1:\n        fs = fs_r1\n    if not fs:\n        raise FileNotFoundError(f\"No file found for {model}/{var}\")\n    return xr.open_dataset(fs[0], use_cftime=True)\n\n\ndef load_area(model):\n    \"\"\"Load the model's ocean-cell areas, masking CESM2 with sftof.\"\"\"\n    y, x = META[model][\"y\"], META[model][\"x\"]\n\n    ds = open_fixed_file(model, \"areacello\")\n    area = ds[\"areacello\"].squeeze().transpose(y, x).values.astype(np.float64)\n    area = np.where(np.isfinite(area), area, 0.0)\n\n    if model == \"CESM2\":\n        ds2 = open_fixed_file(model, \"sftof\")\n        sft = ds2[\"sftof\"].squeeze().transpose(y, x).values.astype(np.float64)\n        area = np.where(sft > 0.0, area, 0.0)\n    else:\n        area = np.where(area > 0.0, area, 0.0)\n\n    return area\n\n\n# ---------------------------------------------------------------------------\n# Density and mixed-layer-depth operator\n# ---------------------------------------------------------------------------\ndef sigma0_from_TS(T, S):\n    \"\"\"\n    EOS-80 potential density anomaly sigma0 (kg m-3), using potential\n    temperature T (degC) and practical salinity S.\n    \"\"\"\n    T = np.asarray(T, dtype=np.float64)\n    S = np.asarray(S, dtype=np.float64)\n\n    # CMIP6 salinity is usually stored as practical-salinity numbers (~35).\n    # Some files may encode it as 0.035 or as 35000; normalise defensively.\n    finite = np.isfinite(S)\n    if np.any(finite):\n        med = np.nanmedian(S)\n        if med < 1.0:\n            S = S * 1000.0\n        elif med > 100.0:\n            S = S / 1000.0\n\n    S = np.where(S < 0.0, np.nan, S)\n\n    rho_w = (\n        999.842594\n        + 6.793952e-2 * T\n        - 9.095290e-3 * T**2\n        + 1.001685e-4 * T**3\n        - 1.120083e-6 * T**4\n        + 6.536332e-9 * T**5\n    )\n    A = (\n        0.824493\n        - 4.0899e-3 * T\n        + 7.6438e-5 * T**2\n        - 8.2467e-7 * T**3\n        + 5.3875e-9 * T**4\n    )\n    B = -5.72466e-3 + 1.0227e-4 * T - 1.6546e-6 * T**2\n    C = 4.8314e-4\n\n    rho = rho_w + A * S + B * S**1.5 + C * S**2\n    return rho - 1000.0\n\n\ndef compute_mld(T, S, depth, ref_depth=REF_DEPTH, threshold=DENSITY_THRESHOLD):\n    \"\"\"\n    Offline mixed layer depth from T/S profiles.\n\n    T, S : shape (lev, ny, nx)\n    depth: 1-D positive-down depth axis in metres\n\n    Returns MLD shape (ny, nx).  The MLD is the first depth at which sigma0\n    exceeds sigma0 at ref_depth by threshold, linearly interpolated between\n    bracketing levels.  If no such crossing exists, the deepest valid level is\n    used.\n    \"\"\"\n    sig = sigma0_from_TS(T, S)\n    L, ny, nx = sig.shape\n\n    depth = np.asarray(depth, dtype=np.float64)\n    if depth[0] > depth[-1]:\n        depth = depth[::-1]\n        sig = sig[::-1]\n\n    valid = np.isfinite(sig)\n    depth3 = depth[:, None, None]\n\n    # sigma at the reference depth, using the nearest valid levels above/below.\n    above_mask = valid & (depth3 <= ref_depth)\n    below_mask = valid & (depth3 >= ref_depth)\n\n    has_above = above_mask.any(axis=0)\n    has_below = below_mask.any(axis=0)\n\n    idx_above = L - 1 - np.argmax(above_mask[::-1, :, :], axis=0)\n    idx_below = np.argmax(below_mask, axis=0)\n\n    idx_above_safe = np.where(has_above, idx_above, 0)\n    idx_below_safe = np.where(has_below, idx_below, 0)\n\n    sig_above = np.take_along_axis(\n        sig, idx_above_safe[None, :, :], axis=0\n    )[0]\n    sig_below = np.take_along_axis(\n        sig, idx_below_safe[None, :, :], axis=0\n    )[0]\n\n    d_above = depth[idx_above_safe]\n    d_below = depth[idx_below_safe]\n\n    denom_ref = d_below - d_above\n    frac_ref = np.where(\n        denom_ref != 0.0, (ref_depth - d_above) / denom_ref, 0.0\n    )\n    sig_both = sig_above + frac_ref * (sig_below - sig_above)\n\n    sig_ref = np.where(\n        has_above & has_below,\n        sig_both,\n        np.where(has_above, sig_above, np.where(has_below, sig_below, np.nan)),\n    )\n\n    delta = sig - sig_ref[None, :, :]\n\n    # First level at or below ref_depth where the threshold is reached.\n    cond = valid & (depth3 >= ref_depth) & (delta >= threshold)\n    has_cross = cond.any(axis=0)\n    j = np.argmax(cond, axis=0)\n\n    # Default for no crossing: deepest valid level.\n    rev_valid = valid[::-1, :, :]\n    has_any = valid.any(axis=0)\n    last_valid = L - 1 - np.argmax(rev_valid, axis=0)\n    bottom_depth = np.where(has_any, depth[last_valid], np.nan)\n    mld = np.array(bottom_depth, dtype=np.float64)\n\n    if np.any(has_cross):\n        jj = np.where(has_cross, j, 0)\n        depth_j = depth[jj]\n        delta_j = np.take_along_axis(delta, jj[None, :, :], axis=0)[0]\n\n        jm1 = np.maximum(jj - 1, 0)\n        depth_jm1 = depth[jm1]\n        delta_jm1 = np.take_along_axis(delta, jm1[None, :, :], axis=0)[0]\n\n        # If the previous level is shallower than the reference depth, the\n        # true lower bracket is the reference depth itself (delta = 0).\n        use_ref = (depth_jm1 < ref_depth) & (depth_j >= ref_depth)\n        depth_jm1 = np.where(use_ref, ref_depth, depth_jm1)\n        delta_jm1 = np.where(use_ref, 0.0, delta_jm1)\n\n        denom = delta_j - delta_jm1\n        with np.errstate(divide=\"ignore\", invalid=\"ignore\"):\n            frac = (threshold - delta_jm1) / denom\n        cross = depth_jm1 + frac * (depth_j - depth_jm1)\n\n        bad = ~np.isfinite(cross)\n        cross = np.where(bad, depth_j, cross)\n        cross = np.where(jj > 0, cross, depth[0])\n        mld = np.where(has_cross, cross, mld)\n\n    return mld\n\n\n# ---------------------------------------------------------------------------\n# Regridding for display only\n# ---------------------------------------------------------------------------\ndef regrid_to_regular(lon2d, lat2d, field, tlon, tlat):\n    \"\"\"Nearest-neighbour regridding to a regular lon/lat display grid.\"\"\"\n    try:\n        from scipy.interpolate import griddata\n\n        pts = np.column_stack((lon2d.ravel(), lat2d.ravel()))\n        vals = field.ravel()\n        good = np.isfinite(vals) & np.isfinite(pts[:, 0]) & np.isfinite(pts[:, 1])\n        if not np.any(good):\n            return np.full((len(tlat), len(tlon)), np.nan)\n\n        lon_grid, lat_grid = np.meshgrid(tlon, tlat)\n        out = griddata(\n            pts[good], vals[good], (lon_grid, lat_grid), method=\"nearest\"\n        )\n        return out\n    except Exception:\n        # Fallback: simple area-of-influence binning.\n        out_sum = np.zeros((len(tlat), len(tlon)), dtype=np.float64)\n        out_cnt = np.zeros_like(out_sum)\n        dlon = tlon[1] - tlon[0]\n        dlat = tlat[1] - tlat[0]\n        ix = np.floor((lon2d - (tlon[0] - dlon / 2.0)) / dlon).astype(int)\n        iy = np.floor((lat2d - (tlat[0] - dlat / 2.0)) / dlat).astype(int)\n        good = (\n            np.isfinite(field)\n            & (ix >= 0)\n            & (ix < len(tlon))\n            & (iy >= 0)\n            & (iy < len(tlat))\n        )\n        np.add.at(out_sum, (iy[good], ix[good]), field[good])\n        np.add.at(out_cnt, (iy[good], ix[good]), 1.0)\n        return np.where(out_cnt > 0.0, out_sum / out_cnt, np.nan)\n\n\ndef coarse_disagreement(lon2d, lat2d, area, diff, mask, lon_step=10.0, lat_step=10.0):\n    \"\"\"Return the top coarse boxes by area fraction with |diff| > 20 m.\"\"\"\n    lon_edges = np.arange(-180.0, 180.0 + lon_step, lon_step)\n    lat_edges = np.arange(-90.0, 90.0 + lat_step, lat_step)\n\n    ix = np.clip(np.digitize(lon2d, lon_edges) - 1, 0, len(lon_edges) - 2)\n    iy = np.clip(np.digitize(lat2d, lat_edges) - 1, 0, len(lat_edges) - 2)\n\n    good = mask & np.isfinite(diff) & np.isfinite(area) & (area > 0.0)\n    bad = good & (np.abs(diff) > 20.0)\n\n    area_valid = np.zeros((len(lat_edges) - 1, len(lon_edges) - 1), dtype=np.float64)\n    area_bad = np.zeros_like(area_valid)\n\n    np.add.at(area_valid, (iy[good], ix[good]), area[good])\n    np.add.at(area_bad, (iy[bad], ix[bad]), area[bad])\n\n    frac = np.where(area_valid > 0.0, 100.0 * area_bad / area_valid, np.nan)\n    idx = np.argwhere(np.isfinite(frac) & (area_valid > 0.0))\n    if idx.size == 0:\n        return pd.DataFrame()\n\n    vals = frac[idx[:, 0], idx[:, 1]]\n    order = np.argsort(vals)[::-1][:5]\n\n    rows = []\n    for o in order:\n        i, j = idx[o]\n        rows.append(\n            dict(\n                lat_min=float(lat_edges[i]),\n                lat_max=float(lat_edges[i + 1]),\n                lon_min=float(lon_edges[j]),\n                lon_max=float(lon_edges[j + 1]),\n                area_fraction_gt20=float(frac[i, j]),\n                area_valid=float(area_valid[i, j]),\n            )\n        )\n    return pd.DataFrame(rows)\n\n\n# ---------------------------------------------------------------------------\n# Main computation\n# ---------------------------------------------------------------------------\nresults = {}\nfig1_src = {}\nfig2_data = {}\nregion_stats = {}\nmodel_variant = {}\n\nfor model in MODELS:\n    by_t = files_for_variable(model, \"thetao\")\n    by_s = files_for_variable(model, \"so\")\n    by_m = files_for_variable(model, \"mlotst\")\n\n    candidates = sorted(set(by_t) & set(by_s) & set(by_m))\n    if not candidates:\n        candidates = sorted(set(by_t) | set(by_s) | set(by_m))\n    if not candidates:\n        raise FileNotFoundError(f\"No historical thetao/so/mlotst files for {model}\")\n\n    variant = \"r1i1p1f1\" if \"r1i1p1f1\" in candidates else candidates[0]\n    model_variant[model] = variant\n\n    ds_t = open_time_files(by_t[variant])\n    ds_s = open_time_files(by_s[variant])\n    ds_ml = open_time_files(by_m[variant])\n\n    y_dim = META[model][\"y\"]\n    x_dim = META[model][\"x\"]\n\n    ny = ds_t.sizes[y_dim]\n    nx = ds_t.sizes[x_dim]\n\n    area = load_area(model)\n    total_ocean_area = float(np.nansum(area))\n\n    # 2-D longitude/latitude for display and region diagnostics.\n    lon_name = META[model][\"lon\"]\n    lat_name = META[model][\"lat\"]\n    lon_coord = ds_t[lon_name].values\n    lat_coord = ds_t[lat_name].values\n    if lon_coord.ndim == 1 and lat_coord.ndim == 1:\n        lon2d, lat2d = np.meshgrid(lon_coord, lat_coord)\n    elif lon_coord.ndim == 2 and lat_coord.ndim == 2:\n        lon2d, lat2d = lon_coord, lat_coord\n    else:\n        lon2d, lat2d = np.meshgrid(np.ravel(lon_coord), np.ravel(lat_coord))\n\n    lon2d = ((lon2d + 180.0) % 360.0) - 180.0\n\n    # Depth axis in metres.\n    lev_da = ds_t[\"lev\"]\n    lev_units = str(lev_da.attrs.get(\"units\", \"\")).lower()\n    lev_vals = lev_da.values.astype(np.float64)\n    if \"cm\" in lev_units:\n        lev_m = lev_vals * 0.01\n    elif lev_units.strip() in {\"m\", \"meter\", \"metre\", \"meters\", \"metres\"}:\n        lev_m = lev_vals * 1.0\n    else:\n        lev_m = lev_vals * META[model][\"depth_scale\"]\n\n    for month in MONTHS:\n        cond_t = (\n            (ds_t.time.dt.year >= Y0)\n            & (ds_t.time.dt.year <= Y1)\n            & (ds_t.time.dt.month == month)\n        )\n        cond_s = (\n            (ds_s.time.dt.year >= Y0)\n            & (ds_s.time.dt.year <= Y1)\n            & (ds_s.time.dt.month == month)\n        )\n        cond_m = (\n            (ds_ml.time.dt.year >= Y0)\n            & (ds_ml.time.dt.year <= Y1)\n            & (ds_ml.time.dt.month == month)\n        )\n\n        ds_t_m = ds_t.sel(time=cond_t)\n        ds_s_m = ds_s.sel(time=cond_s)\n        ds_ml_m = ds_ml.sel(time=cond_m)\n\n        n = ds_t_m.sizes[\"time\"]\n        if ds_s_m.sizes[\"time\"] != n:\n            ds_s_m = ds_s_m.sel(time=ds_t_m.time)\n        if ds_ml_m.sizes[\"time\"] != n:\n            ds_ml_m = ds_ml_m.sel(time=ds_t_m.time)\n\n        sum_op = np.zeros((ny, nx), dtype=np.float64)\n        sum_ml = np.zeros((ny, nx), dtype=np.float64)\n        count = np.zeros((ny, nx), dtype=np.int16)\n\n        for i in range(n):\n            T = (\n                ds_t_m[\"thetao\"]\n                .isel(time=i)\n                .transpose(\"lev\", y_dim, x_dim)\n                .load()\n                .values\n            )\n            S = (\n                ds_s_m[\"so\"]\n                .isel(time=i)\n                .transpose(\"lev\", y_dim, x_dim)\n                .load()\n                .values\n            )\n            ml = (\n                ds_ml_m[\"mlotst\"]\n                .isel(time=i)\n                .transpose(y_dim, x_dim)\n                .load()\n                .values\n            )\n\n            T = np.where(T > 1.0e20, np.nan, T)\n            S = np.where(S > 1.0e20, np.nan, S)\n            ml = np.where(ml > 1.0e20, np.nan, ml)\n\n            mld = compute_mld(T, S, lev_m)\n            valid = np.isfinite(mld) & np.isfinite(ml)\n\n            if np.any(valid):\n                sum_op[valid] += mld[valid]\n                sum_ml[valid] += ml[valid]\n                count[valid] += 1\n\n        valid_all = count == n\n\n        op_clim = np.full((ny, nx), np.nan, dtype=np.float64)\n        ml_clim = np.full((ny, nx), np.nan, dtype=np.float64)\n        op_clim[valid_all] = sum_op[valid_all] / float(n)\n        ml_clim[valid_all] = sum_ml[valid_all] / float(n)\n\n        diff = op_clim - ml_clim\n        mask = valid_all & np.isfinite(op_clim) & np.isfinite(ml_clim)\n\n        x = op_clim[mask]\n        y = ml_clim[mask]\n        a = area[mask]\n\n        if x.size > 0:\n            bias = float(np.mean(x - y))\n            rmsd = float(np.sqrt(np.mean((x - y) ** 2)))\n            corr = float(np.corrcoef(x, y)[0, 1]) if x.size > 1 else np.nan\n\n            area_valid = float(np.sum(a))\n            frac_gt20 = (\n                float(np.sum(a[np.abs(x - y) > 20.0]) / area_valid * 100.0)\n                if area_valid > 0.0\n                else np.nan\n            )\n            frac_valid_area = (\n                float(area_valid / total_ocean_area * 100.0)\n                if total_ocean_area > 0.0\n                else np.nan\n            )\n        else:\n            bias = np.nan\n            rmsd = np.nan\n            corr = np.nan\n            area_valid = 0.0\n            frac_gt20 = np.nan\n            frac_valid_area = np.nan\n\n        results[(model, month)] = dict(\n            model=model,\n            month=month,\n            month_name=MONTH_NAMES[month],\n            bias=bias,\n            rmsd=rmsd,\n            corr=corr,\n            frac_gt20=frac_gt20,\n            frac_valid_area=frac_valid_area,\n            n_cells=int(x.size),\n            area_valid=area_valid,\n            total_ocean_area=total_ocean_area,\n            diff=diff,\n            op_clim=op_clim,\n            ml_clim=ml_clim,\n            x=x,\n            y=y,\n            lon2d=lon2d,\n            lat2d=lat2d,\n            area=area,\n            mask=mask,\n        )\n\n        fig2_data[(model, month)] = (x, y, bias, rmsd, corr)\n        fig1_src[(model, month)] = regrid_to_regular(\n            lon2d, lat2d, diff, TARGET_LON, TARGET_LAT\n        )\n        region_stats[(model, month)] = coarse_disagreement(\n            lon2d, lat2d, area, diff, mask\n        )\n\n# ---------------------------------------------------------------------------\n# Tables / rankings / plotting ranges\n# ---------------------------------------------------------------------------\nrows = []\nfor key, r in results.items():\n    rows.append(\n        {\n            \"model\": r[\"model\"],\n            \"month\": r[\"month\"],\n            \"month_name\": r[\"month_name\"],\n            \"bias_m\": r[\"bias\"],\n            \"rmsd_m\": r[\"rmsd\"],\n            \"corr\": r[\"corr\"],\n            \"area_pct_absdiff_gt20\": r[\"frac_gt20\"],\n            \"valid_area_pct_of_ocean\": r[\"frac_valid_area\"],\n            \"n_cells\": r[\"n_cells\"],\n            \"area_valid_m2\": r[\"area_valid\"],\n            \"total_ocean_area_m2\": r[\"total_ocean_area\"],\n        }\n    )\n\nresults_df = pd.DataFrame(rows).sort_values([\"model\", \"month\"]).reset_index(drop=True)\n\nmodel_rmsd = results_df.groupby(\"model\")[\"rmsd_m\"].mean().sort_values()\nranking = list(model_rmsd.index)\nranking_criterion = \"mean of March and September RMSD (lower is better)\"\n\nall_fig1 = np.concatenate([fig1_src[k].ravel() for k in fig1_src])\nall_fig1 = all_fig1[np.isfinite(all_fig1)]\nif all_fig1.size:\n    fig1_vmax = float(np.nanpercentile(np.abs(all_fig1), 98.0))\nelse:\n    fig1_vmax = 100.0\nif not np.isfinite(fig1_vmax) or fig1_vmax <= 0.0:\n    fig1_vmax = 100.0\n\nall_scatter = np.concatenate(\n    [np.concatenate([fig2_data[k][0], fig2_data[k][1]]) for k in fig2_data]\n)\nall_scatter = all_scatter[np.isfinite(all_scatter) & (all_scatter > 0.0)]\nif all_scatter.size:\n    fig2_lim_min = 10.0 ** np.floor(np.log10(np.nanmin(all_scatter)))\n    fig2_lim_max = 10.0 ** np.ceil(np.log10(np.nanmax(all_scatter)))\nelse:\n    fig2_lim_min, fig2_lim_max = 0.1, 10000.0\n\nfig2_lim_min = max(float(fig2_lim_min), 0.1)\nfig2_lim_max = float(fig2_lim_max)\nif fig2_lim_max <= fig2_lim_min:\n    fig2_lim_max = fig2_lim_min * 10.0\nfig2_lims = (fig2_lim_min, fig2_lim_max)\n\n_tick_candidates = np.array(\n    [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]\n)\nfig2_ticks = [\n    float(t) for t in _tick_candidates if fig2_lims[0] <= t <= fig2_lims[1]\n]\nif len(fig2_ticks) < 2:\n    fig2_ticks = [fig2_lims[0], fig2_lims[1]]\n\nprint(results_df.to_string(index=False))\nprint(\"\\nRanking (most to least internally consistent):\")\nfor i, model in enumerate(ranking, 1):\n    print(f\"{i}. {model}  mean RMSD = {model_rmsd.loc[model]:.1f} m\")",
+          "success": true,
+          "materialized_results": {
+            "materialized": 3,
+            "megabytes": 834.1,
+            "seconds": 8.9,
+            "kept_lazy": [
+              "ds_ml (7233 MB)",
+              "ds_t (23824 MB)",
+              "ds_s (23824 MB)"
+            ]
+          },
+          "output": {
+            "ROOT_HIST": "/data1/lorraine-20419/benchmark_cmip6/historical",
+            "Y0": 1971,
+            "Y1": 2000,
+            "MONTHS": [
+              3,
+              9
+            ],
+            "MONTH_NAMES": {
+              "3": "March",
+              "9": "September"
+            },
+            "MODELS": [
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR"
+            ],
+            "META": {
+              "CESM2": {
+                "y": "nlat",
+                "x": "nlon",
+                "lat": "lat",
+                "lon": "lon",
+                "depth_scale": 0.01
+              },
+              "GFDL-ESM4": {
+                "y": "lat",
+                "x": "lon",
+                "lat": "lat",
+                "lon": "lon",
+                "depth_scale": 1.0
+              },
+              "MPI-ESM1-2-LR": {
+                "y": "j",
+                "x": "i",
+                "lat": "latitude",
+                "lon": "longitude",
+                "depth_scale": 1.0
+              }
+            },
+            "REF_DEPTH": 10.0,
+            "DENSITY_THRESHOLD": 0.03,
+            "TARGET_LON": {
+              "type": "ndarray",
+              "shape": [
+                360
+              ],
+              "size": 360,
+              "n_valid": 360,
+              "min": -179.5,
+              "max": 179.5,
+              "mean": 0.0,
+              "std": 103.92264751567228
+            },
+            "TARGET_LAT": {
+              "type": "ndarray",
+              "shape": [
+                180
+              ],
+              "size": 180,
+              "n_valid": 180,
+              "min": -89.5,
+              "max": 89.5,
+              "mean": 0.0,
+              "std": 51.96072234550504
+            },
+            "results": {
+              "('CESM2', 3)": {
+                "model": "CESM2",
+                "month": 3,
+                "month_name": "March",
+                "bias": 1.6213314470510696,
+                "rmsd": 35.70185733671406,
+                "corr": 0.9586369836714526,
+                "frac_gt20": 3.7703181721366232,
+                "frac_valid_area": 100.0,
+                "n_cells": 86096,
+                "area_valid": 360511672773792.0,
+                "total_ocean_area": 360511672773792.0,
+                "diff": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 86096,
+                  "min": -349.85962415965946,
+                  "max": 1314.374664402153,
+                  "mean": 1.6213314470510696,
+                  "std": 35.66502350524792
+                },
+                "op_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 86096,
+                  "min": 10.16251559514033,
+                  "max": 1915.0255729937267,
+                  "mean": 66.67197418657672,
+                  "std": 124.91164012682373
+                },
+                "ml_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 86096,
+                  "min": 0.0,
+                  "max": 1903.8141723632812,
+                  "mean": 65.05064273952564,
+                  "std": 116.9304145292194
+                },
+                "x": {
+                  "type": "ndarray",
+                  "shape": [
+                    86096
+                  ],
+                  "size": 86096,
+                  "n_valid": 86096,
+                  "min": 10.16251559514033,
+                  "max": 1915.0255729937267,
+                  "mean": 66.67197418657672,
+                  "std": 124.91164012682373
+                },
+                "y": {
+                  "type": "ndarray",
+                  "shape": [
+                    86096
+                  ],
+                  "size": 86096,
+                  "n_valid": 86096,
+                  "min": 0.0,
+                  "max": 1903.8141723632812,
+                  "mean": 65.05064273952564,
+                  "std": 116.9304145292194
+                },
+                "lon2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 122880,
+                  "min": -179.99673455712582,
+                  "max": 179.99924679439192,
+                  "mean": -3.176752654123318,
+                  "std": 101.10700020175777
+                },
+                "lat2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 122880,
+                  "min": -79.2205226074621,
+                  "max": 89.70640964187461,
+                  "mean": 2.791601116953018,
+                  "std": 43.44720217375342
+                },
+                "area": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 122880,
+                  "min": 0.0,
+                  "max": 7288963072.0,
+                  "mean": 2933851503.692969,
+                  "std": 2218787886.38115
+                },
+                "mask": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "values": [
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False"
+                  ]
+                }
+              },
+              "('CESM2', 9)": {
+                "model": "CESM2",
+                "month": 9,
+                "month_name": "September",
+                "bias": 0.31986566305248787,
+                "rmsd": 7.814801239482865,
+                "corr": 0.9921396400103369,
+                "frac_gt20": 1.360785778869969,
+                "frac_valid_area": 100.0,
+                "n_cells": 86096,
+                "area_valid": 360511672773792.0,
+                "total_ocean_area": 360511672773792.0,
+                "diff": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 86096,
+                  "min": -52.97657470965362,
+                  "max": 529.7513608787548,
+                  "mean": 0.31986566305248787,
+                  "std": 7.808252324958698
+                },
+                "op_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 86096,
+                  "min": 10.176679244346388,
+                  "max": 564.4453613136303,
+                  "mean": 69.93721341399237,
+                  "std": 62.18389960132885
+                },
+                "ml_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 86096,
+                  "min": 0.0,
+                  "max": 403.73697967529296,
+                  "mean": 69.61734775093989,
+                  "std": 61.04838892956951
+                },
+                "x": {
+                  "type": "ndarray",
+                  "shape": [
+                    86096
+                  ],
+                  "size": 86096,
+                  "n_valid": 86096,
+                  "min": 10.176679244346388,
+                  "max": 564.4453613136303,
+                  "mean": 69.93721341399237,
+                  "std": 62.18389960132885
+                },
+                "y": {
+                  "type": "ndarray",
+                  "shape": [
+                    86096
+                  ],
+                  "size": 86096,
+                  "n_valid": 86096,
+                  "min": 0.0,
+                  "max": 403.73697967529296,
+                  "mean": 69.61734775093989,
+                  "std": 61.04838892956951
+                },
+                "lon2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 122880,
+                  "min": -179.99673455712582,
+                  "max": 179.99924679439192,
+                  "mean": -3.176752654123318,
+                  "std": 101.10700020175777
+                },
+                "lat2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 122880,
+                  "min": -79.2205226074621,
+                  "max": 89.70640964187461,
+                  "mean": 2.791601116953018,
+                  "std": 43.44720217375342
+                },
+                "area": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "n_valid": 122880,
+                  "min": 0.0,
+                  "max": 7288963072.0,
+                  "mean": 2933851503.692969,
+                  "std": 2218787886.38115
+                },
+                "mask": {
+                  "type": "ndarray",
+                  "shape": [
+                    384,
+                    320
+                  ],
+                  "size": 122880,
+                  "values": [
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False"
+                  ]
+                }
+              },
+              "('GFDL-ESM4', 3)": {
+                "model": "GFDL-ESM4",
+                "month": 3,
+                "month_name": "March",
+                "bias": -5.476644442745724,
+                "rmsd": 33.67085694840567,
+                "corr": 0.9689030097798512,
+                "frac_gt20": 6.869580793758683,
+                "frac_valid_area": 100.0,
+                "n_cells": 44564,
+                "area_valid": 361110931290015.25,
+                "total_ocean_area": 361110931290015.25,
+                "diff": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 44564,
+                  "min": -632.1378231080744,
+                  "max": 1476.934751329577,
+                  "mean": -5.476644442745724,
+                  "std": 33.22247692884654
+                },
+                "op_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 44564,
+                  "min": 10.0,
+                  "max": 3135.7478876919968,
+                  "mean": 50.83488131963939,
+                  "std": 134.05929215705228
+                },
+                "ml_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 44564,
+                  "min": 0.9927991151809692,
+                  "max": 3049.74547068278,
+                  "mean": 56.311525762385116,
+                  "std": 131.72582411721015
+                },
+                "x": {
+                  "type": "ndarray",
+                  "shape": [
+                    44564
+                  ],
+                  "size": 44564,
+                  "n_valid": 44564,
+                  "min": 10.0,
+                  "max": 3135.7478876919968,
+                  "mean": 50.83488131963939,
+                  "std": 134.05929215705228
+                },
+                "y": {
+                  "type": "ndarray",
+                  "shape": [
+                    44564
+                  ],
+                  "size": 44564,
+                  "n_valid": 44564,
+                  "min": 0.9927991151809692,
+                  "max": 3049.74547068278,
+                  "mean": 56.311525762385116,
+                  "std": 131.72582411721015
+                },
+                "lon2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 64800,
+                  "min": -179.5,
+                  "max": 179.5,
+                  "mean": 0.0,
+                  "std": 103.92264751567228
+                },
+                "lat2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 64800,
+                  "min": -89.5,
+                  "max": 89.5,
+                  "mean": 0.0,
+                  "std": 51.96072234550504
+                },
+                "area": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 64800,
+                  "min": 0.0,
+                  "max": 12390983680.0,
+                  "mean": 5572699556.94468,
+                  "std": 4892158005.51933
+                },
+                "mask": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "values": [
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False"
+                  ]
+                }
+              },
+              "('GFDL-ESM4', 9)": {
+                "model": "GFDL-ESM4",
+                "month": 9,
+                "month_name": "September",
+                "bias": -4.09540279327944,
+                "rmsd": 19.40891044237363,
+                "corr": 0.9733714205460104,
+                "frac_gt20": 7.362392157000072,
+                "frac_valid_area": 100.0,
+                "n_cells": 44564,
+                "area_valid": 361110931290015.25,
+                "total_ocean_area": 361110931290015.25,
+                "diff": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 44564,
+                  "min": -160.26162707548121,
+                  "max": 799.147243819567,
+                  "mean": -4.09540279327944,
+                  "std": 18.97191293783732
+                },
+                "op_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 44564,
+                  "min": 10.0,
+                  "max": 1098.3782274634916,
+                  "mean": 55.23679720522934,
+                  "std": 81.67015914103733
+                },
+                "ml_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 44564,
+                  "min": 0.9601655781269074,
+                  "max": 1074.7267810821534,
+                  "mean": 59.33219999850878,
+                  "std": 76.42342553772494
+                },
+                "x": {
+                  "type": "ndarray",
+                  "shape": [
+                    44564
+                  ],
+                  "size": 44564,
+                  "n_valid": 44564,
+                  "min": 10.0,
+                  "max": 1098.3782274634916,
+                  "mean": 55.23679720522934,
+                  "std": 81.67015914103733
+                },
+                "y": {
+                  "type": "ndarray",
+                  "shape": [
+                    44564
+                  ],
+                  "size": 44564,
+                  "n_valid": 44564,
+                  "min": 0.9601655781269074,
+                  "max": 1074.7267810821534,
+                  "mean": 59.33219999850878,
+                  "std": 76.42342553772494
+                },
+                "lon2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 64800,
+                  "min": -179.5,
+                  "max": 179.5,
+                  "mean": 0.0,
+                  "std": 103.92264751567228
+                },
+                "lat2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 64800,
+                  "min": -89.5,
+                  "max": 89.5,
+                  "mean": 0.0,
+                  "std": 51.96072234550504
+                },
+                "area": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "n_valid": 64800,
+                  "min": 0.0,
+                  "max": 12390983680.0,
+                  "mean": 5572699556.94468,
+                  "std": 4892158005.51933
+                },
+                "mask": {
+                  "type": "ndarray",
+                  "shape": [
+                    180,
+                    360
+                  ],
+                  "size": 64800,
+                  "values": [
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False"
+                  ]
+                }
+              },
+              "('MPI-ESM1-2-LR', 3)": {
+                "model": "MPI-ESM1-2-LR",
+                "month": 3,
+                "month_name": "March",
+                "bias": 2.7784886725416587,
+                "rmsd": 28.876829087138933,
+                "corr": 0.993247212829329,
+                "frac_gt20": 1.737441496905516,
+                "frac_valid_area": 100.0,
+                "n_cells": 36791,
+                "area_valid": 365975311658496.0,
+                "total_ocean_area": 365975311658496.0,
+                "diff": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 36791,
+                  "min": -429.41258686130874,
+                  "max": 536.0755018442096,
+                  "mean": 2.7784886725416587,
+                  "std": 28.74284708974375
+                },
+                "op_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 36791,
+                  "min": 10.070038467416847,
+                  "max": 2661.9287389931737,
+                  "mean": 97.9163860355497,
+                  "std": 190.38974779758658
+                },
+                "ml_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 36791,
+                  "min": 6.070362917582194,
+                  "max": 2403.408499145508,
+                  "mean": 95.13789736300805,
+                  "std": 170.71249405665526
+                },
+                "x": {
+                  "type": "ndarray",
+                  "shape": [
+                    36791
+                  ],
+                  "size": 36791,
+                  "n_valid": 36791,
+                  "min": 10.070038467416847,
+                  "max": 2661.9287389931737,
+                  "mean": 97.9163860355497,
+                  "std": 190.38974779758658
+                },
+                "y": {
+                  "type": "ndarray",
+                  "shape": [
+                    36791
+                  ],
+                  "size": 36791,
+                  "n_valid": 36791,
+                  "min": 6.070362917582194,
+                  "max": 2403.408499145508,
+                  "mean": 95.13789736300805,
+                  "std": 170.71249405665526
+                },
+                "lon2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 56320,
+                  "min": -179.98650855515638,
+                  "max": 179.99320214054296,
+                  "mean": -11.688109683494938,
+                  "std": 86.13683577959553
+                },
+                "lat2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 56320,
+                  "min": -83.96550988220439,
+                  "max": 89.72660369238089,
+                  "mean": 11.336055347692735,
+                  "std": 55.357212731498535
+                },
+                "area": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 56320,
+                  "min": 0.0,
+                  "max": 33998391296.0,
+                  "mean": 6498141187.118182,
+                  "std": 8790133048.199862
+                },
+                "mask": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "values": [
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False"
+                  ]
+                }
+              },
+              "('MPI-ESM1-2-LR', 9)": {
+                "model": "MPI-ESM1-2-LR",
+                "month": 9,
+                "month_name": "September",
+                "bias": -5.049829631023711,
+                "rmsd": 36.484652470008456,
+                "corr": 0.9846950546372685,
+                "frac_gt20": 3.958621280993634,
+                "frac_valid_area": 100.0,
+                "n_cells": 36791,
+                "area_valid": 365975311658496.0,
+                "total_ocean_area": 365975311658496.0,
+                "diff": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 36791,
+                  "min": -795.3761351704557,
+                  "max": 87.989358487635,
+                  "mean": -5.049829631023711,
+                  "std": 36.13348981976317
+                },
+                "op_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 36791,
+                  "min": 10.053542756248968,
+                  "max": 2797.720186456574,
+                  "mean": 81.28680737949298,
+                  "std": 138.24240526706092
+                },
+                "ml_clim": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 36791,
+                  "min": 6.063059457143148,
+                  "max": 2755.256243387858,
+                  "mean": 86.33663701051671,
+                  "std": 163.05468713560546
+                },
+                "x": {
+                  "type": "ndarray",
+                  "shape": [
+                    36791
+                  ],
+                  "size": 36791,
+                  "n_valid": 36791,
+                  "min": 10.053542756248968,
+                  "max": 2797.720186456574,
+                  "mean": 81.28680737949298,
+                  "std": 138.24240526706092
+                },
+                "y": {
+                  "type": "ndarray",
+                  "shape": [
+                    36791
+                  ],
+                  "size": 36791,
+                  "n_valid": 36791,
+                  "min": 6.063059457143148,
+                  "max": 2755.256243387858,
+                  "mean": 86.33663701051671,
+                  "std": 163.05468713560546
+                },
+                "lon2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 56320,
+                  "min": -179.98650855515638,
+                  "max": 179.99320214054296,
+                  "mean": -11.688109683494938,
+                  "std": 86.13683577959553
+                },
+                "lat2d": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 56320,
+                  "min": -83.96550988220439,
+                  "max": 89.72660369238089,
+                  "mean": 11.336055347692735,
+                  "std": 55.357212731498535
+                },
+                "area": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "n_valid": 56320,
+                  "min": 0.0,
+                  "max": 33998391296.0,
+                  "mean": 6498141187.118182,
+                  "std": 8790133048.199862
+                },
+                "mask": {
+                  "type": "ndarray",
+                  "shape": [
+                    220,
+                    256
+                  ],
+                  "size": 56320,
+                  "values": [
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False",
+                    "False"
+                  ]
+                }
+              }
+            },
+            "fig1_src": {
+              "('CESM2', 3)": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 64800,
+                "min": -349.85962415965946,
+                "max": 1314.374664402153,
+                "mean": 3.958645501309538,
+                "std": 29.29154473879829
+              },
+              "('CESM2', 9)": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 64800,
+                "min": -52.97657470965362,
+                "max": 529.7513608787548,
+                "mean": 4.605213689502414,
+                "std": 25.70360634193057
+              },
+              "('GFDL-ESM4', 3)": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 64800,
+                "min": -632.1378231080744,
+                "max": 1476.934751329577,
+                "mean": -1.917044470062871,
+                "std": 40.344436318069434
+              },
+              "('GFDL-ESM4', 9)": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 64800,
+                "min": -160.26162707548121,
+                "max": 799.147243819567,
+                "mean": 2.9801807076723414,
+                "std": 34.19080212200617
+              },
+              "('MPI-ESM1-2-LR', 3)": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 64800,
+                "min": -305.91640329634174,
+                "max": 536.0755018442096,
+                "mean": -0.0277656640584978,
+                "std": 14.82751388648682
+              },
+              "('MPI-ESM1-2-LR', 9)": {
+                "type": "ndarray",
+                "shape": [
+                  180,
+                  360
+                ],
+                "size": 64800,
+                "n_valid": 64800,
+                "min": -795.3761351704557,
+                "max": 87.989358487635,
+                "mean": -1.8378152991161953,
+                "std": 27.041093497382263
+              }
+            },
+            "fig2_data": {
+              "('CESM2', 3)": [
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    86096
+                  ],
+                  "size": 86096,
+                  "n_valid": 86096,
+                  "min": 10.16251559514033,
+                  "max": 1915.0255729937267,
+                  "mean": 66.67197418657672,
+                  "std": 124.91164012682373
+                },
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    86096
+                  ],
+                  "size": 86096,
+                  "n_valid": 86096,
+                  "min": 0.0,
+                  "max": 1903.8141723632812,
+                  "mean": 65.05064273952564,
+                  "std": 116.9304145292194
+                },
+                1.6213314470510696,
+                35.70185733671406,
+                0.9586369836714526
+              ],
+              "('CESM2', 9)": [
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    86096
+                  ],
+                  "size": 86096,
+                  "n_valid": 86096,
+                  "min": 10.176679244346388,
+                  "max": 564.4453613136303,
+                  "mean": 69.93721341399237,
+                  "std": 62.18389960132885
+                },
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    86096
+                  ],
+                  "size": 86096,
+                  "n_valid": 86096,
+                  "min": 0.0,
+                  "max": 403.73697967529296,
+                  "mean": 69.61734775093989,
+                  "std": 61.04838892956951
+                },
+                0.31986566305248787,
+                7.814801239482865,
+                0.9921396400103369
+              ],
+              "('GFDL-ESM4', 3)": [
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    44564
+                  ],
+                  "size": 44564,
+                  "n_valid": 44564,
+                  "min": 10.0,
+                  "max": 3135.7478876919968,
+                  "mean": 50.83488131963939,
+                  "std": 134.05929215705228
+                },
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    44564
+                  ],
+                  "size": 44564,
+                  "n_valid": 44564,
+                  "min": 0.9927991151809692,
+                  "max": 3049.74547068278,
+                  "mean": 56.311525762385116,
+                  "std": 131.72582411721015
+                },
+                -5.476644442745724,
+                33.67085694840567,
+                0.9689030097798512
+              ],
+              "('GFDL-ESM4', 9)": [
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    44564
+                  ],
+                  "size": 44564,
+                  "n_valid": 44564,
+                  "min": 10.0,
+                  "max": 1098.3782274634916,
+                  "mean": 55.23679720522934,
+                  "std": 81.67015914103733
+                },
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    44564
+                  ],
+                  "size": 44564,
+                  "n_valid": 44564,
+                  "min": 0.9601655781269074,
+                  "max": 1074.7267810821534,
+                  "mean": 59.33219999850878,
+                  "std": 76.42342553772494
+                },
+                -4.09540279327944,
+                19.40891044237363,
+                0.9733714205460104
+              ],
+              "('MPI-ESM1-2-LR', 3)": [
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    36791
+                  ],
+                  "size": 36791,
+                  "n_valid": 36791,
+                  "min": 10.070038467416847,
+                  "max": 2661.9287389931737,
+                  "mean": 97.9163860355497,
+                  "std": 190.38974779758658
+                },
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    36791
+                  ],
+                  "size": 36791,
+                  "n_valid": 36791,
+                  "min": 6.070362917582194,
+                  "max": 2403.408499145508,
+                  "mean": 95.13789736300805,
+                  "std": 170.71249405665526
+                },
+                2.7784886725416587,
+                28.876829087138933,
+                0.993247212829329
+              ],
+              "('MPI-ESM1-2-LR', 9)": [
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    36791
+                  ],
+                  "size": 36791,
+                  "n_valid": 36791,
+                  "min": 10.053542756248968,
+                  "max": 2797.720186456574,
+                  "mean": 81.28680737949298,
+                  "std": 138.24240526706092
+                },
+                {
+                  "type": "ndarray",
+                  "shape": [
+                    36791
+                  ],
+                  "size": 36791,
+                  "n_valid": 36791,
+                  "min": 6.063059457143148,
+                  "max": 2755.256243387858,
+                  "mean": 86.33663701051671,
+                  "std": 163.05468713560546
+                },
+                -5.049829631023711,
+                36.484652470008456,
+                0.9846950546372685
+              ]
+            },
+            "region_stats": {
+              "('CESM2', 3)": "   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\n0     60.0     70.0    150.0    160.0               100.0  4.305634e+10\n1     20.0     30.0     40.0     50.0               100.0  2.600090e+10\n2     50.0     60.0     20.0     30.0               100.0  9.124694e+10\n3    -30.0    -20.0    140.0    150.0               100.0  9.496699e+09\n4     60.0     70.0   -150.0   -140.0               100.0  1.649725e+10",
+              "('CESM2', 9)": "   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\n0    -30.0    -20.0    140.0    150.0          100.000000  9.496699e+09\n1     20.0     30.0     40.0     50.0          100.000000  2.600090e+10\n2    -20.0    -10.0    130.0    140.0           75.254461  4.795069e+11\n3     30.0     40.0    -90.0    -80.0           75.163384  4.529797e+10\n4     60.0     70.0     20.0     30.0           65.390604  5.703212e+10",
+              "('GFDL-ESM4', 3)": "   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\n0     30.0     40.0    -70.0    -60.0           98.946968  1.015027e+12\n1     40.0     50.0      0.0     10.0           97.480949  2.468363e+11\n2     30.0     40.0   -180.0   -170.0           93.725938  1.015027e+12\n3     30.0     40.0    150.0    160.0           92.017930  1.015027e+12\n4     70.0     80.0      0.0     10.0           89.104017  3.210756e+11",
+              "('GFDL-ESM4', 9)": "   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\n0    -80.0    -70.0    -70.0    -60.0           97.602257  1.445941e+10\n1    -80.0    -70.0     20.0     30.0           89.473125  4.968746e+09\n2    -80.0    -70.0    160.0    170.0           82.824013  1.042598e+11\n3    -40.0    -30.0    -10.0      0.0           78.090886  1.012499e+12\n4    -40.0    -30.0    110.0    120.0           73.196978  7.799416e+11",
+              "('MPI-ESM1-2-LR', 3)": "   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\n0     40.0     50.0    120.0    130.0          100.000000  2.507115e+10\n1     70.0     80.0      0.0     10.0           85.410570  3.218226e+11\n2     70.0     80.0    -10.0      0.0           67.706220  3.187608e+11\n3     60.0     70.0    -40.0    -30.0           67.678887  3.576414e+11\n4     60.0     70.0    -20.0    -10.0           63.364805  4.495122e+11",
+              "('MPI-ESM1-2-LR', 9)": "   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\n0    -70.0    -60.0    -30.0    -20.0           98.992348  5.199788e+11\n1    -70.0    -60.0    -20.0    -10.0           91.313919  5.280817e+11\n2    -70.0    -60.0    -40.0    -30.0           80.456908  5.290638e+11\n3    -80.0    -70.0   -170.0   -160.0           69.382150  2.784526e+11\n4    -80.0    -70.0   -160.0   -150.0           69.138777  2.658327e+11"
+            },
+            "model_variant": {
+              "CESM2": "r1i1p1f1",
+              "GFDL-ESM4": "r1i1p1f1",
+              "MPI-ESM1-2-LR": "r1i1p1f1"
+            },
+            "rows": [
+              {
+                "model": "CESM2",
+                "month": 3,
+                "month_name": "March",
+                "bias_m": 1.6213314470510696,
+                "rmsd_m": 35.70185733671406,
+                "corr": 0.9586369836714526,
+                "area_pct_absdiff_gt20": 3.7703181721366232,
+                "valid_area_pct_of_ocean": 100.0,
+                "n_cells": 86096,
+                "area_valid_m2": 360511672773792.0,
+                "total_ocean_area_m2": 360511672773792.0
+              },
+              {
+                "model": "CESM2",
+                "month": 9,
+                "month_name": "September",
+                "bias_m": 0.31986566305248787,
+                "rmsd_m": 7.814801239482865,
+                "corr": 0.9921396400103369,
+                "area_pct_absdiff_gt20": 1.360785778869969,
+                "valid_area_pct_of_ocean": 100.0,
+                "n_cells": 86096,
+                "area_valid_m2": 360511672773792.0,
+                "total_ocean_area_m2": 360511672773792.0
+              },
+              {
+                "model": "GFDL-ESM4",
+                "month": 3,
+                "month_name": "March",
+                "bias_m": -5.476644442745724,
+                "rmsd_m": 33.67085694840567,
+                "corr": 0.9689030097798512,
+                "area_pct_absdiff_gt20": 6.869580793758683,
+                "valid_area_pct_of_ocean": 100.0,
+                "n_cells": 44564,
+                "area_valid_m2": 361110931290015.25,
+                "total_ocean_area_m2": 361110931290015.25
+              },
+              {
+                "model": "GFDL-ESM4",
+                "month": 9,
+                "month_name": "September",
+                "bias_m": -4.09540279327944,
+                "rmsd_m": 19.40891044237363,
+                "corr": 0.9733714205460104,
+                "area_pct_absdiff_gt20": 7.362392157000072,
+                "valid_area_pct_of_ocean": 100.0,
+                "n_cells": 44564,
+                "area_valid_m2": 361110931290015.25,
+                "total_ocean_area_m2": 361110931290015.25
+              },
+              {
+                "model": "MPI-ESM1-2-LR",
+                "month": 3,
+                "month_name": "March",
+                "bias_m": 2.7784886725416587,
+                "rmsd_m": 28.876829087138933,
+                "corr": 0.993247212829329,
+                "area_pct_absdiff_gt20": 1.737441496905516,
+                "valid_area_pct_of_ocean": 100.0,
+                "n_cells": 36791,
+                "area_valid_m2": 365975311658496.0,
+                "total_ocean_area_m2": 365975311658496.0
+              },
+              {
+                "model": "MPI-ESM1-2-LR",
+                "month": 9,
+                "month_name": "September",
+                "bias_m": -5.049829631023711,
+                "rmsd_m": 36.484652470008456,
+                "corr": 0.9846950546372685,
+                "area_pct_absdiff_gt20": 3.958621280993634,
+                "valid_area_pct_of_ocean": 100.0,
+                "n_cells": 36791,
+                "area_valid_m2": 365975311658496.0,
+                "total_ocean_area_m2": 365975311658496.0
+              }
+            ],
+            "results_df": "           model  month month_name  ...  n_cells  area_valid_m2  total_ocean_area_m2\n0          CESM2      3      March  ...    86096   3.605117e+14         3.605117e+14\n1          CESM2      9  September  ...    86096   3.605117e+14         3.605117e+14\n2      GFDL-ESM4      3      March  ...    44564   3.611109e+14         3.611109e+14\n3      GFDL-ESM4      9  September  ...    44564   3.611109e+14         3.611109e+14\n4  MPI-ESM1-2-LR      3      March  ...    36791   3.659753e+14         3.659753e+14\n5  MPI-ESM1-2-LR      9  September  ...    36791   3.659753e+14         3.659753e+14\n\n[6 rows x 11 columns]",
+            "model_rmsd": "model\nCESM2            21.758329\nGFDL-ESM4        26.539884\nMPI-ESM1-2-LR    32.680741\nName: rmsd_m, dtype: float64",
+            "ranking": [
+              "CESM2",
+              "GFDL-ESM4",
+              "MPI-ESM1-2-LR"
+            ],
+            "ranking_criterion": "mean of March and September RMSD (lower is better)",
+            "all_fig1": {
+              "type": "ndarray",
+              "shape": [
+                388800
+              ],
+              "size": 388800,
+              "n_valid": 388800,
+              "min": -795.3761351704557,
+              "max": 1476.934751329577,
+              "mean": 1.2935690775411217,
+              "std": 29.746720221060137
+            },
+            "fig1_vmax": 52.71134708497384,
+            "all_scatter": {
+              "type": "ndarray",
+              "shape": [
+                669655
+              ],
+              "size": 669655,
+              "n_valid": 669655,
+              "min": 0.0006316992764671644,
+              "max": 3135.7478876919968,
+              "mean": 69.44784924264827,
+              "std": 119.11377415518365
+            },
+            "fig2_lim_min": 0.1,
+            "fig2_lim_max": 10000.0,
+            "fig2_lims": [
+              0.1,
+              10000.0
+            ],
+            "fig2_ticks": [
+              0.1,
+              0.2,
+              0.5,
+              1.0,
+              2.0,
+              5.0,
+              10.0,
+              20.0,
+              50.0,
+              100.0,
+              200.0,
+              500.0,
+              1000.0,
+              2000.0,
+              5000.0,
+              10000.0
+            ]
+          },
+          "omitted_loop_variables": [
+            "S",
+            "T",
+            "a",
+            "area",
+            "area_valid",
+            "bias",
+            "by_m",
+            "by_s",
+            "by_t",
+            "candidates",
+            "cond_m",
+            "cond_s",
+            "cond_t",
+            "corr",
+            "count",
+            "diff",
+            "ds_ml",
+            "ds_ml_m",
+            "ds_s",
+            "ds_s_m",
+            "ds_t",
+            "ds_t_m",
+            "frac_gt20",
+            "frac_valid_area",
+            "i",
+            "key",
+            "lat2d",
+            "lat_coord",
+            "lat_name",
+            "lev_da",
+            "lev_m",
+            "lev_units",
+            "lev_vals",
+            "lon2d",
+            "lon_coord",
+            "lon_name",
+            "mask",
+            "ml",
+            "ml_clim",
+            "mld",
+            "model",
+            "month",
+            "n",
+            "nx",
+            "ny",
+            "op_clim",
+            "r",
+            "rmsd",
+            "sum_ml",
+            "sum_op",
+            "total_ocean_area",
+            "valid",
+            "valid_all",
+            "variant",
+            "x",
+            "x_dim",
+            "y",
+            "y_dim"
+          ]
+        }
+      ],
+      "visualization_iterations": [
+        {
+          "iteration": 1,
+          "code": "# Figure 1: operator MLD minus published mlotst, on a common regular map grid.\nfig1, axes1 = plt.subplots(3, 2, figsize=(12, 11), sharex=True, sharey=True)\n\nfor i, model in enumerate(MODELS):\n    for j, month in enumerate(MONTHS):\n        ax = axes1[i, j]\n        data = fig1_src[(model, month)]\n        im = ax.pcolormesh(\n            TARGET_LON,\n            TARGET_LAT,\n            data,\n            cmap=\"RdBu_r\",\n            vmin=-fig1_vmax,\n            vmax=fig1_vmax,\n            shading=\"auto\",\n        )\n        ax.set_xlim(-180, 180)\n        ax.set_ylim(-90, 90)\n        ax.set_xticks([-180, -120, -60, 0, 60, 120, 180])\n        ax.set_yticks([-90, -60, -30, 0, 30, 60, 90])\n        ax.grid(True, linewidth=0.2, alpha=0.4)\n        ax.set_title(f\"{model} — {MONTH_NAMES[month]}\")\n        if i == 2:\n            ax.set_xlabel(\"Longitude\")\n        if j == 0:\n            ax.set_ylabel(\"Latitude\")\n\nfig1.suptitle(\"Operator MLD minus published mlotst (m)\", fontsize=14)\ncbar = fig1.colorbar(\n    im,\n    ax=axes1.ravel().tolist(),\n    orientation=\"horizontal\",\n    fraction=0.04,\n    pad=0.06,\n)\ncbar.set_label(\"Operator MLD - mlotst (m)\")\n\n# Figure 2: operator MLD vs published mlotst scatter, common logarithmic axes.\nfig2, axes2 = plt.subplots(3, 2, figsize=(11, 12), sharex=True, sharey=True)\n\nfor i, model in enumerate(MODELS):\n    for j, month in enumerate(MONTHS):\n        ax = axes2[i, j]\n        x, y, bias, rmsd, corr = fig2_data[(model, month)]\n\n        ax.scatter(x, y, s=1, alpha=0.15, edgecolors=\"none\", rasterized=True)\n        ax.plot(fig2_lims, fig2_lims, \"k--\", linewidth=0.9)\n\n        ax.set_xscale(\"log\")\n        ax.set_yscale(\"log\")\n        ax.set_xlim(fig2_lims)\n        ax.set_ylim(fig2_lims)\n        ax.set_xticks(fig2_ticks)\n        ax.set_yticks(fig2_ticks)\n        ax.set_xticklabels([f\"{t:g}\" for t in fig2_ticks])\n        ax.set_yticklabels([f\"{t:g}\" for t in fig2_ticks])\n        ax.minorticks_off()\n        ax.grid(True, which=\"major\", linewidth=0.2, alpha=0.4)\n\n        ax.set_title(f\"{model} — {MONTH_NAMES[month]}\")\n        ax.text(\n            0.04,\n            0.96,\n            f\"bias = {bias:.1f} m\\nRMSD = {rmsd:.1f} m\\nr = {corr:.3f}\",\n            transform=ax.transAxes,\n            va=\"top\",\n            ha=\"left\",\n            fontsize=8,\n            bbox=dict(boxstyle=\"round\", facecolor=\"white\", alpha=0.8, edgecolor=\"none\"),\n        )\n\n        if i == 2:\n            ax.set_xlabel(\"Operator MLD (m)\")\n        if j == 0:\n            ax.set_ylabel(\"Published mlotst (m)\")\n\nfig2.suptitle(\"Operator MLD vs published mlotst\", fontsize=14)",
+          "success": true,
+          "output": {
+            "fig1": "Figure(1200x1100)",
+            "axes1": {
+              "type": "ndarray",
+              "shape": [
+                3,
+                2
+              ],
+              "size": 6,
+              "values": [
+                "Axes(0.125,0.676176;0.352273x0.203824)",
+                "Axes(0.547727,0.676176;0.352273x0.203824)",
+                "Axes(0.125,0.431588;0.352273x0.203824)",
+                "Axes(0.547727,0.431588;0.352273x0.203824)",
+                "Axes(0.125,0.187;0.352273x0.203824)",
+                "Axes(0.547727,0.187;0.352273x0.203824)"
+              ]
+            },
+            "cbar": "<matplotlib.colorbar.Colorbar object at 0x7aa925681a90>",
+            "fig2": "Figure(1100x1200)",
+            "axes2": {
+              "type": "ndarray",
+              "shape": [
+                3,
+                2
+              ],
+              "size": 6,
+              "values": [
+                "Axes(0.125,0.653529;0.352273x0.226471)",
+                "Axes(0.547727,0.653529;0.352273x0.226471)",
+                "Axes(0.125,0.381765;0.352273x0.226471)",
+                "Axes(0.547727,0.381765;0.352273x0.226471)",
+                "Axes(0.125,0.11;0.352273x0.226471)",
+                "Axes(0.547727,0.11;0.352273x0.226471)"
+              ]
+            }
+          },
+          "omitted_loop_variables": [
+            "ax",
+            "data",
+            "im",
+            "j"
+          ]
+        }
+      ],
+      "visualization_paths": [
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T4_deepseek-flash_20261025_064215/turn01/figures/visualization_T4_deepseek-flash_20261025_064215_turn1_1.png",
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T4_deepseek-flash_20261025_064215/turn01/figures/visualization_T4_deepseek-flash_20261025_064215_turn1_2.png"
+      ],
+      "selected_data": {
+        "name": [
+          "cmip6_historical"
+        ],
+        "path": [
+          "/data1/lorraine-20419/benchmark_cmip6/historical"
+        ],
+        "how": "inferred from the root directories the executed code names"
+      },
+      "observation": "[\n  {\n    \"type\": \"computation\",\n    \"status\": \"success\",\n    \"results\": {\n      \"ROOT_HIST\": \"/data1/lorraine-20419/benchmark_cmip6/historical\",\n      \"Y0\": 1971,\n      \"Y1\": 2000,\n      \"MONTHS\": [\n        3,\n        9\n      ],\n      \"MONTH_NAMES\": {\n        \"3\": \"March\",\n        \"9\": \"September\"\n      },\n      \"MODELS\": [\n        \"CESM2\",\n        \"GFDL-ESM4\",\n        \"MPI-ESM1-2-LR\"\n      ],\n      \"META\": {\n        \"CESM2\": {\n          \"y\": \"nlat\",\n          \"x\": \"nlon\",\n          \"lat\": \"lat\",\n          \"lon\": \"lon\",\n          \"depth_scale\": 0.01\n        },\n        \"GFDL-ESM4\": {\n          \"y\": \"lat\",\n          \"x\": \"lon\",\n          \"lat\": \"lat\",\n          \"lon\": \"lon\",\n          \"depth_scale\": 1.0\n        },\n        \"MPI-ESM1-2-LR\": {\n          \"y\": \"j\",\n          \"x\": \"i\",\n          \"lat\": \"latitude\",\n          \"lon\": \"longitude\",\n          \"depth_scale\": 1.0\n        }\n      },\n      \"REF_DEPTH\": 10.0,\n      \"DENSITY_THRESHOLD\": 0.03,\n      \"TARGET_LON\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          360\n        ],\n        \"size\": 360,\n        \"n_valid\": 360,\n        \"min\": -179.5,\n        \"max\": 179.5,\n        \"mean\": 0.0,\n        \"std\": 103.92264751567228\n      },\n      \"TARGET_LAT\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          180\n        ],\n        \"size\": 180,\n        \"n_valid\": 180,\n        \"min\": -89.5,\n        \"max\": 89.5,\n        \"mean\": 0.0,\n        \"std\": 51.96072234550504\n      },\n      \"results\": {\n        \"('CESM2', 3)\": {\n          \"model\": \"CESM2\",\n          \"month\": 3,\n          \"month_name\": \"March\",\n          \"bias\": 1.6213314470510696,\n          \"rmsd\": 35.70185733671406,\n          \"corr\": 0.9586369836714526,\n          \"frac_gt20\": 3.7703181721366232,\n          \"frac_valid_area\": 100.0,\n          \"n_cells\": 86096,\n          \"area_valid\": 360511672773792.0,\n          \"total_ocean_area\": 360511672773792.0,\n          \"diff\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 86096,\n            \"min\": -349.85962415965946,\n            \"max\": 1314.374664402153,\n            \"mean\": 1.6213314470510696,\n            \"std\": 35.66502350524792\n          },\n          \"op_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 86096,\n            \"min\": 10.16251559514033,\n            \"max\": 1915.0255729937267,\n            \"mean\": 66.67197418657672,\n            \"std\": 124.91164012682373\n          },\n          \"ml_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 86096,\n            \"min\": 0.0,\n            \"max\": 1903.8141723632812,\n            \"mean\": 65.05064273952564,\n            \"std\": 116.9304145292194\n          },\n          \"x\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              86096\n            ],\n            \"size\": 86096,\n            \"n_valid\": 86096,\n            \"min\": 10.16251559514033,\n            \"max\": 1915.0255729937267,\n            \"mean\": 66.67197418657672,\n            \"std\": 124.91164012682373\n          },\n          \"y\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              86096\n            ],\n            \"size\": 86096,\n            \"n_valid\": 86096,\n            \"min\": 0.0,\n            \"max\": 1903.8141723632812,\n            \"mean\": 65.05064273952564,\n            \"std\": 116.9304145292194\n          },\n          \"lon2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 122880,\n            \"min\": -179.99673455712582,\n            \"max\": 179.99924679439192,\n            \"mean\": -3.176752654123318,\n            \"std\": 101.10700020175777\n          },\n          \"lat2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 122880,\n            \"min\": -79.2205226074621,\n            \"max\": 89.70640964187461,\n            \"mean\": 2.791601116953018,\n            \"std\": 43.44720217375342\n          },\n          \"area\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 122880,\n            \"min\": 0.0,\n            \"max\": 7288963072.0,\n            \"mean\": 2933851503.692969,\n            \"std\": 2218787886.38115\n          },\n          \"mask\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"values\": [\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\"\n            ]\n          }\n        },\n        \"('CESM2', 9)\": {\n          \"model\": \"CESM2\",\n          \"month\": 9,\n          \"month_name\": \"September\",\n          \"bias\": 0.31986566305248787,\n          \"rmsd\": 7.814801239482865,\n          \"corr\": 0.9921396400103369,\n          \"frac_gt20\": 1.360785778869969,\n          \"frac_valid_area\": 100.0,\n          \"n_cells\": 86096,\n          \"area_valid\": 360511672773792.0,\n          \"total_ocean_area\": 360511672773792.0,\n          \"diff\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 86096,\n            \"min\": -52.97657470965362,\n            \"max\": 529.7513608787548,\n            \"mean\": 0.31986566305248787,\n            \"std\": 7.808252324958698\n          },\n          \"op_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 86096,\n            \"min\": 10.176679244346388,\n            \"max\": 564.4453613136303,\n            \"mean\": 69.93721341399237,\n            \"std\": 62.18389960132885\n          },\n          \"ml_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 86096,\n            \"min\": 0.0,\n            \"max\": 403.73697967529296,\n            \"mean\": 69.61734775093989,\n            \"std\": 61.04838892956951\n          },\n          \"x\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              86096\n            ],\n            \"size\": 86096,\n            \"n_valid\": 86096,\n            \"min\": 10.176679244346388,\n            \"max\": 564.4453613136303,\n            \"mean\": 69.93721341399237,\n            \"std\": 62.18389960132885\n          },\n          \"y\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              86096\n            ],\n            \"size\": 86096,\n            \"n_valid\": 86096,\n            \"min\": 0.0,\n            \"max\": 403.73697967529296,\n            \"mean\": 69.61734775093989,\n            \"std\": 61.04838892956951\n          },\n          \"lon2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 122880,\n            \"min\": -179.99673455712582,\n            \"max\": 179.99924679439192,\n            \"mean\": -3.176752654123318,\n            \"std\": 101.10700020175777\n          },\n          \"lat2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 122880,\n            \"min\": -79.2205226074621,\n            \"max\": 89.70640964187461,\n            \"mean\": 2.791601116953018,\n            \"std\": 43.44720217375342\n          },\n          \"area\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"n_valid\": 122880,\n            \"min\": 0.0,\n            \"max\": 7288963072.0,\n            \"mean\": 2933851503.692969,\n            \"std\": 2218787886.38115\n          },\n          \"mask\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              384,\n              320\n            ],\n            \"size\": 122880,\n            \"values\": [\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\"\n            ]\n          }\n        },\n        \"('GFDL-ESM4', 3)\": {\n          \"model\": \"GFDL-ESM4\",\n          \"month\": 3,\n          \"month_name\": \"March\",\n          \"bias\": -5.476644442745724,\n          \"rmsd\": 33.67085694840567,\n          \"corr\": 0.9689030097798512,\n          \"frac_gt20\": 6.869580793758683,\n          \"frac_valid_area\": 100.0,\n          \"n_cells\": 44564,\n          \"area_valid\": 361110931290015.25,\n          \"total_ocean_area\": 361110931290015.25,\n          \"diff\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 44564,\n            \"min\": -632.1378231080744,\n            \"max\": 1476.934751329577,\n            \"mean\": -5.476644442745724,\n            \"std\": 33.22247692884654\n          },\n          \"op_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 44564,\n            \"min\": 10.0,\n            \"max\": 3135.7478876919968,\n            \"mean\": 50.83488131963939,\n            \"std\": 134.05929215705228\n          },\n          \"ml_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 44564,\n            \"min\": 0.9927991151809692,\n            \"max\": 3049.74547068278,\n            \"mean\": 56.311525762385116,\n            \"std\": 131.72582411721015\n          },\n          \"x\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              44564\n            ],\n            \"size\": 44564,\n            \"n_valid\": 44564,\n            \"min\": 10.0,\n            \"max\": 3135.7478876919968,\n            \"mean\": 50.83488131963939,\n            \"std\": 134.05929215705228\n          },\n          \"y\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              44564\n            ],\n            \"size\": 44564,\n            \"n_valid\": 44564,\n            \"min\": 0.9927991151809692,\n            \"max\": 3049.74547068278,\n            \"mean\": 56.311525762385116,\n            \"std\": 131.72582411721015\n          },\n          \"lon2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 64800,\n            \"min\": -179.5,\n            \"max\": 179.5,\n            \"mean\": 0.0,\n            \"std\": 103.92264751567228\n          },\n          \"lat2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 64800,\n            \"min\": -89.5,\n            \"max\": 89.5,\n            \"mean\": 0.0,\n            \"std\": 51.96072234550504\n          },\n          \"area\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 64800,\n            \"min\": 0.0,\n            \"max\": 12390983680.0,\n            \"mean\": 5572699556.94468,\n            \"std\": 4892158005.51933\n          },\n          \"mask\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"values\": [\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\"\n            ]\n          }\n        },\n        \"('GFDL-ESM4', 9)\": {\n          \"model\": \"GFDL-ESM4\",\n          \"month\": 9,\n          \"month_name\": \"September\",\n          \"bias\": -4.09540279327944,\n          \"rmsd\": 19.40891044237363,\n          \"corr\": 0.9733714205460104,\n          \"frac_gt20\": 7.362392157000072,\n          \"frac_valid_area\": 100.0,\n          \"n_cells\": 44564,\n          \"area_valid\": 361110931290015.25,\n          \"total_ocean_area\": 361110931290015.25,\n          \"diff\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 44564,\n            \"min\": -160.26162707548121,\n            \"max\": 799.147243819567,\n            \"mean\": -4.09540279327944,\n            \"std\": 18.97191293783732\n          },\n          \"op_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 44564,\n            \"min\": 10.0,\n            \"max\": 1098.3782274634916,\n            \"mean\": 55.23679720522934,\n            \"std\": 81.67015914103733\n          },\n          \"ml_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 44564,\n            \"min\": 0.9601655781269074,\n            \"max\": 1074.7267810821534,\n            \"mean\": 59.33219999850878,\n            \"std\": 76.42342553772494\n          },\n          \"x\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              44564\n            ],\n            \"size\": 44564,\n            \"n_valid\": 44564,\n            \"min\": 10.0,\n            \"max\": 1098.3782274634916,\n            \"mean\": 55.23679720522934,\n            \"std\": 81.67015914103733\n          },\n          \"y\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              44564\n            ],\n            \"size\": 44564,\n            \"n_valid\": 44564,\n            \"min\": 0.9601655781269074,\n            \"max\": 1074.7267810821534,\n            \"mean\": 59.33219999850878,\n            \"std\": 76.42342553772494\n          },\n          \"lon2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 64800,\n            \"min\": -179.5,\n            \"max\": 179.5,\n            \"mean\": 0.0,\n            \"std\": 103.92264751567228\n          },\n          \"lat2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 64800,\n            \"min\": -89.5,\n            \"max\": 89.5,\n            \"mean\": 0.0,\n            \"std\": 51.96072234550504\n          },\n          \"area\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"n_valid\": 64800,\n            \"min\": 0.0,\n            \"max\": 12390983680.0,\n            \"mean\": 5572699556.94468,\n            \"std\": 4892158005.51933\n          },\n          \"mask\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              180,\n              360\n            ],\n            \"size\": 64800,\n            \"values\": [\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\"\n            ]\n          }\n        },\n        \"('MPI-ESM1-2-LR', 3)\": {\n          \"model\": \"MPI-ESM1-2-LR\",\n          \"month\": 3,\n          \"month_name\": \"March\",\n          \"bias\": 2.7784886725416587,\n          \"rmsd\": 28.876829087138933,\n          \"corr\": 0.993247212829329,\n          \"frac_gt20\": 1.737441496905516,\n          \"frac_valid_area\": 100.0,\n          \"n_cells\": 36791,\n          \"area_valid\": 365975311658496.0,\n          \"total_ocean_area\": 365975311658496.0,\n          \"diff\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 36791,\n            \"min\": -429.41258686130874,\n            \"max\": 536.0755018442096,\n            \"mean\": 2.7784886725416587,\n            \"std\": 28.74284708974375\n          },\n          \"op_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 36791,\n            \"min\": 10.070038467416847,\n            \"max\": 2661.9287389931737,\n            \"mean\": 97.9163860355497,\n            \"std\": 190.38974779758658\n          },\n          \"ml_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 36791,\n            \"min\": 6.070362917582194,\n            \"max\": 2403.408499145508,\n            \"mean\": 95.13789736300805,\n            \"std\": 170.71249405665526\n          },\n          \"x\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              36791\n            ],\n            \"size\": 36791,\n            \"n_valid\": 36791,\n            \"min\": 10.070038467416847,\n            \"max\": 2661.9287389931737,\n            \"mean\": 97.9163860355497,\n            \"std\": 190.38974779758658\n          },\n          \"y\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              36791\n            ],\n            \"size\": 36791,\n            \"n_valid\": 36791,\n            \"min\": 6.070362917582194,\n            \"max\": 2403.408499145508,\n            \"mean\": 95.13789736300805,\n            \"std\": 170.71249405665526\n          },\n          \"lon2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 56320,\n            \"min\": -179.98650855515638,\n            \"max\": 179.99320214054296,\n            \"mean\": -11.688109683494938,\n            \"std\": 86.13683577959553\n          },\n          \"lat2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 56320,\n            \"min\": -83.96550988220439,\n            \"max\": 89.72660369238089,\n            \"mean\": 11.336055347692735,\n            \"std\": 55.357212731498535\n          },\n          \"area\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 56320,\n            \"min\": 0.0,\n            \"max\": 33998391296.0,\n            \"mean\": 6498141187.118182,\n            \"std\": 8790133048.199862\n          },\n          \"mask\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"values\": [\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\"\n            ]\n          }\n        },\n        \"('MPI-ESM1-2-LR', 9)\": {\n          \"model\": \"MPI-ESM1-2-LR\",\n          \"month\": 9,\n          \"month_name\": \"September\",\n          \"bias\": -5.049829631023711,\n          \"rmsd\": 36.484652470008456,\n          \"corr\": 0.9846950546372685,\n          \"frac_gt20\": 3.958621280993634,\n          \"frac_valid_area\": 100.0,\n          \"n_cells\": 36791,\n          \"area_valid\": 365975311658496.0,\n          \"total_ocean_area\": 365975311658496.0,\n          \"diff\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 36791,\n            \"min\": -795.3761351704557,\n            \"max\": 87.989358487635,\n            \"mean\": -5.049829631023711,\n            \"std\": 36.13348981976317\n          },\n          \"op_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 36791,\n            \"min\": 10.053542756248968,\n            \"max\": 2797.720186456574,\n            \"mean\": 81.28680737949298,\n            \"std\": 138.24240526706092\n          },\n          \"ml_clim\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 36791,\n            \"min\": 6.063059457143148,\n            \"max\": 2755.256243387858,\n            \"mean\": 86.33663701051671,\n            \"std\": 163.05468713560546\n          },\n          \"x\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              36791\n            ],\n            \"size\": 36791,\n            \"n_valid\": 36791,\n            \"min\": 10.053542756248968,\n            \"max\": 2797.720186456574,\n            \"mean\": 81.28680737949298,\n            \"std\": 138.24240526706092\n          },\n          \"y\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              36791\n            ],\n            \"size\": 36791,\n            \"n_valid\": 36791,\n            \"min\": 6.063059457143148,\n            \"max\": 2755.256243387858,\n            \"mean\": 86.33663701051671,\n            \"std\": 163.05468713560546\n          },\n          \"lon2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 56320,\n            \"min\": -179.98650855515638,\n            \"max\": 179.99320214054296,\n            \"mean\": -11.688109683494938,\n            \"std\": 86.13683577959553\n          },\n          \"lat2d\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 56320,\n            \"min\": -83.96550988220439,\n            \"max\": 89.72660369238089,\n            \"mean\": 11.336055347692735,\n            \"std\": 55.357212731498535\n          },\n          \"area\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"n_valid\": 56320,\n            \"min\": 0.0,\n            \"max\": 33998391296.0,\n            \"mean\": 6498141187.118182,\n            \"std\": 8790133048.199862\n          },\n          \"mask\": {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              220,\n              256\n            ],\n            \"size\": 56320,\n            \"values\": [\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\",\n              \"False\"\n            ]\n          }\n        }\n      },\n      \"fig1_src\": {\n        \"('CESM2', 3)\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 64800,\n          \"min\": -349.85962415965946,\n          \"max\": 1314.374664402153,\n          \"mean\": 3.958645501309538,\n          \"std\": 29.29154473879829\n        },\n        \"('CESM2', 9)\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 64800,\n          \"min\": -52.97657470965362,\n          \"max\": 529.7513608787548,\n          \"mean\": 4.605213689502414,\n          \"std\": 25.70360634193057\n        },\n        \"('GFDL-ESM4', 3)\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 64800,\n          \"min\": -632.1378231080744,\n          \"max\": 1476.934751329577,\n          \"mean\": -1.917044470062871,\n          \"std\": 40.344436318069434\n        },\n        \"('GFDL-ESM4', 9)\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 64800,\n          \"min\": -160.26162707548121,\n          \"max\": 799.147243819567,\n          \"mean\": 2.9801807076723414,\n          \"std\": 34.19080212200617\n        },\n        \"('MPI-ESM1-2-LR', 3)\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 64800,\n          \"min\": -305.91640329634174,\n          \"max\": 536.0755018442096,\n          \"mean\": -0.0277656640584978,\n          \"std\": 14.82751388648682\n        },\n        \"('MPI-ESM1-2-LR', 9)\": {\n          \"type\": \"ndarray\",\n          \"shape\": [\n            180,\n            360\n          ],\n          \"size\": 64800,\n          \"n_valid\": 64800,\n          \"min\": -795.3761351704557,\n          \"max\": 87.989358487635,\n          \"mean\": -1.8378152991161953,\n          \"std\": 27.041093497382263\n        }\n      },\n      \"fig2_data\": {\n        \"('CESM2', 3)\": [\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              86096\n            ],\n            \"size\": 86096,\n            \"n_valid\": 86096,\n            \"min\": 10.16251559514033,\n            \"max\": 1915.0255729937267,\n            \"mean\": 66.67197418657672,\n            \"std\": 124.91164012682373\n          },\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              86096\n            ],\n            \"size\": 86096,\n            \"n_valid\": 86096,\n            \"min\": 0.0,\n            \"max\": 1903.8141723632812,\n            \"mean\": 65.05064273952564,\n            \"std\": 116.9304145292194\n          },\n          1.6213314470510696,\n          35.70185733671406,\n          0.9586369836714526\n        ],\n        \"('CESM2', 9)\": [\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              86096\n            ],\n            \"size\": 86096,\n            \"n_valid\": 86096,\n            \"min\": 10.176679244346388,\n            \"max\": 564.4453613136303,\n            \"mean\": 69.93721341399237,\n            \"std\": 62.18389960132885\n          },\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              86096\n            ],\n            \"size\": 86096,\n            \"n_valid\": 86096,\n            \"min\": 0.0,\n            \"max\": 403.73697967529296,\n            \"mean\": 69.61734775093989,\n            \"std\": 61.04838892956951\n          },\n          0.31986566305248787,\n          7.814801239482865,\n          0.9921396400103369\n        ],\n        \"('GFDL-ESM4', 3)\": [\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              44564\n            ],\n            \"size\": 44564,\n            \"n_valid\": 44564,\n            \"min\": 10.0,\n            \"max\": 3135.7478876919968,\n            \"mean\": 50.83488131963939,\n            \"std\": 134.05929215705228\n          },\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              44564\n            ],\n            \"size\": 44564,\n            \"n_valid\": 44564,\n            \"min\": 0.9927991151809692,\n            \"max\": 3049.74547068278,\n            \"mean\": 56.311525762385116,\n            \"std\": 131.72582411721015\n          },\n          -5.476644442745724,\n          33.67085694840567,\n          0.9689030097798512\n        ],\n        \"('GFDL-ESM4', 9)\": [\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              44564\n            ],\n            \"size\": 44564,\n            \"n_valid\": 44564,\n            \"min\": 10.0,\n            \"max\": 1098.3782274634916,\n            \"mean\": 55.23679720522934,\n            \"std\": 81.67015914103733\n          },\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              44564\n            ],\n            \"size\": 44564,\n            \"n_valid\": 44564,\n            \"min\": 0.9601655781269074,\n            \"max\": 1074.7267810821534,\n            \"mean\": 59.33219999850878,\n            \"std\": 76.42342553772494\n          },\n          -4.09540279327944,\n          19.40891044237363,\n          0.9733714205460104\n        ],\n        \"('MPI-ESM1-2-LR', 3)\": [\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              36791\n            ],\n            \"size\": 36791,\n            \"n_valid\": 36791,\n            \"min\": 10.070038467416847,\n            \"max\": 2661.9287389931737,\n            \"mean\": 97.9163860355497,\n            \"std\": 190.38974779758658\n          },\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              36791\n            ],\n            \"size\": 36791,\n            \"n_valid\": 36791,\n            \"min\": 6.070362917582194,\n            \"max\": 2403.408499145508,\n            \"mean\": 95.13789736300805,\n            \"std\": 170.71249405665526\n          },\n          2.7784886725416587,\n          28.876829087138933,\n          0.993247212829329\n        ],\n        \"('MPI-ESM1-2-LR', 9)\": [\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              36791\n            ],\n            \"size\": 36791,\n            \"n_valid\": 36791,\n            \"min\": 10.053542756248968,\n            \"max\": 2797.720186456574,\n            \"mean\": 81.28680737949298,\n            \"std\": 138.24240526706092\n          },\n          {\n            \"type\": \"ndarray\",\n            \"shape\": [\n              36791\n            ],\n            \"size\": 36791,\n            \"n_valid\": 36791,\n            \"min\": 6.063059457143148,\n            \"max\": 2755.256243387858,\n            \"mean\": 86.33663701051671,\n            \"std\": 163.05468713560546\n          },\n          -5.049829631023711,\n          36.484652470008456,\n          0.9846950546372685\n        ]\n      },\n      \"region_stats\": {\n        \"('CESM2', 3)\": \"   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\\n0     60.0     70.0    150.0    160.0               100.0  4.305634e+10\\n1     20.0     30.0     40.0     50.0               100.0  2.600090e+10\\n2     50.0     60.0     20.0     30.0               100.0  9.124694e+10\\n3    -30.0    -20.0    140.0    150.0               100.0  9.496699e+09\\n4     60.0     70.0   -150.0   -140.0               100.0  1.649725e+10\",\n        \"('CESM2', 9)\": \"   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\\n0    -30.0    -20.0    140.0    150.0          100.000000  9.496699e+09\\n1     20.0     30.0     40.0     50.0          100.000000  2.600090e+10\\n2    -20.0    -10.0    130.0    140.0           75.254461  4.795069e+11\\n3     30.0     40.0    -90.0    -80.0           75.163384  4.529797e+10\\n4     60.0     70.0     20.0     30.0           65.390604  5.703212e+10\",\n        \"('GFDL-ESM4', 3)\": \"   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\\n0     30.0     40.0    -70.0    -60.0           98.946968  1.015027e+12\\n1     40.0     50.0      0.0     10.0           97.480949  2.468363e+11\\n2     30.0     40.0   -180.0   -170.0           93.725938  1.015027e+12\\n3     30.0     40.0    150.0    160.0           92.017930  1.015027e+12\\n4     70.0     80.0      0.0     10.0           89.104017  3.210756e+11\",\n        \"('GFDL-ESM4', 9)\": \"   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\\n0    -80.0    -70.0    -70.0    -60.0           97.602257  1.445941e+10\\n1    -80.0    -70.0     20.0     30.0           89.473125  4.968746e+09\\n2    -80.0    -70.0    160.0    170.0           82.824013  1.042598e+11\\n3    -40.0    -30.0    -10.0      0.0           78.090886  1.012499e+12\\n4    -40.0    -30.0    110.0    120.0           73.196978  7.799416e+11\",\n        \"('MPI-ESM1-2-LR', 3)\": \"   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\\n0     40.0     50.0    120.0    130.0          100.000000  2.507115e+10\\n1     70.0     80.0      0.0     10.0           85.410570  3.218226e+11\\n2     70.0     80.0    -10.0      0.0           67.706220  3.187608e+11\\n3     60.0     70.0    -40.0    -30.0           67.678887  3.576414e+11\\n4     60.0     70.0    -20.0    -10.0           63.364805  4.495122e+11\",\n        \"('MPI-ESM1-2-LR', 9)\": \"   lat_min  lat_max  lon_min  lon_max  area_fraction_gt20    area_valid\\n0    -70.0    -60.0    -30.0    -20.0           98.992348  5.199788e+11\\n1    -70.0    -60.0    -20.0    -10.0           91.313919  5.280817e+11\\n2    -70.0    -60.0    -40.0    -30.0           80.456908  5.290638e+11\\n3    -80.0    -70.0   -170.0   -160.0           69.382150  2.784526e+11\\n4    -80.0    -70.0   -160.0   -150.0           69.138777  2.658327e+11\"\n      },\n      \"model_variant\": {\n        \"CESM2\": \"r1i1p1f1\",\n        \"GFDL-ESM4\": \"r1i1p1f1\",\n        \"MPI-ESM1-2-LR\": \"r1i1p1f1\"\n      },\n      \"rows\": [\n        {\n          \"model\": \"CESM2\",\n          \"month\": 3,\n          \"month_name\": \"March\",\n          \"bias_m\": 1.6213314470510696,\n          \"rmsd_m\": 35.70185733671406,\n          \"corr\": 0.9586369836714526,\n          \"area_pct_absdiff_gt20\": 3.7703181721366232,\n          \"valid_area_pct_of_ocean\": 100.0,\n          \"n_cells\": 86096,\n          \"area_valid_m2\": 360511672773792.0,\n          \"total_ocean_area_m2\": 360511672773792.0\n        },\n        {\n          \"model\": \"CESM2\",\n          \"month\": 9,\n          \"month_name\": \"September\",\n          \"bias_m\": 0.31986566305248787,\n          \"rmsd_m\": 7.814801239482865,\n          \"corr\": 0.9921396400103369,\n          \"area_pct_absdiff_gt20\": 1.360785778869969,\n          \"valid_area_pct_of_ocean\": 100.0,\n          \"n_cells\": 86096,\n          \"area_valid_m2\": 360511672773792.0,\n          \"total_ocean_area_m2\": 360511672773792.0\n        },\n        {\n          \"model\": \"GFDL-ESM4\",\n          \"month\": 3,\n          \"month_name\": \"March\",\n          \"bias_m\": -5.476644442745724,\n          \"rmsd_m\": 33.67085694840567,\n          \"corr\": 0.9689030097798512,\n          \"area_pct_absdiff_gt20\": 6.869580793758683,\n          \"valid_area_pct_of_ocean\": 100.0,\n          \"n_cells\": 44564,\n          \"area_valid_m2\": 361110931290015.25,\n          \"total_ocean_area_m2\": 361110931290015.25\n        },\n        {\n          \"model\": \"GFDL-ESM4\",\n          \"month\": 9,\n          \"month_name\": \"September\",\n          \"bias_m\": -4.09540279327944,\n          \"rmsd_m\": 19.40891044237363,\n          \"corr\": 0.9733714205460104,\n          \"area_pct_absdiff_gt20\": 7.362392157000072,\n          \"valid_area_pct_of_ocean\": 100.0,\n          \"n_cells\": 44564,\n          \"area_valid_m2\": 361110931290015.25,\n          \"total_ocean_area_m2\": 361110931290015.25\n        },\n        {\n          \"model\": \"MPI-ESM1-2-LR\",\n          \"month\": 3,\n          \"month_name\": \"March\",\n          \"bias_m\": 2.7784886725416587,\n          \"rmsd_m\": 28.876829087138933,\n          \"corr\": 0.993247212829329,\n          \"area_pct_absdiff_gt20\": 1.737441496905516,\n          \"valid_area_pct_of_ocean\": 100.0,\n          \"n_cells\": 36791,\n          \"area_valid_m2\": 365975311658496.0,\n          \"total_ocean_area_m2\": 365975311658496.0\n        },\n        {\n          \"model\": \"MPI-ESM1-2-LR\",\n          \"month\": 9,\n          \"month_name\": \"September\",\n          \"bias_m\": -5.049829631023711,\n          \"rmsd_m\": 36.484652470008456,\n          \"corr\": 0.9846950546372685,\n          \"area_pct_absdiff_gt20\": 3.958621280993634,\n          \"valid_area_pct_of_ocean\": 100.0,\n          \"n_cells\": 36791,\n          \"area_valid_m2\": 365975311658496.0,\n          \"total_ocean_area_m2\": 365975311658496.0\n        }\n      ],\n      \"results_df\": \"           model  month month_name  ...  n_cells  area_valid_m2  total_ocean_area_m2\\n0          CESM2      3      March  ...    86096   3.605117e+14         3.605117e+14\\n1          CESM2      9  September  ...    86096   3.605117e+14         3.605117e+14\\n2      GFDL-ESM4      3      March  ...    44564   3.611109e+14         3.611109e+14\\n3      GFDL-ESM4      9  September  ...    44564   3.611109e+14         3.611109e+14\\n4  MPI-ESM1-2-LR      3      March  ...    36791   3.659753e+14         3.659753e+14\\n5  MPI-ESM1-2-LR      9  September  ...    36791   3.659753e+14         3.659753e+14\\n\\n[6 rows x 11 columns]\",\n      \"model_rmsd\": \"model\\nCESM2            21.758329\\nGFDL-ESM4        26.539884\\nMPI-ESM1-2-LR    32.680741\\nName: rmsd_m, dtype: float64\",\n      \"ranking\": [\n        \"CESM2\",\n        \"GFDL-ESM4\",\n        \"MPI-ESM1-2-LR\"\n      ],\n      \"ranking_criterion\": \"mean of March and September RMSD (lower is better)\",\n      \"all_fig1\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          388800\n        ],\n        \"size\": 388800,\n        \"n_valid\": 388800,\n        \"min\": -795.3761351704557,\n        \"max\": 1476.934751329577,\n        \"mean\": 1.2935690775411217,\n        \"std\": 29.746720221060137\n      },\n      \"fig1_vmax\": 52.71134708497384,\n      \"all_scatter\": {\n        \"type\": \"ndarray\",\n        \"shape\": [\n          669655\n        ],\n        \"size\": 669655,\n        \"n_valid\": 669655,\n        \"min\": 0.0006316992764671644,\n        \"max\": 3135.7478876919968,\n        \"mean\": 69.44784924264827,\n        \"std\": 119.11377415518365\n      },\n      \"fig2_lim_min\": 0.1,\n      \"fig2_lim_max\": 10000.0,\n      \"fig2_lims\": [\n        0.1,\n        10000.0\n      ],\n      \"fig2_ticks\": [\n        0.1,\n        0.2,\n        0.5,\n        1.0,\n        2.0,\n        5.0,\n        10.0,\n        20.0,\n        50.0,\n        100.0,\n        200.0,\n        500.0,\n        1000.0,\n        2000.0,\n        5000.0,\n        10000.0\n      ]\n    }\n  },\n  {\n    \"type\": \"visualization\",\n    \"status\": \"success\",\n    \"paths\": [\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T4_deepseek-flash_20261025_064215/turn01/figures/visualization_T4_deepseek-flash_20261025_064215_turn1_1.png\",\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T4_deepseek-flash_20261025_064215/turn01/figures/visualization_T4_deepseek-flash_20261025_064215_turn1_2.png\"\n    ]\n  }\n]",
+      "solution": "<solution>\nThe internal-consistency test was performed by computing an offline MLD from each model’s own monthly `thetao` and `so` with a sigma-theta threshold of 0.03 kg m⁻³ relative to 10 m, interpolating the first crossing between model levels, and comparing it with the same model’s published `mlotst`. All statistics below use only cells where both fields are defined for all 30 Marches or all 30 Septembers. Mean difference, RMSD and correlation are cell-wise over that common mask; the percentage-area statistics are area-weighted with each model’s `areacello`.\n\n### Numerical results: operator MLD minus published `mlotst`\n\n| Model | Month | Mean difference (m) | RMSD (m) | Pearson correlation | Area with \\|difference\\| > 20 m (%) | Common-valid area (% of model ocean) |\n|---|---:|---:|---:|---:|---:|---:|\n| CESM2 | March | 1.6 | 35.7 | 0.959 | 3.8 | 100.0 |\n| CESM2 | September | 0.3 | 7.8 | 0.992 | 1.4 | 100.0 |\n| GFDL-ESM4 | March | -5.5 | 33.7 | 0.969 | 6.9 | 100.0 |\n| GFDL-ESM4 | September | -4.1 | 19.4 | 0.973 | 7.4 | 100.0 |\n| MPI-ESM1-2-LR | March | 2.8 | 28.9 | 0.993 | 1.7 | 100.0 |\n| MPI-ESM1-2-LR | September | -5.0 | 36.5 | 0.985 | 4.0 | 100.0 |\n\nPositive mean differences mean the offline operator MLD is deeper than the published `mlotst`.\n\n### Ranking and criterion\n\nUsing the mean of the March and September RMSD as the ranking criterion, lower RMSD being better, the models rank from most to least internally consistent as:\n\n1. **CESM2** — mean RMSD = 21.8 m  \n2. **GFDL-ESM4** — mean RMSD = 26.5 m  \n3. **MPI-ESM1-2-LR** — mean RMSD = 32.7 m  \n\nThis ranking is metric-dependent. By mean correlation, MPI-ESM1-2-LR is highest (mean r ≈ 0.989, versus CESM2 ≈ 0.975 and GFDL-ESM4 ≈ 0.971). By the percentage of area with |difference| > 20 m, GFDL-ESM4 is clearly the worst, while CESM2 and MPI-ESM1-2-LR are closer. The robust conclusion is that CESM2 performs best or near-best by RMSD and has a very small September error; MPI-ESM1-2-LR has the highest spatial correlation and a small March >20 m area but a large September RMSD in the Southern Ocean; GFDL-ESM4 has the most widespread area exceeding 20 m.\n\n### Where the disagreement concentrates\n\nThe coarse 10° area-weighted diagnostics show that disagreement is not spatially uniform:\n\n- **CESM2:** largest March errors are localized in high northern latitudes (especially 60–70°N near 150–160°E and North Atlantic/Nordic boxes), the Arabian/Red Sea region around 20–30°N, 40–50°E, and a Southern Indian sector near 30–20°S, 140–150°E. September is much better, with residual boxes near the Gulf of Mexico/western Atlantic, the western Pacific, and high-latitude North Atlantic.\n- **GFDL-ESM4:** the most widespread disagreement, concentrated in western boundary current regions (Gulf Stream and Kuroshio), North Atlantic/North Pacific midlatitudes, Arctic/Nordic seas in March, and the Southern Ocean/Antarctic plus South Atlantic/Indian sectors in September.\n- **MPI-ESM1-2-LR:** March disagreement is concentrated in the high-latitude North Atlantic/Nordic/Arctic region and western North Pacific; September disagreement is strongly concentrated in the Southern Ocean/Antarctic, especially 60–80°S.\n\n### Why the operator and `mlotst` are not expected to agree exactly\n\nEven though both quantities come from the same simulation, they are not expected to be identical:\n\n1. **Online versus offline calculation:** `mlotst` is the model’s online mixed-layer diagnostic, computed from the model state and its own algorithm at model time steps. The offline operator uses monthly-mean `thetao` and `so`, so it loses sub-monthly covariation and nonlinear averaging effects.\n2. **Different density and threshold implementation:** `mlotst` is defined with a density threshold relative to 10 m, but models may use slightly different density formulas, reference treatment, and vertical interpolation. The offline operator here uses EOS-80 from potential temperature and practical salinity.\n3. **Vertical discretization:** The offline MLD interpolates the first threshold crossing between model levels. The published `mlotst` may use a different interpolation, a different reference level, or the model’s native vertical-grid treatment.\n4. **Masking, sea ice, and marginal seas:** Mixed-layer diagnostics are sensitive near coasts, marginal seas, high latitudes, and sea-ice edges, where monthly means, missing values, and ice/ocean masks can affect the computed crossing.\n5. **Highly nonlinear threshold behavior:** Small differences in near-surface stratification can move the first density-threshold crossing by many metres, especially in regions with weak or shallow stratification and strong vertical gradients, such as western boundary currents, the Southern Ocean, and high-latitude convection regions.\n\n### Figures\n\nThe requested figures were generated:\n\n- **Figure 1:** 3 × 2 global maps of operator MLD minus published `mlotst`, with rows CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, columns March and September, all panels on a common longitude–latitude display grid and using one shared diverging colour scale centred on zero (approximately ±52.7 m from the 98th percentile of the displayed differences).\n- **Figure 2:** 3 × 2 log–log scatter plots of operator MLD versus published `mlotst`, with common axes (0.1–10,000 m), a dashed y = x line, and each panel annotated with its mean difference, RMSD and correlation. The points lie close to the one-to-one line overall, consistent with the high correlations, with the largest departures in regions and months with deep MLDs and strong localized biases.\n</solution>",
+      "timestamp": "2026-10-25T06:56:47.343800"
+    }
+  ]
+}

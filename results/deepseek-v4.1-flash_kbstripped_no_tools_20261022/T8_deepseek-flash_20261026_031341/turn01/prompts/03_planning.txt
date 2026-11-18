@@ -1,0 +1,176 @@
+# exchange 3: planning
+# elapsed: 25.5 s
+
+===== SYSTEM =====
+You are an oceanographic data analysis assistant with conversation history support.
+
+
+
+Available tools: none. There are no project functions in this setting; the analysis code opens
+the datasets' raw files itself with numpy, pandas and xarray.
+
+Available datasets:
+{
+  "woa23": {
+    "description": "[climatology] World Ocean Atlas 2023 (NOAA/NCEI) 1.00 degree objectively analysed climatology. Temperature and salinity come on two climate normals, 1971-2000 and 1991-2020; oxygen, apparent oxygen utilization and percent oxygen saturation each provide both a 1971-2000 normal (the default) and a 1965-2022 all-period (all) composite; nutrients provide only the 1965-2022 all-period composite. Variables: apparent_oxygen_utilization, nitrate, oxygen, percent_oxygen_saturation, phosphate, salinity, silicate, temperature."
+  },
+  "glodap": {
+    "description": "[climatology] GLODAPv2 global ocean carbon chemistry mapped climatology (DIVA objective analysis), built from 1972-2013 input data. No time dimension, 33 standard depth levels. Variables: Cant, NO3, OmegaA, OmegaC, PI_TCO2, PO4, TAlk, TCO2, oxygen, pHts25p0, pHtsinsitutp, salinity, silicate, temperature. Climatology period 1972-2013."
+  },
+  "seanoe_mld": {
+    "description": "[climatology] Global ocean mixed layer depth (MLD) monthly climatology from the LOPS laboratory. The criterion is a potential density increase of 0.03 kg/m3 relative to the reference depth. Based on a month-by-month objective analysis of 1970-2021 Argo and WOD profiles. Variables: mask, mld_dr003, n_obs. Climatology period 1970-2021."
+  },
+  "ersst": {
+    "description": "[timeseries] NOAA Extended Reconstructed SST v5 (in situ observations only), monthly mean, 1854 to present. Surface only, no vertical dimension. Variables: sst."
+  },
+  "cpc_indices": {
+    "description": "[index] NOAA monthly climate indices. The four Nino products are CPC ENSO monitoring indices, giving regional mean SST and its anomaly in degC. The PDO product is a NOAA NCEI pattern index and is dimensionless; it is kept here so the monthly indices live together, despite the dataset id naming CPC. Products: ersst5_81-10, ersst5_91-20, oisst, oni, pdo."
+  },
+  "cmip6_historical": {
+    "description": "[timeseries] CMIP6 historical (all-forcing historical simulation) ocean component, Omon monthly frequency plus Ofx fixed fields. Three models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 1850-01 to 2014-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  },
+  "cmip6_ssp245": {
+    "description": "[timeseries] CMIP6 ScenarioMIP ssp245 (SSP2-4.5, concentration-driven). Grid and coordinate definitions are the same as historical; they differ in time range, variant label and variable coverage. Models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR. Monthly, 2015-01 to 2100-12. Variables differ by model; a variable a model does not publish is reported as missing when it is loaded."
+  }
+}
+
+Domain knowledge retrieved for this question (grouped by [fragment-id] (severity)):
+<domain_knowledge>
+[cmip6-carbonate-system-definitions] (must)
+- `dissic` is C_T = CO2* + HCO3- + CO3-- and `talk` is the total alkalinity equivalent (carbonate + nitrogen + silicate + borate terms); compare model `ph` only with an observational pH on the **total scale at in-situ temperature and pressure** — check which GLODAP field is in-situ (`pHtsinsitutp`, not `pHts25p0`).
+- The CESM2 paper does not document its carbonate constants, so state this as an unverified assumption where the comparison depends on them.
+
+[cmip6-bgc-units-per-volume] (must)
+- Model `dissic`/`talk` are mol m-3 (per volume): convert to µmol kg-1 with µmol kg-1 = mmol m-3 × 1000 / ρ using the **in-situ** density (`compute_potential_density_anomaly` with `ref_pressure=None`); `transform_unit`'s default constant density errs by about a per cent below the surface — pass the in-situ field and report `attrs['density_assumption']`.
+- Never label mol m-3 × 1000 as "µmol kg-1"; two concentrations on different bases cannot be differenced until one is converted.
+
+[common-comparison-mask] (must)
+- Put all fields on the GLODAP 1° grid, build **one** mask over all sources with `build_comparison_mask` and apply `.where(mask)` to every field before bias/RMSE/correlation; pass `ocean_only=False` because the reference is GLODAP, not WOA23 (the default would drop 1459 valid cells).
+- A mask does not carry between levels: for the 0/100/500/1000/2000 m biases take the cells from the fields at each depth, and report the cell counts alongside the metrics.
+
+[monthly-means-are-time-averages] (must)
+- The 2002 annual mean must weight months by their calendar length with `temporal_aggregate` (`freq='mean'`), not an equal-weight time mean; state the order of operations where a nonlinear diagnostic (density, pH-related quantities) is formed from monthly T/S.
+- Sub-monthly variance cannot be recovered from monthly means; do not report it.
+
+[cmip6-grid-labels] (should)
+- GFDL-ESM4 is `grid_label='gr'`: its values are already remapped to a 1° grid with a regridded land–sea mask, so its "native-grid" numbers are 1°-archive numbers and budgets are only approximately conservative.
+- Resolution differs ~2.5× between CESM2 (100 km) and MPI (250 km); state that features narrower than the coarse grid are not comparable in amplitude.
+
+[omip-native-grid-vs-regridded] (should)
+- Compute every number (global/basin means, region means) on each source's own grid with its own weights; regrid to the WOA 1° grid only for maps, pattern correlation and RMSE on the common mask, and say which numbers come from which grid.
+- The fixed-depth biases need each product interpolated to 0, 100, 500, 1000, 2000 m with `regrid_vertical`, not the nearest level selected; state the regridding method used for the maps.
+
+[omip-weighted-means-and-integrals] (should)
+- A global mean of `dissic`/`talk`/`thetao` is Σ T·volcello / Σ volcello over valid ocean cells, with the weight restricted to the same cells as the data (NaN-aware); a 0–50 m mean is area-weighted with `areacello` — unweighted `mean()` is wrong.
+- Use `compute_basic_stat` with `op='area_weighted_mean'` (or `op='volume_weighted_mean'` where depth is included); `compute_difference_metrics` weights by area by default and `analyze_correlation` needs `weighting='area'`.
+</domain_knowledge>
+
+Data selection rules:
+1. <selected_data> must contain dataset IDs exactly as listed above (e.g. woa23, cmip6_historical).
+   Never put a file path there, and never invent a name. One dataset ID holds many variables, and
+   CMIP6 also holds several models; those are chosen in the next step, not here.
+2. Long-term trends, interannual variability and scenario projections need a timeseries dataset
+   (cmip6_historical, cmip6_ssp245, ersst). Mean state, seasonal cycle and vertical structure need a
+   climatology (woa23, glodap, seanoe_mld). A question about the ENSO monitoring index itself needs
+   cpc_indices.
+3. Select several datasets, comma-separated, when the question compares a model against observations
+   or needs variables that live in different products.
+4. Reading data: there are no loading functions. The code step opens the raw files of the datasets
+   you select and is shown where they live and how they are laid out; plan the reading as part of
+   the steps.
+5. Regional and global means are area- or volume-weighted, never plain averages over lat/lon: plan
+   where the weights come from (for CMIP6, the model's own areacello / volcello fixed fields).
+
+How to write the plan:
+1. Write the plan as numbered steps, each naming the datasets, variables and models it needs.
+   End it with an "Other notes:" section, one line each, holding only the caveats the answer must
+   state.
+2. Add no computational constraint of your own. Every definition, weighting, mask, threshold,
+   interpolation, filter or correction a step applies must come from the question or from what is
+   given above (the dataset descriptions, and any domain knowledge); do not devise one that
+   none of them states (an extra mask, a partial-layer weighting, a screening threshold).
+3. There are no project tools to call: plan every step as an operation the code performs on the raw
+   data with the standard libraries (numpy, pandas, xarray).
+4. Do not round intermediate values: later steps use the unrounded results of earlier ones, and a
+   value is rounded only where it is reported, to the precision the question asks for.
+5. The steps, any notes under them and Other notes all go inside the <plan> tags; nothing outside them
+   is passed on to the later steps.
+
+How to use the domain knowledge:
+1. Priority: definitions and procedures the user states explicitly in the question come first, the
+   dataset descriptions second, the knowledge fragments last. Use the fragments to settle
+   choices the question leaves open and to find the caveats that must be stated. When a fragment
+   conflicts with what the question prescribes, follow the question and record the difference under
+   Other notes so the answer can explain it.
+2. Under the step where a piece of knowledge FIRST matters, add one line "- Note [fragment-id]: ..."
+   carrying what to do (the formula, threshold, unit conversion or check). Each
+   fragment gets exactly ONE such note line in the whole plan, under a step or under Other notes, not
+   both. A later step that also depends on it names "[fragment-id]" inline in its own text, with no
+   further note line and no restatement - the next stage reads the whole plan. Do not copy the
+   knowledge text into the plan.
+3. Other notes also hold the differences between the question's definition and the protocol; a line
+   that comes from a fragment takes the form "- [fragment-id] ...".
+4. Cite every fragment of severity must at least once, in a step or under Other notes. Fragments of
+   severity should or info that end up unused may be left out.
+5. The notes may name functions of this project in backticks (`compute_basic_stat`,
+   `load_regular_data`, ...). None of them exists in this setting: read such a name as the operation
+   it stands for, and plan that operation on the raw data.
+
+Analyze the user's question and select appropriate data. Follow this format strictly:
+<plan>numbered steps: the datasets, variables and models each step needs, with the knowledge notes under each step, then Other notes</plan>
+<selected_data>comma-separated list of dataset IDs you will use</selected_data>
+
+IMPORTANT: Your response MUST contain all required XML tags, and tags must be properly closed.
+
+
+===== USER =====
+User question: Evaluate the ocean carbon system of three CMIP6 models against the GLODAPv2.2016b mapped climatology: dissolved inorganic carbon, total alkalinity and pH.
+
+Data to use:
+- CMIP6 historical `dissic`, `talk`, `ph`, `thetao` and `so` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, for the calendar year 2002, plus `dissic`, `thetao` and `so` for 1971-2000.
+- Each model's own areacello and volcello.
+- GLODAPv2.2016b mapped climatology: TCO2, TAlk and pH.
+
+Expected numerical results, with the models taken as their 2002 annual mean unless stated otherwise, and model DIC and alkalinity compared in micromoles per kilogram:
+- The global mean over 0-50 m of DIC and of total alkalinity for each model and for GLODAP (for every source one mean over all its 0-50 m cells), in micromoles per kilogram to the nearest whole unit, and each model's difference from GLODAP.
+- The same 0-50 m mean for pH on the total scale, to 3 decimal places, and each model's difference from GLODAP.
+- For the map of 0-50 m mean DIC (each cell's mean over its own 0-50 m levels), compared on the GLODAP 1-degree grid: each model's mean bias and RMSE in micromoles per kilogram to the nearest whole unit, and the spatial correlation to 3 decimal places.
+- For each model, the global mean DIC bias (model minus GLODAP) at 0, 100, 500, 1000 and 2000 m, compared on the GLODAP 1-degree grid and averaged, at each depth, over every cell where that model and GLODAP are both defined at that depth, in micromoles per kilogram to the nearest whole unit.
+- For each model, the period change of the global 0-50 m mean DIC, 2002 minus the 1971-2000 average, in micromoles per kilogram to the nearest whole unit, and its ratio to that model's 0-50 m DIC difference from GLODAP as defined in the first item to 2 decimal places, with what that implies for reading the bias as a model error.
+- Which model reproduces the observed carbon system best, and whether the three models' errors in DIC, alkalinity and pH are consistent in sign.
+
+Expected visualizations:
+- Figure 1, three global maps in one row, one per model, of the 0-50 m DIC bias against GLODAP on the cells of the map comparison, with one diverging colour scale centred on zero shared by all three panels and labelled in micromoles per kilogram.
+- Figure 2, a single panel of the vertical profile of the global mean DIC bias: depth on the vertical axis increasing downward, bias in micromoles per kilogram on the horizontal axis, one line per model, a vertical zero reference line, and the five sampled depths marked.
+
+Now output your reasoning and selections.
+
+===== RESPONSE =====
+<plan>
+1. Open the GLODAPv2.2016b mapped climatology files and read TCO2, TAlk and pH together with the salinity and temperature fields and the lat/lon/depth axes (no time dimension, 33 standard levels). Read the pH field as `pHtsinsitutp`, i.e. total scale at in-situ temperature and pressure, and derive cell areas from its 1° lat/lon axes for later area weighting.
+   - Note [cmip6-carbonate-system-definitions]: compare the model `ph` only against the in-situ, total-scale GLODAP field `pHtsinsitutp`, not `pHts25p0`; and remember `dissic` is C_T and `talk` is the total-alkalinity equivalent, so they are the counterparts of GLODAP TCO2 and TAlk.
+2. Open the CMIP6 historical files for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR: monthly `dissic`, `talk`, `ph`, `thetao`, `so` for calendar year 2002, monthly `dissic`, `thetao`, `so` for 1971-2000, and each model's Ofx fixed fields `areacello` and `volcello`. Record per model which requested variable is reported missing rather than silently skipping it.
+3. For each model, each month and each depth level, compute in-situ density from that month's `thetao`/`so` (`compute_potential_density_anomaly` with `ref_pressure=None`) and convert monthly `dissic` and `talk` from mol m-3 to µmol kg-1.
+   - Note [cmip6-bgc-units-per-volume]: use µmol kg-1 = mmol m-3 × 1000 / ρ with the in-situ density field (not a constant density, which errs by about a per cent below the surface); never label mol m-3 × 1000 as µmol kg-1, and report the density assumption when the numbers are given.
+4. Build the 2002 annual mean of every model field (and of the derived µmol kg-1 concentrations) by weighting the twelve months with their calendar lengths (`temporal_aggregate`, `freq='mean'`), and separately build the 1971-2000 mean of `dissic`, `thetao`, `so`. Order of operations: density and the per-volume-to-per-mass conversion are formed from each month's T/S first, and only then are the monthly concentrations averaged — so the nonlinear density step is not applied to an annual-mean T/S.
+   - Note [monthly-means-are-time-averages]: weight months by calendar length rather than an equal-weight time mean, and state this order of operations explicitly; sub-monthly variance cannot be recovered from monthly means and must not be reported.
+5. On each source's own grid, compute the global 0-50 m mean of DIC and of total alkalinity: one area-weighted mean over all level-cells whose depth lies in 0-50 m, weighting every model level-cell by that model's `areacello` and every GLODAP level-cell by its 1° cell area (`compute_basic_stat`, `op='area_weighted_mean'`). Report each model's value, GLODAP's value and model minus GLODAP in µmol kg-1 to the nearest whole unit.
+   - Note [omip-weighted-means-and-integrals]: global means of `dissic`/`talk` are sums weighted by cell area (volume where depth is included), restricted NaN-aware to the same valid cells as the data; a 0-50 m mean is area-weighted with `areacello` and a plain `mean()` is wrong.
+   - Note [omip-native-grid-vs-regridded]: compute every global/basin/region number on each source's own grid with its own weights (each model's `areacello`, GLODAP's own 1° areas), and regrid to the GLODAP 1° grid only for the maps, the pattern correlation and the RMSE; state in the answer which numbers come from which grid.
+6. Repeat step 5 for `ph` against GLODAP `pHtsinsitutp` on the 0-50 m cells, reporting the total-scale means to 3 decimal places and each model's difference from GLODAP. [cmip6-carbonate-system-definitions]: the CESM2 documentation does not state its carbonate constants, so the CESM2 pH comparison rests on an unverified assumption and this must be said.
+7. Map comparison of 0-50 m DIC: for each model reduce every horizontal cell to its own mean over that cell's 0-50 m levels, remap those 2-D fields and the correspondingly reduced GLODAP TCO2 field to the GLODAP 1° grid (bilinear interpolation onto the GLODAP lat/lon; GFDL-ESM4 is already on a 1° archive grid), then build one mask over all four sources with `build_comparison_mask(..., ocean_only=False)` and apply `.where(mask)` to every field before any metric. On the common masked cells compute each model's area-weighted mean bias, RMSE and spatial pattern correlation against GLODAP (`compute_difference_metrics`, which weights by area by default, and `analyze_correlation` with `weighting='area'`), reporting bias and RMSE in µmol kg-1 to the nearest unit and correlation to 3 decimals. The regridding method used for these maps (bilinear onto the GLODAP 1° grid) is stated with the results.
+   - Note [common-comparison-mask]: put all fields on the GLODAP 1° grid, use a single mask built with `build_comparison_mask` and pass `ocean_only=False` because the reference is GLODAP, not WOA23 (the default would drop 1459 valid cells).
+8. Fixed-depth DIC biases: interpolate each model's 2002 annual-mean DIC and GLODAP TCO2 vertically to 0, 100, 500, 1000 and 2000 m with `regrid_vertical` (`[omip-native-grid-vs-regridded]`), place them on the GLODAP 1° grid, and at each depth form the model-minus-GLODAP difference and its area-weighted global mean over exactly those cells where that model and GLODAP are both defined at that depth; report the bias in µmol kg-1 to the nearest unit and the cell count next to each value. `[common-comparison-mask]` the mask does not carry between levels, so the cells are taken from the fields at each depth rather than reused from the 0-50 m map.
+9. Period change of DIC: for each model compute the global 0-50 m DIC mean for 1971-2000 the same way as in step 5 (on its own grid, area-weighted) and subtract it from the 2002 value (`[monthly-means-are-time-averages]`), reporting the change in µmol kg-1 to the nearest unit; then divide that change by the same model's 0-50 m DIC difference from GLODAP obtained in step 5 and report the ratio to 2 decimal places, stating what such a ratio implies for reading the GLODAP bias as a model error (how much of the apparent offset is a period/drift mismatch rather than a structural error).
+10. Rank the three models using the step 5-8 metrics (0-50 m DIC bias and RMSE, alkalinity bias, pH difference), state which reproduces the observed carbon system best, and check whether the signs of the three models' DIC, alkalinity and pH errors are mutually consistent, flagging any model whose variables were reported missing in step 2.
+
+Other notes:
+- [cmip6-carbonate-system-definitions] The CESM2 model paper documents no carbonate-system constants, so wherever its `ph` enters the comparison this is an unverified assumption and must be stated as such.
+- [cmip6-grid-labels] GFDL-ESM4 is `grid_label='gr'`: its values are already remapped to a 1° grid with a regridded land-sea mask, so its "native-grid" numbers are 1°-archive numbers and its budgets are only approximately conservative; CESM2 (~100 km) and MPI (~250 km) differ in resolution by about 2.5×, so features narrower than the coarse grid are not comparable in amplitude.
+- [omip-native-grid-vs-regridded] State that global/basin means come from each source's own grid and weights, while bias, RMSE and pattern correlation come from the GLODAP 1° common mask, and name the vertical regridding used for the fixed depths.
+- [monthly-means-are-time-averages] Sub-monthly variability cannot be reconstructed from monthly means and is not reported.
+- [common-comparison-mask] Because the reference is GLODAP, the comparison mask is built with `ocean_only=False`; the default ocean-only mask would discard 1459 valid GLODAP cells.
+- [omip-weighted-means-and-integrals] Every reported mean is area-weighted (volume-weighted where depth is integrated) and NaN-aware; unweighted lat/lon averages are not used anywhere.
+- The GLODAP climatology (1972-2013, no time dimension) and the models' 2002 annual mean are not synchronous, which the step 9 ratio quantifies.
+</plan>
+<selected_data>cmip6_historical, glodap</selected_data>

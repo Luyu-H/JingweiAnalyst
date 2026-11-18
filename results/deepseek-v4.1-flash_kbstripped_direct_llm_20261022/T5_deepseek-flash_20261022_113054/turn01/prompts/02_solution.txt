@@ -1,0 +1,2130 @@
+# exchange 2: solution
+# elapsed: 33.9 s
+
+===== SYSTEM =====
+
+The user's question:
+Assess sea surface salinity (SSS) in three CMIP6 models: their mean-state bias against observations, their historical trend, and their end-of-century change under the ssp245 scenario.
+
+Data to use:
+- CMIP6 historical `so` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1950-01 to 2014-12.
+- CMIP6 ssp245 `so` from the same three models, monthly, 2071-01 to 2100-12.
+- Each model's own areacello and volcello.
+- WOA23 salinity, the 1971-2000 climate normal, annual, objectively analysed.
+- The WOA23 1-degree land-sea mask (landsea_01, ocean is value > 1) and basin mask (basinmask_01).
+
+SSS at each grid cell is the mean salinity of its levels whose depths lie within 0-10 m (WOA23: 0, 5 and 10 m; one or two levels per model), each level weighted by its full cell volume rather than by its overlap with 0-10 m, defined the same way for the models and for WOA23, reported in psu.
+
+Expected numerical results:
+- The global mean 1971-2000 SSS of each model and of WOA23, to 2 decimal places, and each model's difference from WOA23 to 2 decimal places.
+- For each model, the RMSE against WOA23 in psu to 2 decimal places and the spatial Pearson correlation with WOA23 to 3 decimal places, on the WOA23 1-degree grid.
+- For each model, the linear trend of the annual global mean SSS over historical 1950-2014 and over ssp245 2071-2100, each in psu per decade to 3 significant figures with its 95 per cent confidence interval, its R-squared, and whether the interval excludes zero; and the ratio of the ssp245 slope to the historical slope to 1 decimal place, with a statement of whether that ratio is meaningful.
+- For each model, the mean change delta SSS (ssp245 2071-2100 mean minus historical 1995-2014 mean) in psu to 2 decimal places, for the global ocean and for the Atlantic, Indian and Pacific basins (basins as defined by the WOA23 basin mask, marginal seas folded into their parent ocean; the Southern and Arctic Oceans are basins of their own and excluded), together with any caveat arising from the ensemble members used for each model's two experiments.
+
+Expected visualizations:
+- Figure 1, three global maps in one row, one per model, of the SSS bias (model 1971-2000 climatology minus WOA23) on the cells of that comparison, one diverging colour scale centred on zero shared by all three panels, with the colour bar labelled in psu.
+- Figure 2, three global maps in one row, one per model, of the cell-by-cell linear trend of annual-mean SSS over 1950-2014 in psu per decade, drawn as maps on a common longitude-latitude frame (each panel a true geographic map, with curvilinear model fields put on a regular longitude-latitude grid for display only) with one shared diverging colour scale centred on zero, and cells significant at p < 0.05 stippled on top of the trend field.
+- Figure 3, a single time-series panel of the global mean SSS of all three models, with the historical 1950-2014 and ssp245 2071-2100 segments drawn separately (the 2015-2070 gap left empty), each segment overlaid with its own fitted line, the y axis labelled in psu, and each model in a colour used consistently across all three figures.
+
+The code that ran:
+<executed_code>
+# ============================================================
+# Computation
+# ============================================================
+import os, glob, io
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+from scipy import stats
+from scipy.spatial import cKDTree
+
+HIST_ROOT = "/data1/lorraine-20419/benchmark_cmip6/historical"
+SSP_ROOT  = "/data1/lorraine-20419/benchmark_cmip6/ssp245"
+WOA_ROOT  = "/data1/lorraine-20419/ocean_data/WOA23/climatology"
+MASK_ROOT = "/data1/lorraine-20419/ocean_data/WOA23/masks"
+
+MODEL_CFG = {
+    "CESM2": {
+        "y": "nlat", "x": "nlon", "lat": "lat", "lon": "lon",
+        "depth": "lev", "depth_scale": 0.01, "ocean_mask_from": "sftof",
+    },
+    "GFDL-ESM4": {
+        "y": "lat", "x": "lon", "lat": "lat", "lon": "lon",
+        "depth": "lev", "depth_scale": 1.0, "ocean_mask_from": None,
+    },
+    "MPI-ESM1-2-LR": {
+        "y": "j", "x": "i", "lat": "latitude", "lon": "longitude",
+        "depth": "lev", "depth_scale": 1.0, "ocean_mask_from": None,
+    },
+}
+MODEL_NAMES = list(MODEL_CFG.keys())
+MODEL_COLORS = {
+    "CESM2": "tab:blue",
+    "GFDL-ESM4": "tab:orange",
+    "MPI-ESM1-2-LR": "tab:green",
+}
+BASIN_CODES = {1: "Atlantic", 2: "Pacific", 3: "Indian"}
+
+
+# ------------------------------------------------------------
+# Small helpers
+# ------------------------------------------------------------
+def get_files(root, model, var, exp):
+    d = os.path.join(root, model, var)
+    files = sorted(glob.glob(os.path.join(d, "*.nc")))
+    if exp is not None:
+        files = [f for f in files if f"_{exp}_" in os.path.basename(f)]
+    return files
+
+
+def variant_from_file(f):
+    parts = os.path.basename(f).split("_")
+    return parts[4] if len(parts) >= 5 else None
+
+
+def choose_variant_files(files):
+    if not files:
+        return [], None, []
+    variants = {}
+    for f in files:
+        v = variant_from_file(f)
+        variants.setdefault(v, []).append(f)
+    best_v = max(variants.items(), key=lambda kv: len(kv[1]))[0]
+    return variants[best_v], best_v, list(variants.keys())
+
+
+def open_nc_files(files, use_cftime=True):
+    if len(files) == 1:
+        return xr.open_dataset(files[0], use_cftime=use_cftime)
+    return xr.open_mfdataset(files, combine="by_coords", use_cftime=use_cftime)
+
+
+def load_fixed(model, exp_root, exp_name, var):
+    files = get_files(exp_root, model, var, exp_name)
+    source = exp_name
+    if not files:
+        files = get_files(HIST_ROOT, model, var, "historical")
+        source = "historical"
+    if not files:
+        return None, None, None, None
+    files_sel, v, all_v = choose_variant_files(files)
+    ds = xr.open_dataset(files_sel[0], use_cftime=True)
+    if var not in ds:
+        return None, v, source, all_v
+    da = ds[var]
+    if "time" in da.dims:
+        da = da.isel(time=0)
+    da = da.squeeze()
+    return da, v, source, all_v
+
+
+def mean_years(da, y0, y1):
+    yrs = da.time.dt.year
+    m = (yrs >= y0) & (yrs <= y1)
+    return da.isel(time=np.where(m)[0]).mean("time")
+
+
+def global_mean_native(data, area):
+    data = np.asarray(data, dtype=float)
+    area = np.asarray(area, dtype=float)
+    valid = np.isfinite(data) & np.isfinite(area) & (area > 0)
+    if not np.any(valid):
+        return np.nan
+    return float(np.nansum(data[valid] * area[valid]) / np.nansum(area[valid]))
+
+
+def global_mean_series(sss, area):
+    dims = [d for d in sss.dims if d != "time"]
+    valid = np.isfinite(sss) & (area > 0)
+    num = (sss.where(valid, 0) * area.where(valid, 0)).sum(dims)
+    den = area.where(valid, 0).sum(dims)
+    gm = num / den
+    return gm.groupby("time.year").mean()
+
+
+def linear_trend_stats(years, values):
+    x = np.asarray(years, dtype=float)
+    y = np.asarray(values, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+    n = len(x)
+    if n < 3:
+        return {
+            "slope_per_decade": np.nan, "ci95": (np.nan, np.nan),
+            "r2": np.nan, "p": np.nan, "n": n,
+            "excludes_zero": False,
+        }
+    xm = x.mean()
+    ym = y.mean()
+    sxx = np.sum((x - xm) ** 2)
+    if sxx == 0:
+        return {
+            "slope_per_decade": np.nan, "ci95": (np.nan, np.nan),
+            "r2": np.nan, "p": np.nan, "n": n,
+            "excludes_zero": False,
+        }
+    slope = np.sum((x - xm) * (y - ym)) / sxx
+    intercept = ym - slope * xm
+    resid = y - (intercept + slope * x)
+    sse = np.sum(resid ** 2)
+    dof = n - 2
+    se = np.sqrt(sse / dof / sxx) if sse > 0 else 0.0
+    tcrit = stats.t.ppf(0.975, dof)
+    slope_dec = slope * 10.0
+    ci = (slope_dec - tcrit * se * 10.0, slope_dec + tcrit * se * 10.0)
+    if se > 0:
+        tstat = slope / se
+        p = 2.0 * stats.t.sf(abs(tstat), dof)
+    else:
+        p = 1.0 if abs(slope) < 1e-15 else 0.0
+    sst = np.sum((y - ym) ** 2)
+    r2 = 1.0 - sse / sst if sst > 0 else np.nan
+    return {
+        "slope_per_decade": float(slope_dec),
+        "ci95": (float(ci[0]), float(ci[1])),
+        "r2": float(r2),
+        "p": float(p),
+        "n": int(n),
+        "excludes_zero": bool(ci[0] > 0 or ci[1] < 0),
+    }
+
+
+def trend_map(annual_da):
+    years = annual_da["year"].values.astype(float)
+    y = annual_da.values.astype(float)
+    n = len(years)
+    t = years - years.mean()
+    sxx = np.sum(t ** 2)
+    y_mean = np.nanmean(y, axis=0)
+    num = np.nansum(t[:, None, None] * (y - y_mean[None, :, :]), axis=0)
+    slope = num / sxx
+    intercept = y_mean - slope * years.mean()
+    resid = y - (intercept[None, :, :] + slope[None, :, :] * years[:, None, None])
+    sse = np.nansum(resid ** 2, axis=0)
+    dof = n - 2
+    with np.errstate(invalid="ignore", divide="ignore"):
+        se = np.sqrt(sse / dof / sxx)
+        tstat = slope / se
+        p = 2.0 * stats.t.sf(np.abs(tstat), dof)
+    return slope * 10.0, p
+
+
+def regrid_to_woa(data_native, lat2d, lon2d, woa_lat, woa_lon, woa_ocean, max_dist_deg=10.0):
+    data = np.asarray(data_native, dtype=float)
+    valid = np.isfinite(data)
+    out = np.full((len(woa_lat), len(woa_lon)), np.nan)
+    if not np.any(valid):
+        return out
+
+    lat = np.asarray(lat2d, dtype=float)[valid]
+    lon = np.asarray(lon2d, dtype=float)[valid]
+    vals = data[valid]
+
+    lon_rad = np.deg2rad(((lon + 180.0) % 360.0) - 180.0)
+    lat_rad = np.deg2rad(lat)
+    pts = np.column_stack([
+        np.cos(lat_rad) * np.cos(lon_rad),
+        np.cos(lat_rad) * np.sin(lon_rad),
+        np.sin(lat_rad),
+    ])
+    tree = cKDTree(pts)
+
+    lon_t, lat_t = np.meshgrid(woa_lon, woa_lat)
+    lon_t_rad = np.deg2rad(((lon_t + 180.0) % 360.0) - 180.0)
+    lat_t_rad = np.deg2rad(lat_t)
+    tpts = np.column_stack([
+        (np.cos(lat_t_rad) * np.cos(lon_t_rad)).ravel(),
+        (np.cos(lat_t_rad) * np.sin(lon_t_rad)).ravel(),
+        np.sin(lat_t_rad).ravel(),
+    ])
+    dist, idx = tree.query(tpts, k=1)
+    vals_out = vals[idx].reshape(len(woa_lat), len(woa_lon))
+    dist_deg = np.rad2deg(2.0 * np.arcsin(np.minimum(dist / 2.0, 1.0))).reshape(
+        len(woa_lat), len(woa_lon)
+    )
+    out = np.where(dist_deg <= max_dist_deg, vals_out, np.nan)
+    out = np.where(woa_ocean, out, np.nan)
+    return out
+
+
+def get_layer_thickness(ds, depth_name):
+    depth = np.asarray(ds[depth_name].values, dtype=float)
+    bname = None
+    for v in ds.variables:
+        low = v.lower()
+        if ("bnd" in low or "bound" in low) and depth_name.lower() in low:
+            bname = v
+            break
+    thick = None
+    if bname is not None:
+        b = np.asarray(ds[bname].values, dtype=float)
+        if b.ndim == 2 and b.shape[1] == 2:
+            thick = np.abs(b[:, 1] - b[:, 0])
+        elif b.ndim == 1 and len(b) == len(depth) + 1:
+            thick = np.abs(np.diff(b))
+    if thick is None:
+        thick = np.empty(len(depth), dtype=float)
+        if len(depth) > 1:
+            thick[:-1] = np.abs(np.diff(depth))
+            thick[-1] = thick[-2]
+        else:
+            thick[:] = 1.0
+    return thick
+
+
+# ------------------------------------------------------------
+# WOA23 mask readers
+# ------------------------------------------------------------
+def _read_msk_table(path):
+    with open(path, "r") as f:
+        lines = f.readlines()
+    hidx = None
+    for i, l in enumerate(lines):
+        low = l.lower()
+        if "lat" in low and "lon" in low:
+            hidx = i
+            break
+    if hidx is None:
+        hidx = 0
+        while hidx < len(lines) and (
+            lines[hidx].strip().startswith("#") or not lines[hidx].strip()
+        ):
+            hidx += 1
+    header = lines[hidx].lstrip("#").strip()
+    data_lines = [header]
+    for l in lines[hidx + 1:]:
+        s = l.strip()
+        if s and not s.startswith("#"):
+            data_lines.append(l)
+    return pd.read_csv(io.StringIO("".join(data_lines)), delim_whitespace=True)
+
+
+def load_landsea_mask():
+    df = _read_msk_table(os.path.join(MASK_ROOT, "landsea_01.msk"))
+    lat_col = [c for c in df.columns if "lat" in c.lower()][0]
+    lon_col = [c for c in df.columns if "lon" in c.lower()][0]
+    val_col = [
+        c for c in df.columns
+        if "bottom" in c.lower() or "level" in c.lower() or "sea" in c.lower()
+    ][0]
+
+    lat = df[lat_col].values.astype(float)
+    lon = df[lon_col].values.astype(float)
+    val = df[val_col].values.astype(float)
+
+    mask_std = np.zeros((180, 360), dtype=bool)
+    ilat = np.rint(lat - (-89.5)).astype(int)
+    ilon = np.rint(lon - (-179.5)).astype(int) % 360
+    good = (ilat >= 0) & (ilat < 180) & (ilon >= 0) & (ilon < 360)
+    mask_std[ilat[good], ilon[good]] = val[good] > 1
+    return mask_std
+
+
+def load_basin_surface():
+    df = _read_msk_table(os.path.join(MASK_ROOT, "basinmask_01.msk"))
+    lat_col = [c for c in df.columns if "lat" in c.lower()][0]
+    lon_col = [c for c in df.columns if "lon" in c.lower()][0]
+    other = [c for c in df.columns if c not in (lat_col, lon_col)]
+
+    lev_cols = [c for c in other if "lev" in c.lower() or "depth" in c.lower()]
+    bas_cols = [c for c in other if "basin" in c.lower()]
+
+    if lev_cols and bas_cols:
+        lev_col = lev_cols[0]
+        bas_col = bas_cols[0]
+        lev_vals = pd.to_numeric(df[lev_col], errors="coerce").values.astype(float)
+        if np.any(lev_vals == 0):
+            surf = 0.0
+        elif np.any(lev_vals == 1):
+            surf = 1.0
+        else:
+            surf = np.nanmin(lev_vals)
+        df_s = df[lev_vals == surf]
+        vals = df_s[bas_col].values.astype(float)
+        lat = df_s[lat_col].values.astype(float)
+        lon = df_s[lon_col].values.astype(float)
+    else:
+        bas_col = None
+        for c in other:
+            if "basin" in c.lower() or "bas" in c.lower():
+                bas_col = c
+                break
+        if bas_col is None:
+            for c in other:
+                if not str(c).isdigit():
+                    bas_col = c
+                    break
+        vals = df[bas_col].values.astype(float)
+        lat = df[lat_col].values.astype(float)
+        lon = df[lon_col].values.astype(float)
+
+    basin_std = np.full((180, 360), np.nan, dtype=float)
+    ilat = np.rint(lat - (-89.5)).astype(int)
+    ilon = np.rint(lon - (-179.5)).astype(int) % 360
+    good = (ilat >= 0) & (ilat < 180) & (ilon >= 0) & (ilon < 360)
+    basin_std[ilat[good], ilon[good]] = vals[good]
+    return basin_std
+
+
+# ------------------------------------------------------------
+# Load WOA23 salinity and masks
+# ------------------------------------------------------------
+woa_candidates = glob.glob(
+    os.path.join(WOA_ROOT, "salinity", "1971-2000_climate_normal",
+                 "woa23_decav71A0_s00_01.nc")
+)
+if not woa_candidates:
+    woa_candidates = glob.glob(
+        os.path.join(WOA_ROOT, "salinity", "1971-2000_climate_normal", "*.nc")
+    )
+woa_file = woa_candidates[0]
+woa_ds = xr.open_dataset(woa_file, decode_times=False)
+
+# Find the objectively analysed salinity variable, e.g. s_an
+vname = None
+for v in woa_ds.data_vars:
+    low = v.lower()
+    if "an" in low and ("s" in low or "sal" in low):
+        vname = v
+        break
+if vname is None:
+    vname = [v for v in woa_ds.data_vars
+             if any("depth" in d.lower() for d in woa_ds[v].dims)][0]
+
+da = woa_ds[vname]
+if "time" in da.dims:
+    da = da.isel(time=0)
+
+depth_name = [d for d in woa_ds.dims if "depth" in d.lower()][0]
+depth_vals = woa_ds[depth_name].values.astype(float)
+lev_idx_woa = np.where((depth_vals >= 0.0) & (depth_vals <= 10.0))[0]
+da_top = da.isel({depth_name: lev_idx_woa})
+
+thick_full = get_layer_thickness(woa_ds, depth_name)
+thick = thick_full[lev_idx_woa]
+thick_da = xr.DataArray(
+    thick, dims=[depth_name], coords={depth_name: da_top[depth_name]}
+)
+valid_top = np.isfinite(da_top)
+num_top = (da_top.where(valid_top, 0) * thick_da).sum(depth_name)
+den_top = (valid_top * thick_da).sum(depth_name)
+woa_sss_da = num_top / den_top
+
+lat_name = [c for c in woa_ds.coords if "lat" in c.lower()][0]
+lon_name = [c for c in woa_ds.coords if "lon" in c.lower()][0]
+woa_lat = woa_ds[lat_name].values.astype(float)
+woa_lon = woa_ds[lon_name].values.astype(float)
+woa_sss = woa_sss_da.values.astype(float)
+
+# WOA masks
+try:
+    landsea_std = load_landsea_mask()
+    ilat_woa = np.rint(woa_lat - (-89.5)).astype(int)
+    ilon_woa = np.rint(woa_lon - (-179.5)).astype(int) % 360
+    woa_ocean = landsea_std[np.ix_(ilat_woa, ilon_woa)]
+except Exception:
+    woa_ocean = np.isfinite(woa_sss)
+
+try:
+    basin_std = load_basin_surface()
+    basin_woa = basin_std[np.ix_(ilat_woa, ilon_woa)]
+except Exception:
+    basin_woa = np.full_like(woa_sss, np.nan, dtype=float)
+
+woa_sss = np.where(woa_ocean, woa_sss, np.nan)
+woa_area = np.cos(np.deg2rad(woa_lat))[:, None] * np.ones((1, len(woa_lon)))
+
+valid_woa = woa_ocean & np.isfinite(woa_sss)
+woa_global_mean = float(
+    np.nansum(woa_sss[valid_woa] * woa_area[valid_woa])
+    / np.nansum(woa_area[valid_woa])
+)
+
+
+# ------------------------------------------------------------
+# Model SSS loader / segment processor
+# ------------------------------------------------------------
+def load_model_sss(model, root, exp_name, y0, y1):
+    cfg = MODEL_CFG[model]
+    files = get_files(root, model, "so", exp_name)
+    files_sel, v_so, all_v_so = choose_variant_files(files)
+    if not files_sel:
+        raise RuntimeError(f"No 'so' files for {model} {exp_name}")
+
+    ds = open_nc_files(files_sel, use_cftime=True)
+    yrs = ds.time.dt.year
+    tmask = (yrs >= y0) & (yrs <= y1)
+    ds = ds.isel(time=np.where(tmask)[0])
+
+    lev_vals = ds[cfg["depth"]].values.astype(float)
+    lev_m = lev_vals * cfg["depth_scale"]
+    lev_idx = np.where((lev_m >= 0.0) & (lev_m <= 10.0))[0]
+
+    so = ds["so"].isel(lev=lev_idx)
+
+    vol, v_vol, src_vol, _ = load_fixed(model, root, exp_name, "volcello")
+    if vol is None:
+        raise RuntimeError(f"No volcello for {model} {exp_name}")
+    vol = vol.isel(lev=lev_idx)
+
+    area, v_area, src_area, _ = load_fixed(model, root, exp_name, "areacello")
+    if area is None:
+        raise RuntimeError(f"No areacello for {model} {exp_name}")
+
+    if cfg.get("ocean_mask_from") == "sftof":
+        sftof, v_sf, src_sf, _ = load_fixed(model, root, exp_name, "sftof")
+        if sftof is not None:
+            area = area.where(sftof > 0)
+            vol = vol.where(sftof > 0)
+            so = so.where(sftof > 0)
+
+    valid = np.isfinite(so) & (vol > 0)
+    num = (so.where(valid, 0) * vol.where(valid, 0)).sum("lev")
+    den = vol.where(valid, 0).sum("lev")
+    sss = (num / den).where(den > 0)
+
+    lat = ds[cfg["lat"]].values.astype(float)
+    lon = ds[cfg["lon"]].values.astype(float)
+    if lat.ndim == 1 and lon.ndim == 1:
+        lon2d, lat2d = np.meshgrid(lon, lat)
+    else:
+        lat2d = lat
+        lon2d = lon
+
+    return {
+        "sss": sss,
+        "area": area,
+        "lat2d": lat2d,
+        "lon2d": lon2d,
+        "variant_so": v_so,
+        "all_variants_so": all_v_so,
+        "variant_vol": v_vol,
+        "source_vol": src_vol,
+        "variant_area": v_area,
+        "source_area": src_area,
+    }
+
+
+def process_segment(model, root, exp_name, y0, y1, clim_periods, compute_trend=False):
+    d = load_model_sss(model, root, exp_name, y0, y1)
+    sss = d["sss"]
+    area = d["area"]
+    lat2d = d["lat2d"]
+    lon2d = d["lon2d"]
+
+    gm_annual = global_mean_series(sss, area)
+
+    clim_maps = {}
+    clim_native = {}
+    clim_global_native = {}
+    for name, (cy0, cy1) in clim_periods.items():
+        cn = mean_years(sss, cy0, cy1)
+        clim_native[name] = cn
+        clim_global_native[name] = global_mean_native(cn, area)
+        clim_maps[name] = regrid_to_woa(
+            cn.values, lat2d, lon2d, woa_lat, woa_lon, woa_ocean
+        )
+
+    trend_woa = None
+    p_woa = None
+    if compute_trend:
+        annual_cell = sss.groupby("time.year").mean("time")
+        tr, p = trend_map(annual_cell)
+        trend_woa = regrid_to_woa(
+            tr, lat2d, lon2d, woa_lat, woa_lon, woa_ocean
+        )
+        p_woa = regrid_to_woa(
+            p, lat2d, lon2d, woa_lat, woa_lon, woa_ocean
+        )
+
+    return {
+        "gm_annual": gm_annual,
+        "clim_maps": clim_maps,
+        "clim_native": clim_native,
+        "clim_global_native": clim_global_native,
+        "trend_woa": trend_woa,
+        "p_woa": p_woa,
+        "variant_so": d["variant_so"],
+        "all_variants_so": d["all_variants_so"],
+        "variant_vol": d["variant_vol"],
+        "source_vol": d["source_vol"],
+        "variant_area": d["variant_area"],
+        "source_area": d["source_area"],
+    }
+
+
+# ------------------------------------------------------------
+# Process all models
+# ------------------------------------------------------------
+model_results = {}
+bias_maps = {}
+trend_maps = {}
+p_maps = {}
+gm_hist_dict = {}
+gm_ssp_dict = {}
+
+for model in MODEL_NAMES:
+    hist = process_segment(
+        model, HIST_ROOT, "historical", 1950, 2014,
+        {"1971-2000": (1971, 2000), "1995-2014": (1995, 2014)},
+        compute_trend=True,
+    )
+    ssp = process_segment(
+        model, SSP_ROOT, "ssp245", 2071, 2100,
+        {"2071-2100": (2071, 2100)},
+        compute_trend=False,
+    )
+
+    gm_hist = hist["gm_annual"]
+    gm_ssp = ssp["gm_annual"]
+    gm_hist_dict[model] = gm_hist
+    gm_ssp_dict[model] = gm_ssp
+
+    model_global_1971_2000 = hist["clim_global_native"]["1971-2000"]
+    bias_to_woa = model_global_1971_2000 - woa_global_mean
+
+    model_clim_woa = hist["clim_maps"]["1971-2000"]
+    bias_map = model_clim_woa - woa_sss
+
+    valid = (
+        woa_ocean
+        & np.isfinite(model_clim_woa)
+        & np.isfinite(woa_sss)
+    )
+    diff = model_clim_woa[valid] - woa_sss[valid]
+    rmse = float(np.sqrt(np.mean(diff ** 2)))
+    corr = float(np.corrcoef(model_clim_woa[valid], woa_sss[valid])[0, 1])
+
+    hist_trend = linear_trend_stats(
+        gm_hist["year"].values.astype(float), gm_hist.values
+    )
+    ssp_trend = linear_trend_stats(
+        gm_ssp["year"].values.astype(float), gm_ssp.values
+    )
+
+    hist_slope = hist_trend["slope_per_decade"]
+    ssp_slope = ssp_trend["slope_per_decade"]
+    ratio = ssp_slope / hist_slope if abs(hist_slope) > 1e-15 else np.nan
+    ratio_meaningful = bool(
+        hist_trend["excludes_zero"] and abs(hist_slope) > 1e-4
+    )
+
+    hist_1995_2014_woa = hist["clim_maps"]["1995-2014"]
+    ssp_2071_2100_woa = ssp["clim_maps"]["2071-2100"]
+    delta_woa = ssp_2071_2100_woa - hist_1995_2014_woa
+
+    delta_global_woa = global_mean_native(delta_woa, woa_area)
+    delta_global_native = (
+        ssp["clim_global_native"]["2071-2100"]
+        - hist["clim_global_native"]["1995-2014"]
+    )
+
+    delta_basins = {}
+    for code, bname in BASIN_CODES.items():
+        mask_b = (
+            woa_ocean
+            & (basin_woa == code)
+            & np.isfinite(delta_woa)
+        )
+        if np.any(mask_b):
+            delta_basins[bname] = float(
+                np.nansum(delta_woa[mask_b] * woa_area[mask_b])
+                / np.nansum(woa_area[mask_b])
+            )
+        else:
+            delta_basins[bname] = np.nan
+
+    variants = {
+        "historical_so": hist["variant_so"],
+        "ssp245_so": ssp["variant_so"],
+        "historical_volcello": hist["variant_vol"],
+        "ssp245_volcello": ssp["variant_vol"],
+        "historical_areacello": hist["variant_area"],
+        "ssp245_areacello": ssp["variant_area"],
+    }
+
+    caveat = ""
+    if hist["variant_so"] != ssp["variant_so"]:
+        caveat = (
+            f"historical so is {hist['variant_so']} but ssp245 so is "
+            f"{ssp['variant_so']}; the delta change conflates the scenario "
+            "change with an ensemble-member difference."
+        )
+
+    model_results[model] = {
+        "global_mean_1971_2000": float(model_global_1971_2000),
+        "bias_to_woa": float(bias_to_woa),
+        "rmse_vs_woa": rmse,
+        "corr_vs_woa": corr,
+        "trend_historical": hist_trend,
+        "trend_ssp245": ssp_trend,
+        "ratio_ssp_to_hist": float(ratio) if np.isfinite(ratio) else np.nan,
+        "ratio_meaningful": ratio_meaningful,
+        "delta_global_woa": float(delta_global_woa),
+        "delta_global_native": float(delta_global_native),
+        "delta_basins": delta_basins,
+        "variants": variants,
+        "variant_caveat": caveat,
+    }
+
+    bias_maps[model] = bias_map
+    trend_maps[model] = hist["trend_woa"]
+    p_maps[model] = hist["p_woa"]
+
+
+results = {
+    "woa_global_mean_1971_2000": woa_global_mean,
+    "models": model_results,
+    "basin_codes": BASIN_CODES,
+}
+
+# Print a compact summary for convenience
+print("WOA23 global mean SSS 1971-2000:", round(woa_global_mean, 2), "psu")
+for m in MODEL_NAMES:
+    r = model_results[m]
+    print("\n", m)
+    print("  global mean 1971-2000:", round(r["global_mean_1971_2000"], 2), "psu")
+    print("  bias vs WOA23:", round(r["bias_to_woa"], 2), "psu")
+    print("  RMSE vs WOA23:", round(r["rmse_vs_woa"], 2), "psu")
+    print("  correlation vs WOA23:", round(r["corr_vs_woa"], 3))
+    for seg in ["trend_historical", "trend_ssp245"]:
+        t = r[seg]
+        print(f"  {seg}: slope={t['slope_per_decade']:.3g} psu/dec, "
+              f"95% CI=({t['ci95'][0]:.3g}, {t['ci95'][1]:.3g}), "
+              f"R2={t['r2']:.3f}, excludes_zero={t['excludes_zero']}")
+    print("  ratio ssp/hist:", round(r["ratio_ssp_to_hist"], 1),
+          "meaningful:", r["ratio_meaningful"])
+    print("  delta global (WOA grid):", round(r["delta_global_woa"], 2), "psu")
+    print("  delta global (native):", round(r["delta_global_native"], 2), "psu")
+    for b, v in r["delta_basins"].items():
+        print(f"  delta {b}:", round(v, 2), "psu")
+    if r["variant_caveat"]:
+        print("  CAVEAT:", r["variant_caveat"])
+
+# --- visualization ---
+# ============================================================
+# Visualization
+# ============================================================
+
+# Figure 1: SSS bias maps (model 1971-2000 minus WOA23)
+fig1, axes1 = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
+vmax1 = max(np.nanmax(np.abs(bias_maps[m])) for m in MODEL_NAMES)
+if not np.isfinite(vmax1) or vmax1 == 0:
+    vmax1 = 1.0
+im1 = None
+for ax, model in zip(axes1, MODEL_NAMES):
+    im1 = ax.pcolormesh(
+        woa_lon, woa_lat, bias_maps[model],
+        cmap="RdBu_r", vmin=-vmax1, vmax=vmax1, shading="auto"
+    )
+    ax.set_title(model)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-90, 90)
+fig1.colorbar(im1, ax=axes1, shrink=0.8, label="psu")
+
+# Figure 2: cell-by-cell historical SSS trend, 1950-2014
+fig2, axes2 = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
+vmax2 = max(np.nanmax(np.abs(trend_maps[m])) for m in MODEL_NAMES)
+if not np.isfinite(vmax2) or vmax2 == 0:
+    vmax2 = 0.1
+im2 = None
+for ax, model in zip(axes2, MODEL_NAMES):
+    im2 = ax.pcolormesh(
+        woa_lon, woa_lat, trend_maps[model],
+        cmap="RdBu_r", vmin=-vmax2, vmax=vmax2, shading="auto"
+    )
+    sig = np.nan_to_num(p_maps[model], nan=1.0) < 0.05
+    ax.contourf(
+        woa_lon, woa_lat, sig.astype(float),
+        levels=[0.5, 1.5], colors="none", hatches=["..."]
+    )
+    ax.set_title(model)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-90, 90)
+fig2.colorbar(im2, ax=axes2, shrink=0.8, label="psu per decade")
+
+# Figure 3: global mean SSS time series, historical and ssp245
+fig3, ax3 = plt.subplots(figsize=(10, 5))
+for model in MODEL_NAMES:
+    color = MODEL_COLORS[model]
+    hist = gm_hist_dict[model]
+    ssp = gm_ssp_dict[model]
+
+    ax3.plot(hist["year"], hist.values, color=color, linewidth=1.5,
+             label=f"{model} historical")
+    ax3.plot(ssp["year"], ssp.values, color=color, linewidth=1.5,
+             label=f"{model} ssp245")
+
+    for da, ls in [(hist, "--"), (ssp, ":")]:
+        x = da["year"].values.astype(float)
+        y = da.values.astype(float)
+        coef = np.polyfit(x, y, 1)
+        ax3.plot(x, np.polyval(coef, x), color=color, linestyle=ls,
+                 linewidth=1.0)
+
+ax3.set_xlabel("Year")
+ax3.set_ylabel("SSS (psu)")
+ax3.set_title("Global mean sea surface salinity")
+ax3.grid(True, alpha=0.3)
+ax3.legend(ncol=2, fontsize=8)
+</executed_code>
+
+Status: computation succeeded; visualization generated
+
+Results:
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "HIST_ROOT": "/data1/lorraine-20419/benchmark_cmip6/historical",
+      "SSP_ROOT": "/data1/lorraine-20419/benchmark_cmip6/ssp245",
+      "WOA_ROOT": "/data1/lorraine-20419/ocean_data/WOA23/climatology",
+      "MASK_ROOT": "/data1/lorraine-20419/ocean_data/WOA23/masks",
+      "MODEL_CFG": {
+        "CESM2": {
+          "y": "nlat",
+          "x": "nlon",
+          "lat": "lat",
+          "lon": "lon",
+          "depth": "lev",
+          "depth_scale": 0.01,
+          "ocean_mask_from": "sftof"
+        },
+        "GFDL-ESM4": {
+          "y": "lat",
+          "x": "lon",
+          "lat": "lat",
+          "lon": "lon",
+          "depth": "lev",
+          "depth_scale": 1.0,
+          "ocean_mask_from": null
+        },
+        "MPI-ESM1-2-LR": {
+          "y": "j",
+          "x": "i",
+          "lat": "latitude",
+          "lon": "longitude",
+          "depth": "lev",
+          "depth_scale": 1.0,
+          "ocean_mask_from": null
+        }
+      },
+      "MODEL_NAMES": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "MODEL_COLORS": {
+        "CESM2": "tab:blue",
+        "GFDL-ESM4": "tab:orange",
+        "MPI-ESM1-2-LR": "tab:green"
+      },
+      "BASIN_CODES": {
+        "1": "Atlantic",
+        "2": "Pacific",
+        "3": "Indian"
+      },
+      "woa_candidates": [
+        "/data1/lorraine-20419/ocean_data/WOA23/climatology/salinity/1971-2000_climate_normal/woa23_decav71A0_s00_01.nc"
+      ],
+      "woa_file": "/data1/lorraine-20419/ocean_data/WOA23/climatology/salinity/1971-2000_climate_normal/woa23_decav71A0_s00_01.nc",
+      "woa_ds": {
+        "crs": {
+          "type": "DataArray",
+          "dims": {},
+          "size": 1,
+          "n_valid": 1,
+          "min": -2147483647.0,
+          "max": -2147483647.0,
+          "mean": -2147483647.0,
+          "std": 0.0,
+          "values": -2147483647
+        },
+        "lat_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 180,
+            "nbounds": 2
+          },
+          "size": 360,
+          "n_valid": 360,
+          "min": -90.0,
+          "max": 90.0,
+          "mean": 0.0,
+          "std": 51.96312713623047
+        },
+        "lon_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "lon": 360,
+            "nbounds": 2
+          },
+          "size": 720,
+          "n_valid": 720,
+          "min": -180.0,
+          "max": 180.0,
+          "mean": 0.0,
+          "std": 103.9238510131836
+        },
+        "depth_bnds": {
+          "type": "DataArray",
+          "dims": {
+            "depth": 102,
+            "nbounds": 2
+          },
+          "size": 204,
+          "n_valid": 204,
+          "min": 0.0,
+          "max": 5500.0,
+          "mean": 1738.2353515625,
+          "std": 1683.3563232421875
+        },
+        "climatology_bounds": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "nbounds": 2
+          },
+          "size": 2,
+          "n_valid": 2,
+          "min": 1704.0,
+          "max": 2064.0,
+          "mean": 1884.0,
+          "std": 180.0,
+          "values": [
+            [
+              1704.0,
+              2064.0
+            ]
+          ]
+        },
+        "s_an": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Objectively analyzed mean fields for sea_water_practical_salinity at standard depth levels.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 5.046989917755127,
+          "max": 40.82008743286133,
+          "mean": 34.6580810546875,
+          "std": 0.9418185353279114
+        },
+        "s_mn": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Average of all unflagged interpolated values at each standard depth level for sea_water_practical_salinity in each grid-square which contain at least one measurement.",
+          "size": 6609600,
+          "n_valid": 1628757,
+          "min": 0.01987222023308277,
+          "max": 41.15299987792969,
+          "mean": 34.71023941040039,
+          "std": 1.1675490140914917
+        },
+        "s_dd": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "The number of observations of sea_water_practical_salinity in each grid-square at each standard depth level.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 22787.0,
+          "mean": 9.637121218997825,
+          "std": 98.40967443233278
+        },
+        "s_sd": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "The standard deviation about the statistical mean of sea_water_practical_salinity in each grid-square at each standard depth level.",
+          "size": 6609600,
+          "n_valid": 1621426,
+          "min": 0.0,
+          "max": 13.794036865234375,
+          "mean": 0.059541214257478714,
+          "std": 0.1468503177165985
+        },
+        "s_se": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "The standard error about the statistical mean of sea_water_practical_salinity in each grid-square at each standard depth level.",
+          "size": 6609600,
+          "n_valid": 1621426,
+          "min": 0.0,
+          "max": 8.566245079040527,
+          "mean": 0.019669486209750175,
+          "std": 0.05041050165891647
+        },
+        "s_oa": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "statistical mean value minus the objectively analyzed mean value for sea_water_practical_salinity.",
+          "size": 6609600,
+          "n_valid": 1628757,
+          "min": -18.18041229248047,
+          "max": 5.785600662231445,
+          "mean": -0.0008444316918030381,
+          "std": 0.16387303173542023
+        },
+        "s_gp": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "The number of grid-squares within the smallest radius of influence around each grid-square which contain a statistical mean for sea_water_practical_salinity.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 433.0,
+          "mean": 37.39747201975183,
+          "std": 36.29578489774025
+        },
+        "s_sdo": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "Objectively analyzed standard deviation fields for sea_water_practical_salinity at standard depth levels.",
+          "size": 6609600,
+          "n_valid": 3305010,
+          "min": 0.0,
+          "max": 7.68201208114624,
+          "mean": 0.05516912788152695,
+          "std": 0.11921617388725281
+        },
+        "s_sea": {
+          "type": "DataArray",
+          "dims": {
+            "time": 1,
+            "depth": 102,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "1",
+          "long_name": "The standard error about the objectively analyzed data of sea_water_practical_salinity defined in Levitus et al. (2012) GRL.",
+          "size": 6609600,
+          "n_valid": 3288211,
+          "min": 0.0,
+          "max": 0.2690090835094452,
+          "mean": 0.0010719281854107976,
+          "std": 0.0028157499618828297
+        }
+      },
+      "vname": "s_an",
+      "da": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 102,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "1",
+        "long_name": "Objectively analyzed mean fields for sea_water_practical_salinity at standard depth levels.",
+        "size": 6609600,
+        "n_valid": 3305010,
+        "min": 5.046989917755127,
+        "max": 40.82008743286133,
+        "mean": 34.6580810546875,
+        "std": 0.9418185353279114
+      },
+      "depth_name": "depth",
+      "depth_vals": {
+        "type": "ndarray",
+        "shape": [
+          102
+        ],
+        "size": 102,
+        "n_valid": 102,
+        "min": 0.0,
+        "max": 5500.0,
+        "mean": 1738.235294117647,
+        "std": 1683.6734242538364
+      },
+      "lev_idx_woa": {
+        "type": "ndarray",
+        "shape": [
+          3
+        ],
+        "size": 3,
+        "n_valid": 3,
+        "min": 0.0,
+        "max": 2.0,
+        "mean": 1.0,
+        "std": 0.816496580927726,
+        "values": [
+          0,
+          1,
+          2
+        ]
+      },
+      "da_top": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 3,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "1",
+        "long_name": "Objectively analyzed mean fields for sea_water_practical_salinity at standard depth levels.",
+        "size": 194400,
+        "n_valid": 123212,
+        "min": 5.05649995803833,
+        "max": 40.1953125,
+        "mean": 34.14434051513672,
+        "std": 2.189706802368164
+      },
+      "thick_full": {
+        "type": "ndarray",
+        "shape": [
+          102
+        ],
+        "size": 102,
+        "n_valid": 102,
+        "min": 2.5,
+        "max": 100.0,
+        "mean": 53.92156862745098,
+        "std": 36.453552578296446
+      },
+      "thick": {
+        "type": "ndarray",
+        "shape": [
+          3
+        ],
+        "size": 3,
+        "n_valid": 3,
+        "min": 2.5,
+        "max": 5.0,
+        "mean": 4.166666666666667,
+        "std": 1.178511301977579,
+        "values": [
+          2.5,
+          5.0,
+          5.0
+        ]
+      },
+      "thick_da": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 3
+        },
+        "size": 3,
+        "n_valid": 3,
+        "min": 2.5,
+        "max": 5.0,
+        "mean": 4.166666666666667,
+        "std": 1.178511301977579,
+        "values": [
+          2.5,
+          5.0,
+          5.0
+        ]
+      },
+      "valid_top": {
+        "type": "DataArray",
+        "dims": {
+          "depth": 3,
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "1",
+        "long_name": "Objectively analyzed mean fields for sea_water_practical_salinity at standard depth levels.",
+        "size": 194400,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "num_top": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "1",
+        "long_name": "Objectively analyzed mean fields for sea_water_practical_salinity at standard depth levels.",
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 0.0,
+        "max": 502.3652935028076,
+        "mean": 270.59724580102863,
+        "std": 206.77702926908688
+      },
+      "den_top": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "1",
+        "long_name": "Objectively analyzed mean fields for sea_water_practical_salinity at standard depth levels.",
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 0.0,
+        "max": 12.5,
+        "mean": 7.921913580246914,
+        "std": 6.020816362549516
+      },
+      "woa_sss_da": {
+        "type": "DataArray",
+        "dims": {
+          "lat": 180,
+          "lon": 360
+        },
+        "units": "1",
+        "long_name": "Objectively analyzed mean fields for sea_water_practical_salinity at standard depth levels.",
+        "size": 64800,
+        "n_valid": 41088,
+        "min": 5.057987880706787,
+        "max": 40.18922348022461,
+        "mean": 34.15745457482997,
+        "std": 2.1584964268226647
+      },
+      "lat_name": "lat",
+      "lon_name": "lon",
+      "woa_lat": {
+        "type": "ndarray",
+        "shape": [
+          180
+        ],
+        "size": 180,
+        "n_valid": 180,
+        "min": -89.5,
+        "max": 89.5,
+        "mean": 0.0,
+        "std": 51.96072234550504
+      },
+      "woa_lon": {
+        "type": "ndarray",
+        "shape": [
+          360
+        ],
+        "size": 360,
+        "n_valid": 360,
+        "min": -179.5,
+        "max": 179.5,
+        "mean": 0.0,
+        "std": 103.92264751567228
+      },
+      "woa_sss": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "n_valid": 41088,
+        "min": 5.057987880706787,
+        "max": 40.18922348022461,
+        "mean": 34.15745457482997,
+        "std": 2.1584964268226647
+      },
+      "woa_ocean": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "basin_woa": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "n_valid": 0
+      },
+      "woa_area": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "n_valid": 64800,
+        "min": 0.008726535498373897,
+        "max": 0.9999619230641713,
+        "mean": 0.6366278526673906,
+        "std": 0.3077417378389015
+      },
+      "valid_woa": {
+        "type": "ndarray",
+        "shape": [
+          180,
+          360
+        ],
+        "size": 64800,
+        "values": [
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False",
+          "False"
+        ]
+      },
+      "woa_global_mean": 34.63385483944885,
+      "model_results": {
+        "CESM2": {
+          "global_mean_1971_2000": 34.31577029508485,
+          "bias_to_woa": -0.31808454436399813,
+          "rmse_vs_woa": 1.0686038241577054,
+          "corr_vs_woa": 0.8740668898089656,
+          "trend_historical": {
+            "slope_per_decade": -0.0026757350334754354,
+            "ci95": [
+              -0.003859509946796664,
+              -0.0014919601201542063
+            ],
+            "r2": 0.24462847349300187,
+            "p": 2.8163217889740472e-05,
+            "n": 65,
+            "excludes_zero": true
+          },
+          "trend_ssp245": {
+            "slope_per_decade": -0.02091746600769518,
+            "ci95": [
+              -0.023469862320822477,
+              -0.018365069694567884
+            ],
+            "r2": 0.9096216647139059,
+            "p": 3.7890215422969735e-16,
+            "n": 30,
+            "excludes_zero": true
+          },
+          "ratio_ssp_to_hist": 7.817465386520759,
+          "ratio_meaningful": true,
+          "delta_global_woa": -0.11394345434195008,
+          "delta_global_native": -0.11754707423848032,
+          "delta_basins": {
+            "Atlantic": NaN,
+            "Pacific": NaN,
+            "Indian": NaN
+          },
+          "variants": {
+            "historical_so": "r1i1p1f1",
+            "ssp245_so": "r10i1p1f1",
+            "historical_volcello": "r1i1p1f1",
+            "ssp245_volcello": "r10i1p1f1",
+            "historical_areacello": "r1i1p1f1",
+            "ssp245_areacello": "r10i1p1f1"
+          },
+          "variant_caveat": "historical so is r1i1p1f1 but ssp245 so is r10i1p1f1; the delta change conflates the scenario change with an ensemble-member difference."
+        },
+        "GFDL-ESM4": {
+          "global_mean_1971_2000": 34.56036162897449,
+          "bias_to_woa": -0.07349321047436064,
+          "rmse_vs_woa": 1.020955361958636,
+          "corr_vs_woa": 0.882192593365001,
+          "trend_historical": {
+            "slope_per_decade": -0.0010958068020693905,
+            "ci95": [
+              -0.0021539874784075705,
+              -3.7626125731210405e-05
+            ],
+            "r2": 0.06364815936398383,
+            "p": 0.04261624633591195,
+            "n": 65,
+            "excludes_zero": true
+          },
+          "trend_ssp245": {
+            "slope_per_decade": -0.005340601631478553,
+            "ci95": [
+              -0.008320097585871027,
+              -0.002361105677086078
+            ],
+            "r2": 0.3249948028587568,
+            "p": 0.0010059058199089488,
+            "n": 30,
+            "excludes_zero": true
+          },
+          "ratio_ssp_to_hist": 4.87367081623606,
+          "ratio_meaningful": true,
+          "delta_global_woa": -0.004902480825555752,
+          "delta_global_native": -0.007973882929917409,
+          "delta_basins": {
+            "Atlantic": NaN,
+            "Pacific": NaN,
+            "Indian": NaN
+          },
+          "variants": {
+            "historical_so": "r1i1p1f1",
+            "ssp245_so": "r1i1p1f1",
+            "historical_volcello": "r1i1p1f1",
+            "ssp245_volcello": "r1i1p1f1",
+            "historical_areacello": "r1i1p1f1",
+            "ssp245_areacello": "r1i1p1f1"
+          },
+          "variant_caveat": ""
+        },
+        "MPI-ESM1-2-LR": {
+          "global_mean_1971_2000": 34.35609652576989,
+          "bias_to_woa": -0.27775831367895876,
+          "rmse_vs_woa": 1.2125298387340333,
+          "corr_vs_woa": 0.8408592881374517,
+          "trend_historical": {
+            "slope_per_decade": -0.0006866138298194724,
+            "ci95": [
+              -0.002350100213317819,
+              0.0009768725536788744
+            ],
+            "r2": 0.010683664043084296,
+            "p": 0.41258209870896656,
+            "n": 65,
+            "excludes_zero": false
+          },
+          "trend_ssp245": {
+            "slope_per_decade": -0.02285376220974694,
+            "ci95": [
+              -0.028870216992883262,
+              -0.01683730742661062
+            ],
+            "r2": 0.6837708221636088,
+            "p": 1.7806772668316032e-08,
+            "n": 30,
+            "excludes_zero": true
+          },
+          "ratio_ssp_to_hist": 33.284739131683025,
+          "ratio_meaningful": false,
+          "delta_global_woa": -0.08274608911091386,
+          "delta_global_native": -0.08868916442909835,
+          "delta_basins": {
+            "Atlantic": NaN,
+            "Pacific": NaN,
+            "Indian": NaN
+          },
+          "variants": {
+            "historical_so": "r1i1p1f1",
+            "ssp245_so": "r1i1p1f1",
+            "historical_volcello": "r1i1p1f1",
+            "ssp245_volcello": "r1i1p1f1",
+            "historical_areacello": "r1i1p1f1",
+            "ssp245_areacello": "r1i1p1f1"
+          },
+          "variant_caveat": ""
+        }
+      },
+      "bias_maps": {
+        "CESM2": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 41087,
+          "min": -7.3390495300293,
+          "max": 33.89402122497559,
+          "mean": -0.21377917547446693,
+          "std": 1.0470017178295024
+        },
+        "GFDL-ESM4": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 41087,
+          "min": -12.048261833190917,
+          "max": 30.163781356811523,
+          "mean": 0.06871044391799601,
+          "std": 1.0186406265257053
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 41085,
+          "min": -13.391896629333495,
+          "max": 37.8660327911377,
+          "mean": -0.26119477368248367,
+          "std": 1.18406330068174
+        }
+      },
+      "trend_maps": {
+        "CESM2": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 41088,
+          "min": -0.23868074867275216,
+          "max": 0.2489589486088784,
+          "mean": -0.008789259352798229,
+          "std": 0.027267429916893172
+        },
+        "GFDL-ESM4": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 41088,
+          "min": -0.2842523955798649,
+          "max": 0.24848174381922997,
+          "mean": -0.0009166406256492823,
+          "std": 0.02690745364567241
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 41088,
+          "min": -0.5254551414009576,
+          "max": 0.4477069769705926,
+          "mean": -0.011180280312573626,
+          "std": 0.05357813112842253
+        }
+      },
+      "p_maps": {
+        "CESM2": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 41087,
+          "min": 2.4724350756629196e-50,
+          "max": 0.999805330827124,
+          "mean": 0.23004552634539738,
+          "std": 0.2932516788791928
+        },
+        "GFDL-ESM4": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 41087,
+          "min": 6.383459792325082e-18,
+          "max": 0.9999293487056437,
+          "mean": 0.2614679226997973,
+          "std": 0.30024908757688307
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "ndarray",
+          "shape": [
+            180,
+            360
+          ],
+          "size": 64800,
+          "n_valid": 41085,
+          "min": 4.123449729323915e-12,
+          "max": 0.9999986420637457,
+          "mean": 0.24082175015082416,
+          "std": 0.29373312938301005
+        }
+      },
+      "gm_hist_dict": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "year": 65
+          },
+          "units": "0.001",
+          "long_name": "Sea Water Salinity",
+          "size": 65,
+          "n_valid": 65,
+          "min": 34.28575897216797,
+          "max": 34.32985305786133,
+          "mean": 34.31065315833459,
+          "std": 0.010149880614829524
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "year": 65
+          },
+          "units": "0.001",
+          "long_name": "Sea Water Salinity",
+          "size": 65,
+          "n_valid": 65,
+          "min": 34.53718566894531,
+          "max": 34.5766716003418,
+          "mean": 34.55802917480469,
+          "std": 0.00814915169030428
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "year": 65
+          },
+          "units": "0.001",
+          "long_name": "Sea Water Salinity",
+          "size": 65,
+          "n_valid": 65,
+          "min": 34.319732666015625,
+          "max": 34.38003921508789,
+          "mean": 34.35309982299805,
+          "std": 0.012463034130632877
+        }
+      },
+      "gm_ssp_dict": {
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "year": 30
+          },
+          "units": "0.001",
+          "long_name": "Sea Water Salinity",
+          "size": 30,
+          "n_valid": 30,
+          "min": 34.14811325073242,
+          "max": 34.21871566772461,
+          "mean": 34.18331527709961,
+          "std": 0.018983133137226105,
+          "values": [
+            34.21871566772461,
+            34.20896911621094,
+            34.20399856567383,
+            34.204593658447266,
+            34.208316802978516,
+            34.20676040649414,
+            34.20133590698242,
+            34.1976318359375,
+            34.19547653198242,
+            34.191585540771484,
+            34.18675994873047,
+            34.19414138793945,
+            34.18703842163086,
+            34.17959213256836,
+            34.180538177490234,
+            34.18172073364258,
+            34.17961120605469,
+            34.192169189453125,
+            34.180477142333984,
+            34.178287506103516,
+            34.18661880493164,
+            34.17801284790039,
+            34.165889739990234,
+            34.16481018066406,
+            34.15974426269531,
+            34.15248489379883,
+            34.14811325073242,
+            34.16004943847656,
+            34.15306091308594,
+            34.15300369262695
+          ]
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "year": 30
+          },
+          "units": "0.001",
+          "long_name": "Sea Water Salinity",
+          "size": 30,
+          "n_valid": 30,
+          "min": 34.53032684326172,
+          "max": 34.560699462890625,
+          "mean": 34.54276657104492,
+          "std": 0.008108513429760933,
+          "values": [
+            34.54376983642578,
+            34.551673889160156,
+            34.54105758666992,
+            34.53956985473633,
+            34.55622863769531,
+            34.560699462890625,
+            34.55964279174805,
+            34.55314254760742,
+            34.54662322998047,
+            34.546932220458984,
+            34.550594329833984,
+            34.54399490356445,
+            34.5449104309082,
+            34.53258514404297,
+            34.5375862121582,
+            34.54896926879883,
+            34.539798736572266,
+            34.53257369995117,
+            34.53032684326172,
+            34.5343017578125,
+            34.5366096496582,
+            34.545928955078125,
+            34.53937911987305,
+            34.53434371948242,
+            34.537567138671875,
+            34.53445053100586,
+            34.53855895996094,
+            34.54872131347656,
+            34.53841018676758,
+            34.533973693847656
+          ]
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "year": 30
+          },
+          "units": "0.001",
+          "long_name": "Sea Water Salinity",
+          "size": 30,
+          "n_valid": 30,
+          "min": 34.230472564697266,
+          "max": 34.3060188293457,
+          "mean": 34.2636604309082,
+          "std": 0.023921679705381393,
+          "values": [
+            34.28950119018555,
+            34.29896545410156,
+            34.291072845458984,
+            34.28200149536133,
+            34.282371520996094,
+            34.29429626464844,
+            34.3060188293457,
+            34.298248291015625,
+            34.29396438598633,
+            34.2968635559082,
+            34.27508544921875,
+            34.272212982177734,
+            34.266902923583984,
+            34.26227951049805,
+            34.25460433959961,
+            34.23564529418945,
+            34.232242584228516,
+            34.23308181762695,
+            34.2484245300293,
+            34.25017166137695,
+            34.260223388671875,
+            34.24366760253906,
+            34.232845306396484,
+            34.242679595947266,
+            34.24576187133789,
+            34.23849105834961,
+            34.230472564697266,
+            34.25152587890625,
+            34.25636672973633,
+            34.24393844604492
+          ]
+        }
+      },
+      "results": {
+        "woa_global_mean_1971_2000": 34.63385483944885,
+        "models": {
+          "CESM2": {
+            "global_mean_1971_2000": 34.31577029508485,
+            "bias_to_woa": -0.31808454436399813,
+            "rmse_vs_woa": 1.0686038241577054,
+            "corr_vs_woa": 0.8740668898089656,
+            "trend_historical": {
+              "slope_per_decade": -0.0026757350334754354,
+              "ci95": [
+                -0.003859509946796664,
+                -0.0014919601201542063
+              ],
+              "r2": 0.24462847349300187,
+              "p": 2.8163217889740472e-05,
+              "n": 65,
+              "excludes_zero": true
+            },
+            "trend_ssp245": {
+              "slope_per_decade": -0.02091746600769518,
+              "ci95": [
+                -0.023469862320822477,
+                -0.018365069694567884
+              ],
+              "r2": 0.9096216647139059,
+              "p": 3.7890215422969735e-16,
+              "n": 30,
+              "excludes_zero": true
+            },
+            "ratio_ssp_to_hist": 7.817465386520759,
+            "ratio_meaningful": true,
+            "delta_global_woa": -0.11394345434195008,
+            "delta_global_native": -0.11754707423848032,
+            "delta_basins": {
+              "Atlantic": NaN,
+              "Pacific": NaN,
+              "Indian": NaN
+            },
+            "variants": {
+              "historical_so": "r1i1p1f1",
+              "ssp245_so": "r10i1p1f1",
+              "historical_volcello": "r1i1p1f1",
+              "ssp245_volcello": "r10i1p1f1",
+              "historical_areacello": "r1i1p1f1",
+              "ssp245_areacello": "r10i1p1f1"
+            },
+            "variant_caveat": "historical so is r1i1p1f1 but ssp245 so is r10i1p1f1; the delta change conflates the scenario change with an ensemble-member difference."
+          },
+          "GFDL-ESM4": {
+            "global_mean_1971_2000": 34.56036162897449,
+            "bias_to_woa": -0.07349321047436064,
+            "rmse_vs_woa": 1.020955361958636,
+            "corr_vs_woa": 0.882192593365001,
+            "trend_historical": {
+              "slope_per_decade": -0.0010958068020693905,
+              "ci95": [
+                -0.0021539874784075705,
+                -3.7626125731210405e-05
+              ],
+              "r2": 0.06364815936398383,
+              "p": 0.04261624633591195,
+              "n": 65,
+              "excludes_zero": true
+            },
+            "trend_ssp245": {
+              "slope_per_decade": -0.005340601631478553,
+              "ci95": [
+                -0.008320097585871027,
+                -0.002361105677086078
+              ],
+              "r2": 0.3249948028587568,
+              "p": 0.0010059058199089488,
+              "n": 30,
+              "excludes_zero": true
+            },
+            "ratio_ssp_to_hist": 4.87367081623606,
+            "ratio_meaningful": true,
+            "delta_global_woa": -0.004902480825555752,
+            "delta_global_native": -0.007973882929917409,
+            "delta_basins": {
+              "Atlantic": NaN,
+              "Pacific": NaN,
+              "Indian": NaN
+            },
+            "variants": {
+              "historical_so": "r1i1p1f1",
+              "ssp245_so": "r1i1p1f1",
+              "historical_volcello": "r1i1p1f1",
+              "ssp245_volcello": "r1i1p1f1",
+              "historical_areacello": "r1i1p1f1",
+              "ssp245_areacello": "r1i1p1f1"
+            },
+            "variant_caveat": ""
+          },
+          "MPI-ESM1-2-LR": {
+            "global_mean_1971_2000": 34.35609652576989,
+            "bias_to_woa": -0.27775831367895876,
+            "rmse_vs_woa": 1.2125298387340333,
+            "corr_vs_woa": 0.8408592881374517,
+            "trend_historical": {
+              "slope_per_decade": -0.0006866138298194724,
+              "ci95": [
+                -0.002350100213317819,
+                0.0009768725536788744
+              ],
+              "r2": 0.010683664043084296,
+              "p": 0.41258209870896656,
+              "n": 65,
+              "excludes_zero": false
+            },
+            "trend_ssp245": {
+              "slope_per_decade": -0.02285376220974694,
+              "ci95": [
+                -0.028870216992883262,
+                -0.01683730742661062
+              ],
+              "r2": 0.6837708221636088,
+              "p": 1.7806772668316032e-08,
+              "n": 30,
+              "excludes_zero": true
+            },
+            "ratio_ssp_to_hist": 33.284739131683025,
+            "ratio_meaningful": false,
+            "delta_global_woa": -0.08274608911091386,
+            "delta_global_native": -0.08868916442909835,
+            "delta_basins": {
+              "Atlantic": NaN,
+              "Pacific": NaN,
+              "Indian": NaN
+            },
+            "variants": {
+              "historical_so": "r1i1p1f1",
+              "ssp245_so": "r1i1p1f1",
+              "historical_volcello": "r1i1p1f1",
+              "ssp245_volcello": "r1i1p1f1",
+              "historical_areacello": "r1i1p1f1",
+              "ssp245_areacello": "r1i1p1f1"
+            },
+            "variant_caveat": ""
+          }
+        },
+        "basin_codes": {
+          "1": "Atlantic",
+          "2": "Pacific",
+          "3": "Indian"
+        }
+      }
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T5_deepseek-flash_20261022_113054/turn01/figures/visualization_T5_deepseek-flash_20261022_113054_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T5_deepseek-flash_20261022_113054/turn01/figures/visualization_T5_deepseek-flash_20261022_113054_turn1_2.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T5_deepseek-flash_20261022_113054/turn01/figures/visualization_T5_deepseek-flash_20261022_113054_turn1_3.png"
+    ]
+  }
+]
+</observation>
+
+Answer the user's question inside <solution></solution> tags, based on these results.
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+The computation succeeded for the global mean state, global trends, and global change, but the WOA23 basin-mask reader did not work in this run: `basin_woa` had `n_valid = 0`, so all Atlantic/Indian/Pacific basin changes came out as `NaN`. Those basin values therefore cannot be reported from this execution and should be recomputed after fixing the `basinmask_01.msk` parsing. The global and map results below are unaffected.
+
+### 1. Mean-state SSS and bias against WOA23, 1971–2000
+
+WOA23 global mean SSS over the ocean is **34.63 psu**.
+
+| Model | Global mean SSS (psu) | Bias vs WOA23 (psu) | RMSE vs WOA23 (psu) | Spatial correlation |
+|---|---:|---:|---:|---:|
+| CESM2 | 34.32 | −0.32 | 1.07 | 0.874 |
+| GFDL-ESM4 | 34.56 | −0.07 | 1.02 | 0.882 |
+| MPI-ESM1-2-LR | 34.36 | −0.28 | 1.21 | 0.841 |
+
+All three models are slightly **fresher than WOA23** in the global mean. GFDL-ESM4 has the smallest global-mean bias and the best RMSE/correlation. CESM2 and MPI-ESM1-2-LR are fresher by about −0.32 and −0.28 psu, respectively. The spatial correlations are all high (0.84–0.88), so the large-scale SSS pattern is reasonably represented, but the RMSE of about 1 psu indicates substantial local biases. The bias maps contain some very large local values, especially in coastal/regridded cells, even though the global-mean biases are small.
+
+### 2. Linear trends of annual global-mean SSS
+
+Historical period: 1950–2014. SSP245 period: 2071–2100. Slopes are in psu per decade; confidence intervals are 95%.
+
+| Model | Historical slope | 95% CI | R² | Excludes zero? | SSP245 slope | 95% CI | R² | Excludes zero? | SSP/hist ratio | Ratio meaningful? |
+|---|---:|---:|---:|---|---:|---:|---:|---|---:|---|
+| CESM2 | −0.00268 | [−0.00386, −0.00149] | 0.245 | Yes | −0.0209 | [−0.0235, −0.0184] | 0.910 | Yes | 7.8 | Yes* |
+| GFDL-ESM4 | −0.00110 | [−0.00215, −0.0000376] | 0.0636 | Yes | −0.00534 | [−0.00832, −0.00236] | 0.325 | Yes | 4.9 | Yes |
+| MPI-ESM1-2-LR | −0.000687 | [−0.00235, 0.000977] | 0.0107 | No | −0.0229 | [−0.0289, −0.0168] | 0.684 | Yes | 33.3 | No |
+
+\* CESM2’s ratio is statistically nonzero, but it is affected by the ensemble-member caveat described below.
+
+Historically, all three models show weak global freshening. The trend is statistically significant for CESM2 and GFDL-ESM4, but only marginally for GFDL-ESM4 given its very low R²; for MPI-ESM1-2-LR the historical confidence interval includes zero, so its historical trend is not robust. Over 2071–2100 under SSP245, all three models show significant freshening trends, with CESM2 and MPI-ESM1-2-LR freshening much faster than GFDL-ESM4. The ratio is not meaningful for MPI-ESM1-2-LR because the historical slope is statistically indistinguishable from zero. For CESM2 the ratio should also be interpreted cautiously because the historical and SSP245 experiments use different ensemble members.
+
+### 3. End-of-century SSS change: SSP245 2071–2100 minus historical 1995–2014
+
+Values are area-weighted mean ΔSSS in psu, rounded to two decimals. The first global value uses the WOA comparison grid; the native-grid value is given in parentheses.
+
+| Model | Global ΔSSS | Atlantic ΔSSS | Indian ΔSSS | Pacific ΔSSS | Caveat |
+|---|---:|---:|---:|---:|---|
+| CESM2 | −0.11 (−0.12 native) | NaN | NaN | NaN | historical uses r1i1p1f1; SSP245 uses r10i1p1f1 |
+| GFDL-ESM4 | −0.00 (−0.01 native; unrounded −0.0049) | NaN | NaN | NaN | same member r1i1p1f1 |
+| MPI-ESM1-2-LR | −0.08 (−0.09 native) | NaN | NaN | NaN | same member r1i1p1f1 |
+
+The global ocean freshens by about **−0.11 psu for CESM2** and **−0.08 psu for MPI-ESM1-2-LR**, while **GFDL-ESM4 is essentially unchanged** (slight freshening of about −0.005 psu on the WOA grid, −0.008 psu on its native grid). The basin breakdown is missing because the basin mask was not loaded correctly. In a corrected run, the WOA23 basin mask would need to be parsed with its surface level and basin codes so that marginal seas are folded into their parent ocean and the Southern and Arctic basins are excluded.
+
+### 4. Ensemble-member caveat
+
+The main caveat concerns CESM2: `so`, `volcello`, and `areacello` are from **r1i1p1f1** in the historical experiment but from **r10i1p1f1** in SSP245. Therefore the CESM2 ΔSSS and the SSP/historical slope ratio conflate the scenario change with an ensemble-member difference. GFDL-ESM4 and MPI-ESM1-2-LR use r1i1p1f1 consistently in both experiments, so their changes are not affected by this particular issue.
+
+### 5. Overall assessment
+
+- **Mean state:** all models are slightly too fresh globally; GFDL-ESM4 is closest to WOA23, while CESM2 and MPI-ESM1-2-LR are fresher by about 0.3 psu. Spatial correlations are high but RMSE is about 1 psu, indicating regionally important SSS biases.
+- **Historical trend:** global freshening is weak and not significant in MPI-ESM1-2-LR; CESM2 and GFDL-ESM4 show statistically significant but small freshening.
+- **SSP245 end-century:** all models freshen over 2071–2100, with much stronger trends in CESM2 and MPI-ESM1-2-LR than in GFDL-ESM4. The global mean change by the end of the century is modest in these experiments: about −0.1 psu or less.
+- **Basin means:** could not be computed in this run because the WOA23 basin mask returned no valid basin values. The global conclusions are robust, but the Atlantic/Indian/Pacific breakdown still needs to be recomputed after fixing the mask parser.
+- **Figures:** Figure 1 shows the shared-scale model-minus-WOA SSS bias maps; Figure 2 shows the 1950–2014 cell-wise annual-mean SSS trend with p < 0.05 stippling; Figure 3 shows the global-mean SSS time series with the historical and SSP245 segments separated by the 2015–2070 gap and with fitted lines.
+</solution>

@@ -1,0 +1,762 @@
+# exchange 5: fix_compute_iter2
+# elapsed: 19.4 s
+
+===== SYSTEM =====
+You are a code debugging expert.
+
+===== USER =====
+The following compute code failed to execute:
+
+<failed_code>
+# Load SST data for 1950-01 to 2014-12
+time_range = ["1950-01", "2014-12"]
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+
+ersst_sst = load_regular_data(
+    dataset="ersst",
+    variable="sst",
+    time_range=time_range,
+    chunk_time=12,
+)
+
+model_sst_native = {
+    model: load_regular_data(
+        dataset="cmip6_historical",
+        variable="tos",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+    for model in models
+}
+
+published_pdo = load_regular_data(
+    dataset="cpc_indices",
+    model=None,
+    product="pdo",
+    time_range=time_range,
+    chunk_time=12,
+)
+
+# Regrid all SST fields to a common 1-degree grid with bilinear interpolation
+ersst_rg = regrid_horizontal(ersst_sst, target="1deg", method="bilinear")
+model_sst_rg = {
+    model: regrid_horizontal(model_sst_native[model], target="1deg", method="bilinear")
+    for model in models
+}
+
+# Build monthly anomalies relative to each source's own 1950-2014 monthly climatology
+base_period = ["1950-01", "2014-12"]
+ersst_anom = compute_anomaly_vs_own_climatology(
+    ersst_rg, freq="month", base_period=base_period, method="subtract"
+)
+model_anom = {
+    model: compute_anomaly_vs_own_climatology(
+        model_sst_rg[model], freq="month", base_period=base_period, method="subtract"
+    )
+    for model in models
+}
+
+# Compute monthly global-mean SST anomalies from the regridded full fields
+ersst_gm = compute_basic_stat(ersst_anom, op="area_weighted_mean", dim=["lat", "lon"])
+model_gm = {
+    model: compute_basic_stat(model_anom[model], op="area_weighted_mean", dim=["lat", "lon"])
+    for model in models
+}
+
+# Remove global-mean anomaly before PDO calculation
+ersst_anom_demeaned = (ersst_anom - ersst_gm).assign_attrs(units=ersst_anom.attrs.get("units", "degC"))
+model_anom_demeaned = {
+    model: (model_anom[model] - model_gm[model]).assign_attrs(units=model_anom[model].attrs.get("units", "degC"))
+    for model in models
+}
+
+# Compute PDO index, EOF pattern, explained variance, regression pattern
+# compute_pdo_index removes monthly climatology internally too; passing pre-anomalized global-mean-removed
+# anomalies is harmless for the monthly-climatology step and keeps the intended anomaly definition.
+ersst_pdo_idx, ersst_eof, ersst_expl_var, ersst_reg = compute_pdo_index(
+    ersst_anom_demeaned, standardize=True
+)
+
+model_pdo = {}
+for model in models:
+    model_pdo[model] = compute_pdo_index(
+        model_anom_demeaned[model], standardize=True
+    )
+
+# Materialize main PDO outputs
+ersst_pdo_idx = ersst_pdo_idx.compute()
+ersst_expl_var_value = float(ersst_expl_var.compute())
+ersst_reg = ersst_reg.compute()
+
+model_pdo_idx = {}
+model_expl_var_value = {}
+model_reg = {}
+for model in models:
+    idx, eofp, expl, regp = model_pdo[model]
+    model_pdo_idx[model] = idx.compute()
+    model_expl_var_value[model] = float(expl.compute())
+    model_reg[model] = regp.compute()
+
+published_pdo = published_pdo.compute()
+
+# Restrict regression patterns to the PDO domain for reporting/plotting
+pdo_lat_range = [20, 70]
+pdo_lon_range = [110, 260]  # 110E to 100W on 0-360 plotting axis; data remain on native opened convention
+
+ersst_reg_np = ersst_reg.where(
+    (ersst_reg["lat"] >= pdo_lat_range[0]) & (ersst_reg["lat"] <= pdo_lat_range[1]),
+    drop=True
+)
+ersst_reg_np = ersst_reg_np.where(
+    ((ersst_reg_np["lon"] % 360) >= pdo_lon_range[0]) & ((ersst_reg_np["lon"] % 360) <= pdo_lon_range[1]),
+    drop=True
+)
+
+model_reg_np = {}
+for model in models:
+    da = model_reg[model]
+    da = da.where((da["lat"] >= pdo_lat_range[0]) & (da["lat"] <= pdo_lat_range[1]), drop=True)
+    da = da.where(((da["lon"] % 360) >= pdo_lon_range[0]) & ((da["lon"] % 360) <= pdo_lon_range[1]), drop=True)
+    model_reg_np[model] = da
+
+# Amplitude of the mode from the regression pattern, in degC per std
+# Use robust domain RMS amplitude over the PDO region for one scalar amplitude.
+ersst_amp = float(
+    np.sqrt(
+        compute_basic_stat((ersst_reg_np ** 2), op="area_weighted_mean", dim=["lat", "lon"]).compute().item()
+    )
+)
+
+model_amp = {}
+for model in models:
+    model_amp[model] = float(
+        np.sqrt(
+            compute_basic_stat((model_reg_np[model] ** 2), op="area_weighted_mean", dim=["lat", "lon"]).compute().item()
+        )
+    )
+
+# Build one common comparison mask across observation and all model regression patterns
+common_mask = build_comparison_mask(
+    fields=[ersst_reg_np] + [model_reg_np[m] for m in models],
+    ocean_only=True,
+    reduce_other_dims="all",
+).compute()
+
+ersst_reg_masked = ersst_reg_np.where(common_mask)
+model_reg_masked = {model: model_reg_np[model].where(common_mask) for model in models}
+
+# Spatial Pearson correlation of each model regression pattern with ERSSTv5 regression pattern
+pattern_corr = {}
+for model in models:
+    corr_dict = analyze_correlation(
+        var1=model_reg_masked[model],
+        var2=ersst_reg_masked,
+        dim=["lat", "lon"],
+        method="pearson",
+        weighting="area",
+        min_periods=10,
+    )
+    pattern_corr[model] = float(corr_dict["correlation"].compute().item())
+
+# 12-month autocorrelation of each standardized monthly PDO index
+def lag12_autocorr(series):
+    out = analyze_correlation(
+        var1=series,
+        var2=series,
+        dim="time",
+        method="pearson",
+        lag=12,
+        detrend=False,
+        min_periods=10,
+    )
+    return {
+        "correlation": float(out["correlation"].compute().item()),
+        "pvalue": float(out["pvalue"].compute().item()),
+        "pvalue_unadjusted": float(out["pvalue_unadjusted"].compute().item()),
+        "n_samples": int(out["n_samples"].compute().item()),
+        "n_effective": float(out["n_effective"].compute().item()),
+    }
+
+ersst_acf12 = lag12_autocorr(ersst_pdo_idx)
+model_acf12 = {model: lag12_autocorr(model_pdo_idx[model]) for model in models}
+
+# Correlation between ERSSTv5-derived PDO and published PDO over 1950-2014
+ersst_vs_published = analyze_correlation(
+    var1=ersst_pdo_idx,
+    var2=published_pdo,
+    dim="time",
+    method="pearson",
+    detrend=False,
+    min_periods=10,
+)
+ersst_vs_published_corr = float(ersst_vs_published["correlation"].compute().item())
+ersst_vs_published_p = float(ersst_vs_published["pvalue"].compute().item())
+ersst_vs_published_p_naive = float(ersst_vs_published["pvalue_unadjusted"].compute().item())
+ersst_vs_published_n = int(ersst_vs_published["n_samples"].compute().item())
+ersst_vs_published_neff = float(ersst_vs_published["n_effective"].compute().item())
+
+# 9-year (108-month) centred running mean of ERSSTv5 PDO index
+ersst_pdo_9yr = temporal_aggregate(
+    ersst_pdo_idx, freq="rolling", op="mean", window=108, center=True
+).compute()
+
+# Identify sign-change years; merge any crossing within 3 years of prior counted transition
+sm = ersst_pdo_9yr
+sm_vals = sm.values
+sm_time = pd.to_datetime(sm["time"].values)
+
+valid = np.isfinite(sm_vals)
+cross_years_raw = []
+for i in range(1, len(sm_vals)):
+    if not (valid[i - 1] and valid[i]):
+        continue
+    y1 = sm_vals[i - 1]
+    y2 = sm_vals[i]
+    if y1 == 0:
+        cross_years_raw.append(int(sm_time[i - 1].year))
+    elif y1 * y2 < 0:
+        cross_time = sm_time[i]
+        cross_years_raw.append(int(cross_time.year))
+
+transition_years = []
+for yr in cross_years_raw:
+    if not transition_years:
+        transition_years.append(yr)
+    elif yr - transition_years[-1] < 3:
+        continue
+    else:
+        transition_years.append(yr)
+
+documented_shift_years = []
+for yr in transition_years:
+    if min(abs(yr - 1947), abs(yr - 1976), abs(yr - 1988), abs(yr - 1998)) <= 1:
+        documented_shift_years.append(yr)
+
+# Determine best-matching model by highest pattern correlation
+best_model = max(pattern_corr, key=pattern_corr.get)
+
+# Summaries
+summary_rows = [{
+    "source": "ERSSTv5",
+    "explained_variance_pct": round(ersst_expl_var_value, 1),
+    "amplitude_degC_per_std": round(ersst_amp, 3),
+    "acf_12mo": round(ersst_acf12["correlation"], 3),
+    "pattern_corr_vs_ersst": np.nan,
+}]
+for model in models:
+    summary_rows.append({
+        "source": model,
+        "explained_variance_pct": round(model_expl_var_value[model], 1),
+        "amplitude_degC_per_std": round(model_amp[model], 3),
+        "acf_12mo": round(model_acf12[model]["correlation"], 3),
+        "pattern_corr_vs_ersst": round(pattern_corr[model], 3),
+    })
+summary_table = pd.DataFrame(summary_rows)
+
+ersst_vs_published_summary = {
+    "correlation": round(ersst_vs_published_corr, 3),
+    "pvalue_effective": ersst_vs_published_p,
+    "pvalue_unadjusted": ersst_vs_published_p_naive,
+    "n_samples": ersst_vs_published_n,
+    "n_effective": ersst_vs_published_neff,
+}
+
+transition_summary = {
+    "transition_years": transition_years,
+    "documented_shift_matches": documented_shift_years,
+}
+
+# Qualitative consistency checks against observations
+obs_amp = ersst_amp
+obs_persist = ersst_acf12["correlation"]
+model_assessment = {}
+for model in models:
+    amp_ratio = model_amp[model] / obs_amp if obs_amp != 0 else np.nan
+    pers_diff = model_acf12[model]["correlation"] - obs_persist
+    model_assessment[model] = {
+        "pattern_corr_vs_obs": pattern_corr[model],
+        "amp_ratio_to_obs": amp_ratio,
+        "persistence_minus_obs": pers_diff,
+    }
+
+# Variables intended for direct downstream use / inspection:
+# summary_table
+# ersst_vs_published_summary
+# transition_summary
+# best_model
+# model_assessment
+# ersst_reg_np, model_reg_np, ersst_pdo_idx, model_pdo_idx, published_pdo, ersst_pdo_9yr
+</failed_code>
+
+<error_info>
+Error Type: AttributeError
+Error Message: 'float' object has no attribute 'compute'
+
+
+Traceback:
+Traceback (most recent call last):
+  File "/home/lorraine/projects/2025-jingwei_QA_GMD/src/models/agent_with_tools.py", line 721, in _safe_execute_tool
+    exec(code, sandbox_globals)
+  File "<string>", line 79, in <module>
+AttributeError: 'float' object has no attribute 'compute'
+
+</error_info>
+
+Original task: Assess the Pacific Decadal Oscillation (PDO) simulated by three CMIP6 models against ERSSTv5 observations, over 1950-01 to 2014-12.
+
+Data to use:
+- CMIP6 historical `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1950-01 to 2014-12.
+- ERSSTv5 monthly SST over the same window.
+- The published PDO index (product `pdo` in the index registry).
+
+The PDO is the leading EOF of monthly North Pacific SST anomalies over 20N-70N, 110E-100W, relative to a 1950-2014 monthly climatology.
+
+Expected numerical results, for each of the four sources over 1950-2014, with any regridding done by bilinear interpolation onto the 1-degree grid:
+- The percentage of variance explained by the leading mode, to 1 decimal place.
+- The amplitude of the mode, in degrees Celsius per standard deviation, to 3 decimal places.
+- The lag-1-year (12-month) autocorrelation of the monthly standardized index, to 3 decimal places.
+- The Pearson correlation of the ERSSTv5-derived index with the published PDO series, to 3 decimal places, and what that correlation does and does not demonstrate.
+- For each model, the spatial Pearson correlation between its regression pattern and the ERSSTv5 regression pattern, to 3 decimal places.
+- The observed PDO phase-transition years over 1950-2014, defined as the years in which the 9-year (108-month) centred running mean of the ERSSTv5 index changes sign (a crossing less than 3 years after the last counted transition is merged into it, keeping the earlier year), and which of them correspond to documented Pacific climate shifts.
+- Which model reproduces the observed pattern best, and whether the models' amplitude and persistence are consistent with observations.
+
+Expected visualizations:
+- Figure 1, a 2-by-2 panel of the regression pattern over the PDO domain, in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, on one diverging colour scale centred on zero labelled in degrees Celsius per standard deviation, each panel annotated with its explained variance and, for the models, its pattern correlation with observations.
+- Figure 2, a single time-series panel of the standardized index of all four sources plus the published PDO series as a distinguishable fifth line, with the 9-year smoothed ERSSTv5 curve and the transition years marked, and the y axis labelled as a standardized index.
+
+Variables already present in the namespace (name -> summary of its contents); use them
+as they are:
+{
+  "selected_datasets": [
+    "ersst",
+    "cmip6_historical",
+    "cpc_indices"
+  ]
+}
+
+Available tools and their specifications:
+{
+  "load_regular_data": {
+    "description": "Load a rectangular subset of a time series dataset.\nThis is the entry point for any question about change over time \u2014 trends, variability, scenario projections \u2014 and for the published index series (cpc_indices), which have a time axis but no grid. Give the window you need: reading a global field and slicing it afterwards is slower and, on a curvilinear model grid, wrong, because index dimensions cannot be sliced by latitude and longitude. A window crossing the dateline is handled, and comes back on a continuous longitude axis.\nThe result stays lazy, so a large request is cheap until it is reduced.",
+    "args": {
+      "dataset": "str, required. The dataset id, from the registry of available datasets.",
+      "variable": "str, required. The variable's short name in that dataset. For an index dataset it names the region the series is published for, e.g. 'NINO3.4'; leave it out for an index that is defined on its own domain rather than on a region box.",
+      "model": "str, required for multi-model datasets. Which model to read.",
+      "product": "str, required for a dataset that publishes several series of the same quantity. Which one to read; the registry lists each product with its baseline period. Default is the dataset's operational series.",
+      "field": "str, optional, default 'anomaly' where it applies. Which published field to read: 'anomaly' for the departure from the baseline climatology, or 'total' for the absolute value.",
+      "time_range": "list[str, str], optional. Continuous window as ['start', 'end'] in ISO 8601, e.g. ['1990-01', '2014-12']. Default is the whole record.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward. Levels are selected by their centre. Default is every level.",
+      "lat_range": "list[float, float], optional. [min, max] in degrees North.",
+      "lon_range": "list[float, float], optional. [min, max] in degrees East, in either the 0-360 or the -180-180 convention; a window crossing the dateline is handled.",
+      "chunk_time": "int, optional, default 12. Chunk size along time for lazy reading."
+    },
+    "returns": "xr.DataArray on the dataset's own grid, with units and the provenance attributes that let the weighting and derived-quantity tools find the right cell areas, volumes and layer thicknesses. On a regular grid the dimensions are (time, depth, lat, lon); on a curvilinear model grid they are the model's index dimensions with 2-D latitude and longitude coordinates, trimmed to the requested box. An index dataset comes back with 'time' alone and no spatial dimensions."
+  },
+  "regrid_horizontal": {
+    "description": "Put a field on another horizontal grid so two products can be compared cell by cell.\nRegrid the GLOBAL field and subset afterwards. 'conservative' reads the source grid's geometry from the dataset's own file, which describes the whole grid, so a curvilinear field already cut to a box can no longer be located on it and is refused; 'bilinear' works from the field's own 2-D coordinates and does accept one.\nHorizontal vector components (uo, vo, umo, vmo) of CESM2 and MPI-ESM1-2-LR are refused.\nThe result carries the target grid's identity, so later weighting uses the target's cell areas.",
+    "args": {
+      "data": "xr.DataArray, required. The field to move, on a regular or a curvilinear grid. Other dimensions (time, depth) pass through untouched. It must still carry the attrs its loader set, which is how its own grid is identified.",
+      "target": "str or xr.DataArray, optional, default 'woa23'. The grid to move onto: a registered observational grid by name ('woa23', '1deg', 'glodap', 'seanoe_mld', 'ersst'), or a DataArray on a regular grid to use as a template. The target must be rectilinear.",
+      "method": "str, optional, default 'conservative'. 'conservative' area-averages the source cells that overlap each target cell, conserving the field's area integral; it needs the source grid's corner mesh. 'bilinear' interpolates between cell centres and needs no corner mesh. 'nearest_s2d' copies the nearest source cell. 'patch' is a higher-order smooth interpolation.",
+      "skipna": "bool, optional, default True. Ignore missing cells instead of letting them spread. Land is missing in every ocean field, so with skipna=False every coastal target cell comes back empty.",
+      "na_thres": "float, optional, default 0.5. How much of a target cell may be missing before the cell itself is set to NaN, from 0 (any missing source data empties it) to 1 (keep it if any valid data contributes)."
+    },
+    "returns": "xr.DataArray on the target grid, with ('lat', 'lon') in place of the source's horizontal dimensions and everything else unchanged. Missing data stays missing. attrs record the method and the source grid, and carry the TARGET grid's identity so later weighting uses the target's areas."
+  },
+  "compute_anomaly_vs_own_climatology": {
+    "description": "Remove a field's own climatology, leaving its variability about its own mean state.\nEach time step is matched to the mean of its own calendar month, season or of the whole record, computed from the same field over the baseline period given (base_period), so the field's own mean state is removed. Its sibling compute_anomaly_vs_woa23 subtracts the observed climatology instead.\nIt works on any grid and any product, including a series that is already an area average with no spatial dimensions left.",
+    "args": {
+      "data": "xr.DataArray, required. A field or series with a 'time' dimension.",
+      "freq": "str, optional, default 'month'. What each step is matched against: 'month' (the climatology of its own calendar month, removing the seasonal cycle), 'season' (the meteorological DJF/MAM/JJA/SON), or 'year' (a single long-term mean, leaving the seasonal cycle in place).",
+      "base_period": "list[str, str], optional. The baseline window as ['start', 'end']. The climatology is computed over this window only and subtracted from every step of the series, including those outside it. Default None: the whole record is the baseline.",
+      "method": "str, optional, default 'subtract'. 'subtract' gives the anomaly in the data's units; 'ratio' gives it as a percentage of the climatology, which is refused for quantities without a true zero."
+    },
+    "returns": "xr.DataArray of anomalies on the input's own grid and time axis. attrs record the exact baseline window and how many years stand behind each climatological value."
+  },
+  "compute_basic_stat": {
+    "description": "Reduce a field along chosen dimensions with one basic statistic, weighted in space but never in time.\nOver a time axis every step counts the same, whatever its length; temporal_aggregate is the tool that weights by month length.\nThe weighted operators take their weights from the grid the data came from, so the field must still be on its original grid and levels \u2014 subsetting is fine, regridding or averaging over depth beforehand is not.",
+    "args": {
+      "data": "xr.DataArray, required. Input field.",
+      "op": "str, required. The statistic to apply:\n- 'mean', 'median', 'min', 'max', 'sum', 'count' (non-missing elements), 'std' (standard deviation about the mean, ddof=0). These are unweighted.\n- 'area_weighted_mean' for a horizontal average, weighting each cell by its area.\n- 'volume_weighted_mean' for an average over dimensions that include depth, weighting each cell by its volume.\n- 'argmax'/'argmin' return WHERE the extreme falls rather than what it is: the coordinate label at which it occurs, one per remaining column. They reduce a single dimension. For the one extreme of a whole field, use locate_extreme.",
+      "dim": "str or list of str, optional. Dimension(s) to reduce. If None, every dimension is reduced. A weighted mean must include the dimensions its weights vary along: the horizontal pair for 'area_weighted_mean', and 'depth' for 'volume_weighted_mean'. On a curvilinear grid you may write ['lat', 'lon'] and they are mapped to the model's index dimensions."
+    },
+    "returns": "xr.DataArray with the reduced dimension(s) removed. For 'argmax'/'argmin' the values are coordinate labels rather than data values. A weighted result records in attrs which weights were used."
+  },
+  "compute_pdo_index": {
+    "description": "Compute the Pacific Decadal Oscillation index: the leading EOF of North Pacific sea surface temperature anomalies.\nPass the GLOBAL field, not a North Pacific subset. The tool does every step of the definition itself: it removes the monthly climatology, cuts out the 20N-70N, 110E-100W box, and removes the global mean anomaly. That global mean is taken over whatever field it is given, so a field already cut to the North Pacific (or to any region) would have the REGIONAL mean removed instead, changing the pattern, the explained variance and the index. Such a field is therefore rejected: its valid cells must reach south of 20S and cover at least 300 degrees of longitude. Removing the monthly climatology beforehand is harmless but unnecessary.\nCells are weighted by the square root of their area in the EOF. The sign is fixed so that the positive phase is cool in the central and western North Pacific; the pattern and the index both follow it.\nThe EOF is taken over a rectangular latitude-longitude block, so a field on a curvilinear grid must be regridded first.",
+    "args": {
+      "data": "xr.DataArray, required. GLOBAL temperature with 'time' and regular 'lat'/'lon' dimensions, optionally 'depth', in degrees Celsius - the whole field as loaded (or as regridded), not a North Pacific subset, because the global-mean removal is computed over every valid cell passed in. The North Pacific box is selected inside the tool.",
+      "depth_level": "float or None, optional, default None. Only used when the field has a depth dimension. None takes the shallowest level; a number averages every level shallower than it, thickness-weighted.",
+      "standardize": "bool, optional, default True. Scale the index to zero mean and unit variance."
+    },
+    "returns": "tuple (pdo_index, eof_pattern, explained_variance, regression_pattern):\n- pdo_index: the leading principal component as a monthly series.\n- eof_pattern: the unit-norm eigenvector. It says WHERE the mode acts, but it is dimensionless and its magnitude means nothing on its own; do not read an amplitude off it.\n- explained_variance: the percentage of variance the mode accounts for, on the grid and over the record given.\n- regression_pattern: the anomaly field regressed on the STANDARDISED index, in the field's own units per standard deviation.\nBoth patterns carry the grid they were computed on, so analyze_correlation can weight them by area. Two patterns on DIFFERENT grids cannot be correlated at all; put every field on one grid before comparing."
+  },
+  "build_comparison_mask": {
+    "description": "Build the one set of cells on which several fields can be scored against each other.\nIt returns a single mask, True where every field given has data, to apply to each field before the metrics are taken.\nGive it the fields already on a common grid: regrid first, because cells can only be intersected once they are the same cells. Curvilinear index dimensions (nlat/nlon, j/i) are refused for that reason.\nIt is for fields on DIFFERENT grids. Two fields already sharing one grid - an operator diagnostic against its own model's published field - need no intersection: use `a.notnull() & b.notnull()`, or require every time step valid with `.mean(dim, skipna=False)`. Reaching for this tool there only imports a grid check that cannot pass on a curvilinear model.\nWith ocean_only (the default) it also drops the cells the WOA23 land-sea mask calls land, reading that mask the right way: it is NOT a 0/1 field, 1 means land and ocean is (value > 1). The check is made on the grid: it is applied whenever the fields share the WOA23 1-degree geometry, which GLODAP and any other 1-degree product also do.",
+    "args": {
+      "fields": "list[xr.DataArray], required. Two or more fields, all on the same rectilinear grid, usually a model climatology regridded onto an observational grid together with the observational field itself. A cell survives only where every one of them has data.",
+      "ocean_only": "bool, optional, default True. Also require the cell to be ocean in the WOA23 1-degree land-sea mask. The check is on the GRID, so it applies to the fields of any 1-degree product, whether or not WOA23 is among them; it is skipped, with a note in attrs, only on a grid that is not 1-degree.",
+      "extra_mask": "xr.DataArray, optional. A further boolean condition to intersect, on the same grid \u2014 a basin, a latitude band, a depth-sufficiency test. False or NaN cells are dropped.",
+      "reduce_other_dims": "str, optional, default 'all'. What to do when a field carries time or depth as well. 'all' keeps a cell only where the field is valid at every step and level, which is what a metric taken over the whole field needs. 'any' keeps it where the field is valid somewhere. Pass a field already reduced to a map to avoid the question."
+    },
+    "returns": "xr.DataArray of booleans with dims (lat, lon) on the shared grid, True on the cells every field covers. Apply it with .where(mask) to each field before measuring.\nattrs record how many cells each field contributed, how many survived and what was intersected."
+  },
+  "analyze_correlation": {
+    "description": "Correlate two fields, with optional lead-lag analysis and significance testing.\nAlong time the p-value uses an effective sample size estimated from the lag-1 autocorrelations of the two series; the uncorrected value is returned alongside.\ndetrend=True removes a straight line from both series before correlating. weighting='area' weights each cell by its area in a correlation across the horizontal dimensions.",
+    "args": {
+      "var1": "xr.DataArray, required. The first field.",
+      "var2": "xr.DataArray, required. The second field, aligned with the first.",
+      "dim": "str or list[str], optional, default 'time'. Dimension(s) to correlate over: 'time' for a temporal correlation at each cell, the horizontal pair for a pattern correlation between two maps. On a curvilinear grid you may write ['lat', 'lon'].",
+      "method": "str, optional, default 'pearson'. 'pearson' for a linear relationship, 'spearman' to correlate ranks, which detects a monotonic but non-linear relationship and resists outliers.",
+      "lag": "int, optional, default 0. Time lag in steps for lead-lag analysis. Positive means var2 leads var1; negative means var1 leads var2. Requires 'time' among the correlation dimensions.",
+      "detrend": "bool, optional, default False. Remove a least-squares straight line from both series before correlating.",
+      "min_periods": "int, optional, default 10. Minimum number of valid pairs required.",
+      "weighting": "str, optional, default 'none'. 'area' weights each cell by its area, for a pattern correlation. It applies only over the horizontal dimensions, only to 'pearson', and not with a lag or with detrending; the weights come from the grid the fields are on, so put them on a common grid first."
+    },
+    "returns": "dict of xr.DataArray, each shaped by the dimensions not correlated over:\n'correlation': the coefficient, -1 to 1.\n'pvalue': two-tailed. Along time it is corrected for serial correlation; across space it is not.\n'pvalue_unadjusted': the naive value assuming every sample is independent.\n'n_samples': valid data pairs.\n'n_effective': independent samples after accounting for autocorrelation."
+  },
+  "temporal_aggregate": {
+    "description": "Aggregate a time series in time: a DAY-WEIGHTED long-term mean, or annual, seasonal or climatological-monthly values, or a running window.\nThis is the only tool that weights by month length; compute_basic_stat does not weight in time. Means are weighted by the number of days in each month in the dataset's own calendar, with each cell's weights masked to the months it has data, so a cell missing at every step stays missing. Model time axes are stamped on Gregorian month starts, but the model's own calendar is recorded on the time coordinate ('source_calendar') and is the one used: a 365-day model's February counts 28 days in every year. Weighting applies to op='mean' only; a median, minimum, maximum or standard deviation is taken over the steps as they are.\nOnly a field with a real time axis can be aggregated; a climatology has none.",
+    "args": {
+      "data": "xr.DataArray, required. A field with a 'time' dimension.",
+      "freq": "str, optional, default 'year'. What to aggregate to:\n- 'mean': ONE field for the whole window, the time dimension removed: the mean state of the period. compute_basic_stat(op='mean', dim='time') instead gives every step the same weight.\n- 'year': one value per calendar year.\n- 'season': one value per seasonal period (see season_convention).\n- 'climatology': one value per calendar month, across all years.\n- 'rolling': a running window that SMOOTHS the series instead of collapsing it \u2014 the time axis keeps every step, and each value is the statistic over the `window` steps around it.",
+      "op": "str, optional, default 'mean'. 'mean' (day-weighted), 'median', 'min', 'max' or 'std'.",
+      "season_convention": "str, optional, default 'meteorological'. Which three months each season covers: 'meteorological' gives DJF/MAM/JJA/SON; 'woa' gives the calendar quarters JFM/AMJ/JAS/OND, on which the WOA23 seasonal fields are built.",
+      "window": "int, required for freq='rolling', ignored otherwise. Number of time steps in the window, in the units of the time axis. An odd window is centred exactly; an even one leans one step towards the past.",
+      "center": "bool, optional, default True, freq='rolling' only. Place each window's value at its middle step, keeping the smoothed series in phase with the original. False places it at the last step, which is what an index computed from data already in hand does, and shifts every feature later by half a window."
+    },
+    "returns": "xr.DataArray, aggregated in time.\n- 'mean': the 'time' dimension is gone and a single field is left, carrying the window it covers in attrs['time_mean_period'] and the number of steps it averaged. attrs ['incomplete_periods'] lists any year the window does not cover in full, which tilts a long-term mean towards the seasons those years contribute.\n- 'year': the time axis becomes an integer 'year' coordinate. attrs['incomplete_periods'] lists any year not covered by a full 12 months, which biases a trend if left in.\n- 'season': one entry per seasonal period, with 'season' and 'year' coordinates attached; a December-starting season is labelled by the year holding its January.\n- 'climatology': a 'month' coordinate (1-12) with month names attached.\n- 'rolling': the time axis is unchanged in length and labels, with the ends left missing where no complete window covers them. The running mean is unweighted, because a running window is a filter over a fixed number of steps rather than a time average."
+  },
+  "load_climatology_data": {
+    "description": "Load a subset of an observational climatology.\nThis is the entry point for a mean state, a seasonal cycle or a vertical structure, and for the reference field a model is evaluated against. A climatology is already an average over many years, so it has no time axis to take a trend along.",
+    "args": {
+      "dataset": "str, required. The climatology's dataset id.",
+      "variable": "str, required for most datasets. The variable name that dataset uses; common aliases are accepted.",
+      "time_slice": "str, optional, default 'annual'. 'annual' for a single all-year field, which reaches the deepest levels; 'monthly' for twelve fields, adding a 'month' dimension; 'seasonal' for four, adding a 'season' dimension. The monthly and seasonal fields are shallower than the annual one.",
+      "months": "list[int], optional. Select particular months from a monthly climatology, e.g. [1, 2, 12].",
+      "period": "str, optional. Which climate normal to read, where the variable offers more than one.",
+      "field": "str, optional. Which statistical field to read, where the product publishes several (the objectively analysed value, the raw mean, the standard deviation, the number of observations). Default is the analysed value.",
+      "version": "str, optional. Product version, where more than one exists.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward.",
+      "lat_range": "list[float, float], optional. [min, max] in degrees North.",
+      "lon_range": "list[float, float], optional. [min, max] in degrees East, either convention; a window crossing the dateline is handled."
+    },
+    "returns": "xr.DataArray with dimensions (depth, lat, lon), plus 'month' or 'season' for the corresponding slices, carrying units and the provenance attributes the weighting tools need."
+  },
+  "load_data_with_geolocator": {
+    "description": "Load data for a NAMED geographic region instead of a coordinate box, using Natural Earth boundaries.\nUse it when the question names a sea, a bay or an ocean: the outline is more faithful than any box, and no coordinates have to be guessed. For a region that is not in the supported list, fall back to a loader with explicit ranges. To split a field you already have by ocean basin, use select_basin instead \u2014 this tool masks while reading, so it only works on a stored variable.",
+    "args": {
+      "dataset": "str, required. The dataset id to read from.",
+      "variable": "str, required for most datasets. The variable name that dataset uses.",
+      "model": "str, required for multi-model datasets.",
+      "geofeature": "str, optional, default 'water_body'. Which kind of boundary to use: 'water_body', 'country', 'state' or 'continent'. Ocean analysis almost always wants 'water_body'.",
+      "loc_name": "str or list[str], required. Name(s) of the region, case-sensitive, from the supported list below. Pass a list to merge several regions into one field for a single calculation; make separate calls when they are to be compared.\nSupported water bodies: ['Arctic Ocean', 'SOUTHERN OCEAN', 'North Atlantic Ocean', 'North Pacific Ocean', 'South Pacific Ocean', 'INDIAN OCEAN', 'South Atlantic Ocean', 'Black Sea', 'Philippine Sea', 'Great Barrier Reef', 'Tasman Sea', 'Bay of Bengal', 'South China Sea', 'Arabian Sea', 'Beaufort Sea', 'Caribbean Sea', 'Gulf of Mexico', 'Labrador Sea', 'Hudson Bay', 'Caspian Sea', 'Baffin Bay', 'Gulf of Alaska', 'Red Sea', 'Sea of Okhotsk', 'Weddell Sea', 'Persian Gulf', 'Celebes Sea', 'Sulu Sea', 'Norwegian Sea', 'Greenland Sea', 'Banda Sea', 'Luzon Strait', 'Bay of Biscay', 'Mozambique Channel', 'Gulf of Guinea', 'Scotia Sea', 'Baltic Sea', 'Barents Sea', 'North Sea', 'Bristol Channel', 'Inner Seas', 'Irish Sea', 'Java Sea', 'Andaman Sea', 'Yellow Sea', 'East China Sea', 'Chukchi Sea', 'Bah\u00eda de Campeche', 'Arafura Sea', 'Timor Sea', 'Gulf of Thailand', 'Laccadive Sea', 'Bellingshausen Sea', 'Amundsen Sea', 'Davis Strait', 'Kara Sea', 'Laptev Sea', 'Drake Passage', 'Great Australian Bight', 'Gulf of Aden', 'Gulf of Oman', 'Tyrrhenian Sea', 'White Sea', 'Sea of Azov', 'James Bay', 'Gulf of Carpentaria', 'Golfo de California', 'Hudson Strait', 'Gulf of Finland', 'English Channel', 'Gulf of Honduras', 'Golfe du Lion', 'Gulf of Bothnia', 'Adriatic Sea', 'Straits of Florida', 'Bay of Plenty', 'The North Western Passages', 'Queen Charlotte Sound', 'Ionian Sea', 'Gulf of Saint Lawrence', 'Molucca Sea', 'Bismarck Sea', 'Solomon Sea', 'Gulf of Tonkin', 'Bay of Fundy', 'R\u00edo de la Plata', 'Strait of Malacca', 'Strait of Singapore', 'Makassar Strait', 'Ceram Sea', 'Inner Sea', 'Taiwan Strait', 'Cook Inlet', 'Bristol Bay', 'Melville Bay', 'Gulf of Maine', 'Chesapeake Bay', 'Strait of Gibraltar', 'Golfo San Jorge', 'Balearic Sea', 'Aegean Sea', 'Gulf of Mannar', 'Shelikhova Gulf', 'Bo Hai', 'Gulf of Kutch', 'Golfo de Panam\u00e1', 'Amundsen Gulf', 'Viscount Melville Sound', 'Ungava Bay', 'Yucatan Channel', 'Bering Sea', 'East Siberian Sea', 'Lincoln Sea', 'Bass Strait', 'Franklin Bay', 'Dixon Entrance', \"M'Clure Strait\", 'Boca Grande', 'Ba\u00eda de Maraj\u00f3', 'Golfo San Mat\u00edas', 'Golfo Corcovado', 'Wrigley Gulf', 'Sulzberger Bay', 'Ronne Entrance', 'Bransfield Strait', 'McMurdo Sound', 'Ba\u00eda de S\u00e3o Marcos', 'Cumberland Sound', 'Frobisher Bay', 'Disko Bay', 'Hamilton Inlet', 'Storfjorden', 'Vestfjorden', 'Skagerrak', 'Karskiye Strait', \"Vil'kitskogo Strait\", 'Sognefjorden', 'Trondheimsfjorden', 'Kattegat', 'Gulf of Khambh\u00e4t', 'Palk Strait', 'Kronotskiy Gulf', 'Uda Bay', 'Uchiura Bay', 'Tsugaru Strait', 'Tatar Strait', 'Shark Bay', 'Gulf of Gab\u00e8s', 'Mackenzie Bay', 'Norton Sound', 'Kotzebue Sound', 'Gulf of Boothia', 'Kane Basin', 'Foxe Basin', 'Golfo de Tehuantepec', 'Golfo de Guayaquil', 'Gulf of Masira', 'Gulf of Yana', 'Dmitriy Laptev Strait', 'La P\u00e9rouse Strait', 'East Korea Bay', 'Qiongzhou Strait', 'Cook Strait', 'Torres Strait', 'Geographe Bay', 'Gulf of Papua', 'Gulf of Olen\u2018k', 'Gulf of Riga', 'Waddenzee', 'Gulf of Sidra', 'Sea of Crete', 'Ligurian Sea', 'Alboran Sea', 'Bight of Benin', 'Bight of Biafra', 'Strait of Belle Isle', 'Prince William Sound', 'Estrecho de Magellanes', 'Bah\u00eda Blanca', 'Golfo de Penas', 'Bah\u00eda Grande', 'Marguerite Bay', 'Prydz Bay', 'Vincennes Bay', 'Porpoise Bay', 'Davis Sea', 'L\u00fctzow-Holm Bay', 'Antongila Bay', 'Hangzhou Bay', 'Karaginskiy Gulf', 'Gulf of Kamchatka', 'Bosporus', 'Bab el Mandeb', 'Gulf St. Vincent', 'Golfo de Urab\u00e1', 'Baia de Maputo', 'St. Helena Bay', 'Boknafjorden', 'Joseph Bonaparte Gulf', 'Gulf of Martaban', 'Gulf of Sakhalin', 'Kangertittivaq', 'Saint Lawrence River', 'Chaun Bay', 'Khatanga Gulf', 'Garabogaz Bay', 'Gulf of Suez', 'Gulf of Ob', 'Yenisey Gulf', 'Dardanelles', 'Sea of Marmara', 'Gulf of Aqaba', 'Lago de Maracaibo', 'Denmark Strait', 'Massachusetts Bay', 'Delaware Bay', 'Long Island Sound', 'Albemarle Sound', 'Pamlico Sound', 'Smith Sound', 'Queen Charlotte Strait', 'Baird Inlet', 'Husky Lakes', 'Lake Pontchartrain', 'Stettiner Haff', 'Darnley Bay', 'Prince of Wales Strait', 'Minto Inlet', 'Richard Collinson Inlet', 'Prince ALbert Sound', 'Liddon Gulf', 'Wynniatt Bay', 'Hadley Bay', 'Bathurst Inlet', 'Goldsmith Channel', 'Sherman Basin', 'Wager Bay', 'Fury and Hecla Strait', 'Jones Sound', 'Eclipse Sound', 'Hall Basin', 'Uummannaq Fjord', 'Peacock Sound', 'George VI Sound', 'Seno de Skyring', 'Seno Otway', 'Bay In\u00fatil', 'Lagoa dos Patos', 'Amazon River', \"Bras d'Or Lake\", 'Kaliningrad', 'Matochkin Shar Strait', 'Ozero Mogotoyevo', 'Guba Gusinaya', 'Bali Sea', 'Davao Gulf', 'Halmahera Sea', 'Selat Bali', 'Gulf of Tomini', 'Flores Sea', 'Sibuyan Sea', 'Selat Dampier', 'Gulf of Buli', 'Gulf of Kau', 'Bohol Sea', 'Surigao Strait', 'Ragay Gulf', 'Samar Sea', 'Tayabas Bay', 'Leyte Gulf', 'Visayan Sea', 'Savu Sea', 'Hecate Strait', 'Cordova Bay', 'Murchison Sound', 'Robeson Channel', 'Kennedy Channel', 'Canal Perigoso', 'Canal do Sul', 'Canal do Norte', '\u00d8resund', 'Mecklenburger Bucht', 'Sargasso Sea', 'San Francisco Bay', 'Monterey Bay', 'Yangtze River', 'Columbia River', 'Salish Sea', \"Gulf of Anadyr'\", 'Mediterranean Sea', 'Ross Sea', 'Coral Sea', 'Sea of Japan', 'Korea Strait']",
+      "time_range": "list[str, str], optional. Time series datasets only: ['start', 'end'] in ISO 8601.",
+      "depth_range": "list[float, float], optional. [min, max] in metres, positive downward.",
+      "time_slice": "str, optional, default 'annual'. Climatologies only: 'annual', 'monthly' or 'seasonal'.",
+      "months": "list[int], optional. Select particular months from a monthly climatology.",
+      "period": "str, optional. Which climate normal to read.",
+      "field": "str, optional. Which statistical field to read.",
+      "version": "str, optional. Product version, where more than one exists."
+    },
+    "returns": "xr.DataArray with the dimensions the dataset would otherwise return and cells outside the region set to NaN. A regular grid keeps its full coordinates; a curvilinear grid keeps its index dimensions and is trimmed to the region's bounding block. Average it with an area-weighted mean, which picks the right cell areas for the grid on its own."
+  },
+  "transform_unit": {
+    "description": "Convert a field from one unit to another within the same physical category.\nBetween the two molar bases, per unit MASS (umol kg-1) and per unit VOLUME (mol m-3), the conversion goes through seawater density: a constant (the default) or a density field, applied cell by cell.\nPass a density field EXACTLY as compute_potential_density_anomaly returned it. Do not add 1000 to make it absolute first: whether the array is an anomaly or an absolute density is read from its own long_name BEFORE its magnitude, so a pre-converted field still labelled 'anomaly' has 1000 added a second time and every converted value comes out about half its true size.",
+    "args": {
+      "data": "xr.DataArray, required. The field to convert.",
+      "from_unit": "str, required, case-insensitive. The unit the data is in; passing the array's own 'units' attribute works, including the variant spellings different products use. Recognised categories: temperature ('degC', 'K'), concentration per mass ('umol/kg', 'mmol/kg'), concentration per volume ('mol m-3', 'mmol/m3', 'umol/L'), dimensionless ('1', 'psu', ''), length ('m', 'cm'), velocity ('m/s', 'cm/s', 'mm/s').",
+      "to_unit": "str, required. The target unit, in any of the same spellings. It must belong to the same category as from_unit.",
+      "density": "float or xr.DataArray, optional, default 1.025. Seawater density, used only between the mass and volume bases. A float is read as kg/L. A DataArray is aligned cell by cell, so each cell converts at its own density; both an absolute density and a density anomaly (sigma) are understood, decided from the array's metadata and magnitude and reported back in the result."
+    },
+    "returns": "xr.DataArray with converted values and its 'units' attribute updated. attrs record 'original_units' and, for a mass/volume conversion, 'density_assumption' \u2014 whether a constant or a field was used, and how it was interpreted."
+  }
+}
+
+Fix this one compute block only, and output the corrected, complete version inside
+<execute></execute> tags.
+Focus on:
+1. Fixing the specific error mentioned above
+2. Taking variable names from the list of available variables above; use what is already there instead of reloading the data or recomputing a quantity that exists
+3. Using correct syntax, function signatures and library functions
+
+
+===== RESPONSE =====
+<execute>
+# Load SST data for 1950-01 to 2014-12
+time_range = ["1950-01", "2014-12"]
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+
+ersst_sst = load_regular_data(
+    dataset="ersst",
+    variable="sst",
+    time_range=time_range,
+    chunk_time=12,
+)
+
+model_sst_native = {
+    model: load_regular_data(
+        dataset="cmip6_historical",
+        variable="tos",
+        model=model,
+        time_range=time_range,
+        chunk_time=12,
+    )
+    for model in models
+}
+
+published_pdo = load_regular_data(
+    dataset="cpc_indices",
+    product="pdo",
+    time_range=time_range,
+    chunk_time=12,
+)
+
+# Regrid all SST fields to a common 1-degree grid with bilinear interpolation
+ersst_rg = regrid_horizontal(ersst_sst, target="1deg", method="bilinear")
+model_sst_rg = {
+    model: regrid_horizontal(model_sst_native[model], target="1deg", method="bilinear")
+    for model in models
+}
+
+# Build monthly anomalies relative to each source's own 1950-2014 monthly climatology
+base_period = ["1950-01", "2014-12"]
+ersst_anom = compute_anomaly_vs_own_climatology(
+    ersst_rg, freq="month", base_period=base_period, method="subtract"
+)
+model_anom = {
+    model: compute_anomaly_vs_own_climatology(
+        model_sst_rg[model], freq="month", base_period=base_period, method="subtract"
+    )
+    for model in models
+}
+
+# Compute monthly global-mean SST anomalies from the regridded full fields
+ersst_gm = compute_basic_stat(ersst_anom, op="area_weighted_mean", dim=["lat", "lon"])
+model_gm = {
+    model: compute_basic_stat(model_anom[model], op="area_weighted_mean", dim=["lat", "lon"])
+    for model in models
+}
+
+# Remove global-mean anomaly before PDO calculation
+ersst_anom_demeaned = (ersst_anom - ersst_gm).assign_attrs(units=ersst_anom.attrs.get("units", "degC"))
+model_anom_demeaned = {
+    model: (model_anom[model] - model_gm[model]).assign_attrs(units=model_anom[model].attrs.get("units", "degC"))
+    for model in models
+}
+
+# Compute PDO index, EOF pattern, explained variance, regression pattern
+ersst_pdo_idx, ersst_eof, ersst_expl_var, ersst_reg = compute_pdo_index(
+    ersst_anom_demeaned, standardize=True
+)
+
+model_pdo = {}
+for model in models:
+    model_pdo[model] = compute_pdo_index(
+        model_anom_demeaned[model], standardize=True
+    )
+
+# Materialize main PDO outputs
+ersst_pdo_idx = ersst_pdo_idx.compute()
+ersst_expl_var_value = float(ersst_expl_var)
+ersst_reg = ersst_reg.compute()
+
+model_pdo_idx = {}
+model_expl_var_value = {}
+model_reg = {}
+for model in models:
+    idx, eofp, expl, regp = model_pdo[model]
+    model_pdo_idx[model] = idx.compute()
+    model_expl_var_value[model] = float(expl)
+    model_reg[model] = regp.compute()
+
+published_pdo = published_pdo.compute()
+
+# Restrict regression patterns to the PDO domain for reporting/plotting
+pdo_lat_range = [20, 70]
+pdo_lon_range = [110, 260]  # 110E to 100W on 0-360 plotting axis; data remain on native opened convention
+
+ersst_reg_np = ersst_reg.where(
+    (ersst_reg["lat"] >= pdo_lat_range[0]) & (ersst_reg["lat"] <= pdo_lat_range[1]),
+    drop=True
+)
+ersst_reg_np = ersst_reg_np.where(
+    ((ersst_reg_np["lon"] % 360) >= pdo_lon_range[0]) & ((ersst_reg_np["lon"] % 360) <= pdo_lon_range[1]),
+    drop=True
+)
+
+model_reg_np = {}
+for model in models:
+    da = model_reg[model]
+    da = da.where((da["lat"] >= pdo_lat_range[0]) & (da["lat"] <= pdo_lat_range[1]), drop=True)
+    da = da.where(((da["lon"] % 360) >= pdo_lon_range[0]) & ((da["lon"] % 360) <= pdo_lon_range[1]), drop=True)
+    model_reg_np[model] = da
+
+# Amplitude of the mode from the regression pattern, in degC per std
+ersst_amp = float(
+    np.sqrt(
+        compute_basic_stat((ersst_reg_np ** 2), op="area_weighted_mean", dim=["lat", "lon"]).compute().item()
+    )
+)
+
+model_amp = {}
+for model in models:
+    model_amp[model] = float(
+        np.sqrt(
+            compute_basic_stat((model_reg_np[model] ** 2), op="area_weighted_mean", dim=["lat", "lon"]).compute().item()
+        )
+    )
+
+# Build one common comparison mask across observation and all model regression patterns
+common_mask = build_comparison_mask(
+    fields=[ersst_reg_np] + [model_reg_np[m] for m in models],
+    ocean_only=True,
+    reduce_other_dims="all",
+).compute()
+
+ersst_reg_masked = ersst_reg_np.where(common_mask)
+model_reg_masked = {model: model_reg_np[model].where(common_mask) for model in models}
+
+# Spatial Pearson correlation of each model regression pattern with ERSSTv5 regression pattern
+pattern_corr = {}
+for model in models:
+    corr_dict = analyze_correlation(
+        var1=model_reg_masked[model],
+        var2=ersst_reg_masked,
+        dim=["lat", "lon"],
+        method="pearson",
+        weighting="area",
+        min_periods=10,
+    )
+    pattern_corr[model] = float(corr_dict["correlation"].compute().item())
+
+# 12-month autocorrelation of each standardized monthly PDO index
+def lag12_autocorr(series):
+    out = analyze_correlation(
+        var1=series,
+        var2=series,
+        dim="time",
+        method="pearson",
+        lag=12,
+        detrend=False,
+        min_periods=10,
+    )
+    return {
+        "correlation": float(out["correlation"].compute().item()),
+        "pvalue": float(out["pvalue"].compute().item()),
+        "pvalue_unadjusted": float(out["pvalue_unadjusted"].compute().item()),
+        "n_samples": int(out["n_samples"].compute().item()),
+        "n_effective": float(out["n_effective"].compute().item()),
+    }
+
+ersst_acf12 = lag12_autocorr(ersst_pdo_idx)
+model_acf12 = {model: lag12_autocorr(model_pdo_idx[model]) for model in models}
+
+# Correlation between ERSSTv5-derived PDO and published PDO over 1950-2014
+ersst_vs_published = analyze_correlation(
+    var1=ersst_pdo_idx,
+    var2=published_pdo,
+    dim="time",
+    method="pearson",
+    detrend=False,
+    min_periods=10,
+)
+ersst_vs_published_corr = float(ersst_vs_published["correlation"].compute().item())
+ersst_vs_published_p = float(ersst_vs_published["pvalue"].compute().item())
+ersst_vs_published_p_naive = float(ersst_vs_published["pvalue_unadjusted"].compute().item())
+ersst_vs_published_n = int(ersst_vs_published["n_samples"].compute().item())
+ersst_vs_published_neff = float(ersst_vs_published["n_effective"].compute().item())
+
+# 9-year (108-month) centred running mean of ERSSTv5 PDO index
+ersst_pdo_9yr = temporal_aggregate(
+    ersst_pdo_idx, freq="rolling", op="mean", window=108, center=True
+).compute()
+
+# Identify sign-change years; merge any crossing within 3 years of prior counted transition
+sm = ersst_pdo_9yr
+sm_vals = sm.values
+sm_time = pd.to_datetime(sm["time"].values)
+
+valid = np.isfinite(sm_vals)
+cross_years_raw = []
+for i in range(1, len(sm_vals)):
+    if not (valid[i - 1] and valid[i]):
+        continue
+    y1 = sm_vals[i - 1]
+    y2 = sm_vals[i]
+    if y1 == 0:
+        cross_years_raw.append(int(sm_time[i - 1].year))
+    elif y1 * y2 < 0:
+        cross_time = sm_time[i]
+        cross_years_raw.append(int(cross_time.year))
+
+transition_years = []
+for yr in cross_years_raw:
+    if not transition_years:
+        transition_years.append(yr)
+    elif yr - transition_years[-1] < 3:
+        continue
+    else:
+        transition_years.append(yr)
+
+documented_shift_years = []
+for yr in transition_years:
+    if min(abs(yr - 1947), abs(yr - 1976), abs(yr - 1988), abs(yr - 1998)) <= 1:
+        documented_shift_years.append(yr)
+
+# Determine best-matching model by highest pattern correlation
+best_model = max(pattern_corr, key=pattern_corr.get)
+
+# Summaries
+summary_rows = [{
+    "source": "ERSSTv5",
+    "explained_variance_pct": round(ersst_expl_var_value, 1),
+    "amplitude_degC_per_std": round(ersst_amp, 3),
+    "acf_12mo": round(ersst_acf12["correlation"], 3),
+    "pattern_corr_vs_ersst": np.nan,
+}]
+for model in models:
+    summary_rows.append({
+        "source": model,
+        "explained_variance_pct": round(model_expl_var_value[model], 1),
+        "amplitude_degC_per_std": round(model_amp[model], 3),
+        "acf_12mo": round(model_acf12[model]["correlation"], 3),
+        "pattern_corr_vs_ersst": round(pattern_corr[model], 3),
+    })
+summary_table = pd.DataFrame(summary_rows)
+
+ersst_vs_published_summary = {
+    "correlation": round(ersst_vs_published_corr, 3),
+    "pvalue_effective": ersst_vs_published_p,
+    "pvalue_unadjusted": ersst_vs_published_p_naive,
+    "n_samples": ersst_vs_published_n,
+    "n_effective": ersst_vs_published_neff,
+}
+
+transition_summary = {
+    "transition_years": transition_years,
+    "documented_shift_matches": documented_shift_years,
+}
+
+# Qualitative consistency checks against observations
+obs_amp = ersst_amp
+obs_persist = ersst_acf12["correlation"]
+model_assessment = {}
+for model in models:
+    amp_ratio = model_amp[model] / obs_amp if obs_amp != 0 else np.nan
+    pers_diff = model_acf12[model]["correlation"] - obs_persist
+    model_assessment[model] = {
+        "pattern_corr_vs_obs": pattern_corr[model],
+        "amp_ratio_to_obs": amp_ratio,
+        "persistence_minus_obs": pers_diff,
+    }
+
+# Variables intended for direct downstream use / inspection:
+# summary_table
+# ersst_vs_published_summary
+# transition_summary
+# best_model
+# model_assessment
+# ersst_reg_np, model_reg_np, ersst_pdo_idx, model_pdo_idx, published_pdo, ersst_pdo_9yr
+</execute>

@@ -1,0 +1,749 @@
+{
+  "session_id": "T2_deepseek-flash_20261022_102855",
+  "total_turns": 1,
+  "max_turns": 10,
+  "history": [
+    {
+      "session_id": "T2_deepseek-flash_20261022_102855",
+      "user_query": "Rebuild the Nino 3.4 index from the raw ERSSTv5 sea surface temperature field and check it against the series NOAA/CPC publishes, then use the same code to reproduce the offset between CPC's two baseline periods.\n\nData to use:\n- ERSSTv5 monthly SST, 1950-01 to 2023-12, on its native 2-degree grid.\n- The CPC monthly Nino index on the 1991-2020 baseline (`ersst5_91-20`), Nino 3.4 anomaly column: the main reference.\n- The CPC monthly Nino index on the 1981-2010 baseline (`ersst5_81-10`), Nino 3.4 anomaly column: the control.\n- The CPC ONI series (`oni`), the official 3-month running index.\n\nExpected numerical results:\n- RECON_9120, the monthly Nino 3.4 index reconstructed from ERSSTv5 as the SST anomaly over 5S-5N, 170W-120W relative to a 1991-2020 monthly climatology, 1950-01 to 2023-12. Against the CPC 1991-2020 Nino 3.4 anomaly over that window, report the Pearson correlation to 6 decimal places, the RMSE in degrees Celsius to 4 decimal places, and the largest absolute deviation in degrees Celsius to 4 decimal places with the year and month at which it occurs.\n- The number of El Nino events in RECON_9120 over 1950-2023 under the operational ONI criterion (at least 5 consecutive overlapping 3-month seasons, i.e. values of the 3-month centred running mean, at or above +0.5 degrees Celsius), and the three events with the highest peak values, each with the year and month of its peak and its peak value in degrees Celsius to 2 decimal places.\n- The same count and the same three largest peaks for the CPC ONI series under the identical criterion, with an explanation of why the two counts differ.\n- The mean baseline offset of the reconstruction, RECON_8110 (the same index relative to the 1981-2010 baseline) minus RECON_9120, as the unweighted mean over the months of 1950-01 to 2020-12, in degrees Celsius to 3 decimal places.\n- The mean published baseline offset, CPC 1981-2010 minus CPC 1991-2020 Nino 3.4 anomaly, as the unweighted mean over the same months, in degrees Celsius to 3 decimal places, and how closely it agrees with the reconstructed offset.\n\nExpected visualizations:\n- Figure 1, a two-row figure sharing a time axis over 1950-2023. The upper row overlays the RECON_9120 and CPC 1991-2020 monthly anomalies, the 3-month running mean, the +0.5 and -0.5 degrees Celsius thresholds, and shading between the threshold and the running-mean curve, warm during detected El Nino events and cool during detected La Nina events (at least 5 consecutive seasons at or below -0.5 degrees Celsius). The lower row shows RECON_9120 minus CPC on its own vertical scale. Label both vertical axes in degrees Celsius.\n- Figure 2, a square scatter plot of RECON_9120 (y) against the CPC 1991-2020 series (x), one point per month, with identical axis ranges and ticks, a 1:1 reference line, and the correlation and RMSE annotated.",
+      "language": "en",
+      "turn_number": 1,
+      "bundle_path": "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T2_deepseek-flash_20261022_102855/turn01",
+      "selected_tools": [],
+      "knowledge": null,
+      "generated_code": "<compute>\nimport numpy as np\nimport pandas as pd\nimport xarray as xr\n\n# ----------------------------------------------------------------------\n# 1. Rebuild Niño 3.4 from the raw ERSSTv5 gridded SST field\n# ----------------------------------------------------------------------\nersst_path = \"/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc\"\nds = xr.open_dataset(ersst_path)\nsst = ds[\"sst\"].sel(time=slice(\"1950-01-01\", \"2023-12-31\"))\n\n# ERSSTv5 is on 0-360 longitude.  170W-120W = 190E-240E.\nlat_n34 = sst[\"lat\"].where((sst[\"lat\"] >= -5) & (sst[\"lat\"] <= 5), drop=True)\nlon_n34 = sst[\"lon\"].where((sst[\"lon\"] >= 190) & (sst[\"lon\"] <= 240), drop=True)\nsst_n34 = sst.sel(lat=lat_n34, lon=lon_n34)\n\n# Area-weighted regional mean over the Niño 3.4 box.\nw = np.cos(np.deg2rad(sst_n34[\"lat\"]))\nn34_monthly = sst_n34.weighted(w).mean(dim=(\"lat\", \"lon\")).load()\n\ndef monthly_anomaly(da, base_start, base_end):\n    base = da.sel(time=slice(base_start, base_end))\n    clim = base.groupby(\"time.month\").mean(\"time\")\n    return da.groupby(\"time.month\") - clim\n\nrecon_9120_da = monthly_anomaly(n34_monthly, \"1991-01-01\", \"2020-12-31\")\nrecon_8110_da = monthly_anomaly(n34_monthly, \"1981-01-01\", \"2010-12-31\")\n\ndef to_period_series(da, name):\n    s = da.to_series()\n    try:\n        idx = pd.PeriodIndex(pd.to_datetime(s.index), freq=\"M\")\n    except Exception:\n        idx = pd.PeriodIndex(\n            year=[t.year for t in s.index],\n            month=[t.month for t in s.index],\n            freq=\"M\",\n        )\n    s.index = idx\n    s.name = name\n    return s.sort_index()\n\nRECON_9120 = to_period_series(recon_9120_da, \"RECON_9120\")\nRECON_8110 = to_period_series(recon_8110_da, \"RECON_8110\")\n\n# ----------------------------------------------------------------------\n# 2. Read CPC monthly Niño indices and ONI\n# ----------------------------------------------------------------------\ndef read_cpc_nino_monthly(path):\n    rows = []\n    with open(path, \"r\") as fh:\n        for line in fh:\n            line = line.strip()\n            if not line or line.startswith(\"#\"):\n                continue\n            parts = line.split()\n            if parts[0].upper() in (\"YR\", \"YEAR\"):\n                continue\n            if len(parts) < 10:\n                continue\n            try:\n                vals = [float(parts[i]) for i in range(10)]\n            except ValueError:\n                continue\n            rows.append(vals)\n    cols = [\n        \"YR\", \"MON\",\n        \"NINO1+2\", \"ANOM1+2\",\n        \"NINO3\", \"ANOM3\",\n        \"NINO4\", \"ANOM4\",\n        \"NINO3.4\", \"ANOM3.4\",\n    ]\n    df = pd.DataFrame(rows, columns=cols)\n    df[\"time\"] = pd.PeriodIndex(\n        year=df[\"YR\"].astype(int),\n        month=df[\"MON\"].astype(int),\n        freq=\"M\",\n    )\n    return df.set_index(\"time\").sort_index()\n\ncpc91 = read_cpc_nino_monthly(\n    \"/data1/lorraine-20419/ocean_data/CPC/ersst5.nino.mth.91-20.ascii\"\n)\ncpc81 = read_cpc_nino_monthly(\n    \"/data1/lorraine-20419/ocean_data/CPC/ersst5.nino.mth.81-10.ascii\"\n)\ncpc_9120_n34 = cpc91[\"ANOM3.4\"].loc[\"1950-01\":\"2023-12\"]\ncpc_8110_n34 = cpc81[\"ANOM3.4\"].loc[\"1950-01\":\"2020-12\"]\n\nseason_center_month = {\n    \"DJF\": 1, \"JFM\": 2, \"FMA\": 3, \"MAM\": 4,\n    \"AMJ\": 5, \"MJJ\": 6, \"JJA\": 7, \"JAS\": 8,\n    \"ASO\": 9, \"SON\": 10, \"OND\": 11, \"NDJ\": 12,\n}\n\ndef read_oni(path):\n    rows = []\n    with open(path, \"r\") as fh:\n        for line in fh:\n            line = line.strip()\n            if not line or line.startswith(\"#\"):\n                continue\n            parts = line.split()\n            if parts[0].upper() == \"SEAS\":\n                continue\n            if len(parts) < 4:\n                continue\n            seas = parts[0].upper()\n            if seas not in season_center_month:\n                continue\n            try:\n                yr = int(float(parts[1]))\n                total = float(parts[2])\n                anom = float(parts[3])\n            except ValueError:\n                continue\n            rows.append((seas, yr, total, anom))\n    df = pd.DataFrame(rows, columns=[\"SEAS\", \"YR\", \"TOTAL\", \"ANOM\"])\n    df[\"month\"] = df[\"SEAS\"].map(season_center_month).astype(int)\n    df[\"time\"] = pd.PeriodIndex(\n        year=df[\"YR\"].astype(int),\n        month=df[\"month\"],\n        freq=\"M\",\n    )\n    return df.set_index(\"time\").sort_index()\n\noni = read_oni(\"/data1/lorraine-20419/ocean_data/CPC/oni.ascii.txt\")\noni_n34 = oni[\"ANOM\"].loc[\"1950-01\":\"2023-12\"]\n\n# ----------------------------------------------------------------------\n# 3. Compare reconstruction against CPC 1991-2020 monthly anomalies\n# ----------------------------------------------------------------------\ncomp = pd.concat(\n    [\n        RECON_9120.rename(\"RECON_9120\"),\n        cpc_9120_n34.rename(\"CPC_9120\"),\n    ],\n    axis=1,\n    join=\"inner\",\n).dropna().loc[\"1950-01\":\"2023-12\"]\n\ndiff_recon_cpc = comp[\"RECON_9120\"] - comp[\"CPC_9120\"]\ncorr_9120_cpc = float(comp[\"RECON_9120\"].corr(comp[\"CPC_9120\"]))\nrmse_9120_cpc = float(np.sqrt(np.mean(diff_recon_cpc**2)))\nmax_abs_dev_time = diff_recon_cpc.abs().idxmax()\nmax_abs_dev_9120_cpc = float(diff_recon_cpc.abs().max())\nmax_abs_dev_signed = float(diff_recon_cpc.loc[max_abs_dev_time])\nmax_abs_dev_year = int(max_abs_dev_time.year)\nmax_abs_dev_month = int(max_abs_dev_time.month)\n\ncorr_9120_cpc_6 = round(corr_9120_cpc, 6)\nrmse_9120_cpc_4 = round(rmse_9120_cpc, 4)\nmax_abs_dev_9120_cpc_4 = round(max_abs_dev_9120_cpc, 4)\n\n# ----------------------------------------------------------------------\n# 4. Event detection under the operational ONI threshold criterion\n# ----------------------------------------------------------------------\ndef find_threshold_events(series, threshold, warm=True, min_len=5):\n    \"\"\"Return contiguous runs of length >= min_len with values >= threshold\n    (warm=True) or <= threshold (warm=False).  Each run is one event; the\n    event peak is the max (min for La Niña) 3-month running-mean value.\"\"\"\n    s = series.dropna().sort_index()\n    mask = (s >= threshold) if warm else (s <= threshold)\n\n    events = []\n    run = []\n\n    def add_run(run_periods):\n        if len(run_periods) < min_len:\n            return\n        seg = s.loc[run_periods]\n        if warm:\n            peak_time = seg.idxmax()\n            peak_value = float(seg.max())\n        else:\n            peak_time = seg.idxmin()\n            peak_value = float(seg.min())\n        events.append(\n            {\n                \"start\": run_periods[0],\n                \"end\": run_periods[-1],\n                \"length\": len(run_periods),\n                \"peak_time\": peak_time,\n                \"peak_value\": peak_value,\n            }\n        )\n\n    for t, flag in mask.items():\n        if bool(flag):\n            run.append(t)\n        else:\n            add_run(run)\n            run = []\n    add_run(run)\n    return events\n\n# 3-month centred running mean of the reconstruction.\nrecon_9120_run3 = RECON_9120.rolling(window=3, center=True, min_periods=3).mean()\n\nelnino_events_recon = find_threshold_events(\n    recon_9120_run3, 0.5, warm=True, min_len=5\n)\nlanina_events_recon = find_threshold_events(\n    recon_9120_run3, -0.5, warm=False, min_len=5\n)\nn_elnino_recon = len(elnino_events_recon)\ntop3_elnino_recon = sorted(\n    elnino_events_recon, key=lambda e: e[\"peak_value\"], reverse=True\n)[:3]\ntop3_elnino_recon_table = pd.DataFrame(\n    [\n        {\n            \"year\": int(e[\"peak_time\"].year),\n            \"month\": int(e[\"peak_time\"].month),\n            \"peak_value\": round(e[\"peak_value\"], 2),\n            \"start\": e[\"start\"],\n            \"end\": e[\"end\"],\n            \"length\": e[\"length\"],\n        }\n        for e in top3_elnino_recon\n    ]\n)\n\n# ONI is already a 3-month running mean.\nelnino_events_oni = find_threshold_events(\n    oni_n34, 0.5, warm=True, min_len=5\n)\nlanina_events_oni = find_threshold_events(\n    oni_n34, -0.5, warm=False, min_len=5\n)\nn_elnino_oni = len(elnino_events_oni)\ntop3_elnino_oni = sorted(\n    elnino_events_oni, key=lambda e: e[\"peak_value\"], reverse=True\n)[:3]\ntop3_elnino_oni_table = pd.DataFrame(\n    [\n        {\n            \"year\": int(e[\"peak_time\"].year),\n            \"month\": int(e[\"peak_time\"].month),\n            \"peak_value\": round(e[\"peak_value\"], 2),\n            \"start\": e[\"start\"],\n            \"end\": e[\"end\"],\n            \"length\": e[\"length\"],\n        }\n        for e in top3_elnino_oni\n    ]\n)\n\nn_elnino_count_difference = n_elnino_recon - n_elnino_oni\ncount_explanation = (\n    \"RECON_9120 uses one fixed 1991-2020 monthly climatology for the whole record, \"\n    \"while the official CPC ONI uses a 30-year centred normal that is rolled forward \"\n    \"every five years, together with CPC's operational Nino3.4 processing.  Seasons \"\n    \"close to the +/-0.5 degC threshold can therefore fall on different sides of the \"\n    \"criterion, so the number of qualifying events can differ.\"\n)\n\n# ----------------------------------------------------------------------\n# 5. Baseline offsets: 1981-2010 minus 1991-2020\n# ----------------------------------------------------------------------\nrecon_baseline_comp = pd.concat(\n    [\n        RECON_8110.rename(\"RECON_8110\"),\n        RECON_9120.rename(\"RECON_9120\"),\n    ],\n    axis=1,\n    join=\"inner\",\n).dropna().loc[\"1950-01\":\"2020-12\"]\n\noffset_recon_8110_minus_9120 = float(\n    (recon_baseline_comp[\"RECON_8110\"]\n     - recon_baseline_comp[\"RECON_9120\"]).mean()\n)\noffset_recon_8110_minus_9120_3 = round(offset_recon_8110_minus_9120, 3)\n\ncpc_baseline_comp = pd.concat(\n    [\n        cpc_8110_n34.rename(\"CPC_8110\"),\n        cpc_9120_n34.rename(\"CPC_9120\"),\n    ],\n    axis=1,\n    join=\"inner\",\n).dropna().loc[\"1950-01\":\"2020-12\"]\n\noffset_cpc_8110_minus_9120 = float(\n    (cpc_baseline_comp[\"CPC_8110\"]\n     - cpc_baseline_comp[\"CPC_9120\"]).mean()\n)\noffset_cpc_8110_minus_9120_3 = round(offset_cpc_8110_minus_9120, 3)\n\noffset_agreement_abs = abs(\n    offset_recon_8110_minus_9120 - offset_cpc_8110_minus_9120\n)\noffset_agreement_abs_3 = round(offset_agreement_abs, 3)\n</compute>\n\n<visualize>\n# ----------------------------------------------------------------------\n# Figure 1: reconstruction, CPC monthly, running mean and event shading\n# ----------------------------------------------------------------------\nfig1, (ax1, ax2) = plt.subplots(\n    2, 1, figsize=(14, 8), sharex=True,\n    gridspec_kw={\"height_ratios\": [3, 1]}\n)\n\nt_comp = comp.index.to_timestamp()\n\nax1.plot(\n    t_comp, comp[\"RECON_9120\"].values,\n    color=\"tab:blue\", lw=0.7, alpha=0.85,\n    label=\"RECON_9120 monthly\"\n)\nax1.plot(\n    t_comp, comp[\"CPC_9120\"].values,\n    color=\"tab:orange\", lw=0.7, alpha=0.85,\n    label=\"CPC 1991-2020 monthly\"\n)\n\nrm = recon_9120_run3.loc[comp.index]\nax1.plot(\n    t_comp, rm.values,\n    color=\"black\", lw=1.6,\n    label=\"RECON 3-month running mean\"\n)\n\nax1.axhline(0.5, color=\"red\", ls=\"--\", lw=0.9, label=\"+0.5 °C\")\nax1.axhline(-0.5, color=\"blue\", ls=\"--\", lw=0.9, label=\"-0.5 °C\")\n\nfor ev in elnino_events_recon:\n    seg = recon_9120_run3.loc[ev[\"start\"]:ev[\"end\"]].dropna()\n    ax1.fill_between(\n        seg.index.to_timestamp(),\n        0.5,\n        seg.values,\n        where=seg.values >= 0.5,\n        color=\"red\",\n        alpha=0.25,\n        interpolate=True,\n        linewidth=0,\n    )\n\nfor ev in lanina_events_recon:\n    seg = recon_9120_run3.loc[ev[\"start\"]:ev[\"end\"]].dropna()\n    ax1.fill_between(\n        seg.index.to_timestamp(),\n        -0.5,\n        seg.values,\n        where=seg.values <= -0.5,\n        color=\"blue\",\n        alpha=0.25,\n        interpolate=True,\n        linewidth=0,\n    )\n\nax1.set_ylabel(\"SST anomaly (°C)\")\nax1.set_xlim(pd.Timestamp(\"1950-01-01\"), pd.Timestamp(\"2023-12-31\"))\nax1.grid(True, alpha=0.3)\nax1.legend(loc=\"upper left\", ncol=2, fontsize=8)\nax1.set_title(\"Niño 3.4 reconstruction vs CPC 1991-2020\")\n\nax2.plot(\n    t_comp,\n    (comp[\"RECON_9120\"] - comp[\"CPC_9120\"]).values,\n    color=\"purple\", lw=0.8,\n)\nax2.axhline(0.0, color=\"black\", lw=0.6)\nax2.set_ylabel(\"RECON − CPC (°C)\")\nax2.set_xlabel(\"Time\")\nax2.grid(True, alpha=0.3)\n\n# ----------------------------------------------------------------------\n# Figure 2: square scatter of reconstruction vs CPC monthly anomalies\n# ----------------------------------------------------------------------\nfig2, ax = plt.subplots(figsize=(6.5, 6.5))\n\nx = comp[\"CPC_9120\"].values\ny = comp[\"RECON_9120\"].values\nax.scatter(x, y, s=8, alpha=0.45, color=\"tab:green\", edgecolors=\"none\")\n\nlo = float(min(np.nanmin(x), np.nanmin(y)))\nhi = float(max(np.nanmax(x), np.nanmax(y)))\npad = 0.10\nlim = (lo - pad, hi + pad)\n\nax.plot(lim, lim, \"k--\", lw=1.0, label=\"1:1 line\")\nax.set_xlim(lim)\nax.set_ylim(lim)\nax.set_aspect(\"equal\", adjustable=\"box\")\n\nticks = np.arange(\n    np.floor(lim[0] * 2.0) / 2.0,\n    np.ceil(lim[1] * 2.0) / 2.0 + 0.25,\n    0.5,\n)\nax.set_xticks(ticks)\nax.set_yticks(ticks)\n\nax.set_xlabel(\"CPC Niño 3.4 anomaly 1991-2020 (°C)\")\nax.set_ylabel(\"RECON_9120 (°C)\")\nax.grid(True, alpha=0.3)\nax.text(\n    0.04, 0.96,\n    f\"Pearson r = {corr_9120_cpc_6:.6f}\\nRMSE = {rmse_9120_cpc_4:.4f} °C\",\n    transform=ax.transAxes,\n    va=\"top\",\n    fontsize=9,\n)\nax.legend(loc=\"lower right\", fontsize=8)\nax.set_title(\"Monthly Niño 3.4: reconstruction vs CPC\")\n</visualize>",
+      "compute_iterations": [
+        {
+          "iteration": 1,
+          "code": "import numpy as np\nimport pandas as pd\nimport xarray as xr\n\n# ----------------------------------------------------------------------\n# 1. Rebuild Niño 3.4 from the raw ERSSTv5 gridded SST field\n# ----------------------------------------------------------------------\nersst_path = \"/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc\"\nds = xr.open_dataset(ersst_path)\nsst = ds[\"sst\"].sel(time=slice(\"1950-01-01\", \"2023-12-31\"))\n\n# ERSSTv5 is on 0-360 longitude.  170W-120W = 190E-240E.\nlat_n34 = sst[\"lat\"].where((sst[\"lat\"] >= -5) & (sst[\"lat\"] <= 5), drop=True)\nlon_n34 = sst[\"lon\"].where((sst[\"lon\"] >= 190) & (sst[\"lon\"] <= 240), drop=True)\nsst_n34 = sst.sel(lat=lat_n34, lon=lon_n34)\n\n# Area-weighted regional mean over the Niño 3.4 box.\nw = np.cos(np.deg2rad(sst_n34[\"lat\"]))\nn34_monthly = sst_n34.weighted(w).mean(dim=(\"lat\", \"lon\")).load()\n\ndef monthly_anomaly(da, base_start, base_end):\n    base = da.sel(time=slice(base_start, base_end))\n    clim = base.groupby(\"time.month\").mean(\"time\")\n    return da.groupby(\"time.month\") - clim\n\nrecon_9120_da = monthly_anomaly(n34_monthly, \"1991-01-01\", \"2020-12-31\")\nrecon_8110_da = monthly_anomaly(n34_monthly, \"1981-01-01\", \"2010-12-31\")\n\ndef to_period_series(da, name):\n    s = da.to_series()\n    try:\n        idx = pd.PeriodIndex(pd.to_datetime(s.index), freq=\"M\")\n    except Exception:\n        idx = pd.PeriodIndex(\n            year=[t.year for t in s.index],\n            month=[t.month for t in s.index],\n            freq=\"M\",\n        )\n    s.index = idx\n    s.name = name\n    return s.sort_index()\n\nRECON_9120 = to_period_series(recon_9120_da, \"RECON_9120\")\nRECON_8110 = to_period_series(recon_8110_da, \"RECON_8110\")\n\n# ----------------------------------------------------------------------\n# 2. Read CPC monthly Niño indices and ONI\n# ----------------------------------------------------------------------\ndef read_cpc_nino_monthly(path):\n    rows = []\n    with open(path, \"r\") as fh:\n        for line in fh:\n            line = line.strip()\n            if not line or line.startswith(\"#\"):\n                continue\n            parts = line.split()\n            if parts[0].upper() in (\"YR\", \"YEAR\"):\n                continue\n            if len(parts) < 10:\n                continue\n            try:\n                vals = [float(parts[i]) for i in range(10)]\n            except ValueError:\n                continue\n            rows.append(vals)\n    cols = [\n        \"YR\", \"MON\",\n        \"NINO1+2\", \"ANOM1+2\",\n        \"NINO3\", \"ANOM3\",\n        \"NINO4\", \"ANOM4\",\n        \"NINO3.4\", \"ANOM3.4\",\n    ]\n    df = pd.DataFrame(rows, columns=cols)\n    df[\"time\"] = pd.PeriodIndex(\n        year=df[\"YR\"].astype(int),\n        month=df[\"MON\"].astype(int),\n        freq=\"M\",\n    )\n    return df.set_index(\"time\").sort_index()\n\ncpc91 = read_cpc_nino_monthly(\n    \"/data1/lorraine-20419/ocean_data/CPC/ersst5.nino.mth.91-20.ascii\"\n)\ncpc81 = read_cpc_nino_monthly(\n    \"/data1/lorraine-20419/ocean_data/CPC/ersst5.nino.mth.81-10.ascii\"\n)\ncpc_9120_n34 = cpc91[\"ANOM3.4\"].loc[\"1950-01\":\"2023-12\"]\ncpc_8110_n34 = cpc81[\"ANOM3.4\"].loc[\"1950-01\":\"2020-12\"]\n\nseason_center_month = {\n    \"DJF\": 1, \"JFM\": 2, \"FMA\": 3, \"MAM\": 4,\n    \"AMJ\": 5, \"MJJ\": 6, \"JJA\": 7, \"JAS\": 8,\n    \"ASO\": 9, \"SON\": 10, \"OND\": 11, \"NDJ\": 12,\n}\n\ndef read_oni(path):\n    rows = []\n    with open(path, \"r\") as fh:\n        for line in fh:\n            line = line.strip()\n            if not line or line.startswith(\"#\"):\n                continue\n            parts = line.split()\n            if parts[0].upper() == \"SEAS\":\n                continue\n            if len(parts) < 4:\n                continue\n            seas = parts[0].upper()\n            if seas not in season_center_month:\n                continue\n            try:\n                yr = int(float(parts[1]))\n                total = float(parts[2])\n                anom = float(parts[3])\n            except ValueError:\n                continue\n            rows.append((seas, yr, total, anom))\n    df = pd.DataFrame(rows, columns=[\"SEAS\", \"YR\", \"TOTAL\", \"ANOM\"])\n    df[\"month\"] = df[\"SEAS\"].map(season_center_month).astype(int)\n    df[\"time\"] = pd.PeriodIndex(\n        year=df[\"YR\"].astype(int),\n        month=df[\"month\"],\n        freq=\"M\",\n    )\n    return df.set_index(\"time\").sort_index()\n\noni = read_oni(\"/data1/lorraine-20419/ocean_data/CPC/oni.ascii.txt\")\noni_n34 = oni[\"ANOM\"].loc[\"1950-01\":\"2023-12\"]\n\n# ----------------------------------------------------------------------\n# 3. Compare reconstruction against CPC 1991-2020 monthly anomalies\n# ----------------------------------------------------------------------\ncomp = pd.concat(\n    [\n        RECON_9120.rename(\"RECON_9120\"),\n        cpc_9120_n34.rename(\"CPC_9120\"),\n    ],\n    axis=1,\n    join=\"inner\",\n).dropna().loc[\"1950-01\":\"2023-12\"]\n\ndiff_recon_cpc = comp[\"RECON_9120\"] - comp[\"CPC_9120\"]\ncorr_9120_cpc = float(comp[\"RECON_9120\"].corr(comp[\"CPC_9120\"]))\nrmse_9120_cpc = float(np.sqrt(np.mean(diff_recon_cpc**2)))\nmax_abs_dev_time = diff_recon_cpc.abs().idxmax()\nmax_abs_dev_9120_cpc = float(diff_recon_cpc.abs().max())\nmax_abs_dev_signed = float(diff_recon_cpc.loc[max_abs_dev_time])\nmax_abs_dev_year = int(max_abs_dev_time.year)\nmax_abs_dev_month = int(max_abs_dev_time.month)\n\ncorr_9120_cpc_6 = round(corr_9120_cpc, 6)\nrmse_9120_cpc_4 = round(rmse_9120_cpc, 4)\nmax_abs_dev_9120_cpc_4 = round(max_abs_dev_9120_cpc, 4)\n\n# ----------------------------------------------------------------------\n# 4. Event detection under the operational ONI threshold criterion\n# ----------------------------------------------------------------------\ndef find_threshold_events(series, threshold, warm=True, min_len=5):\n    \"\"\"Return contiguous runs of length >= min_len with values >= threshold\n    (warm=True) or <= threshold (warm=False).  Each run is one event; the\n    event peak is the max (min for La Niña) 3-month running-mean value.\"\"\"\n    s = series.dropna().sort_index()\n    mask = (s >= threshold) if warm else (s <= threshold)\n\n    events = []\n    run = []\n\n    def add_run(run_periods):\n        if len(run_periods) < min_len:\n            return\n        seg = s.loc[run_periods]\n        if warm:\n            peak_time = seg.idxmax()\n            peak_value = float(seg.max())\n        else:\n            peak_time = seg.idxmin()\n            peak_value = float(seg.min())\n        events.append(\n            {\n                \"start\": run_periods[0],\n                \"end\": run_periods[-1],\n                \"length\": len(run_periods),\n                \"peak_time\": peak_time,\n                \"peak_value\": peak_value,\n            }\n        )\n\n    for t, flag in mask.items():\n        if bool(flag):\n            run.append(t)\n        else:\n            add_run(run)\n            run = []\n    add_run(run)\n    return events\n\n# 3-month centred running mean of the reconstruction.\nrecon_9120_run3 = RECON_9120.rolling(window=3, center=True, min_periods=3).mean()\n\nelnino_events_recon = find_threshold_events(\n    recon_9120_run3, 0.5, warm=True, min_len=5\n)\nlanina_events_recon = find_threshold_events(\n    recon_9120_run3, -0.5, warm=False, min_len=5\n)\nn_elnino_recon = len(elnino_events_recon)\ntop3_elnino_recon = sorted(\n    elnino_events_recon, key=lambda e: e[\"peak_value\"], reverse=True\n)[:3]\ntop3_elnino_recon_table = pd.DataFrame(\n    [\n        {\n            \"year\": int(e[\"peak_time\"].year),\n            \"month\": int(e[\"peak_time\"].month),\n            \"peak_value\": round(e[\"peak_value\"], 2),\n            \"start\": e[\"start\"],\n            \"end\": e[\"end\"],\n            \"length\": e[\"length\"],\n        }\n        for e in top3_elnino_recon\n    ]\n)\n\n# ONI is already a 3-month running mean.\nelnino_events_oni = find_threshold_events(\n    oni_n34, 0.5, warm=True, min_len=5\n)\nlanina_events_oni = find_threshold_events(\n    oni_n34, -0.5, warm=False, min_len=5\n)\nn_elnino_oni = len(elnino_events_oni)\ntop3_elnino_oni = sorted(\n    elnino_events_oni, key=lambda e: e[\"peak_value\"], reverse=True\n)[:3]\ntop3_elnino_oni_table = pd.DataFrame(\n    [\n        {\n            \"year\": int(e[\"peak_time\"].year),\n            \"month\": int(e[\"peak_time\"].month),\n            \"peak_value\": round(e[\"peak_value\"], 2),\n            \"start\": e[\"start\"],\n            \"end\": e[\"end\"],\n            \"length\": e[\"length\"],\n        }\n        for e in top3_elnino_oni\n    ]\n)\n\nn_elnino_count_difference = n_elnino_recon - n_elnino_oni\ncount_explanation = (\n    \"RECON_9120 uses one fixed 1991-2020 monthly climatology for the whole record, \"\n    \"while the official CPC ONI uses a 30-year centred normal that is rolled forward \"\n    \"every five years, together with CPC's operational Nino3.4 processing.  Seasons \"\n    \"close to the +/-0.5 degC threshold can therefore fall on different sides of the \"\n    \"criterion, so the number of qualifying events can differ.\"\n)\n\n# ----------------------------------------------------------------------\n# 5. Baseline offsets: 1981-2010 minus 1991-2020\n# ----------------------------------------------------------------------\nrecon_baseline_comp = pd.concat(\n    [\n        RECON_8110.rename(\"RECON_8110\"),\n        RECON_9120.rename(\"RECON_9120\"),\n    ],\n    axis=1,\n    join=\"inner\",\n).dropna().loc[\"1950-01\":\"2020-12\"]\n\noffset_recon_8110_minus_9120 = float(\n    (recon_baseline_comp[\"RECON_8110\"]\n     - recon_baseline_comp[\"RECON_9120\"]).mean()\n)\noffset_recon_8110_minus_9120_3 = round(offset_recon_8110_minus_9120, 3)\n\ncpc_baseline_comp = pd.concat(\n    [\n        cpc_8110_n34.rename(\"CPC_8110\"),\n        cpc_9120_n34.rename(\"CPC_9120\"),\n    ],\n    axis=1,\n    join=\"inner\",\n).dropna().loc[\"1950-01\":\"2020-12\"]\n\noffset_cpc_8110_minus_9120 = float(\n    (cpc_baseline_comp[\"CPC_8110\"]\n     - cpc_baseline_comp[\"CPC_9120\"]).mean()\n)\noffset_cpc_8110_minus_9120_3 = round(offset_cpc_8110_minus_9120, 3)\n\noffset_agreement_abs = abs(\n    offset_recon_8110_minus_9120 - offset_cpc_8110_minus_9120\n)\noffset_agreement_abs_3 = round(offset_agreement_abs, 3)",
+          "success": true,
+          "materialized_results": {
+            "materialized": 0
+          },
+          "output": {
+            "ersst_path": "/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc",
+            "ds": {
+              "time_bnds": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 2072,
+                  "nbnds": 2
+                },
+                "long_name": "Time Boundaries",
+                "size": 4144,
+                "n_valid": 4144,
+                "min": 9.969209968386869e+36,
+                "max": 9.969209968386869e+36,
+                "mean": 9.969209968386869e+36,
+                "std": 0.0
+              },
+              "sst": {
+                "type": "DataArray",
+                "dims": {
+                  "time": 2072,
+                  "lat": 89,
+                  "lon": 180
+                },
+                "units": "degC",
+                "long_name": "Monthly Means of Sea Surface Temperature",
+                "size": 33193440,
+                "n_valid": 22767136,
+                "min": -1.7999999523162842,
+                "max": 42.326358795166016,
+                "mean": 13.565886497497559,
+                "std": 11.497235298156738
+              }
+            },
+            "sst": {
+              "type": "DataArray",
+              "dims": {
+                "time": 888,
+                "lat": 89,
+                "lon": 180
+              },
+              "units": "degC",
+              "long_name": "Monthly Means of Sea Surface Temperature",
+              "size": 14225760,
+              "n_valid": 9757344,
+              "min": -1.7999999523162842,
+              "max": 34.33403396606445,
+              "mean": 13.73912239074707,
+              "std": 11.535490989685059
+            },
+            "lat_n34": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 5
+              },
+              "units": "degrees_north",
+              "long_name": "Latitude",
+              "size": 5,
+              "n_valid": 5,
+              "min": -4.0,
+              "max": 4.0,
+              "mean": 0.0,
+              "std": 2.8284270763397217,
+              "values": [
+                4.0,
+                2.0,
+                0.0,
+                -2.0,
+                -4.0
+              ]
+            },
+            "lon_n34": {
+              "type": "DataArray",
+              "dims": {
+                "lon": 26
+              },
+              "units": "degrees_east",
+              "long_name": "Longitude",
+              "size": 26,
+              "n_valid": 26,
+              "min": 190.0,
+              "max": 240.0,
+              "mean": 215.0,
+              "std": 15.0,
+              "values": [
+                190.0,
+                192.0,
+                194.0,
+                196.0,
+                198.0,
+                200.0,
+                202.0,
+                204.0,
+                206.0,
+                208.0,
+                210.0,
+                212.0,
+                214.0,
+                216.0,
+                218.0,
+                220.0,
+                222.0,
+                224.0,
+                226.0,
+                228.0,
+                230.0,
+                232.0,
+                234.0,
+                236.0,
+                238.0,
+                240.0
+              ]
+            },
+            "sst_n34": {
+              "type": "DataArray",
+              "dims": {
+                "time": 888,
+                "lat": 5,
+                "lon": 26
+              },
+              "units": "degC",
+              "long_name": "Monthly Means of Sea Surface Temperature",
+              "size": 115440,
+              "n_valid": 115440,
+              "min": 21.128305435180664,
+              "max": 30.721078872680664,
+              "mean": 26.898839950561523,
+              "std": 1.3982429504394531
+            },
+            "w": {
+              "type": "DataArray",
+              "dims": {
+                "lat": 5
+              },
+              "units": "degrees_north",
+              "long_name": "Latitude",
+              "size": 5,
+              "n_valid": 5,
+              "min": 0.9975640773773193,
+              "max": 1.0,
+              "mean": 0.9987819790840149,
+              "std": 0.0010189767926931381,
+              "values": [
+                0.9975640177726746,
+                0.9993910193443298,
+                1.0,
+                0.9993910193443298,
+                0.9975640177726746
+              ]
+            },
+            "n34_monthly": {
+              "type": "DataArray",
+              "dims": {
+                "time": 888
+              },
+              "units": "degC",
+              "long_name": "Monthly Means of Sea Surface Temperature",
+              "size": 888,
+              "n_valid": 888,
+              "min": 24.251270294189453,
+              "max": 29.41488265991211,
+              "mean": 26.898496627807617,
+              "std": 0.9856496453285217
+            },
+            "recon_9120_da": {
+              "type": "DataArray",
+              "dims": {
+                "time": 888
+              },
+              "units": "degC",
+              "long_name": "Monthly Means of Sea Surface Temperature",
+              "size": 888,
+              "n_valid": 888,
+              "min": -2.452564239501953,
+              "max": 2.711048126220703,
+              "mean": -0.18455231511915052,
+              "std": 0.8743461904474855
+            },
+            "recon_8110_da": {
+              "type": "DataArray",
+              "dims": {
+                "time": 888
+              },
+              "units": "degC",
+              "long_name": "Monthly Means of Sea Surface Temperature",
+              "size": 888,
+              "n_valid": 888,
+              "min": -2.3761425018310547,
+              "max": 2.7874698638916016,
+              "mean": -0.12439581080599948,
+              "std": 0.8739837889733708
+            },
+            "RECON_9120": "time\n1950-01   -1.993626\n1950-02   -1.696320\n1950-03   -1.417004\n1950-04   -1.538250\n1950-05   -1.743534\n             ...   \n2023-08    1.348202\n2023-09    1.598574\n2023-10    1.719954\n2023-11    2.023518\n2023-12    2.031172\nFreq: M, Name: RECON_9120, Length: 888, dtype: float64",
+            "RECON_8110": "time\n1950-01   -1.998661\n1950-02   -1.684095\n1950-03   -1.366011\n1950-04   -1.428074\n1950-05   -1.620701\n             ...   \n2023-08    1.371952\n2023-09    1.591513\n2023-10    1.765284\n2023-11    2.099939\n2023-12    2.069445\nFreq: M, Name: RECON_8110, Length: 888, dtype: float64",
+            "cpc91": "             YR  MON  NINO1+2  ANOM1+2  ...  NINO4  ANOM4  NINO3.4  ANOM3.4\ntime                                    ...                                \n1950-01  1950.0  1.0    23.01    -1.55  ...  26.94  -1.38    24.55    -1.99\n1950-02  1950.0  2.0    24.32    -1.78  ...  26.67  -1.53    25.06    -1.69\n1950-03  1950.0  3.0    25.11    -1.38  ...  26.52  -1.80    25.87    -1.42\n1950-04  1950.0  4.0    23.63    -1.90  ...  26.90  -1.73    26.28    -1.54\n1950-05  1950.0  5.0    22.68    -1.74  ...  27.73  -1.18    26.18    -1.75\n...         ...  ...      ...      ...  ...    ...    ...      ...      ...\n2026-02  2026.0  2.0    26.82     0.71  ...  28.40   0.20    26.48    -0.27\n2026-03  2026.0  3.0    27.38     0.89  ...  28.75   0.43    27.27    -0.01\n2026-04  2026.0  4.0    26.85     1.31  ",
+            "cpc81": "             YR   MON  NINO1+2  ANOM1+2  ...  NINO4  ANOM4  NINO3.4  ANOM3.4\ntime                                     ...                                \n1950-01  1950.0   1.0    23.01    -1.53  ...  26.94  -1.30    24.55    -2.00\n1950-02  1950.0   2.0    24.32    -1.70  ...  26.67  -1.43    25.06    -1.68\n1950-03  1950.0   3.0    25.11    -1.31  ...  26.52  -1.68    25.87    -1.37\n1950-04  1950.0   4.0    23.63    -1.83  ...  26.90  -1.55    26.28    -1.43\n1950-05  1950.0   5.0    22.68    -1.59  ...  27.73  -1.01    26.18    -1.63\n...         ...   ...      ...      ...  ...    ...    ...      ...      ...\n2020-08  2020.0   8.0    19.96    -1.05  ...  28.48  -0.17    26.27    -0.57\n2020-09  2020.0   9.0    19.50    -1.23  ...  28.21  -0.45    25.89    -0.84\n2020-10  2020.0  10.0    20.25",
+            "cpc_9120_n34": "time\n1950-01   -1.99\n1950-02   -1.69\n1950-03   -1.42\n1950-04   -1.54\n1950-05   -1.75\n           ... \n2023-08    1.35\n2023-09    1.60\n2023-10    1.72\n2023-11    2.02\n2023-12    2.03\nFreq: M, Name: ANOM3.4, Length: 888, dtype: float64",
+            "cpc_8110_n34": "time\n1950-01   -2.00\n1950-02   -1.68\n1950-03   -1.37\n1950-04   -1.43\n1950-05   -1.63\n           ... \n2020-08   -0.57\n2020-09   -0.84\n2020-10   -1.21\n2020-11   -1.33\n2020-12   -1.14\nFreq: M, Name: ANOM3.4, Length: 852, dtype: float64",
+            "season_center_month": {
+              "DJF": 1,
+              "JFM": 2,
+              "FMA": 3,
+              "MAM": 4,
+              "AMJ": 5,
+              "MJJ": 6,
+              "JJA": 7,
+              "JAS": 8,
+              "ASO": 9,
+              "SON": 10,
+              "OND": 11,
+              "NDJ": 12
+            },
+            "oni": "        SEAS    YR  TOTAL  ANOM  month\ntime                                  \n1950-01  DJF  1950  25.01 -1.32      1\n1950-02  JFM  1950  25.36 -1.20      2\n1950-03  FMA  1950  25.88 -1.12      3\n1950-04  MAM  1950  26.24 -1.08      4\n1950-05  AMJ  1950  26.35 -1.10      5\n...      ...   ...    ...   ...    ...\n2026-03  FMA  2026  27.34  0.11      3\n2026-04  MAM  2026  28.09  0.46      4\n2026-05  AMJ  2026  28.74  0.95      5\n2026-06  MJJ  2026  29.02  1.39      6\n2026-07  JJA  2026  29.09  1.80      7\n\n[919 rows x 5 columns]",
+            "oni_n34": "time\n1950-01   -1.32\n1950-02   -1.20\n1950-03   -1.12\n1950-04   -1.08\n1950-05   -1.10\n           ... \n2023-08    1.25\n2023-09    1.50\n2023-10    1.74\n2023-11    1.90\n2023-12    1.99\nFreq: M, Name: ANOM, Length: 888, dtype: float64",
+            "comp": "         RECON_9120  CPC_9120\ntime                         \n1950-01   -1.993626     -1.99\n1950-02   -1.696320     -1.69\n1950-03   -1.417004     -1.42\n1950-04   -1.538250     -1.54\n1950-05   -1.743534     -1.75\n...             ...       ...\n2023-08    1.348202      1.35\n2023-09    1.598574      1.60\n2023-10    1.719954      1.72\n2023-11    2.023518      2.02\n2023-12    2.031172      2.03\n\n[888 rows x 2 columns]",
+            "diff_recon_cpc": "time\n1950-01   -0.003626\n1950-02   -0.006320\n1950-03    0.002996\n1950-04    0.001750\n1950-05    0.006466\n             ...   \n2023-08   -0.001798\n2023-09   -0.001426\n2023-10   -0.000046\n2023-11    0.003518\n2023-12    0.001172\nFreq: M, Length: 888, dtype: float64",
+            "corr_9120_cpc": 0.9999715691978822,
+            "rmse_9120_cpc": 0.007475235748993,
+            "max_abs_dev_time": "1992-01",
+            "max_abs_dev_9120_cpc": 0.022621002197265705,
+            "max_abs_dev_signed": -0.022621002197265705,
+            "max_abs_dev_year": 1992,
+            "max_abs_dev_month": 1,
+            "corr_9120_cpc_6": 0.999972,
+            "rmse_9120_cpc_4": 0.0075,
+            "max_abs_dev_9120_cpc_4": 0.0226,
+            "recon_9120_run3": "time\n1950-01         NaN\n1950-02   -1.702316\n1950-03   -1.550524\n1950-04   -1.566263\n1950-05   -1.514212\n             ...   \n2023-08    1.322332\n2023-09    1.555576\n2023-10    1.780682\n2023-11    1.924881\n2023-12         NaN\nFreq: M, Name: RECON_9120, Length: 888, dtype: float64",
+            "elnino_events_recon": [
+              {
+                "start": "1957-05",
+                "end": "1958-04",
+                "length": 12,
+                "peak_time": "1958-01",
+                "peak_value": 1.5091298421223958
+              },
+              {
+                "start": "1963-08",
+                "end": "1964-01",
+                "length": 6,
+                "peak_time": "1963-12",
+                "peak_value": 0.847375233968099
+              },
+              {
+                "start": "1965-07",
+                "end": "1966-03",
+                "length": 9,
+                "peak_time": "1965-11",
+                "peak_value": 1.3941421508789062
+              },
+              {
+                "start": "1972-06",
+                "end": "1973-02",
+                "length": 9,
+                "peak_time": "1972-12",
+                "peak_value": 1.9167016347249348
+              },
+              {
+                "start": "1982-07",
+                "end": "1983-05",
+                "length": 11,
+                "peak_time": "1983-01",
+                "peak_value": 2.1474196116129556
+              },
+              {
+                "start": "1986-09",
+                "end": "1988-01",
+                "length": 17,
+                "peak_time": "1987-08",
+                "peak_value": 1.4937076568603516
+              },
+              {
+                "start": "1991-06",
+                "end": "1992-06",
+                "length": 13,
+                "peak_time": "1992-01",
+                "peak_value": 1.750881830851237
+              },
+              {
+                "start": "1994-09",
+                "end": "1995-02",
+                "length": 6,
+                "peak_time": "1994-12",
+                "peak_value": 1.124746322631836
+              },
+              {
+                "start": "1997-05",
+                "end": "1998-04",
+                "length": 12,
+                "peak_time": "1997-12",
+                "peak_value": 2.3533267974853516
+              },
+              {
+                "start": "2002-06",
+                "end": "2003-02",
+                "length": 9,
+                "peak_time": "2002-11",
+                "peak_value": 1.3538646697998047
+              },
+              {
+                "start": "2004-08",
+                "end": "2005-01",
+                "length": 6,
+                "peak_time": "2004-09",
+                "peak_value": 0.7571976979573568
+              },
+              {
+                "start": "2006-09",
+                "end": "2007-01",
+                "length": 5,
+                "peak_time": "2006-12",
+                "peak_value": 0.9437141418457031
+              },
+              {
+                "start": "2009-08",
+                "end": "2010-03",
+                "length": 8,
+                "peak_time": "2009-12",
+                "peak_value": 1.564300537109375
+              },
+              {
+                "start": "2015-03",
+                "end": "2016-04",
+                "length": 14,
+                "peak_time": "2015-12",
+                "peak_value": 2.6435267130533853
+              },
+              {
+                "start": "2018-09",
+                "end": "2019-05",
+                "length": 9,
+                "peak_time": "2018-11",
+                "peak_value": 0.9099458058675131
+              },
+              {
+                "start": "2023-06",
+                "end": "2023-11",
+                "length": 6,
+                "peak_time": "2023-11",
+                "peak_value": 1.9248809814453125
+              }
+            ],
+            "lanina_events_recon": {
+              "type": "list",
+              "length": 25,
+              "head": [
+                {
+                  "start": "1950-02",
+                  "end": "1951-03",
+                  "length": 14,
+                  "peak_time": "1950-02",
+                  "peak_value": -1.7023162841796875
+                },
+                {
+                  "start": "1954-04",
+                  "end": "1957-01",
+                  "length": 34,
+                  "peak_time": "1955-11",
+                  "peak_value": -2.265371322631836
+                },
+                {
+                  "start": "1959-07",
+                  "end": "1959-11",
+                  "length": 5,
+                  "peak_time": "1959-08",
+                  "peak_value": -0.8107687632242838
+                },
+                {
+                  "start": "1961-08",
+                  "end": "1963-01",
+                  "length": 18,
+                  "peak_time": "1962-12",
+                  "peak_value": -0.8889687856038412
+                },
+                {
+                  "start": "1964-04",
+                  "end": "1965-02",
+                  "length": 11,
+                  "peak_time": "1964-10",
+                  "peak_value": -1.4028269449869792
+                }
+              ]
+            },
+            "n_elnino_recon": 16,
+            "top3_elnino_recon": [
+              {
+                "start": "2015-03",
+                "end": "2016-04",
+                "length": 14,
+                "peak_time": "2015-12",
+                "peak_value": 2.6435267130533853
+              },
+              {
+                "start": "1997-05",
+                "end": "1998-04",
+                "length": 12,
+                "peak_time": "1997-12",
+                "peak_value": 2.3533267974853516
+              },
+              {
+                "start": "1982-07",
+                "end": "1983-05",
+                "length": 11,
+                "peak_time": "1983-01",
+                "peak_value": 2.1474196116129556
+              }
+            ],
+            "top3_elnino_recon_table": "   year  month  peak_value    start      end  length\n0  2015     12        2.64  2015-03  2016-04      14\n1  1997     12        2.35  1997-05  1998-04      12\n2  1983      1        2.15  1982-07  1983-05      11",
+            "elnino_events_oni": {
+              "type": "list",
+              "length": 22,
+              "head": [
+                {
+                  "start": "1951-06",
+                  "end": "1952-01",
+                  "length": 8,
+                  "peak_time": "1951-10",
+                  "peak_value": 1.03
+                },
+                {
+                  "start": "1953-04",
+                  "end": "1953-12",
+                  "length": 9,
+                  "peak_time": "1953-10",
+                  "peak_value": 0.78
+                },
+                {
+                  "start": "1957-04",
+                  "end": "1958-05",
+                  "length": 14,
+                  "peak_time": "1958-01",
+                  "peak_value": 1.69
+                },
+                {
+                  "start": "1963-07",
+                  "end": "1964-02",
+                  "length": 8,
+                  "peak_time": "1963-11",
+                  "peak_value": 1.19
+                },
+                {
+                  "start": "1965-06",
+                  "end": "1966-03",
+                  "length": 10,
+                  "peak_time": "1965-11",
+                  "peak_value": 1.82
+                }
+              ]
+            },
+            "lanina_events_oni": [
+              {
+                "start": "1950-01",
+                "end": "1951-01",
+                "length": 13,
+                "peak_time": "1950-01",
+                "peak_value": -1.32
+              },
+              {
+                "start": "1955-03",
+                "end": "1956-04",
+                "length": 14,
+                "peak_time": "1955-11",
+                "peak_value": -1.59
+              },
+              {
+                "start": "1964-05",
+                "end": "1965-01",
+                "length": 9,
+                "peak_time": "1964-10",
+                "peak_value": -0.8
+              },
+              {
+                "start": "1970-07",
+                "end": "1972-01",
+                "length": 19,
+                "peak_time": "1971-02",
+                "peak_value": -1.36
+              },
+              {
+                "start": "1973-05",
+                "end": "1974-06",
+                "length": 14,
+                "peak_time": "1973-12",
+                "peak_value": -2.04
+              },
+              {
+                "start": "1974-10",
+                "end": "1976-03",
+                "length": 18,
+                "peak_time": "1975-12",
+                "peak_value": -1.58
+              },
+              {
+                "start": "1983-10",
+                "end": "1984-02",
+                "length": 5,
+                "peak_time": "1983-11",
+                "peak_value": -0.96
+              },
+              {
+                "start": "1984-10",
+                "end": "1985-06",
+                "length": 9,
+                "peak_time": "1984-12",
+                "peak_value": -1.06
+              },
+              {
+                "start": "1988-05",
+                "end": "1989-05",
+                "length": 13,
+                "peak_time": "1988-12",
+                "peak_value": -1.85
+              },
+              {
+                "start": "1995-08",
+                "end": "1996-03",
+                "length": 8,
+                "peak_time": "1995-11",
+                "peak_value": -1.05
+              },
+              {
+                "start": "1998-07",
+                "end": "2000-06",
+                "length": 24,
+                "peak_time": "1999-12",
+                "peak_value": -1.53
+              },
+              {
+                "start": "2000-10",
+                "end": "2001-02",
+                "length": 5,
+                "peak_time": "2000-12",
+                "peak_value": -0.78
+              },
+              {
+                "start": "2005-11",
+                "end": "2006-03",
+                "length": 5,
+                "peak_time": "2006-01",
+                "peak_value": -0.86
+              },
+              {
+                "start": "2007-08",
+                "end": "2008-06",
+                "length": 11,
+                "peak_time": "2008-01",
+                "peak_value": -1.76
+              },
+              {
+                "start": "2008-11",
+                "end": "2009-03",
+                "length": 5,
+                "peak_time": "2009-01",
+                "peak_value": -0.89
+              },
+              {
+                "start": "2010-06",
+                "end": "2011-05",
+                "length": 12,
+                "peak_time": "2010-11",
+                "peak_value": -1.57
+              },
+              {
+                "start": "2011-08",
+                "end": "2012-02",
+                "length": 7,
+                "peak_time": "2011-11",
+                "peak_value": -1.02
+              },
+              {
+                "start": "2017-11",
+                "end": "2018-03",
+                "length": 5,
+                "peak_time": "2017-12",
+                "peak_value": -0.76
+              },
+              {
+                "start": "2020-09",
+                "end": "2021-04",
+                "length": 8,
+                "peak_time": "2020-11",
+                "peak_value": -1.11
+              },
+              {
+                "start": "2021-09",
+                "end": "2023-01",
+                "length": 17,
+                "peak_time": "2021-11",
+                "peak_value": -0.91
+              }
+            ],
+            "n_elnino_oni": 22,
+            "top3_elnino_oni": [
+              {
+                "start": "2014-10",
+                "end": "2016-05",
+                "length": 20,
+                "peak_time": "2015-12",
+                "peak_value": 2.59
+              },
+              {
+                "start": "1997-05",
+                "end": "1998-04",
+                "length": 12,
+                "peak_time": "1997-12",
+                "peak_value": 2.37
+              },
+              {
+                "start": "1982-05",
+                "end": "1983-06",
+                "length": 14,
+                "peak_time": "1983-01",
+                "peak_value": 2.14
+              }
+            ],
+            "top3_elnino_oni_table": "   year  month  peak_value    start      end  length\n0  2015     12        2.59  2014-10  2016-05      20\n1  1997     12        2.37  1997-05  1998-04      12\n2  1983      1        2.14  1982-05  1983-06      14",
+            "n_elnino_count_difference": -6,
+            "count_explanation": "RECON_9120 uses one fixed 1991-2020 monthly climatology for the whole record, while the official CPC ONI uses a 30-year centred normal that is rolled forward every five years, together with CPC's operational Nino3.4 processing.  Seasons close to the +/-0.5 degC threshold can therefore fall on different sides of the criterion, so the number of qualifying events can differ.",
+            "recon_baseline_comp": "         RECON_8110  RECON_9120\ntime                           \n1950-01   -1.998661   -1.993626\n1950-02   -1.684095   -1.696320\n1950-03   -1.366011   -1.417004\n1950-04   -1.428074   -1.538250\n1950-05   -1.620701   -1.743534\n...             ...         ...\n2020-08   -0.561388   -0.585138\n2020-09   -0.832939   -0.825878\n2020-10   -1.204687   -1.250017\n2020-11   -1.338301   -1.414722\n2020-12   -1.111248   -1.149521\n\n[852 rows x 2 columns]",
+            "offset_recon_8110_minus_9120": 0.06015650431315104,
+            "offset_recon_8110_minus_9120_3": 0.06,
+            "cpc_baseline_comp": "         CPC_8110  CPC_9120\ntime                       \n1950-01     -2.00     -1.99\n1950-02     -1.68     -1.69\n1950-03     -1.37     -1.42\n1950-04     -1.43     -1.54\n1950-05     -1.63     -1.75\n...           ...       ...\n2020-08     -0.57     -0.59\n2020-09     -0.84     -0.83\n2020-10     -1.21     -1.26\n2020-11     -1.33     -1.42\n2020-12     -1.14     -1.15\n\n[852 rows x 2 columns]",
+            "offset_cpc_8110_minus_9120": 0.058333333333333334,
+            "offset_cpc_8110_minus_9120_3": 0.058,
+            "offset_agreement_abs": 0.001823170979817705,
+            "offset_agreement_abs_3": 0.002
+          }
+        }
+      ],
+      "visualization_iterations": [
+        {
+          "iteration": 1,
+          "code": "# ----------------------------------------------------------------------\n# Figure 1: reconstruction, CPC monthly, running mean and event shading\n# ----------------------------------------------------------------------\nfig1, (ax1, ax2) = plt.subplots(\n    2, 1, figsize=(14, 8), sharex=True,\n    gridspec_kw={\"height_ratios\": [3, 1]}\n)\n\nt_comp = comp.index.to_timestamp()\n\nax1.plot(\n    t_comp, comp[\"RECON_9120\"].values,\n    color=\"tab:blue\", lw=0.7, alpha=0.85,\n    label=\"RECON_9120 monthly\"\n)\nax1.plot(\n    t_comp, comp[\"CPC_9120\"].values,\n    color=\"tab:orange\", lw=0.7, alpha=0.85,\n    label=\"CPC 1991-2020 monthly\"\n)\n\nrm = recon_9120_run3.loc[comp.index]\nax1.plot(\n    t_comp, rm.values,\n    color=\"black\", lw=1.6,\n    label=\"RECON 3-month running mean\"\n)\n\nax1.axhline(0.5, color=\"red\", ls=\"--\", lw=0.9, label=\"+0.5 °C\")\nax1.axhline(-0.5, color=\"blue\", ls=\"--\", lw=0.9, label=\"-0.5 °C\")\n\nfor ev in elnino_events_recon:\n    seg = recon_9120_run3.loc[ev[\"start\"]:ev[\"end\"]].dropna()\n    ax1.fill_between(\n        seg.index.to_timestamp(),\n        0.5,\n        seg.values,\n        where=seg.values >= 0.5,\n        color=\"red\",\n        alpha=0.25,\n        interpolate=True,\n        linewidth=0,\n    )\n\nfor ev in lanina_events_recon:\n    seg = recon_9120_run3.loc[ev[\"start\"]:ev[\"end\"]].dropna()\n    ax1.fill_between(\n        seg.index.to_timestamp(),\n        -0.5,\n        seg.values,\n        where=seg.values <= -0.5,\n        color=\"blue\",\n        alpha=0.25,\n        interpolate=True,\n        linewidth=0,\n    )\n\nax1.set_ylabel(\"SST anomaly (°C)\")\nax1.set_xlim(pd.Timestamp(\"1950-01-01\"), pd.Timestamp(\"2023-12-31\"))\nax1.grid(True, alpha=0.3)\nax1.legend(loc=\"upper left\", ncol=2, fontsize=8)\nax1.set_title(\"Niño 3.4 reconstruction vs CPC 1991-2020\")\n\nax2.plot(\n    t_comp,\n    (comp[\"RECON_9120\"] - comp[\"CPC_9120\"]).values,\n    color=\"purple\", lw=0.8,\n)\nax2.axhline(0.0, color=\"black\", lw=0.6)\nax2.set_ylabel(\"RECON − CPC (°C)\")\nax2.set_xlabel(\"Time\")\nax2.grid(True, alpha=0.3)\n\n# ----------------------------------------------------------------------\n# Figure 2: square scatter of reconstruction vs CPC monthly anomalies\n# ----------------------------------------------------------------------\nfig2, ax = plt.subplots(figsize=(6.5, 6.5))\n\nx = comp[\"CPC_9120\"].values\ny = comp[\"RECON_9120\"].values\nax.scatter(x, y, s=8, alpha=0.45, color=\"tab:green\", edgecolors=\"none\")\n\nlo = float(min(np.nanmin(x), np.nanmin(y)))\nhi = float(max(np.nanmax(x), np.nanmax(y)))\npad = 0.10\nlim = (lo - pad, hi + pad)\n\nax.plot(lim, lim, \"k--\", lw=1.0, label=\"1:1 line\")\nax.set_xlim(lim)\nax.set_ylim(lim)\nax.set_aspect(\"equal\", adjustable=\"box\")\n\nticks = np.arange(\n    np.floor(lim[0] * 2.0) / 2.0,\n    np.ceil(lim[1] * 2.0) / 2.0 + 0.25,\n    0.5,\n)\nax.set_xticks(ticks)\nax.set_yticks(ticks)\n\nax.set_xlabel(\"CPC Niño 3.4 anomaly 1991-2020 (°C)\")\nax.set_ylabel(\"RECON_9120 (°C)\")\nax.grid(True, alpha=0.3)\nax.text(\n    0.04, 0.96,\n    f\"Pearson r = {corr_9120_cpc_6:.6f}\\nRMSE = {rmse_9120_cpc_4:.4f} °C\",\n    transform=ax.transAxes,\n    va=\"top\",\n    fontsize=9,\n)\nax.legend(loc=\"lower right\", fontsize=8)\nax.set_title(\"Monthly Niño 3.4: reconstruction vs CPC\")",
+          "success": true,
+          "output": {
+            "fig1": "Figure(1400x800)",
+            "ax1": "Axes(0.125,0.355;0.775x0.525)",
+            "ax2": "Axes(0.125,0.11;0.775x0.175)",
+            "t_comp": "DatetimeIndex(['1950-01-01', '1950-02-01', '1950-03-01', '1950-04-01',\n               '1950-05-01', '1950-06-01', '1950-07-01', '1950-08-01',\n               '1950-09-01', '1950-10-01',\n               ...\n               '2023-03-01', '2023-04-01', '2023-05-01', '2023-06-01',\n               '2023-07-01', '2023-08-01', '2023-09-01', '2023-10-01',\n               '2023-11-01', '2023-12-01'],\n              dtype='datetime64[ns]', name='time', length=888, freq='MS')",
+            "rm": "time\n1950-01         NaN\n1950-02   -1.702316\n1950-03   -1.550524\n1950-04   -1.566263\n1950-05   -1.514212\n             ...   \n2023-08    1.322332\n2023-09    1.555576\n2023-10    1.780682\n2023-11    1.924881\n2023-12         NaN\nFreq: M, Name: RECON_9120, Length: 888, dtype: float64",
+            "fig2": "Figure(650x650)",
+            "ax": "Axes(0.125,0.11;0.775x0.77)",
+            "x": {
+              "type": "ndarray",
+              "shape": [
+                888
+              ],
+              "size": 888,
+              "n_valid": 888,
+              "min": -2.45,
+              "max": 2.72,
+              "mean": -0.18155405405405406,
+              "std": 0.8761708096134565
+            },
+            "y": {
+              "type": "ndarray",
+              "shape": [
+                888
+              ],
+              "size": 888,
+              "n_valid": 888,
+              "min": -2.452564239501953,
+              "max": 2.711048126220703,
+              "mean": -0.18455231511915052,
+              "std": 0.8743461904474855
+            },
+            "lo": -2.452564239501953,
+            "hi": 2.72,
+            "pad": 0.1,
+            "lim": [
+              -2.552564239501953,
+              2.8200000000000003
+            ],
+            "ticks": {
+              "type": "ndarray",
+              "shape": [
+                13
+              ],
+              "size": 13,
+              "n_valid": 13,
+              "min": -3.0,
+              "max": 3.0,
+              "mean": 0.0,
+              "std": 1.8708286933869707,
+              "values": [
+                -3.0,
+                -2.5,
+                -2.0,
+                -1.5,
+                -1.0,
+                -0.5,
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                2.5,
+                3.0
+              ]
+            }
+          },
+          "omitted_loop_variables": [
+            "ev",
+            "seg"
+          ]
+        }
+      ],
+      "visualization_paths": [
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T2_deepseek-flash_20261022_102855/turn01/figures/visualization_T2_deepseek-flash_20261022_102855_turn1_1.png",
+        "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T2_deepseek-flash_20261022_102855/turn01/figures/visualization_T2_deepseek-flash_20261022_102855_turn1_2.png"
+      ],
+      "selected_data": {
+        "name": [
+          "ersst",
+          "cpc_indices"
+        ],
+        "path": [
+          "/data1/lorraine-20419/ocean_data/ERSSTv5",
+          "/data1/lorraine-20419/ocean_data/CPC"
+        ],
+        "how": "inferred from the root directories the executed code names"
+      },
+      "observation": "[\n  {\n    \"type\": \"computation\",\n    \"status\": \"success\",\n    \"results\": {\n      \"ersst_path\": \"/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc\",\n      \"ds\": {\n        \"time_bnds\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 2072,\n            \"nbnds\": 2\n          },\n          \"long_name\": \"Time Boundaries\",\n          \"size\": 4144,\n          \"n_valid\": 4144,\n          \"min\": 9.969209968386869e+36,\n          \"max\": 9.969209968386869e+36,\n          \"mean\": 9.969209968386869e+36,\n          \"std\": 0.0\n        },\n        \"sst\": {\n          \"type\": \"DataArray\",\n          \"dims\": {\n            \"time\": 2072,\n            \"lat\": 89,\n            \"lon\": 180\n          },\n          \"units\": \"degC\",\n          \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n          \"size\": 33193440,\n          \"n_valid\": 22767136,\n          \"min\": -1.7999999523162842,\n          \"max\": 42.326358795166016,\n          \"mean\": 13.565886497497559,\n          \"std\": 11.497235298156738\n        }\n      },\n      \"sst\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 888,\n          \"lat\": 89,\n          \"lon\": 180\n        },\n        \"units\": \"degC\",\n        \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n        \"size\": 14225760,\n        \"n_valid\": 9757344,\n        \"min\": -1.7999999523162842,\n        \"max\": 34.33403396606445,\n        \"mean\": 13.73912239074707,\n        \"std\": 11.535490989685059\n      },\n      \"lat_n34\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"lat\": 5\n        },\n        \"units\": \"degrees_north\",\n        \"long_name\": \"Latitude\",\n        \"size\": 5,\n        \"n_valid\": 5,\n        \"min\": -4.0,\n        \"max\": 4.0,\n        \"mean\": 0.0,\n        \"std\": 2.8284270763397217,\n        \"values\": [\n          4.0,\n          2.0,\n          0.0,\n          -2.0,\n          -4.0\n        ]\n      },\n      \"lon_n34\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"lon\": 26\n        },\n        \"units\": \"degrees_east\",\n        \"long_name\": \"Longitude\",\n        \"size\": 26,\n        \"n_valid\": 26,\n        \"min\": 190.0,\n        \"max\": 240.0,\n        \"mean\": 215.0,\n        \"std\": 15.0,\n        \"values\": [\n          190.0,\n          192.0,\n          194.0,\n          196.0,\n          198.0,\n          200.0,\n          202.0,\n          204.0,\n          206.0,\n          208.0,\n          210.0,\n          212.0,\n          214.0,\n          216.0,\n          218.0,\n          220.0,\n          222.0,\n          224.0,\n          226.0,\n          228.0,\n          230.0,\n          232.0,\n          234.0,\n          236.0,\n          238.0,\n          240.0\n        ]\n      },\n      \"sst_n34\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 888,\n          \"lat\": 5,\n          \"lon\": 26\n        },\n        \"units\": \"degC\",\n        \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n        \"size\": 115440,\n        \"n_valid\": 115440,\n        \"min\": 21.128305435180664,\n        \"max\": 30.721078872680664,\n        \"mean\": 26.898839950561523,\n        \"std\": 1.3982429504394531\n      },\n      \"w\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"lat\": 5\n        },\n        \"units\": \"degrees_north\",\n        \"long_name\": \"Latitude\",\n        \"size\": 5,\n        \"n_valid\": 5,\n        \"min\": 0.9975640773773193,\n        \"max\": 1.0,\n        \"mean\": 0.9987819790840149,\n        \"std\": 0.0010189767926931381,\n        \"values\": [\n          0.9975640177726746,\n          0.9993910193443298,\n          1.0,\n          0.9993910193443298,\n          0.9975640177726746\n        ]\n      },\n      \"n34_monthly\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 888\n        },\n        \"units\": \"degC\",\n        \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n        \"size\": 888,\n        \"n_valid\": 888,\n        \"min\": 24.251270294189453,\n        \"max\": 29.41488265991211,\n        \"mean\": 26.898496627807617,\n        \"std\": 0.9856496453285217\n      },\n      \"recon_9120_da\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 888\n        },\n        \"units\": \"degC\",\n        \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n        \"size\": 888,\n        \"n_valid\": 888,\n        \"min\": -2.452564239501953,\n        \"max\": 2.711048126220703,\n        \"mean\": -0.18455231511915052,\n        \"std\": 0.8743461904474855\n      },\n      \"recon_8110_da\": {\n        \"type\": \"DataArray\",\n        \"dims\": {\n          \"time\": 888\n        },\n        \"units\": \"degC\",\n        \"long_name\": \"Monthly Means of Sea Surface Temperature\",\n        \"size\": 888,\n        \"n_valid\": 888,\n        \"min\": -2.3761425018310547,\n        \"max\": 2.7874698638916016,\n        \"mean\": -0.12439581080599948,\n        \"std\": 0.8739837889733708\n      },\n      \"RECON_9120\": \"time\\n1950-01   -1.993626\\n1950-02   -1.696320\\n1950-03   -1.417004\\n1950-04   -1.538250\\n1950-05   -1.743534\\n             ...   \\n2023-08    1.348202\\n2023-09    1.598574\\n2023-10    1.719954\\n2023-11    2.023518\\n2023-12    2.031172\\nFreq: M, Name: RECON_9120, Length: 888, dtype: float64\",\n      \"RECON_8110\": \"time\\n1950-01   -1.998661\\n1950-02   -1.684095\\n1950-03   -1.366011\\n1950-04   -1.428074\\n1950-05   -1.620701\\n             ...   \\n2023-08    1.371952\\n2023-09    1.591513\\n2023-10    1.765284\\n2023-11    2.099939\\n2023-12    2.069445\\nFreq: M, Name: RECON_8110, Length: 888, dtype: float64\",\n      \"cpc91\": \"             YR  MON  NINO1+2  ANOM1+2  ...  NINO4  ANOM4  NINO3.4  ANOM3.4\\ntime                                    ...                                \\n1950-01  1950.0  1.0    23.01    -1.55  ...  26.94  -1.38    24.55    -1.99\\n1950-02  1950.0  2.0    24.32    -1.78  ...  26.67  -1.53    25.06    -1.69\\n1950-03  1950.0  3.0    25.11    -1.38  ...  26.52  -1.80    25.87    -1.42\\n1950-04  1950.0  4.0    23.63    -1.90  ...  26.90  -1.73    26.28    -1.54\\n1950-05  1950.0  5.0    22.68    -1.74  ...  27.73  -1.18    26.18    -1.75\\n...         ...  ...      ...      ...  ...    ...    ...      ...      ...\\n2026-02  2026.0  2.0    26.82     0.71  ...  28.40   0.20    26.48    -0.27\\n2026-03  2026.0  3.0    27.38     0.89  ...  28.75   0.43    27.27    -0.01\\n2026-04  2026.0  4.0    26.85     1.31  \",\n      \"cpc81\": \"             YR   MON  NINO1+2  ANOM1+2  ...  NINO4  ANOM4  NINO3.4  ANOM3.4\\ntime                                     ...                                \\n1950-01  1950.0   1.0    23.01    -1.53  ...  26.94  -1.30    24.55    -2.00\\n1950-02  1950.0   2.0    24.32    -1.70  ...  26.67  -1.43    25.06    -1.68\\n1950-03  1950.0   3.0    25.11    -1.31  ...  26.52  -1.68    25.87    -1.37\\n1950-04  1950.0   4.0    23.63    -1.83  ...  26.90  -1.55    26.28    -1.43\\n1950-05  1950.0   5.0    22.68    -1.59  ...  27.73  -1.01    26.18    -1.63\\n...         ...   ...      ...      ...  ...    ...    ...      ...      ...\\n2020-08  2020.0   8.0    19.96    -1.05  ...  28.48  -0.17    26.27    -0.57\\n2020-09  2020.0   9.0    19.50    -1.23  ...  28.21  -0.45    25.89    -0.84\\n2020-10  2020.0  10.0    20.25\",\n      \"cpc_9120_n34\": \"time\\n1950-01   -1.99\\n1950-02   -1.69\\n1950-03   -1.42\\n1950-04   -1.54\\n1950-05   -1.75\\n           ... \\n2023-08    1.35\\n2023-09    1.60\\n2023-10    1.72\\n2023-11    2.02\\n2023-12    2.03\\nFreq: M, Name: ANOM3.4, Length: 888, dtype: float64\",\n      \"cpc_8110_n34\": \"time\\n1950-01   -2.00\\n1950-02   -1.68\\n1950-03   -1.37\\n1950-04   -1.43\\n1950-05   -1.63\\n           ... \\n2020-08   -0.57\\n2020-09   -0.84\\n2020-10   -1.21\\n2020-11   -1.33\\n2020-12   -1.14\\nFreq: M, Name: ANOM3.4, Length: 852, dtype: float64\",\n      \"season_center_month\": {\n        \"DJF\": 1,\n        \"JFM\": 2,\n        \"FMA\": 3,\n        \"MAM\": 4,\n        \"AMJ\": 5,\n        \"MJJ\": 6,\n        \"JJA\": 7,\n        \"JAS\": 8,\n        \"ASO\": 9,\n        \"SON\": 10,\n        \"OND\": 11,\n        \"NDJ\": 12\n      },\n      \"oni\": \"        SEAS    YR  TOTAL  ANOM  month\\ntime                                  \\n1950-01  DJF  1950  25.01 -1.32      1\\n1950-02  JFM  1950  25.36 -1.20      2\\n1950-03  FMA  1950  25.88 -1.12      3\\n1950-04  MAM  1950  26.24 -1.08      4\\n1950-05  AMJ  1950  26.35 -1.10      5\\n...      ...   ...    ...   ...    ...\\n2026-03  FMA  2026  27.34  0.11      3\\n2026-04  MAM  2026  28.09  0.46      4\\n2026-05  AMJ  2026  28.74  0.95      5\\n2026-06  MJJ  2026  29.02  1.39      6\\n2026-07  JJA  2026  29.09  1.80      7\\n\\n[919 rows x 5 columns]\",\n      \"oni_n34\": \"time\\n1950-01   -1.32\\n1950-02   -1.20\\n1950-03   -1.12\\n1950-04   -1.08\\n1950-05   -1.10\\n           ... \\n2023-08    1.25\\n2023-09    1.50\\n2023-10    1.74\\n2023-11    1.90\\n2023-12    1.99\\nFreq: M, Name: ANOM, Length: 888, dtype: float64\",\n      \"comp\": \"         RECON_9120  CPC_9120\\ntime                         \\n1950-01   -1.993626     -1.99\\n1950-02   -1.696320     -1.69\\n1950-03   -1.417004     -1.42\\n1950-04   -1.538250     -1.54\\n1950-05   -1.743534     -1.75\\n...             ...       ...\\n2023-08    1.348202      1.35\\n2023-09    1.598574      1.60\\n2023-10    1.719954      1.72\\n2023-11    2.023518      2.02\\n2023-12    2.031172      2.03\\n\\n[888 rows x 2 columns]\",\n      \"diff_recon_cpc\": \"time\\n1950-01   -0.003626\\n1950-02   -0.006320\\n1950-03    0.002996\\n1950-04    0.001750\\n1950-05    0.006466\\n             ...   \\n2023-08   -0.001798\\n2023-09   -0.001426\\n2023-10   -0.000046\\n2023-11    0.003518\\n2023-12    0.001172\\nFreq: M, Length: 888, dtype: float64\",\n      \"corr_9120_cpc\": 0.9999715691978822,\n      \"rmse_9120_cpc\": 0.007475235748993,\n      \"max_abs_dev_time\": \"1992-01\",\n      \"max_abs_dev_9120_cpc\": 0.022621002197265705,\n      \"max_abs_dev_signed\": -0.022621002197265705,\n      \"max_abs_dev_year\": 1992,\n      \"max_abs_dev_month\": 1,\n      \"corr_9120_cpc_6\": 0.999972,\n      \"rmse_9120_cpc_4\": 0.0075,\n      \"max_abs_dev_9120_cpc_4\": 0.0226,\n      \"recon_9120_run3\": \"time\\n1950-01         NaN\\n1950-02   -1.702316\\n1950-03   -1.550524\\n1950-04   -1.566263\\n1950-05   -1.514212\\n             ...   \\n2023-08    1.322332\\n2023-09    1.555576\\n2023-10    1.780682\\n2023-11    1.924881\\n2023-12         NaN\\nFreq: M, Name: RECON_9120, Length: 888, dtype: float64\",\n      \"elnino_events_recon\": [\n        {\n          \"start\": \"1957-05\",\n          \"end\": \"1958-04\",\n          \"length\": 12,\n          \"peak_time\": \"1958-01\",\n          \"peak_value\": 1.5091298421223958\n        },\n        {\n          \"start\": \"1963-08\",\n          \"end\": \"1964-01\",\n          \"length\": 6,\n          \"peak_time\": \"1963-12\",\n          \"peak_value\": 0.847375233968099\n        },\n        {\n          \"start\": \"1965-07\",\n          \"end\": \"1966-03\",\n          \"length\": 9,\n          \"peak_time\": \"1965-11\",\n          \"peak_value\": 1.3941421508789062\n        },\n        {\n          \"start\": \"1972-06\",\n          \"end\": \"1973-02\",\n          \"length\": 9,\n          \"peak_time\": \"1972-12\",\n          \"peak_value\": 1.9167016347249348\n        },\n        {\n          \"start\": \"1982-07\",\n          \"end\": \"1983-05\",\n          \"length\": 11,\n          \"peak_time\": \"1983-01\",\n          \"peak_value\": 2.1474196116129556\n        },\n        {\n          \"start\": \"1986-09\",\n          \"end\": \"1988-01\",\n          \"length\": 17,\n          \"peak_time\": \"1987-08\",\n          \"peak_value\": 1.4937076568603516\n        },\n        {\n          \"start\": \"1991-06\",\n          \"end\": \"1992-06\",\n          \"length\": 13,\n          \"peak_time\": \"1992-01\",\n          \"peak_value\": 1.750881830851237\n        },\n        {\n          \"start\": \"1994-09\",\n          \"end\": \"1995-02\",\n          \"length\": 6,\n          \"peak_time\": \"1994-12\",\n          \"peak_value\": 1.124746322631836\n        },\n        {\n          \"start\": \"1997-05\",\n          \"end\": \"1998-04\",\n          \"length\": 12,\n          \"peak_time\": \"1997-12\",\n          \"peak_value\": 2.3533267974853516\n        },\n        {\n          \"start\": \"2002-06\",\n          \"end\": \"2003-02\",\n          \"length\": 9,\n          \"peak_time\": \"2002-11\",\n          \"peak_value\": 1.3538646697998047\n        },\n        {\n          \"start\": \"2004-08\",\n          \"end\": \"2005-01\",\n          \"length\": 6,\n          \"peak_time\": \"2004-09\",\n          \"peak_value\": 0.7571976979573568\n        },\n        {\n          \"start\": \"2006-09\",\n          \"end\": \"2007-01\",\n          \"length\": 5,\n          \"peak_time\": \"2006-12\",\n          \"peak_value\": 0.9437141418457031\n        },\n        {\n          \"start\": \"2009-08\",\n          \"end\": \"2010-03\",\n          \"length\": 8,\n          \"peak_time\": \"2009-12\",\n          \"peak_value\": 1.564300537109375\n        },\n        {\n          \"start\": \"2015-03\",\n          \"end\": \"2016-04\",\n          \"length\": 14,\n          \"peak_time\": \"2015-12\",\n          \"peak_value\": 2.6435267130533853\n        },\n        {\n          \"start\": \"2018-09\",\n          \"end\": \"2019-05\",\n          \"length\": 9,\n          \"peak_time\": \"2018-11\",\n          \"peak_value\": 0.9099458058675131\n        },\n        {\n          \"start\": \"2023-06\",\n          \"end\": \"2023-11\",\n          \"length\": 6,\n          \"peak_time\": \"2023-11\",\n          \"peak_value\": 1.9248809814453125\n        }\n      ],\n      \"lanina_events_recon\": {\n        \"type\": \"list\",\n        \"length\": 25,\n        \"head\": [\n          {\n            \"start\": \"1950-02\",\n            \"end\": \"1951-03\",\n            \"length\": 14,\n            \"peak_time\": \"1950-02\",\n            \"peak_value\": -1.7023162841796875\n          },\n          {\n            \"start\": \"1954-04\",\n            \"end\": \"1957-01\",\n            \"length\": 34,\n            \"peak_time\": \"1955-11\",\n            \"peak_value\": -2.265371322631836\n          },\n          {\n            \"start\": \"1959-07\",\n            \"end\": \"1959-11\",\n            \"length\": 5,\n            \"peak_time\": \"1959-08\",\n            \"peak_value\": -0.8107687632242838\n          },\n          {\n            \"start\": \"1961-08\",\n            \"end\": \"1963-01\",\n            \"length\": 18,\n            \"peak_time\": \"1962-12\",\n            \"peak_value\": -0.8889687856038412\n          },\n          {\n            \"start\": \"1964-04\",\n            \"end\": \"1965-02\",\n            \"length\": 11,\n            \"peak_time\": \"1964-10\",\n            \"peak_value\": -1.4028269449869792\n          }\n        ]\n      },\n      \"n_elnino_recon\": 16,\n      \"top3_elnino_recon\": [\n        {\n          \"start\": \"2015-03\",\n          \"end\": \"2016-04\",\n          \"length\": 14,\n          \"peak_time\": \"2015-12\",\n          \"peak_value\": 2.6435267130533853\n        },\n        {\n          \"start\": \"1997-05\",\n          \"end\": \"1998-04\",\n          \"length\": 12,\n          \"peak_time\": \"1997-12\",\n          \"peak_value\": 2.3533267974853516\n        },\n        {\n          \"start\": \"1982-07\",\n          \"end\": \"1983-05\",\n          \"length\": 11,\n          \"peak_time\": \"1983-01\",\n          \"peak_value\": 2.1474196116129556\n        }\n      ],\n      \"top3_elnino_recon_table\": \"   year  month  peak_value    start      end  length\\n0  2015     12        2.64  2015-03  2016-04      14\\n1  1997     12        2.35  1997-05  1998-04      12\\n2  1983      1        2.15  1982-07  1983-05      11\",\n      \"elnino_events_oni\": {\n        \"type\": \"list\",\n        \"length\": 22,\n        \"head\": [\n          {\n            \"start\": \"1951-06\",\n            \"end\": \"1952-01\",\n            \"length\": 8,\n            \"peak_time\": \"1951-10\",\n            \"peak_value\": 1.03\n          },\n          {\n            \"start\": \"1953-04\",\n            \"end\": \"1953-12\",\n            \"length\": 9,\n            \"peak_time\": \"1953-10\",\n            \"peak_value\": 0.78\n          },\n          {\n            \"start\": \"1957-04\",\n            \"end\": \"1958-05\",\n            \"length\": 14,\n            \"peak_time\": \"1958-01\",\n            \"peak_value\": 1.69\n          },\n          {\n            \"start\": \"1963-07\",\n            \"end\": \"1964-02\",\n            \"length\": 8,\n            \"peak_time\": \"1963-11\",\n            \"peak_value\": 1.19\n          },\n          {\n            \"start\": \"1965-06\",\n            \"end\": \"1966-03\",\n            \"length\": 10,\n            \"peak_time\": \"1965-11\",\n            \"peak_value\": 1.82\n          }\n        ]\n      },\n      \"lanina_events_oni\": [\n        {\n          \"start\": \"1950-01\",\n          \"end\": \"1951-01\",\n          \"length\": 13,\n          \"peak_time\": \"1950-01\",\n          \"peak_value\": -1.32\n        },\n        {\n          \"start\": \"1955-03\",\n          \"end\": \"1956-04\",\n          \"length\": 14,\n          \"peak_time\": \"1955-11\",\n          \"peak_value\": -1.59\n        },\n        {\n          \"start\": \"1964-05\",\n          \"end\": \"1965-01\",\n          \"length\": 9,\n          \"peak_time\": \"1964-10\",\n          \"peak_value\": -0.8\n        },\n        {\n          \"start\": \"1970-07\",\n          \"end\": \"1972-01\",\n          \"length\": 19,\n          \"peak_time\": \"1971-02\",\n          \"peak_value\": -1.36\n        },\n        {\n          \"start\": \"1973-05\",\n          \"end\": \"1974-06\",\n          \"length\": 14,\n          \"peak_time\": \"1973-12\",\n          \"peak_value\": -2.04\n        },\n        {\n          \"start\": \"1974-10\",\n          \"end\": \"1976-03\",\n          \"length\": 18,\n          \"peak_time\": \"1975-12\",\n          \"peak_value\": -1.58\n        },\n        {\n          \"start\": \"1983-10\",\n          \"end\": \"1984-02\",\n          \"length\": 5,\n          \"peak_time\": \"1983-11\",\n          \"peak_value\": -0.96\n        },\n        {\n          \"start\": \"1984-10\",\n          \"end\": \"1985-06\",\n          \"length\": 9,\n          \"peak_time\": \"1984-12\",\n          \"peak_value\": -1.06\n        },\n        {\n          \"start\": \"1988-05\",\n          \"end\": \"1989-05\",\n          \"length\": 13,\n          \"peak_time\": \"1988-12\",\n          \"peak_value\": -1.85\n        },\n        {\n          \"start\": \"1995-08\",\n          \"end\": \"1996-03\",\n          \"length\": 8,\n          \"peak_time\": \"1995-11\",\n          \"peak_value\": -1.05\n        },\n        {\n          \"start\": \"1998-07\",\n          \"end\": \"2000-06\",\n          \"length\": 24,\n          \"peak_time\": \"1999-12\",\n          \"peak_value\": -1.53\n        },\n        {\n          \"start\": \"2000-10\",\n          \"end\": \"2001-02\",\n          \"length\": 5,\n          \"peak_time\": \"2000-12\",\n          \"peak_value\": -0.78\n        },\n        {\n          \"start\": \"2005-11\",\n          \"end\": \"2006-03\",\n          \"length\": 5,\n          \"peak_time\": \"2006-01\",\n          \"peak_value\": -0.86\n        },\n        {\n          \"start\": \"2007-08\",\n          \"end\": \"2008-06\",\n          \"length\": 11,\n          \"peak_time\": \"2008-01\",\n          \"peak_value\": -1.76\n        },\n        {\n          \"start\": \"2008-11\",\n          \"end\": \"2009-03\",\n          \"length\": 5,\n          \"peak_time\": \"2009-01\",\n          \"peak_value\": -0.89\n        },\n        {\n          \"start\": \"2010-06\",\n          \"end\": \"2011-05\",\n          \"length\": 12,\n          \"peak_time\": \"2010-11\",\n          \"peak_value\": -1.57\n        },\n        {\n          \"start\": \"2011-08\",\n          \"end\": \"2012-02\",\n          \"length\": 7,\n          \"peak_time\": \"2011-11\",\n          \"peak_value\": -1.02\n        },\n        {\n          \"start\": \"2017-11\",\n          \"end\": \"2018-03\",\n          \"length\": 5,\n          \"peak_time\": \"2017-12\",\n          \"peak_value\": -0.76\n        },\n        {\n          \"start\": \"2020-09\",\n          \"end\": \"2021-04\",\n          \"length\": 8,\n          \"peak_time\": \"2020-11\",\n          \"peak_value\": -1.11\n        },\n        {\n          \"start\": \"2021-09\",\n          \"end\": \"2023-01\",\n          \"length\": 17,\n          \"peak_time\": \"2021-11\",\n          \"peak_value\": -0.91\n        }\n      ],\n      \"n_elnino_oni\": 22,\n      \"top3_elnino_oni\": [\n        {\n          \"start\": \"2014-10\",\n          \"end\": \"2016-05\",\n          \"length\": 20,\n          \"peak_time\": \"2015-12\",\n          \"peak_value\": 2.59\n        },\n        {\n          \"start\": \"1997-05\",\n          \"end\": \"1998-04\",\n          \"length\": 12,\n          \"peak_time\": \"1997-12\",\n          \"peak_value\": 2.37\n        },\n        {\n          \"start\": \"1982-05\",\n          \"end\": \"1983-06\",\n          \"length\": 14,\n          \"peak_time\": \"1983-01\",\n          \"peak_value\": 2.14\n        }\n      ],\n      \"top3_elnino_oni_table\": \"   year  month  peak_value    start      end  length\\n0  2015     12        2.59  2014-10  2016-05      20\\n1  1997     12        2.37  1997-05  1998-04      12\\n2  1983      1        2.14  1982-05  1983-06      14\",\n      \"n_elnino_count_difference\": -6,\n      \"count_explanation\": \"RECON_9120 uses one fixed 1991-2020 monthly climatology for the whole record, while the official CPC ONI uses a 30-year centred normal that is rolled forward every five years, together with CPC's operational Nino3.4 processing.  Seasons close to the +/-0.5 degC threshold can therefore fall on different sides of the criterion, so the number of qualifying events can differ.\",\n      \"recon_baseline_comp\": \"         RECON_8110  RECON_9120\\ntime                           \\n1950-01   -1.998661   -1.993626\\n1950-02   -1.684095   -1.696320\\n1950-03   -1.366011   -1.417004\\n1950-04   -1.428074   -1.538250\\n1950-05   -1.620701   -1.743534\\n...             ...         ...\\n2020-08   -0.561388   -0.585138\\n2020-09   -0.832939   -0.825878\\n2020-10   -1.204687   -1.250017\\n2020-11   -1.338301   -1.414722\\n2020-12   -1.111248   -1.149521\\n\\n[852 rows x 2 columns]\",\n      \"offset_recon_8110_minus_9120\": 0.06015650431315104,\n      \"offset_recon_8110_minus_9120_3\": 0.06,\n      \"cpc_baseline_comp\": \"         CPC_8110  CPC_9120\\ntime                       \\n1950-01     -2.00     -1.99\\n1950-02     -1.68     -1.69\\n1950-03     -1.37     -1.42\\n1950-04     -1.43     -1.54\\n1950-05     -1.63     -1.75\\n...           ...       ...\\n2020-08     -0.57     -0.59\\n2020-09     -0.84     -0.83\\n2020-10     -1.21     -1.26\\n2020-11     -1.33     -1.42\\n2020-12     -1.14     -1.15\\n\\n[852 rows x 2 columns]\",\n      \"offset_cpc_8110_minus_9120\": 0.058333333333333334,\n      \"offset_cpc_8110_minus_9120_3\": 0.058,\n      \"offset_agreement_abs\": 0.001823170979817705,\n      \"offset_agreement_abs_3\": 0.002\n    }\n  },\n  {\n    \"type\": \"visualization\",\n    \"status\": \"success\",\n    \"paths\": [\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T2_deepseek-flash_20261022_102855/turn01/figures/visualization_T2_deepseek-flash_20261022_102855_turn1_1.png\",\n      \"/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_direct_llm_20261022/T2_deepseek-flash_20261022_102855/turn01/figures/visualization_T2_deepseek-flash_20261022_102855_turn1_2.png\"\n    ]\n  }\n]",
+      "solution": "<solution>\nReconstructed Niño 3.4 from ERSSTv5 as the cosine-latitude-weighted SST anomaly over 5°S–5°N, 170°W–120°W, using a 1991–2020 monthly climatology, for 1950-01 to 2023-12.\n\nComparison with CPC 1991–2020 monthly Niño 3.4 anomaly:\n- Pearson correlation: **0.999972**\n- RMSE: **0.0075 °C**\n- Largest absolute deviation: **0.0226 °C**, occurring in **1992-01** (January 1992; signed RECON−CPC = **−0.0226 °C**).\n\nEl Niño events under the operational ONI criterion (at least five consecutive 3-month centered running-mean values ≥ +0.5 °C):\n- **RECON_9120: 16 events**\n  - Top three peaks: **2015-12, 2.64 °C**; **1997-12, 2.35 °C**; **1983-01, 2.15 °C**\n- **CPC ONI: 22 events**\n  - Top three peaks: **2015-12, 2.59 °C**; **1997-12, 2.37 °C**; **1983-01, 2.14 °C**\n\nThe count differs by six because the official ONI uses evolving 30-year base periods updated every five years, whereas RECON_9120 uses one fixed 1991–2020 monthly climatology for the whole record. With a warmer modern baseline imposed on early decades, some borderline early El Niño events fall below +0.5 °C in RECON_9120 but qualify in the official ONI. The very small monthly RMSE and near-unity correlation with CPC’s fixed 1991–2020 series indicate that the reconstruction itself is accurate; the event-count difference comes from the baseline definition and operational processing.\n\nBaseline offsets over 1950-01 to 2020-12:\n- Reconstructed: **RECON_8110 − RECON_9120 = +0.060 °C**\n- Published CPC: **CPC 1981–2010 − CPC 1991–2020 = +0.058 °C**\n- Agreement: **0.002 °C**, so the reconstruction reproduces the published baseline offset to within about 0.002 °C.\n\nFigures generated:\n- **Figure 1:** two-row time series over 1950–2023; upper panel overlays RECON_9120 and CPC 1991–2020 monthly anomalies, the 3-month running mean, ±0.5 °C thresholds, and warm/cool shading for detected El Niño/La Niña events; lower panel shows RECON_9120 − CPC on its own vertical scale.\n- **Figure 2:** square scatter plot of RECON_9120 vs CPC 1991–2020 monthly anomalies, with equal axis ranges/ticks, a 1:1 reference line, and the correlation and RMSE annotated (**r = 0.999972**, RMSE = **0.0075 °C**).\n</solution>",
+      "timestamp": "2026-10-22T10:31:39.159115"
+    }
+  ]
+}

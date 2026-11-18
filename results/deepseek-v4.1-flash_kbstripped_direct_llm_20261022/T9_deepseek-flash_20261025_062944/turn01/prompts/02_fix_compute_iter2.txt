@@ -1,0 +1,2262 @@
+# exchange 2: fix_compute_iter2
+# elapsed: 290.0 s
+
+===== SYSTEM =====
+You are a code debugging expert.
+
+===== USER =====
+The following compute code failed to execute:
+
+<failed_code>
+import os
+import re
+import glob
+import numpy as np
+import pandas as pd
+import xarray as xr
+from scipy.spatial import cKDTree
+
+# ---------------------------------------------------------------------------
+# Paths and common PDO domain / target grid
+# ---------------------------------------------------------------------------
+ersst_path = "/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc"
+cpc_root = "/data1/lorraine-20419/ocean_data/CPC"
+pdo_path = os.path.join(cpc_root, "ersst.v6.pdo.dat")
+cmip_hist_root = "/data1/lorraine-20419/benchmark_cmip6/historical"
+
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+
+# 1-degree centre grid, following the WOA/SEANOE half-degree-centre convention.
+target_lat = np.arange(20.5, 70.0, 1.0)
+target_lon = np.arange(110.5, 260.0, 1.0)   # 110.5E to 100.5W, 0-360 convention
+target_lat2d, target_lon2d = np.meshgrid(target_lat, target_lon, indexing="ij")
+ny_t, nx_t = target_lat2d.shape
+
+dates = pd.date_range("1950-01-01", "2014-12-01", freq="MS")
+months_expected = dates.month.values
+nt_expected = len(dates)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def select_time_range(ds, y0=1950, y1=2014):
+    """Select year window and return the dataset plus its month numbers."""
+    ds = ds.sortby("time")
+    yrs = ds.time.dt.year.values
+    mons = ds.time.dt.month.values
+    sel = (yrs >= y0) & (yrs <= y1)
+    ds_sel = ds.isel(time=np.where(sel)[0])
+    return ds_sel, mons[sel]
+
+def to_celsius(da):
+    """CMIP6 tos is normally in K; ERSST is already degC."""
+    u = str(da.attrs.get("units", "")).strip().lower()
+    if u in ("k", "kelvin") or u.endswith("k"):
+        return da - 273.15
+    return da
+
+def _bilinear_solve(pts, T):
+    """
+    Invert the bilinear map of a curvilinear grid cell.
+    pts = [P00, P10, P01, P11], each [lon, lat].
+    Returns (u, v) if T is inside the cell, else None.
+    """
+    P00, P10, P01, P11 = pts
+    a = P00
+    b = P10 - P00
+    c = P01 - P00
+    d = P00 - P10 - P01 + P11
+
+    best = None
+    for u0, v0 in ((0.5, 0.5), (0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)):
+        u, v = u0, v0
+        ok = True
+        for _ in range(25):
+            F = a + b * u + c * v + d * u * v - T
+            if np.linalg.norm(F) < 1e-12:
+                break
+            J = np.array(
+                [
+                    [b[0] + d[0] * v, c[0] + d[0] * u],
+                    [b[1] + d[1] * v, c[1] + d[1] * u],
+                ]
+            )
+            try:
+                delta = np.linalg.solve(J, -F)
+            except np.linalg.LinAlgError:
+                ok = False
+                break
+            u += delta[0]
+            v += delta[1]
+            if not np.isfinite(u) or not np.isfinite(v):
+                ok = False
+                break
+            if np.linalg.norm(delta) < 1e-12:
+                break
+        if ok and (-1e-5 <= u <= 1.0 + 1e-5) and (-1e-5 <= v <= 1.0 + 1e-5):
+            P = a + b * u + c * v + d * u * v
+            res = np.linalg.norm(P - T)
+            if best is None or res < best[0]:
+                best = (res, u, v)
+
+    if best is not None and best[0] < 1e-4:
+        return best[1], best[2]
+    return None
+
+def make_curvilinear_weights(lat2d, lon2d, target_lat, target_lon, max_candidates=12):
+    """
+    Precompute bilinear weights from a logically rectangular curvilinear grid
+    to the target regular 1-degree grid.
+    """
+    lat2d = np.asarray(lat2d, dtype=float)
+    lon2d = np.asarray(lon2d, dtype=float) % 360.0
+    ny, nx = lat2d.shape
+
+    lat_c = 0.25 * (
+        lat2d[:-1, :-1] + lat2d[1:, :-1] + lat2d[:-1, 1:] + lat2d[1:, 1:]
+    )
+    lon_c = 0.25 * (
+        lon2d[:-1, :-1] + lon2d[1:, :-1] + lon2d[:-1, 1:] + lon2d[1:, 1:]
+    )
+    lon_c = lon_c % 360.0
+
+    tree = cKDTree(np.column_stack([lon_c.ravel(), lat_c.ravel()]))
+
+    tlon = (target_lon.ravel() % 360.0)
+    tlat = target_lat.ravel()
+    target_pts = np.column_stack([tlon, tlat])
+
+    dists, cell_ids = tree.query(target_pts, k=max_candidates)
+    if max_candidates == 1:
+        cell_ids = cell_ids[:, None]
+        dists = dists[:, None]
+
+    n_target = len(tlat)
+    idx4 = np.zeros((n_target, 4), dtype=np.int64)
+    w4 = np.zeros((n_target, 4), dtype=float)
+
+    for it in range(n_target):
+        best = None
+
+        for kk in range(cell_ids.shape[1]):
+            cell = cell_ids[it, kk]
+            ci, cj = np.unravel_index(cell, (ny - 1, nx - 1))
+
+            pts = np.array(
+                [
+                    [lon2d[ci, cj], lat2d[ci, cj]],
+                    [lon2d[ci + 1, cj], lat2d[ci + 1, cj]],
+                    [lon2d[ci, cj + 1], lat2d[ci, cj + 1]],
+                    [lon2d[ci + 1, cj + 1], lat2d[ci + 1, cj + 1]],
+                ],
+                dtype=float,
+            )
+
+            clon = lon_c[ci, cj]
+            pts[:, 0] = clon + ((pts[:, 0] - clon + 180.0) % 360.0 - 180.0)
+            T = np.array(
+                [
+                    clon + ((tlon[it] - clon + 180.0) % 360.0 - 180.0),
+                    tlat[it],
+                ]
+            )
+
+            if not (
+                T[0] >= pts[:, 0].min() - 1e-6
+                and T[0] <= pts[:, 0].max() + 1e-6
+                and T[1] >= pts[:, 1].min() - 1e-6
+                and T[1] <= pts[:, 1].max() + 1e-6
+            ):
+                continue
+
+            sol = _bilinear_solve(pts, T)
+            if sol is None:
+                continue
+
+            u, v = sol
+            P = (
+                (1 - u) * (1 - v) * pts[0]
+                + u * (1 - v) * pts[1]
+                + (1 - u) * v * pts[2]
+                + u * v * pts[3]
+            )
+            res = np.linalg.norm(P - T)
+
+            if best is None or res < best[0]:
+                best = (res, ci, cj, u, v)
+
+        if best is not None:
+            _, ci, cj, u, v = best
+            w00 = (1 - u) * (1 - v)
+            w10 = u * (1 - v)
+            w01 = (1 - u) * v
+            w11 = u * v
+            idx4[it] = [
+                ci * nx + cj,
+                (ci + 1) * nx + cj,
+                ci * nx + (cj + 1),
+                (ci + 1) * nx + (cj + 1),
+            ]
+            w4[it] = [w00, w10, w01, w11]
+        else:
+            # Fallback: nearest corner of nearest cell.
+            cell = cell_ids[it, 0]
+            ci, cj = np.unravel_index(cell, (ny - 1, nx - 1))
+            flat = np.array(
+                [
+                    ci * nx + cj,
+                    (ci + 1) * nx + cj,
+                    ci * nx + (cj + 1),
+                    (ci + 1) * nx + (cj + 1),
+                ]
+            )
+            pts = np.array(
+                [
+                    [lon2d[ci, cj], lat2d[ci, cj]],
+                    [lon2d[ci + 1, cj], lat2d[ci + 1, cj]],
+                    [lon2d[ci, cj + 1], lat2d[ci, cj + 1]],
+                    [lon2d[ci + 1, cj + 1], lat2d[ci + 1, cj + 1]],
+                ],
+                dtype=float,
+            )
+            clon = lon_c[ci, cj]
+            pts[:, 0] = clon + ((pts[:, 0] - clon + 180.0) % 360.0 - 180.0)
+            T = np.array(
+                [
+                    clon + ((tlon[it] - clon + 180.0) % 360.0 - 180.0),
+                    tlat[it],
+                ]
+            )
+            jbest = np.argmin(np.linalg.norm(pts - T, axis=1))
+            idx4[it] = [flat[jbest]] * 4
+            w4[it] = [1.0, 0.0, 0.0, 0.0]
+
+    return idx4, w4
+
+def apply_curvilinear_weights(arr, idx4, w4):
+    """Apply precomputed curvilinear bilinear weights to (time, y, x) data."""
+    nt = arr.shape[0]
+    flat = arr.reshape(nt, -1)
+    out = np.empty((nt, idx4.shape[0]), dtype=float)
+    for t in range(nt):
+        out[t] = np.sum(flat[t, idx4] * w4, axis=1)
+    return out.reshape(nt, target_lat.size, target_lon.size)
+
+def compute_pdo(sst, months, target_lat2d, target_lon2d):
+    """
+    Leading EOF/PDO of monthly SST anomalies.
+    Returns variance fraction, standardized index, regression map, amplitude,
+    and lag-12-month autocorrelation.
+    """
+    sst = np.asarray(sst, dtype=float)
+    months = np.asarray(months)
+
+    # Monthly climatology over 1950-2014.
+    clim = np.full((12, sst.shape[1], sst.shape[2]), np.nan, dtype=float)
+    for m in range(1, 13):
+        idxm = months == m
+        if np.any(idxm):
+            clim[m - 1] = np.nanmean(sst[idxm], axis=0)
+
+    anom = sst - clim[months - 1]
+
+    # Complete time series required at a grid point.
+    valid = np.all(np.isfinite(anom), axis=0)
+    X = anom[:, valid]
+
+    lat_valid = target_lat2d[valid]
+    lon_valid = target_lon2d[valid]
+
+    # Standard PDO convention: area weighting by sqrt(cos(latitude)).
+    w = np.sqrt(np.maximum(np.cos(np.deg2rad(lat_valid)), 0.0))
+    Xw = X * w[None, :]
+
+    U, S, Vt = np.linalg.svd(Xw, full_matrices=False)
+    var_expl = float(S[0] ** 2 / np.sum(S ** 2))
+
+    pc = U[:, 0] * S[0]
+    idx_std = pc / np.std(pc, ddof=0)
+
+    # Regression of original SST anomalies onto the standardized PC.
+    amp = (X.T @ idx_std) / np.sum(idx_std ** 2)
+    amap = np.full(sst.shape[1:], np.nan, dtype=float)
+    amap[valid] = amp
+
+    # Fix EOF sign to the PDO-positive convention:
+    # warm western North Pacific and cool central/eastern North Pacific.
+    west_mask = (
+        (target_lat2d >= 20.0)
+        & (target_lat2d <= 45.0)
+        & (target_lon2d >= 120.0)
+        & (target_lon2d <= 180.0)
+    )
+    east_mask = (
+        (target_lat2d >= 20.0)
+        & (target_lat2d <= 50.0)
+        & (target_lon2d >= 180.0)
+        & (target_lon2d <= 260.0)
+    )
+    west = np.nanmean(amap[west_mask])
+    east = np.nanmean(amap[east_mask])
+    if np.isfinite(west) and np.isfinite(east) and (west - east) < 0:
+        amap = -amap
+        idx_std = -idx_std
+
+    amp_max = float(np.nanmax(np.abs(amap)))
+    valid_map = np.isfinite(amap)
+    w_map = np.sqrt(
+        np.maximum(np.cos(np.deg2rad(target_lat2d[valid_map])), 0.0)
+    )
+    amp_rms = float(
+        np.sqrt(np.average(amap[valid_map] ** 2, weights=w_map))
+    )
+
+    ac12 = float(np.corrcoef(idx_std[:-12], idx_std[12:])[0, 1])
+
+    return {
+        "var_expl": var_expl,
+        "idx": idx_std,
+        "amp_map": amap,
+        "amp_max": amp_max,
+        "amp_rms": amp_rms,
+        "ac12": ac12,
+        "valid": valid,
+    }
+
+def load_model_tos(model):
+    """Load, select 1950-2014, convert to degC, and bilinearly regrid tos."""
+    files = sorted(
+        glob.glob(os.path.join(cmip_hist_root, model, "tos", "*.nc"))
+    )
+    if len(files) == 0:
+        raise FileNotFoundError(f"No tos files for {model}")
+
+    # Group by variant, in case more than one variant is present.
+    groups = {}
+    for f in files:
+        parts = os.path.basename(f).split("_")
+        variant = "unknown"
+        for p in parts:
+            if re.match(r"r\d+i\d+p\d+f\d+", p):
+                variant = p
+                break
+        groups.setdefault(variant, []).append(f)
+
+    if len(groups) > 1:
+        if "r1i1p1f1" in groups:
+            variant = "r1i1p1f1"
+        else:
+            variant = max(groups, key=lambda k: len(groups[k]))
+    else:
+        variant = list(groups.keys())[0]
+
+    fs = sorted(groups[variant])
+    if len(fs) == 1:
+        ds = xr.open_dataset(fs[0], use_cftime=True)
+    else:
+        ds = xr.open_mfdataset(
+            fs,
+            combine="by_coords",
+            use_cftime=True,
+            data_vars="minimal",
+            coords="minimal",
+            compat="override",
+        )
+
+    ds, mons = select_time_range(ds, 1950, 2014)
+    da = ds["tos"]
+    da = to_celsius(da)
+
+    ydim, xdim = {
+        "CESM2": ("nlat", "nlon"),
+        "GFDL-ESM4": ("lat", "lon"),
+        "MPI-ESM1-2-LR": ("j", "i"),
+    }[model]
+    da = da.transpose("time", ydim, xdim)
+
+    if model == "GFDL-ESM4":
+        da = da.sortby("lat").sortby("lon")
+        da_reg = da.interp(
+            lat=target_lat, lon=target_lon, method="linear"
+        )
+        arr = da_reg.values.astype(float)
+    else:
+        latname = "lat" if model == "CESM2" else "latitude"
+        lonname = "lon" if model == "CESM2" else "longitude"
+        lat2d = ds[latname].values
+        lon2d = ds[lonname].values
+        if lat2d.ndim == 1:
+            lon2d, lat2d = np.meshgrid(lon2d, lat2d)
+        lon2d = lon2d % 360.0
+
+        idx4, w4 = make_curvilinear_weights(
+            lat2d, lon2d, target_lat, target_lon
+        )
+        arr = apply_curvilinear_weights(da.values.astype(float), idx4, w4)
+
+    if len(mons) != nt_expected:
+        raise ValueError(
+            f"{model}: expected {nt_expected} months, got {len(mons)}"
+        )
+    return arr, mons
+
+# ---------------------------------------------------------------------------
+# Observations: ERSSTv5
+# ---------------------------------------------------------------------------
+ds_ersst = xr.open_dataset(ersst_path)
+ds_ersst, months_obs = select_time_range(ds_ersst, 1950, 2014)
+sst_obs = ds_ersst["sst"]
+sst_obs = sst_obs.sortby("lat").sortby("lon")
+sst_obs_reg = sst_obs.interp(
+    lat=target_lat, lon=target_lon, method="linear"
+)
+arr_obs = sst_obs_reg.values.astype(float)
+
+pdo_obs = compute_pdo(
+    arr_obs, months_obs, target_lat2d, target_lon2d
+)
+
+# ---------------------------------------------------------------------------
+# CMIP6 historical tos
+# ---------------------------------------------------------------------------
+pdo_models = {}
+for model in models:
+    arr_model, mons_model = load_model_tos(model)
+    pdo_models[model] = compute_pdo(
+        arr_model, mons_model, target_lat2d, target_lon2d
+    )
+
+# ---------------------------------------------------------------------------
+# Published PDO index (NCEI, ERSSTv6)
+# ---------------------------------------------------------------------------
+pdo_df = pd.read_csv(pdo_path, sep=r"\s+", comment="#")
+pdo_df.columns = [str(c) for c in pdo_df.columns]
+pdo_df = pdo_df.rename(columns={pdo_df.columns[0]: "Year"})
+
+month_cols = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+]
+pdo_long = pdo_df.melt(
+    id_vars="Year",
+    value_vars=[c for c in month_cols if c in pdo_df.columns],
+    var_name="Month",
+    value_name="pdo",
+)
+pdo_long["month"] = pd.to_datetime(
+    pdo_long["Month"], format="%b"
+).dt.month
+pdo_long["time"] = pd.to_datetime(
+    dict(
+        year=pdo_long["Year"].astype(int),
+        month=pdo_long["month"],
+        day=1,
+    )
+)
+pdo_series = (
+    pdo_long.set_index("time")["pdo"].sort_index().replace(99.99, np.nan)
+)
+pdo_series = pdo_series.reindex(dates)
+pub_idx = pdo_series.values.astype(float)
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+sources = ["ERSSTv5"] + models
+
+var_expl = {"ERSSTv5": pdo_obs["var_expl"]}
+amp_max = {"ERSSTv5": pdo_obs["amp_max"]}
+amp_rms = {"ERSSTv5": pdo_obs["amp_rms"]}
+ac12 = {"ERSSTv5": pdo_obs["ac12"]}
+idx_all = {"ERSSTv5": pdo_obs["idx"]}
+amp_maps = {"ERSSTv5": pdo_obs["amp_map"]}
+
+for model in models:
+    var_expl[model] = pdo_models[model]["var_expl"]
+    amp_max[model] = pdo_models[model]["amp_max"]
+    amp_rms[model] = pdo_models[model]["amp_rms"]
+    ac12[model] = pdo_models[model]["ac12"]
+    idx_all[model] = pdo_models[model]["idx"]
+    amp_maps[model] = pdo_models[model]["amp_map"]
+
+pattern_corr = {}
+for model in models:
+    m = np.isfinite(pdo_obs["amp_map"]) & np.isfinite(
+        pdo_models[model]["amp_map"]
+    )
+    pattern_corr[model] = float(
+        np.corrcoef(
+            pdo_obs["amp_map"][m],
+            pdo_models[model]["amp_map"][m],
+        )[0, 1]
+    )
+
+valid_pub = np.isfinite(pub_idx)
+obs_pub_corr = float(
+    np.corrcoef(
+        pdo_obs["idx"][valid_pub], pub_idx[valid_pub]
+    )[0, 1]
+)
+
+amp_ratio = {
+    model: amp_max[model] / amp_max["ERSSTv5"] for model in models
+}
+ac12_diff = {model: ac12[model] - ac12["ERSSTv5"] for model in models}
+best_model = max(pattern_corr, key=pattern_corr.get)
+
+# ---------------------------------------------------------------------------
+# Observed PDO phase-transition years
+# ---------------------------------------------------------------------------
+def compute_transition_years(idx, dates, window=108):
+    """
+    9-year (108-month) centred running mean; find sign crossings, then merge
+    crossings less than 3 years after the last counted transition.
+    """
+    s = pd.Series(idx, index=pd.to_datetime(dates))
+    smooth = s.rolling(window=window, center=True).mean()
+    sv = smooth.dropna()
+
+    crossings = []
+    vals = sv.values
+    signs = np.sign(vals)
+    for i in range(1, len(sv)):
+        if signs[i] == 0 or signs[i - 1] == 0:
+            continue
+        if signs[i] != signs[i - 1]:
+            x0 = sv.index[i - 1]
+            x1 = sv.index[i]
+            y0 = vals[i - 1]
+            y1 = vals[i]
+            frac = 0.0 if y1 == y0 else (-y0 / (y1 - y0))
+            cross_date = x0 + (x1 - x0) * frac
+            crossings.append(cross_date.year)
+
+    kept = []
+    for yr in crossings:
+        if not kept or (yr - kept[-1]) >= 3:
+            kept.append(int(yr))
+    return kept, smooth
+
+transition_years, smooth_obs = compute_transition_years(
+    pdo_obs["idx"], dates, window=108
+)
+
+documented_shifts = [1976, 1988, 1998, 2014]
+</failed_code>
+
+<error_info>
+Error Type: ValueError
+Error Message: all the input array dimensions except for the concatenation axis must match exactly, but along dimension 0, the array at index 0 has size 150 and the array at index 1 has size 50
+
+
+Traceback:
+Traceback (most recent call last):
+  File "/home/lorraine/projects/2025-jingwei_QA_GMD/src/models/agent_with_tools.py", line 721, in _safe_execute_tool
+    exec(code, sandbox_globals)
+  File "<string>", line 414, in <module>
+  File "<string>", line 382, in load_model_tos
+  File "<string>", line 117, in make_curvilinear_weights
+  File "/home/lorraine/miniconda3/envs/jingwei_QA/lib/python3.11/site-packages/numpy/lib/_shape_base_impl.py", line 669, in column_stack
+    return _nx.concatenate(arrays, 1)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: all the input array dimensions except for the concatenation axis must match exactly, but along dimension 0, the array at index 0 has size 150 and the array at index 1 has size 50
+
+</error_info>
+
+Original task: Assess the Pacific Decadal Oscillation (PDO) simulated by three CMIP6 models against ERSSTv5 observations, over 1950-01 to 2014-12.
+
+Data to use:
+- CMIP6 historical `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1950-01 to 2014-12.
+- ERSSTv5 monthly SST over the same window.
+- The published PDO index (product `pdo` in the index registry).
+
+The PDO is the leading EOF of monthly North Pacific SST anomalies over 20N-70N, 110E-100W, relative to a 1950-2014 monthly climatology.
+
+Expected numerical results, for each of the four sources over 1950-2014, with any regridding done by bilinear interpolation onto the 1-degree grid:
+- The percentage of variance explained by the leading mode, to 1 decimal place.
+- The amplitude of the mode, in degrees Celsius per standard deviation, to 3 decimal places.
+- The lag-1-year (12-month) autocorrelation of the monthly standardized index, to 3 decimal places.
+- The Pearson correlation of the ERSSTv5-derived index with the published PDO series, to 3 decimal places, and what that correlation does and does not demonstrate.
+- For each model, the spatial Pearson correlation between its regression pattern and the ERSSTv5 regression pattern, to 3 decimal places.
+- The observed PDO phase-transition years over 1950-2014, defined as the years in which the 9-year (108-month) centred running mean of the ERSSTv5 index changes sign (a crossing less than 3 years after the last counted transition is merged into it, keeping the earlier year), and which of them correspond to documented Pacific climate shifts.
+- Which model reproduces the observed pattern best, and whether the models' amplitude and persistence are consistent with observations.
+
+Expected visualizations:
+- Figure 1, a 2-by-2 panel of the regression pattern over the PDO domain, in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, on one diverging colour scale centred on zero labelled in degrees Celsius per standard deviation, each panel annotated with its explained variance and, for the models, its pattern correlation with observations.
+- Figure 2, a single time-series panel of the standardized index of all four sources plus the published PDO series as a distinguishable fifth line, with the 9-year smoothed ERSSTv5 curve and the transition years marked, and the y axis labelled as a standardized index.
+
+Datasets available on this machine:
+{
+  "woa23": {
+    "kind": "climatology",
+    "root": "/data1/lorraine-20419/ocean_data/WOA23/climatology",
+    "masks_root": "/data1/lorraine-20419/ocean_data/WOA23/masks",
+    "description": "World Ocean Atlas 2023 (NOAA/NCEI) 1.00 degree objectively analysed climatology. Temperature and salinity come on two climate normals, 1971-2000 and 1991-2020; oxygen, apparent oxygen utilization and percent oxygen saturation each provide both a 1971-2000 normal (the default) and a 1965-2022 all-period (all) composite; nutrients provide only the 1965-2022 all-period composite.",
+    "grid": {
+      "type": "regular",
+      "resolution": 1.0,
+      "lat": [
+        -89.5,
+        89.5
+      ],
+      "lon": [
+        -179.5,
+        179.5
+      ],
+      "lon_convention": "-180_180"
+    },
+    "filename_template": "woa23_{tag}_{prefix}{nn:02d}_01.nc",
+    "time": {
+      "decode": false,
+      "slices": {
+        "annual": [
+          0
+        ],
+        "monthly": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "seasonal": [
+          13,
+          14,
+          15,
+          16
+        ]
+      },
+      "season_names": {
+        "13": "winter",
+        "14": "spring",
+        "15": "summer",
+        "16": "autumn"
+      }
+    },
+    "fields": {
+      "an": "objectively analysed mean field",
+      "mn": "statistical mean of interpolated observations",
+      "dd": "number of observations per grid cell per standard level",
+      "sd": "standard deviation of the statistical mean",
+      "se": "standard error of the statistical mean",
+      "oa": "statistical mean minus objectively analysed mean",
+      "gp": "number of grid points with statistical mean within radius of influence",
+      "sea": "standard error of the objectively analysed mean",
+      "sdo": "standard deviation of the objectively analysed field (t/s only, all time slices; o annual mean only)",
+      "ma": "seasonal/monthly-only field (absent from the annual-mean files, nn=00)"
+    },
+    "default_field": "an",
+    "period_priority": [
+      "1971-2000",
+      "1991-2020",
+      "all"
+    ],
+    "aliases": {
+      "t": "temperature",
+      "temp": "temperature",
+      "thetao": "temperature",
+      "sst": "temperature",
+      "tos": "temperature",
+      "s": "salinity",
+      "so": "salinity",
+      "salt": "salinity",
+      "o": "oxygen",
+      "o2": "oxygen",
+      "n": "nitrate",
+      "no3": "nitrate",
+      "p": "phosphate",
+      "po4": "phosphate",
+      "i": "silicate",
+      "si": "silicate",
+      "sio2": "silicate",
+      "aou": "apparent_oxygen_utilization",
+      "o2sat": "percent_oxygen_saturation",
+      "osat": "percent_oxygen_saturation",
+      "po2sat": "percent_oxygen_saturation"
+    },
+    "variables": {
+      "temperature": {
+        "prefix": "t",
+        "units": "degrees_celsius",
+        "standard_name": "sea_water_temperature",
+        "periods": {
+          "1971-2000": {
+            "subdir": "temperature/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 102
+            }
+          },
+          "1991-2020": {
+            "subdir": "temperature/1991-2020_climate_normal",
+            "tag": "decav91C0",
+            "time_epoch": "1991-01-01",
+            "depth_levels": {
+              "monthly": 57
+            }
+          }
+        }
+      },
+      "salinity": {
+        "prefix": "s",
+        "units": "1",
+        "standard_name": "sea_water_practical_salinity",
+        "periods": {
+          "1971-2000": {
+            "subdir": "salinity/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 102
+            }
+          },
+          "1991-2020": {
+            "subdir": "salinity/1991-2020_climate_normal",
+            "tag": "decav91C0",
+            "time_epoch": "1991-01-01",
+            "depth_levels": {
+              "monthly": 57
+            }
+          }
+        }
+      },
+      "oxygen": {
+        "prefix": "o",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_oxygen_per_unit_mass_in_sea_water",
+        "periods": {
+          "1971-2000": {
+            "subdir": "oxygen/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          },
+          "all": {
+            "subdir": "oxygen/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          }
+        }
+      },
+      "nitrate": {
+        "prefix": "n",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_nitrate_per_unit_mass_in_sea_water",
+        "periods": {
+          "all": {
+            "subdir": "nitrate/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 43,
+              "seasonal": 43
+            }
+          }
+        }
+      },
+      "phosphate": {
+        "prefix": "p",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_phosphate_per_unit_mass_in_sea_water",
+        "periods": {
+          "all": {
+            "subdir": "phosphate/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 43,
+              "seasonal": 43
+            }
+          }
+        }
+      },
+      "silicate": {
+        "prefix": "i",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "moles_of_silicate_per_unit_mass_in_sea_water",
+        "periods": {
+          "all": {
+            "subdir": "silicate/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 43,
+              "seasonal": 43
+            }
+          }
+        }
+      },
+      "apparent_oxygen_utilization": {
+        "prefix": "A",
+        "units": "micromoles_per_kilogram",
+        "standard_name": "apparent_oxygen_utilization_in_sea_water",
+        "periods": {
+          "1971-2000": {
+            "subdir": "apparent_oxygen_utilization/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          },
+          "all": {
+            "subdir": "apparent_oxygen_utilization/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          }
+        }
+      },
+      "percent_oxygen_saturation": {
+        "prefix": "O",
+        "units": "percent",
+        "standard_name": "fractional_saturation_of_oxygen_in_sea_water",
+        "periods": {
+          "1971-2000": {
+            "subdir": "percent_oxygen_saturation/1971-2000_climate_normal",
+            "tag": "decav71A0",
+            "time_epoch": "1971-01-01",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          },
+          "all": {
+            "subdir": "percent_oxygen_saturation/all_time_periods",
+            "tag": "all",
+            "time_epoch": "1965-01-01",
+            "climatology_years": "1965-2022",
+            "depth_levels": {
+              "annual": 102,
+              "monthly": 57,
+              "seasonal": 57
+            }
+          }
+        }
+      }
+    },
+    "depth_reference_file": "nitrate/all_time_periods/woa23_all_n00_01.nc",
+    "masks": {
+      "basin": {
+        "file": "basinmask_01.msk",
+        "note": "Sparse table (41090 rows < 180x360), ocean grid points only. Gives a basin number for each of the 102 standard levels; levels below the sea floor are empty fields. Longitude convention -180~180. Labelling follows WOA13."
+      },
+      "landsea": {
+        "file": "landsea_01.msk",
+        "note": "Full grid table (64800 points + 2 header/comment rows). Bottom_Standard_Level is not 0/1: 1 = land; for every other point (value - 1) is exactly the index of the deepest standard level with data there, verified cell by cell against the WOA23 nitrate field (all 37712 points with mask <= 102 match exactly). Values above 103 mean the sea floor is deeper than the 5500 m bottom of the climatology, and index WOA's longer list of standard levels (down to 138 at the deepest trenches), which has no counterpart on the 102-level axis. The ocean points selected by mask > 1 (41088 of them) are exactly the points where WOA23 has data. Row order is not raster-scan order, so the index must be rebuilt from the Latitude/Longitude columns."
+      }
+    },
+    "notes": [
+      "The directory layout is climatology/<variable>/<period>/; the \"temperature_1971-2000\" spelling in DATA_METADATA.md section 7.2 is wrong.",
+      "The time epoch varies with the period (1971 / 1991 / 1965); DATA_METADATA.md section 7.5 is wrong to claim a uniform 1971.",
+      "Temperature, salinity, oxygen, apparent oxygen utilization and percent oxygen saturation all publish a 1971-2000 normal. The NUTRIENTS (nitrate, phosphate, silicate) do not. They exist only as the 1965-2022 all-period composite, so any model comparison against them carries a period mismatch that cannot be removed, and it must be stated.",
+      "Only temperature and salinity also publish the 1991-2020 normal."
+    ]
+  },
+  "glodap": {
+    "kind": "climatology",
+    "root": "/data1/lorraine-20419/ocean_data/GLODAPv2.2016b_MappedClimatologies",
+    "description": "GLODAPv2 global ocean carbon chemistry mapped climatology (DIVA objective analysis), built from 1972-2013 input data. No time dimension, 33 standard depth levels.",
+    "grid": {
+      "type": "regular",
+      "resolution": 1.0,
+      "lat": [
+        -89.5,
+        89.5
+      ],
+      "lon": [
+        20.5,
+        379.5
+      ],
+      "lon_convention": "20_380"
+    },
+    "filename_template": "GLODAPv2.2016b.{varfile}.nc",
+    "climatology_years": "1972-2013",
+    "depth": {
+      "source_variable": "Depth",
+      "dim": "depth_surface",
+      "levels": [
+        0,
+        10,
+        20,
+        30,
+        50,
+        75,
+        100,
+        125,
+        150,
+        200,
+        250,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900,
+        1000,
+        1100,
+        1200,
+        1300,
+        1400,
+        1500,
+        1750,
+        2000,
+        2500,
+        3000,
+        3500,
+        4000,
+        4500,
+        5000,
+        5500
+      ]
+    },
+    "fields": {
+      "main": "{var}",
+      "error": "{var}_error",
+      "relerr": "{var}_relerr",
+      "input_mean": "Input_mean",
+      "input_std": "Input_std",
+      "input_n": "Input_N"
+    },
+    "default_field": "main",
+    "aliases": {
+      "no3": "NO3",
+      "nitrate": "NO3",
+      "po4": "PO4",
+      "phosphate": "PO4",
+      "si": "silicate",
+      "sio2": "silicate",
+      "o2": "oxygen",
+      "dic": "TCO2",
+      "tco2": "TCO2",
+      "talk": "TAlk",
+      "alkalinity": "TAlk",
+      "cant": "Cant",
+      "temp": "temperature",
+      "thetao": "temperature",
+      "so": "salinity",
+      "ph": "pHtsinsitutp"
+    },
+    "variables": {
+      "temperature": {
+        "varfile": "temperature",
+        "units": "degrees celcius"
+      },
+      "salinity": {
+        "varfile": "salinity",
+        "units": ""
+      },
+      "oxygen": {
+        "varfile": "oxygen",
+        "units": "micro-mol kg-1"
+      },
+      "NO3": {
+        "varfile": "NO3",
+        "units": "micro-mol kg-1"
+      },
+      "PO4": {
+        "varfile": "PO4",
+        "units": "micro-mol kg-1"
+      },
+      "silicate": {
+        "varfile": "silicate",
+        "units": "micro-mol kg-1"
+      },
+      "TCO2": {
+        "varfile": "TCO2",
+        "units": "micro-mol kg-1"
+      },
+      "PI_TCO2": {
+        "varfile": "PI_TCO2",
+        "units": "micro-mol kg-1"
+      },
+      "Cant": {
+        "varfile": "Cant",
+        "units": "micro-mol kg-1"
+      },
+      "TAlk": {
+        "varfile": "TAlk",
+        "units": "micro-mol kg-1"
+      },
+      "pHtsinsitutp": {
+        "varfile": "pHtsinsitutp",
+        "units": ""
+      },
+      "pHts25p0": {
+        "varfile": "pHts25p0",
+        "units": ""
+      },
+      "OmegaA": {
+        "varfile": "OmegaA",
+        "units": ""
+      },
+      "OmegaC": {
+        "varfile": "OmegaC",
+        "units": ""
+      }
+    },
+    "notes": [
+      "The units attribute of Input_mean / Input_std is hard-coded to \"micro-mol kg-1\" in every file. That is an error in the product metadata; take the units from the main variable.",
+      "temperature's units string is spelt \"degrees celcius\" (a typo in the source), which cf_units/pint cannot parse.",
+      "The units attribute of salinity / pH / Omega is an empty string.",
+      "The global Comment attribute is mojibake and unusable."
+    ]
+  },
+  "seanoe_mld": {
+    "kind": "climatology",
+    "root": "/data1/lorraine-20419/ocean_data/SEANOE",
+    "description": "Global ocean mixed layer depth (MLD) monthly climatology from the LOPS laboratory. The criterion is a potential density increase of 0.03 kg/m3 relative to the reference depth. Based on a month-by-month objective analysis of 1970-2021 Argo and WOD profiles.",
+    "grid": {
+      "type": "regular",
+      "resolution": 1.0,
+      "lat": [
+        -89.5,
+        89.5
+      ],
+      "lon": [
+        -179.5,
+        179.5
+      ],
+      "lon_convention": "-180_180"
+    },
+    "climatology_years": "1970-2021",
+    "time": {
+      "decode": false,
+      "dim": "time",
+      "values": [
+        14,
+        45,
+        73,
+        104,
+        134,
+        165,
+        195,
+        226,
+        257,
+        287,
+        318,
+        348
+      ],
+      "interpretation": "day of year at the centre of each month, mapped directly to month = 1..12"
+    },
+    "depth": null,
+    "default_version": "v2024",
+    "versions": {
+      "v2024": {
+        "file": "mld_dr003_ref5m_v2024.nc",
+        "reference_depth_m": 5,
+        "doi": "10.17882/98226",
+        "valid_range": [
+          5.0,
+          1236.94
+        ]
+      },
+      "v2023": {
+        "file": "mld_dr003_ref10m_v2023.nc",
+        "reference_depth_m": 10,
+        "doi": "10.17882/91774",
+        "valid_range": [
+          10.01,
+          1221.18
+        ]
+      }
+    },
+    "variables": {
+      "mld_dr003": {
+        "units": "m",
+        "long_name": "mixed layer depth"
+      },
+      "n_obs": {
+        "units": "count",
+        "long_name": "number of profiles per cell per month"
+      },
+      "mask": {
+        "units": "1",
+        "long_name": "land/sea mask, 0=land 1=ocean",
+        "dims": [
+          "lat",
+          "lon"
+        ]
+      }
+    },
+    "default_variable": "mld_dr003",
+    "notes": [
+      "Every coordinate and variable spells its units attribute `unit`, not CF's `units`, so CF tools do not pick it up; the opener rewrites it to units.",
+      "v2023 references 10 m and v2024 references 5 m, so their MLD lower bounds differ; the two versions cannot be swapped or differenced directly.",
+      "The Timestamp attribute of the v2024 file says 2023, a slip in the product metadata."
+    ]
+  },
+  "ersst": {
+    "kind": "timeseries",
+    "root": "/data1/lorraine-20419/ocean_data/ERSSTv5",
+    "file": "sst.mnmean.nc",
+    "description": "NOAA Extended Reconstructed SST v5 (in situ observations only), monthly mean, 1854 to present. Surface only, no vertical dimension.",
+    "grid": {
+      "type": "regular",
+      "resolution": 2.0,
+      "lat": [
+        -88.0,
+        88.0
+      ],
+      "lon": [
+        0.0,
+        358.0
+      ],
+      "lon_convention": "0_360",
+      "lat_order": "descending"
+    },
+    "time": {
+      "decode": true,
+      "frequency": "monthly",
+      "range": [
+        "1854-01-01",
+        "2026-08-01"
+      ],
+      "stamp": "month_start"
+    },
+    "depth": null,
+    "variables": {
+      "sst": {
+        "units": "degC",
+        "long_name": "Monthly Means of Sea Surface Temperature",
+        "valid_range": [
+          -1.8,
+          45.0
+        ]
+      }
+    },
+    "default_variable": "sst",
+    "notes": [
+      "The global climatology attribute states that the product's internal climatology is based on 1971-2000, but the file stores absolute temperature, not anomalies.",
+      "This is a near-real-time copy (data_modified 2026-09-03); the trailing months may be revised."
+    ]
+  },
+  "cpc_indices": {
+    "kind": "index",
+    "root": "/data1/lorraine-20419/ocean_data/CPC",
+    "description": "NOAA monthly climate indices. The four Nino products are CPC ENSO monitoring indices, giving regional mean SST and its anomaly in degC. The PDO product is a NOAA NCEI pattern index and is dimensionless; it is kept here so the monthly indices live together, despite the dataset id naming CPC.",
+    "default_product": "ersst5_91-20",
+    "products": {
+      "oni": {
+        "file": "oni.ascii.txt",
+        "columns": [
+          "SEAS",
+          "YR",
+          "TOTAL",
+          "ANOM"
+        ],
+        "layout": "seasonal",
+        "range": [
+          "DJF 1950",
+          "JJA 2026"
+        ],
+        "note": "ONI is a 3-month running mean of Nino3.4 SST; the official baseline is a 30-year centred normal rolled forward every 5 years."
+      },
+      "ersst5_91-20": {
+        "file": "ersst5.nino.mth.91-20.ascii",
+        "columns": [
+          "YR",
+          "MON",
+          "NINO1+2",
+          "ANOM",
+          "NINO3",
+          "ANOM",
+          "NINO4",
+          "ANOM",
+          "NINO3.4",
+          "ANOM"
+        ],
+        "layout": "monthly",
+        "baseline": "1991-2020",
+        "range": [
+          "1950-01",
+          "2026-06"
+        ],
+        "note": "the operational baseline CPC has used for all its indices since 2021-01; use this one for routine analysis."
+      },
+      "ersst5_81-10": {
+        "file": "ersst5.nino.mth.81-10.ascii",
+        "columns": [
+          "YR",
+          "MON",
+          "NINO1+2",
+          "ANOM",
+          "NINO3",
+          "ANOM",
+          "NINO4",
+          "ANOM",
+          "NINO3.4",
+          "ANOM"
+        ],
+        "layout": "monthly",
+        "baseline": "1981-2010",
+        "range": [
+          "1950-01",
+          "2020-12"
+        ],
+        "note": "archive of the old baseline, discontinued in 2020-12."
+      },
+      "oisst": {
+        "file": "sstoi.indices",
+        "columns": [
+          "YR",
+          "MON",
+          "NINO1+2",
+          "ANOM",
+          "NINO3",
+          "ANOM",
+          "NINO4",
+          "ANOM",
+          "NINO3.4",
+          "ANOM"
+        ],
+        "layout": "monthly",
+        "source": "OI SST",
+        "range": [
+          "1982-01",
+          "2026-08"
+        ]
+      },
+      "pdo": {
+        "file": "ersst.v6.pdo.dat",
+        "columns": [
+          "Year",
+          "Jan",
+          "Feb",
+          "Mar",
+          "Apr",
+          "May",
+          "Jun",
+          "Jul",
+          "Aug",
+          "Sep",
+          "Oct",
+          "Nov",
+          "Dec"
+        ],
+        "layout": "year_rows",
+        "source": "NOAA NCEI",
+        "sst_product": "ERSST v6",
+        "domain": "North Pacific",
+        "units": "1",
+        "missing_value": 99.99,
+        "range": [
+          "1850-01",
+          "2026-08"
+        ],
+        "note": "The leading principal component of North Pacific SST anomalies, published by NCEI rather than CPC and built from ERSST v6. The gridded `ersst` dataset in this registry is v5, so an index reconstructed from it and this published series rest on different SST products; their difference is not purely an operator difference and must be reported as such."
+      }
+    },
+    "regions": {
+      "NINO1+2": {
+        "lat": [
+          -10,
+          0
+        ],
+        "lon": [
+          -90,
+          -80
+        ]
+      },
+      "NINO3": {
+        "lat": [
+          -5,
+          5
+        ],
+        "lon": [
+          -150,
+          -90
+        ]
+      },
+      "NINO3.4": {
+        "lat": [
+          -5,
+          5
+        ],
+        "lon": [
+          -170,
+          -120
+        ]
+      },
+      "NINO4": {
+        "lat": [
+          -5,
+          5
+        ],
+        "lon": [
+          160,
+          -150
+        ]
+      }
+    },
+    "notes": [
+      "The three Nino files overlap in time but differ in baseline and in how they are produced, so their values must not be mixed.",
+      "The pdo product is a different kind of quantity from the Nino ones. It is a dimensionless pattern index over a whole basin, with no absolute value and no region to select, and comes from a different SST product version, so it is not interchangeable with them.",
+      "The raw header has four columns all named ANOM; the opener renames them to <region>_ANOM."
+    ]
+  },
+  "cmip6_historical": {
+    "kind": "timeseries",
+    "root": "/data1/lorraine-20419/benchmark_cmip6/historical",
+    "experiment": "historical",
+    "description": "CMIP6 historical (all-forcing historical simulation) ocean component, Omon monthly frequency plus Ofx fixed fields. Three models: CESM2, GFDL-ESM4, MPI-ESM1-2-LR.",
+    "layout": "{root}/{model}/{variable}/",
+    "filename_template": "{variable}_{table}_{model}_{experiment}_{variant}_{grid}[_{YYYYMM-YYYYMM}].nc",
+    "time": {
+      "decode": true,
+      "use_cftime": true,
+      "frequency": "monthly",
+      "range": [
+        "1850-01",
+        "2014-12"
+      ],
+      "n_steps": 1980,
+      "normalize_to": "month_start"
+    },
+    "models": {
+      "CESM2": {
+        "institution": "NCAR",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "nlat",
+        "x_dim": "nlon",
+        "shape": [
+          384,
+          320
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "centimeters",
+        "depth_scale": 0.01,
+        "n_levels": 60,
+        "calendar": "noleap",
+        "ocean_mask_from": "sftof",
+        "notes": [
+          "lev is in centimetres and must be multiplied by depth_scale to get metres (500 cm -> 5 m, 537500 cm -> 5375 m).",
+          "But lev_bnds in the same file declares its units as m rather than centimetres, so the layer bounds are already in metres. Applying lev's conversion factor to lev_bnds as well would make layer thicknesses 100 times too small and corrupt vertical integrals outright. load_depth_levels converts each according to its own declared units.",
+          "The raw areacello carries no land-sea mask and covers the whole globe (0.990 of the Earth's surface), whereas GFDL-ESM4 and MPI-ESM1-2-LR publish theirs already masked to the ocean (0.708 / 0.718). After the opener applies the ocean_mask_from above it comes to 0.7068, the same order as the other two models.",
+          "chl has only 15 levels (the top 150 m), unlike the other three-dimensional variables."
+        ]
+      },
+      "GFDL-ESM4": {
+        "institution": "NOAA-GFDL",
+        "grid_type": "regular",
+        "grid_label": "gr",
+        "y_dim": "lat",
+        "x_dim": "lon",
+        "shape": [
+          180,
+          360
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 35,
+        "calendar": "noleap",
+        "notes": [
+          "The only model that can be sliced directly by lat/lon.",
+          "volcello is Omon (time-varying, split across files), not an Ofx fixed field."
+        ]
+      },
+      "MPI-ESM1-2-LR": {
+        "institution": "MPI-M",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "j",
+        "x_dim": "i",
+        "shape": [
+          220,
+          256
+        ],
+        "lat_coord": "latitude",
+        "lon_coord": "longitude",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 40,
+        "calendar": "proleptic_gregorian",
+        "notes": [
+          "wo / wmo use 41 interface levels (0 ~ 6020 m); the coordinate is still named lev (DATA_METADATA.md is wrong to call it lev_2)."
+        ]
+      }
+    },
+    "fixed_field_table": "Ofx",
+    "fixed_fields": [
+      "areacello",
+      "deptho",
+      "sftof",
+      "volcello"
+    ],
+    "notes": [
+      "The variant label must be parsed from the actual filename and never assumed to be r1i1p1f1; historical/CESM2/phycos is r6i1p1f1 and historical/MPI-ESM1-2-LR/ph is r10i1p1f1.",
+      "In a grid-point-wise joint analysis with other variables, those two are not the same ensemble member and must not be treated as the same simulated trajectory.",
+      "CESM2 is missing o2/o2sat/intdic/intpoc; GFDL-ESM4 is missing uo/vo/wo, umo/vmo/wmo and sftof.",
+      "so declares its units as \"0.001\" (the CMIP6 standard spelling for practical salinity), not psu."
+    ]
+  },
+  "cmip6_ssp245": {
+    "kind": "timeseries",
+    "root": "/data1/lorraine-20419/benchmark_cmip6/ssp245",
+    "experiment": "ssp245",
+    "description": "CMIP6 ScenarioMIP ssp245 (SSP2-4.5, concentration-driven). Grid and coordinate definitions are the same as historical; they differ in time range, variant label and variable coverage.",
+    "layout": "{root}/{model}/{variable}/",
+    "filename_template": "{variable}_{table}_{model}_{experiment}_{variant}_{grid}[_{YYYYMM-YYYYMM}].nc",
+    "time": {
+      "decode": true,
+      "use_cftime": true,
+      "frequency": "monthly",
+      "range": [
+        "2015-01",
+        "2100-12"
+      ],
+      "n_steps": 1032,
+      "normalize_to": "month_start"
+    },
+    "models": {
+      "CESM2": {
+        "institution": "NCAR",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "nlat",
+        "x_dim": "nlon",
+        "shape": [
+          384,
+          320
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "centimeters",
+        "depth_scale": 0.01,
+        "n_levels": 60,
+        "calendar": "noleap",
+        "ocean_mask_from": "sftof",
+        "notes": [
+          "lev is in centimetres and must be multiplied by depth_scale to get metres (500 cm -> 5 m, 537500 cm -> 5375 m).",
+          "But lev_bnds in the same file declares its units as m rather than centimetres, so the layer bounds are already in metres. Applying lev's conversion factor to lev_bnds as well would make layer thicknesses 100 times too small and corrupt vertical integrals outright. load_depth_levels converts each according to its own declared units.",
+          "The raw areacello carries no land-sea mask and covers the whole globe (0.990 of the Earth's surface), whereas GFDL-ESM4 and MPI-ESM1-2-LR publish theirs already masked to the ocean (0.708 / 0.718). After the opener applies the ocean_mask_from above it comes to 0.7068, the same order as the other two models.",
+          "chl has only 15 levels (the top 150 m), unlike the other three-dimensional variables."
+        ]
+      },
+      "GFDL-ESM4": {
+        "institution": "NOAA-GFDL",
+        "grid_type": "regular",
+        "grid_label": "gr",
+        "y_dim": "lat",
+        "x_dim": "lon",
+        "shape": [
+          180,
+          360
+        ],
+        "lat_coord": "lat",
+        "lon_coord": "lon",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 35,
+        "calendar": "noleap",
+        "notes": [
+          "The only model that can be sliced directly by lat/lon.",
+          "volcello is Omon (time-varying, split across files), not an Ofx fixed field."
+        ]
+      },
+      "MPI-ESM1-2-LR": {
+        "institution": "MPI-M",
+        "grid_type": "curvilinear",
+        "grid_label": "gn",
+        "y_dim": "j",
+        "x_dim": "i",
+        "shape": [
+          220,
+          256
+        ],
+        "lat_coord": "latitude",
+        "lon_coord": "longitude",
+        "lon_convention": "0_360",
+        "depth_coord": "lev",
+        "depth_units": "m",
+        "depth_scale": 1.0,
+        "n_levels": 40,
+        "calendar": "proleptic_gregorian",
+        "notes": [
+          "wo / wmo use 41 interface levels (0 ~ 6020 m); the coordinate is still named lev (DATA_METADATA.md is wrong to call it lev_2)."
+        ]
+      }
+    },
+    "fixed_field_table": "Ofx",
+    "fixed_fields": [
+      "areacello",
+      "deptho",
+      "sftof",
+      "volcello"
+    ],
+    "fixed_field_fallback": "cmip6_historical",
+    "notes": [
+      "tos and mlotst are missing from ssp245 for all three models (historical has them); for scenario-period SST, the top level of thetao is a usable approximation.",
+      "The bulk of CESM2's ssp245 is r10i1p1f1, but the deptho and sftof fixed fields are r1i1p1f1.",
+      "ssp245/CESM2 has o2 and o2sat (historical/CESM2 does not); ph in ssp245/MPI-ESM1-2-LR is r1i1p1f1 (historical is r10).",
+      "CESM2's ssp245 calendar attribute is written 365_day and historical's noleap; the two are equivalent but the strings differ."
+    ]
+  }
+}
+
+Fix this compute block and output the corrected, complete version inside <execute></execute> tags.
+
+
+===== RESPONSE =====
+Looking at the traceback, the failure is in `make_curvilinear_weights` at `np.column_stack([lon_c.ravel(), lat_c.ravel()])`: the two coordinate arrays handed to it have inconsistent shapes (150 vs 50). The root cause is that the code builds the 2-D latitude/longitude grids from `ds[latname]`/`ds[lonname]` with a fragile `if lat2d.ndim == 1: meshgrid(...)` guard that does not guarantee the coordinate grids end up as two equally-shaped 2-D arrays that match the `tos` array's `(y, x)` shape. For curvilinear CMIP6 grids the coordinates can be 1-D, 2-D, or carry a small "bounds" dimension, so the guard silently produces mismatched grids.
+
+I rewrite the coordinate handling into a robust `_prepare_2d` helper (meshgrid for 1-D, broadcast for mixed, collapse small bounds dims, transpose to match the data shape, explicit shape validation), and remove the dangerous internal meshgrid from `make_curvilinear_weights`. I also make the CPC PDO-file parsing robust (so month-name capitalisation / header quirks don't silently produce an empty frame), then add the required metrics and the two figures.
+
+<execute>
+import os
+import re
+import glob
+import numpy as np
+import pandas as pd
+import xarray as xr
+from scipy.spatial import cKDTree
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------------------------
+# Paths and common PDO domain / target grid
+# ---------------------------------------------------------------------------
+ersst_path = "/data1/lorraine-20419/ocean_data/ERSSTv5/sst.mnmean.nc"
+cpc_root = "/data1/lorraine-20419/ocean_data/CPC"
+pdo_path = os.path.join(cpc_root, "ersst.v6.pdo.dat")
+cmip_hist_root = "/data1/lorraine-20419/benchmark_cmip6/historical"
+
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+
+# 1-degree centre grid, following the WOA/SEANOE half-degree-centre convention.
+target_lat = np.arange(20.5, 70.0, 1.0)
+target_lon = np.arange(110.5, 260.0, 1.0)   # 110.5E to 100.5W, 0-360 convention
+target_lat2d, target_lon2d = np.meshgrid(target_lat, target_lon, indexing="ij")
+ny_t, nx_t = target_lat2d.shape
+
+dates = pd.date_range("1950-01-01", "2014-12-01", freq="MS")
+months_expected = dates.month.values
+nt_expected = len(dates)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def select_time_range(ds, y0=1950, y1=2014):
+    """Select year window and return the dataset plus its month numbers."""
+    ds = ds.sortby("time")
+    yrs = ds.time.dt.year.values
+    mons = ds.time.dt.month.values
+    sel = (yrs >= y0) & (yrs <= y1)
+    ds_sel = ds.isel(time=np.where(sel)[0])
+    return ds_sel, mons[sel]
+
+
+def to_celsius(da):
+    """CMIP6 tos is normally already degC; convert only if declared in K."""
+    u = str(da.attrs.get("units", "")).strip().lower()
+    if u in ("k", "kelvin") or u.endswith("k"):
+        return da - 273.15
+    return da
+
+
+def _prepare_2d(lat_vals, lon_vals, ny, nx):
+    """
+    Return two equally-shaped 2-D (ny, nx) latitude / longitude grids from
+    whatever the coordinate variables happen to look like (1-D, 2-D, or with
+    a small trailing 'bounds' dimension).
+    """
+    lat_vals = np.squeeze(np.asarray(lat_vals, dtype=float))
+    lon_vals = np.squeeze(np.asarray(lon_vals, dtype=float))
+
+    def _collapse(v):
+        # collapse a small 'bounds / vertices' axis if one is present
+        if v.ndim == 2 and v.shape[-1] in (2, 3, 4) and v.shape[0] > 4:
+            return v.mean(axis=-1)
+        if v.ndim == 2 and v.shape[0] in (2, 3, 4) and v.shape[1] > 4:
+            return v.mean(axis=0)
+        return v
+
+    lat_vals = _collapse(lat_vals)
+    lon_vals = _collapse(lon_vals)
+
+    if lat_vals.ndim == 1 and lon_vals.ndim == 1:
+        lat2d, lon2d = np.meshgrid(lat_vals, lon_vals, indexing="ij")
+    elif lat_vals.ndim == 2 and lon_vals.ndim == 2:
+        lat2d, lon2d = lat_vals, lon_vals
+    elif lat_vals.ndim == 1 and lon_vals.ndim == 2:
+        lat2d = np.broadcast_to(lat_vals[:, None], lon_vals.shape)
+        lon2d = lon_vals
+    elif lat_vals.ndim == 2 and lon_vals.ndim == 1:
+        lat2d = lat_vals
+        lon2d = np.broadcast_to(lon_vals[None, :], lat_vals.shape)
+    else:
+        raise ValueError(
+            f"Unsupported coordinate ndims: lat {lat_vals.ndim}, lon {lon_vals.ndim}"
+        )
+
+    if lat2d.shape != lon2d.shape:
+        raise ValueError(f"lat grid {lat2d.shape} != lon grid {lon2d.shape}")
+
+    if lat2d.shape != (ny, nx):
+        if lat2d.shape == (nx, ny):
+            lat2d, lon2d = lat2d.T, lon2d.T
+        else:
+            raise ValueError(
+                f"coordinate grid {lat2d.shape} does not match data ({ny}, {nx})"
+            )
+
+    return np.ascontiguousarray(lat2d), np.ascontiguousarray(lon2d)
+
+
+def _bilinear_solve(pts, T):
+    """
+    Invert the bilinear map of a curvilinear grid cell.
+    pts = [P00, P10, P01, P11], each [lon, lat].
+    Returns (u, v) if T is inside the cell, else None.
+    """
+    P00, P10, P01, P11 = pts
+    a = P00
+    b = P10 - P00
+    c = P01 - P00
+    d = P00 - P10 - P01 + P11
+
+    best = None
+    for u0, v0 in ((0.5, 0.5), (0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)):
+        u, v = u0, v0
+        ok = True
+        for _ in range(25):
+            F = a + b * u + c * v + d * u * v - T
+            if np.linalg.norm(F) < 1e-12:
+                break
+            J = np.array(
+                [
+                    [b[0] + d[0] * v, c[0] + d[0] * u],
+                    [b[1] + d[1] * v, c[1] + d[1] * u],
+                ]
+            )
+            try:
+                delta = np.linalg.solve(J, -F)
+            except np.linalg.LinAlgError:
+                ok = False
+                break
+            u += delta[0]
+            v += delta[1]
+            if not np.isfinite(u) or not np.isfinite(v):
+                ok = False
+                break
+            if np.linalg.norm(delta) < 1e-12:
+                break
+        if ok and (-1e-5 <= u <= 1.0 + 1e-5) and (-1e-5 <= v <= 1.0 + 1e-5):
+            P = a + b * u + c * v + d * u * v
+            res = np.linalg.norm(P - T)
+            if best is None or res < best[0]:
+                best = (res, u, v)
+
+    if best is not None and best[0] < 1e-4:
+        return best[1], best[2]
+    return None
+
+
+def make_curvilinear_weights(lat2d, lon2d, target_lat, target_lon, max_candidates=12):
+    """
+    Precompute bilinear weights from a logically rectangular curvilinear grid
+    to the target regular 1-degree grid.
+    """
+    lat2d = np.asarray(lat2d, dtype=float)
+    lon2d = np.asarray(lon2d, dtype=float) % 360.0
+    if lat2d.shape != lon2d.shape:
+        raise ValueError(f"lat2d {lat2d.shape} and lon2d {lon2d.shape} must match")
+    ny, nx = lat2d.shape
+
+    lat_c = 0.25 * (
+        lat2d[:-1, :-1] + lat2d[1:, :-1] + lat2d[:-1, 1:] + lat2d[1:, 1:]
+    )
+    lon_c = 0.25 * (
+        lon2d[:-1, :-1] + lon2d[1:, :-1] + lon2d[:-1, 1:] + lon2d[1:, 1:]
+    )
+    lon_c = lon_c % 360.0
+
+    tree = cKDTree(np.column_stack([lon_c.ravel(), lat_c.ravel()]))
+
+    tlon = (target_lon.ravel() % 360.0)
+    tlat = target_lat.ravel()
+    target_pts = np.column_stack([tlon, tlat])
+
+    dists, cell_ids = tree.query(target_pts, k=max_candidates)
+    if max_candidates == 1:
+        cell_ids = cell_ids[:, None]
+        dists = dists[:, None]
+
+    n_target = len(tlat)
+    idx4 = np.zeros((n_target, 4), dtype=np.int64)
+    w4 = np.zeros((n_target, 4), dtype=float)
+
+    for it in range(n_target):
+        best = None
+
+        for kk in range(cell_ids.shape[1]):
+            cell = cell_ids[it, kk]
+            ci, cj = np.unravel_index(cell, (ny - 1, nx - 1))
+
+            pts = np.array(
+                [
+                    [lon2d[ci, cj], lat2d[ci, cj]],
+                    [lon2d[ci + 1, cj], lat2d[ci + 1, cj]],
+                    [lon2d[ci, cj + 1], lat2d[ci, cj + 1]],
+                    [lon2d[ci + 1, cj + 1], lat2d[ci + 1, cj + 1]],
+                ],
+                dtype=float,
+            )
+
+            clon = lon_c[ci, cj]
+            pts[:, 0] = clon + ((pts[:, 0] - clon + 180.0) % 360.0 - 180.0)
+            T = np.array(
+                [
+                    clon + ((tlon[it] - clon + 180.0) % 360.0 - 180.0),
+                    tlat[it],
+                ]
+            )
+
+            if not (
+                T[0] >= pts[:, 0].min() - 1e-6
+                and T[0] <= pts[:, 0].max() + 1e-6
+                and T[1] >= pts[:, 1].min() - 1e-6
+                and T[1] <= pts[:, 1].max() + 1e-6
+            ):
+                continue
+
+            sol = _bilinear_solve(pts, T)
+            if sol is None:
+                continue
+
+            u, v = sol
+            P = (
+                (1 - u) * (1 - v) * pts[0]
+                + u * (1 - v) * pts[1]
+                + (1 - u) * v * pts[2]
+                + u * v * pts[3]
+            )
+            res = np.linalg.norm(P - T)
+
+            if best is None or res < best[0]:
+                best = (res, ci, cj, u, v)
+
+        if best is not None:
+            _, ci, cj, u, v = best
+            w00 = (1 - u) * (1 - v)
+            w10 = u * (1 - v)
+            w01 = (1 - u) * v
+            w11 = u * v
+            idx4[it] = [
+                ci * nx + cj,
+                (ci + 1) * nx + cj,
+                ci * nx + (cj + 1),
+                (ci + 1) * nx + (cj + 1),
+            ]
+            w4[it] = [w00, w10, w01, w11]
+        else:
+            # Fallback: nearest corner of nearest cell.
+            cell = cell_ids[it, 0]
+            ci, cj = np.unravel_index(cell, (ny - 1, nx - 1))
+            flat = np.array(
+                [
+                    ci * nx + cj,
+                    (ci + 1) * nx + cj,
+                    ci * nx + (cj + 1),
+                    (ci + 1) * nx + (cj + 1),
+                ]
+            )
+            pts = np.array(
+                [
+                    [lon2d[ci, cj], lat2d[ci, cj]],
+                    [lon2d[ci + 1, cj], lat2d[ci + 1, cj]],
+                    [lon2d[ci, cj + 1], lat2d[ci, cj + 1]],
+                    [lon2d[ci + 1, cj + 1], lat2d[ci + 1, cj + 1]],
+                ],
+                dtype=float,
+            )
+            clon = lon_c[ci, cj]
+            pts[:, 0] = clon + ((pts[:, 0] - clon + 180.0) % 360.0 - 180.0)
+            T = np.array(
+                [
+                    clon + ((tlon[it] - clon + 180.0) % 360.0 - 180.0),
+                    tlat[it],
+                ]
+            )
+            jbest = np.argmin(np.linalg.norm(pts - T, axis=1))
+            idx4[it] = [flat[jbest]] * 4
+            w4[it] = [1.0, 0.0, 0.0, 0.0]
+
+    return idx4, w4
+
+
+def apply_curvilinear_weights(arr, idx4, w4):
+    """Apply precomputed curvilinear bilinear weights to (time, y, x) data."""
+    nt = arr.shape[0]
+    flat = arr.reshape(nt, -1)
+    out = np.empty((nt, idx4.shape[0]), dtype=float)
+    for t in range(nt):
+        out[t] = np.sum(flat[t, idx4] * w4, axis=1)
+    return out.reshape(nt, target_lat.size, target_lon.size)
+
+
+def compute_pdo(sst, months, target_lat2d, target_lon2d):
+    """
+    Leading EOF/PDO of monthly SST anomalies.
+    Returns variance fraction, standardized index, regression map, amplitude,
+    and lag-12-month autocorrelation.
+    """
+    sst = np.asarray(sst, dtype=float)
+    months = np.asarray(months)
+
+    # Monthly climatology over 1950-2014.
+    clim = np.full((12, sst.shape[1], sst.shape[2]), np.nan, dtype=float)
+    for m in range(1, 13):
+        idxm = months == m
+        if np.any(idxm):
+            clim[m - 1] = np.nanmean(sst[idxm], axis=0)
+
+    anom = sst - clim[months - 1]
+
+    # Complete time series required at a grid point.
+    valid = np.all(np.isfinite(anom), axis=0)
+    X = anom[:, valid]
+
+    lat_valid = target_lat2d[valid]
+    lon_valid = target_lon2d[valid]
+
+    # Standard PDO convention: area weighting by sqrt(cos(latitude)).
+    w = np.sqrt(np.maximum(np.cos(np.deg2rad(lat_valid)), 0.0))
+    Xw = X * w[None, :]
+
+    U, S, Vt = np.linalg.svd(Xw, full_matrices=False)
+    var_expl = float(S[0] ** 2 / np.sum(S ** 2))
+
+    pc = U[:, 0] * S[0]
+    idx_std = pc / np.std(pc, ddof=0)
+
+    # Regression of original SST anomalies onto the standardized PC.
+    amp = (X.T @ idx_std) / np.sum(idx_std ** 2)
+    amap = np.full(sst.shape[1:], np.nan, dtype=float)
+    amap[valid] = amp
+
+    # Fix EOF sign to the PDO-positive convention:
+    # warm western North Pacific and cool central/eastern North Pacific.
+    west_mask = (
+        (target_lat2d >= 20.0)
+        & (target_lat2d <= 45.0)
+        & (target_lon2d >= 120.0)
+        & (target_lon2d <= 180.0)
+    )
+    east_mask = (
+        (target_lat2d >= 20.0)
+        & (target_lat2d <= 50.0)
+        & (target_lon2d >= 180.0)
+        & (target_lon2d <= 260.0)
+    )
+    west = np.nanmean(amap[west_mask])
+    east = np.nanmean(amap[east_mask])
+    if np.isfinite(west) and np.isfinite(east) and (west - east) < 0:
+        amap = -amap
+        idx_std = -idx_std
+
+    amp_max = float(np.nanmax(np.abs(amap)))
+    valid_map = np.isfinite(amap)
+    w_map = np.sqrt(
+        np.maximum(np.cos(np.deg2rad(target_lat2d[valid_map])), 0.0)
+    )
+    amp_rms = float(
+        np.sqrt(np.average(amap[valid_map] ** 2, weights=w_map))
+    )
+
+    ac12 = float(np.corrcoef(idx_std[:-12], idx_std[12:])[0, 1])
+
+    return {
+        "var_expl": var_expl,
+        "idx": idx_std,
+        "amp_map": amap,
+        "amp_max": amp_max,
+        "amp_rms": amp_rms,
+        "ac12": ac12,
+        "valid": valid,
+    }
+
+
+def load_model_tos(model):
+    """Load, select 1950-2014, convert to degC, and bilinearly regrid tos."""
+    files = sorted(
+        glob.glob(os.path.join(cmip_hist_root, model, "tos", "*.nc"))
+    )
+    if len(files) == 0:
+        raise FileNotFoundError(f"No tos files for {model}")
+
+    # Group by variant, in case more than one variant is present.
+    groups = {}
+    for f in files:
+        parts = os.path.basename(f).split("_")
+        variant = "unknown"
+        for p in parts:
+            if re.match(r"r\d+i\d+p\d+f\d+", p):
+                variant = p
+                break
+        groups.setdefault(variant, []).append(f)
+
+    if len(groups) > 1:
+        if "r1i1p1f1" in groups:
+            variant = "r1i1p1f1"
+        else:
+            variant = max(groups, key=lambda k: len(groups[k]))
+    else:
+        variant = list(groups.keys())[0]
+
+    fs = sorted(groups[variant])
+    if len(fs) == 1:
+        ds = xr.open_dataset(fs[0], use_cftime=True)
+    else:
+        ds = xr.open_mfdataset(
+            fs,
+            combine="by_coords",
+            use_cftime=True,
+            data_vars="minimal",
+            coords="minimal",
+            compat="override",
+        )
+
+    ds, mons = select_time_range(ds, 1950, 2014)
+    da = ds["tos"]
+    da = to_celsius(da)
+
+    ydim, xdim = {
+        "CESM2": ("nlat", "nlon"),
+        "GFDL-ESM4": ("lat", "lon"),
+        "MPI-ESM1-2-LR": ("j", "i"),
+    }[model]
+
+    # Drop any singleton dimensions other than time / y / x.
+    for d in list(da.dims):
+        if d not in ("time", ydim, xdim) and da.sizes[d] == 1:
+            da = da.isel({d: 0})
+    da = da.transpose("time", ydim, xdim)
+
+    if model == "GFDL-ESM4":
+        da = da.sortby("lat").sortby("lon")
+        da_reg = da.interp(
+            lat=target_lat, lon=target_lon, method="linear"
+        )
+        arr = da_reg.values.astype(float)
+    else:
+        latname = "lat" if model == "CESM2" else "latitude"
+        lonname = "lon" if model == "CESM2" else "longitude"
+        try:
+            lat_vals = ds[latname].values
+            lon_vals = ds[lonname].values
+        except KeyError:
+            lat_vals = da[latname].values
+            lon_vals = da[lonname].values
+
+        ny = da.sizes[ydim]
+        nx = da.sizes[xdim]
+        lat2d, lon2d = _prepare_2d(lat_vals, lon_vals, ny, nx)
+        lon2d = lon2d % 360.0
+
+        idx4, w4 = make_curvilinear_weights(
+            lat2d, lon2d, target_lat, target_lon
+        )
+        arr = apply_curvilinear_weights(da.values.astype(float), idx4, w4)
+
+    if len(mons) != nt_expected:
+        raise ValueError(
+            f"{model}: expected {nt_expected} months, got {len(mons)}"
+        )
+    return arr, mons
+
+
+# ---------------------------------------------------------------------------
+# Observations: ERSSTv5
+# ---------------------------------------------------------------------------
+ds_ersst = xr.open_dataset(ersst_path)
+ds_ersst, months_obs = select_time_range(ds_ersst, 1950, 2014)
+sst_obs = ds_ersst["sst"]
+sst_obs = sst_obs.sortby("lat").sortby("lon")
+sst_obs_reg = sst_obs.interp(
+    lat=target_lat, lon=target_lon, method="linear"
+)
+arr_obs = sst_obs_reg.values.astype(float)
+
+pdo_obs = compute_pdo(
+    arr_obs, months_obs, target_lat2d, target_lon2d
+)
+
+# ---------------------------------------------------------------------------
+# CMIP6 historical tos
+# ---------------------------------------------------------------------------
+pdo_models = {}
+for model in models:
+    arr_model, mons_model = load_model_tos(model)
+    pdo_models[model] = compute_pdo(
+        arr_model, mons_model, target_lat2d, target_lon2d
+    )
+
+# ---------------------------------------------------------------------------
+# Published PDO index (NCEI, ERSSTv6)
+# ---------------------------------------------------------------------------
+month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+with open(pdo_path) as fh:
+    lines = [ln.rstrip("\n") for ln in fh
+             if ln.strip() and not ln.lstrip().startswith("#")]
+
+rows = []
+for ln in lines:
+    parts = ln.split()
+    if len(parts) < 13:
+        continue
+    try:
+        yr = int(float(parts[0]))
+    except ValueError:
+        continue          # header line
+    try:
+        vals = [float(x) for x in parts[1:13]]
+    except ValueError:
+        continue
+    rows.append([yr] + vals)
+
+pdo_df = pd.DataFrame(rows, columns=["Year"] + month_names)
+
+pdo_long = pdo_df.melt(
+    id_vars="Year",
+    value_vars=month_names,
+    var_name="Month",
+    value_name="pdo",
+)
+month_num = {m: i + 1 for i, m in enumerate(month_names)}
+pdo_long["month"] = pdo_long["Month"].map(month_num)
+pdo_long["time"] = pd.to_datetime(
+    dict(
+        year=pdo_long["Year"].astype(int),
+        month=pdo_long["month"].astype(int),
+        day=1,
+    )
+)
+pdo_series = (
+    pdo_long.set_index("time")["pdo"].sort_index().replace(99.99, np.nan)
+)
+pdo_series = pdo_series.reindex(dates)
+pub_idx = pdo_series.values.astype(float)
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+sources = ["ERSSTv5"] + models
+
+var_expl = {"ERSSTv5": pdo_obs["var_expl"]}
+amp_max = {"ERSSTv5": pdo_obs["amp_max"]}
+amp_rms = {"ERSSTv5": pdo_obs["amp_rms"]}
+ac12 = {"ERSSTv5": pdo_obs["ac12"]}
+idx_all = {"ERSSTv5": pdo_obs["idx"]}
+amp_maps = {"ERSSTv5": pdo_obs["amp_map"]}
+
+for model in models:
+    var_expl[model] = pdo_models[model]["var_expl"]
+    amp_max[model] = pdo_models[model]["amp_max"]
+    amp_rms[model] = pdo_models[model]["amp_rms"]
+    ac12[model] = pdo_models[model]["ac12"]
+    idx_all[model] = pdo_models[model]["idx"]
+    amp_maps[model] = pdo_models[model]["amp_map"]
+
+pattern_corr = {}
+for model in models:
+    m = np.isfinite(pdo_obs["amp_map"]) & np.isfinite(
+        pdo_models[model]["amp_map"]
+    )
+    pattern_corr[model] = float(
+        np.corrcoef(
+            pdo_obs["amp_map"][m],
+            pdo_models[model]["amp_map"][m],
+        )[0, 1]
+    )
+
+valid_pub = np.isfinite(pub_idx)
+obs_pub_corr = float(
+    np.corrcoef(
+        pdo_obs["idx"][valid_pub], pub_idx[valid_pub]
+    )[0, 1]
+)
+
+amp_ratio = {
+    model: amp_max[model] / amp_max["ERSSTv5"] for model in models
+}
+ac12_diff = {model: ac12[model] - ac12["ERSSTv5"] for model in models}
+best_model = max(pattern_corr, key=pattern_corr.get)
+
+# ---------------------------------------------------------------------------
+# Observed PDO phase-transition years
+# ---------------------------------------------------------------------------
+def compute_transition_years(idx, dates, window=108):
+    """
+    9-year (108-month) centred running mean; find sign crossings, then merge
+    crossings less than 3 years after the last counted transition.
+    """
+    s = pd.Series(idx, index=pd.to_datetime(dates))
+    smooth = s.rolling(window=window, center=True).mean()
+    sv = smooth.dropna()
+
+    crossings = []
+    vals = sv.values
+    signs = np.sign(vals)
+    for i in range(1, len(sv)):
+        if signs[i] == 0 or signs[i - 1] == 0:
+            continue
+        if signs[i] != signs[i - 1]:
+            x0 = sv.index[i - 1]
+            x1 = sv.index[i]
+            y0 = vals[i - 1]
+            y1 = vals[i]
+            frac = 0.0 if y1 == y0 else (-y0 / (y1 - y0))
+            cross_date = x0 + (x1 - x0) * frac
+            crossings.append(cross_date.year)
+
+    kept = []
+    for yr in crossings:
+        if not kept or (yr - kept[-1]) >= 3:
+            kept.append(int(yr))
+    return kept, smooth
+
+
+transition_years, smooth_obs = compute_transition_years(
+    pdo_obs["idx"], dates, window=108
+)
+
+documented_shifts = [1976, 1988, 1998, 2014]
+matched_shifts = [
+    yr for yr in transition_years
+    if any(abs(yr - d) <= 1 for d in documented_shifts)
+]
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+print("=" * 78)
+print("PDO diagnostics, 1950-2014, North Pacific 20-70N, 110E-100W")
+print("=" * 78)
+print(f"{'source':16s} {'var_expl%':>10s} {'amp_max':>10s} "
+      f"{'amp_rms':>10s} {'ac12':>8s} {'pat_corr':>10s}")
+for src in sources:
+    pc = pattern_corr.get(src, float('nan'))
+    print(f"{src:16s} {100*var_expl[src]:10.1f} {amp_max[src]:10.3f} "
+          f"{amp_rms[src]:10.3f} {ac12[src]:8.3f} {pc:10.3f}")
+
+print("\nAmplitude ratio (model / ERSSTv5, amp_max):")
+for model in models:
+    print(f"  {model:16s} {amp_ratio[model]:.3f}")
+print("lag-12 autocorrelation difference (model - ERSSTv5):")
+for model in models:
+    print(f"  {model:16s} {ac12_diff[model]:+.3f}")
+
+print(f"\nERSSTv5 index vs published PDO (ERSSTv6): r = {obs_pub_corr:.3f}")
+print(f"Best pattern match: {best_model} (r = {pattern_corr[best_model]:.3f})")
+print(f"\nObserved PDO transition years: {transition_years}")
+print(f"Documented shifts:             {documented_shifts}")
+print(f"Transitions matching documented shifts: {matched_shifts}")
+
+# ---------------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------------
+order = ["ERSSTv5", "CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+vmax = max(np.nanmax(np.abs(amp_maps[s])) for s in order)
+
+fig1, axes = plt.subplots(2, 2, figsize=(15, 10))
+for ax, src in zip(axes.ravel(), order):
+    amap = amp_maps[src]
+    pcm = ax.pcolormesh(
+        target_lon2d, target_lat2d, amap,
+        cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto",
+    )
+    ax.set_xlim(target_lon.min(), target_lon.max())
+    ax.set_ylim(target_lat.min(), target_lat.max())
+    ax.set_title(src)
+    ax.set_xlabel("Longitude (deg E)")
+    ax.set_ylabel("Latitude (deg N)")
+    txt = f"var expl = {100*var_expl[src]:.1f}%"
+    if src != "ERSSTv5":
+        txt += f"\npattern corr = {pattern_corr[src]:.3f}"
+    ax.text(0.03, 0.04, txt, transform=ax.transAxes, fontsize=10,
+            va="bottom", ha="left",
+            bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"))
+cbar = fig1.colorbar(pcm, ax=axes.ravel().tolist(), shrink=0.85, pad=0.02)
+cbar.set_label("degC per standard deviation")
+fig1.suptitle("PDO regression pattern (leading mode)", fontsize=14)
+fig1.savefig("fig1_pdo_patterns.png", dpi=150, bbox_inches="tight")
+
+fig2, ax = plt.subplots(figsize=(16, 6))
+colors = {"ERSSTv5": "black", "CESM2": "tab:blue",
+          "GFDL-ESM4": "tab:green", "MPI-ESM1-2-LR": "tab:orange"}
+for src in order:
+    ax.plot(dates, idx_all[src], lw=0.7, alpha=0.7,
+            color=colors[src], label=src)
+ax.plot(dates, pub_idx, lw=1.2, color="purple",
+        label="Published PDO (ERSSTv6)")
+ax.plot(smooth_obs.index, smooth_obs.values, lw=2.5, color="red",
+        label="ERSSTv5 9-yr running mean")
+for yr in transition_years:
+    ax.axvline(pd.Timestamp(f"{yr}-07-01"), color="grey", ls="--", alpha=0.5)
+    ax.text(pd.Timestamp(f"{yr}-07-01"), ax.get_ylim()[1], str(yr),
+            rotation=90, va="top", ha="right", fontsize=9, color="grey")
+ax.set_ylabel("Standardized index")
+ax.set_xlabel("Year")
+ax.set_title("PDO standardized index and observed phase transitions")
+ax.legend(ncol=3, fontsize=9, loc="lower left")
+fig2.savefig("fig2_pdo_series.png", dpi=150, bbox_inches="tight")
+
+print("\nSaved figures: fig1_pdo_patterns.png, fig2_pdo_series.png")
+</execute>

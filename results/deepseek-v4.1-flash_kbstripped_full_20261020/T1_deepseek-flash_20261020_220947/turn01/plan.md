@@ -1,0 +1,26 @@
+# Plan
+
+1. Load the data on native grids with `load_regular_data`: `cmip6_historical` variable `tos` for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly 1950-01 to 2014-12; and `ersst` variable `sst` over the same window. Use `load_areas` for each model’s published surface cell areas and for ERSSTv5’s native 2° cell areas, keeping every source on its own grid.
+- Note [cmip6-grid-labels]: GFDL-ESM4 is `grid_label='gr'`, already 180×360 1°; treat that as its native grid. State the resolution differences when comparing amplitudes because features narrower than the coarse grid are not comparable.
+- Note [cmip6-tos-bulk-top-cell]: use archived `tos` directly; it is the bulk temperature of the top model cell, and top-cell thickness differs among models, so part of any amplitude difference may be definitional; do not substitute level 1 of `thetao`.
+- Note [omip-native-grid-vs-regridded]: compute each source’s index on its own grid with its own cell areas; do not regrid `tos`/`sst` before forming the index, and state which grid each reported number comes from.
+
+2. For each of the four sources, build the monthly Nino 3.4 index with `compute_enso_nino_index`: area-weighted SST anomaly over 5S–5N, 170W–120W, for 1950-01 to 2014-12, relative to that source’s own 1950-2014 monthly climatology. Keep the four 780-month index series and their metadata.
+- Note [anomaly-baselines-and-climate-indices]: use each source’s own 1950-2014 calendar-month climatology; never subtract an observed/WOA climatology from model output; state the climatology and baseline with every index; later count individual months with |anomaly| strictly > 1.0 °C, not persistence-defined events.
+- Note [monthly-means-are-time-averages]: build each monthly climatology as the plain mean of that calendar month’s values over 1950-2014 with no day weights, as in `compute_anomaly_vs_own_climatology`; the 780-month standard deviation is over monthly index values with ddof=0.
+- Note [omip-weighted-means-and-integrals]: the regional index is Σ(`tos`/`sst`·cell area)/Σ(cell area) over valid ocean cells in the box, using each model’s published cell areas and ERSSTv5’s own cell areas; restrict weights to the same valid cells as the SST field and compute time standard deviations unweighted in time with ddof=0.
+
+3. Compute each source’s overall standard deviation over all 780 monthly Nino 3.4 anomaly values with `compute_basic_stat` (`op='std'` along time, unweighted in time, ddof=0). Report the four standard deviations in °C to 2 decimal places; keep unrounded values for the later bias and ratio calculations.
+- Use the ddof=0 convention in [monthly-means-are-time-averages] and [omip-weighted-means-and-integrals].
+
+4. Using the four index series, compute the population standard deviation (ddof=0) for each calendar month by grouping the 780 anomalies by January–December and taking the unweighted time standard deviation within each group. Report all 48 values to 2 decimal places; identify each source’s maximum and minimum calendar-month standard deviation, its peak month and value, its minimum month, and its max-to-min ratio to 2 decimal places. Compare each model’s peak month and max-to-min ratio with ERSSTv5’s to judge whether it reproduces the observed peak month and seasonal phase-locking strength.
+- Grouping by calendar month follows [anomaly-baselines-and-climate-indices]; this grouped standard deviation has no listed tool, so compute it from the index series.
+
+5. Following [anomaly-baselines-and-climate-indices], for each source count the individual months with |Nino 3.4 anomaly| strictly > 1.0 °C and compute the percentage of the 780 months to 1 decimal place. Do not use persistence-defined events (`detect_threshold_events`) for this count.
+
+6. For each model, compute amplitude bias as model overall standard deviation minus ERSSTv5 overall standard deviation, and amplitude ratio as model overall standard deviation divided by ERSSTv5 overall standard deviation, using unrounded step-3 values; report each to 2 decimal places. Rank the three models from smallest to largest absolute amplitude bias. Interpret the ranking with the resolution and top-cell-definition caveats in [cmip6-grid-labels] and [cmip6-tos-bulk-top-cell].
+
+7. Produce Figure 1: a line plot with calendar month January–December on the x axis and standard deviation (°C) on the y axis, four curves on one axis, ERSSTv5 visually distinct from the three model curves, and each curve’s peak month marked. Produce Figure 2: four vertically stacked panels sharing one 1950–2014 time axis, in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, each showing that source’s Nino 3.4 anomaly series on an identical y-axis range containing every series, with +1.0 and −1.0 °C levels marked and each panel annotated with its overall standard deviation and exceedance percentage.
+
+Other notes:
+- [cmip6-experiments-historical-ssp245] Only the historical run is used; coupled runs have their own internal variability, so compare amplitude statistics (overall std, seasonal cycle, exceedance counts), not individual years or event timing, against ERSSTv5. One member per model cannot separate forced amplitude change from internal variability; state this caveat when interpreting model-to-model amplitude differences.

@@ -1,0 +1,925 @@
+# exchange 4: solution
+# elapsed: 22.1 s
+
+===== SYSTEM =====
+
+The user's question:
+Assess the Pacific Decadal Oscillation (PDO) simulated by three CMIP6 models against ERSSTv5 observations, over 1950-01 to 2014-12.
+
+Data to use:
+- CMIP6 historical `tos` from CESM2, GFDL-ESM4 and MPI-ESM1-2-LR, monthly, 1950-01 to 2014-12.
+- ERSSTv5 monthly SST over the same window.
+- The published PDO index (product `pdo` in the index registry).
+
+The PDO is the leading EOF of monthly North Pacific SST anomalies over 20N-70N, 110E-100W, relative to a 1950-2014 monthly climatology.
+
+Expected numerical results, for each of the four sources over 1950-2014, with any regridding done by bilinear interpolation onto the 1-degree grid:
+- The percentage of variance explained by the leading mode, to 1 decimal place.
+- The amplitude of the mode, in degrees Celsius per standard deviation, to 3 decimal places.
+- The lag-1-year (12-month) autocorrelation of the monthly standardized index, to 3 decimal places.
+- The Pearson correlation of the ERSSTv5-derived index with the published PDO series, to 3 decimal places, and what that correlation does and does not demonstrate.
+- For each model, the spatial Pearson correlation between its regression pattern and the ERSSTv5 regression pattern, to 3 decimal places.
+- The observed PDO phase-transition years over 1950-2014, defined as the years in which the 9-year (108-month) centred running mean of the ERSSTv5 index changes sign (a crossing less than 3 years after the last counted transition is merged into it, keeping the earlier year), and which of them correspond to documented Pacific climate shifts.
+- Which model reproduces the observed pattern best, and whether the models' amplitude and persistence are consistent with observations.
+
+Expected visualizations:
+- Figure 1, a 2-by-2 panel of the regression pattern over the PDO domain, in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, on one diverging colour scale centred on zero labelled in degrees Celsius per standard deviation, each panel annotated with its explained variance and, for the models, its pattern correlation with observations.
+- Figure 2, a single time-series panel of the standardized index of all four sources plus the published PDO series as a distinguishable fifth line, with the 9-year smoothed ERSSTv5 curve and the transition years marked, and the y axis labelled as a standardized index.
+
+The analysis plan:
+1. Load monthly CMIP6 historical `tos` for CESM2, GFDL-ESM4 and MPI-ESM1-2-LR over 1950-01 to 2014-12, and monthly ERSSTv5 `sst` over the same window, using `load_regular_data`; select the North Pacific PDO domain 20N-70N, 110E-100W, with a slightly larger loading box if needed for later bilinear regridding.
+2. Load the published PDO monthly series from `cpc_indices` using `load_regular_data` with product `pdo` and variable `pdo`, restricted to 1950-01 to 2014-12.
+3. Bilinearly regrid each CMIP6 `tos` field onto the 1-degree grid using `regrid_horizontal`, so all four SST sources are compared cell by cell over the PDO domain.
+4. For each source, compute monthly anomalies relative to its own 1950-2014 monthly climatology using `compute_anomaly_vs_own_climatology`.
+5. For each source, derive the leading North Pacific SST mode and standardized PDO index over 20N-70N, 110E-100W using `compute_pdo_index`; where the tool returns only the index, use the same anomaly fields and standardized index to obtain the leading-mode explained variance, amplitude in degrees Celsius per standard deviation, and the regression pattern by custom EOF/regression calculation, without rounding intermediate results.
+6. Compute the lag-1-year (12-month) autocorrelation of each monthly standardized index using `analyze_correlation` with a 12-month lag; compare CESM2, GFDL-ESM4 and MPI-ESM1-2-LR with ERSSTv5.
+7. Compute the Pearson correlation between the ERSSTv5-derived standardized PDO index and the published `pdo` series using `analyze_correlation`, and report what the correlation demonstrates and does not demonstrate.
+8. Compute the spatial Pearson correlation between each model’s PDO regression pattern and the ERSSTv5 regression pattern using `analyze_correlation`; use the highest pattern correlation to identify the model reproducing the observed pattern best, while comparing amplitudes and lag-12 autocorrelations separately for consistency.
+9. Compute the 108-month centred running mean of the ERSSTv5 standardized PDO index using `temporal_aggregate` with a running window, then identify sign changes in the smoothed ERSSTv5 index over 1950-2014; merge any crossing less than 3 years after the last counted transition into that transition, keeping the earlier year. Match the resulting phase-transition years to documented Pacific climate shifts, including 1976/77, 1988/89 and 1998/99.
+10. Create Figure 1: a 2-by-2 panel of regression patterns over the PDO domain in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR, using one diverging colour scale centred on zero and labelled in degrees Celsius per standard deviation; annotate each panel with explained variance and, for the models, pattern correlation with ERSSTv5.
+11. Create Figure 2: a single time-series panel of the standardized PDO index for all four sources plus the published PDO series as a distinguishable fifth line, with the 9-year smoothed ERSSTv5 curve and observed transition years marked, and the y axis labelled as a standardized index.
+
+Other notes:
+- The Pearson correlation with the published PDO series measures temporal agreement with an observation-derived index and does not establish independence, causality or a physical mechanism.
+- Pattern correlations assess spatial similarity of regression patterns only, not amplitude, timing or persistence.
+- Amplitude and lag-12 autocorrelation are separate consistency checks from spatial pattern correlation.
+- The PDO domain is 20N-70N, 110E-100W, and anomalies are relative to each source’s 1950-2014 monthly climatology.
+- Transition years use the 108-month centred running mean of the ERSSTv5 index and merge crossings less than 3 years after the previous counted transition, keeping the earlier year.
+- Documented Pacific climate shifts relevant to 1950-2014 include 1976/77, 1988/89 and 1998/99.
+
+The code that actually ran and produced the results below:
+<executed_code>
+# ---------------------------------------------------------------------------
+# PDO assessment: three CMIP6 models vs ERSSTv5, 1950-01 to 2014-12
+# ---------------------------------------------------------------------------
+time_range  = ["1950-01", "2014-12"]
+base_period = ["1950-01", "2014-12"]
+models = ["CESM2", "GFDL-ESM4", "MPI-ESM1-2-LR"]
+order  = ["ERSSTv5"] + models
+
+# ---- 1. load the GLOBAL SST fields (compute_pdo_index needs global coverage
+#         because it removes the global-mean anomaly itself) -----------------
+raw = {}
+raw["ERSSTv5"] = load_regular_data(dataset="ersst", variable="sst",
+                                   time_range=time_range)
+for m in models:
+    raw[m] = load_regular_data(dataset="cmip6_historical", variable="tos",
+                               model=m, time_range=time_range)
+
+# ---- 2. bilinear regridding onto the common 1-degree grid -----------------
+sst_1deg = {k: regrid_horizontal(v, target="1deg", method="bilinear")
+            for k, v in raw.items()}
+
+# ---- 3. monthly anomalies vs each source's own 1950-2014 climatology ------
+sst_anom = {k: compute_anomaly_vs_own_climatology(v, freq="month",
+                                                  base_period=base_period)
+            for k, v in sst_1deg.items()}
+
+# ---- 4. leading North Pacific mode (tool cuts 20N-70N, 110E-100W itself) --
+pdo_index, eof_pattern, explained_variance, regression_pattern = {}, {}, {}, {}
+for k in order:
+    idx, eof, ev, reg = compute_pdo_index(sst_anom[k])
+    pdo_index[k]          = idx.compute()
+    eof_pattern[k]        = eof.compute()
+    explained_variance[k] = float(np.asarray(ev).ravel()[0])
+    regression_pattern[k] = reg.compute()
+
+# ---- 5. amplitude of the mode (deg C per standard deviation of the index) --
+amplitude     = {}
+amplitude_rms = {}
+for k in order:
+    v = np.asarray(regression_pattern[k].values, dtype=float)
+    amplitude[k]     = float(np.nanmax(np.abs(v)))          # peak amplitude
+    amplitude_rms[k] = float(np.sqrt(np.nanmean(v ** 2)))   # domain RMS
+
+# ---- 6. lag-1-year (12-month) autocorrelation of each standardized index --
+lag12_autocorr = {}
+lag12_pvalue   = {}
+for k in order:
+    r = analyze_correlation(pdo_index[k], pdo_index[k], dim="time", lag=12)
+    lag12_autocorr[k] = float(np.asarray(r["correlation"]).ravel()[0])
+    lag12_pvalue[k]   = float(np.asarray(r["pvalue"]).ravel()[0])
+
+# ---- 7. published NOAA/NCEI PDO index and its agreement with ERSSTv5 ------
+# pdo is a basin-wide pattern index defined on its own domain -> no region arg
+pdo_published = load_regular_data(dataset="cpc_indices", product="pdo",
+                                  time_range=time_range)
+pdo_published = pdo_published.squeeze().compute()
+
+_r = analyze_correlation(pdo_index["ERSSTv5"], pdo_published, dim="time")
+corr_published        = float(np.asarray(_r["correlation"]).ravel()[0])
+corr_published_pvalue = float(np.asarray(_r["pvalue"]).ravel()[0])
+corr_published_n      = int(np.asarray(_r["n_samples"]).ravel()[0])
+
+# ---- 8. spatial (area weighted) pattern correlation vs ERSSTv5 ------------
+pattern_corr, pattern_corr_p = {}, {}
+for m in models:
+    r = analyze_correlation(regression_pattern["ERSSTv5"], regression_pattern[m],
+                            dim=["lat", "lon"], method="pearson",
+                            weighting="area")
+    pattern_corr[m]   = float(np.asarray(r["correlation"]).ravel()[0])
+    pattern_corr_p[m] = float(np.asarray(r["pvalue"]).ravel()[0])
+
+# ---- 9. 9-year (108-month) centred running mean of the ERSSTv5 index ------
+smoothed_ersst = temporal_aggregate(pdo_index["ERSSTv5"], freq="rolling",
+                                    op="mean", window=108, center=True).compute()
+sv = np.asarray(smoothed_ersst.values, dtype=float)
+st = pd.to_datetime(np.asarray(smoothed_ersst["time"].values))
+sg = np.sign(sv)
+
+crossings = []
+for i in range(1, len(sv)):
+    if not np.isfinite(sv[i]) or not np.isfinite(sv[i - 1]):
+        continue
+    if sg[i] == 0 or sg[i - 1] == 0:
+        continue
+    if sg[i] != sg[i - 1]:
+        crossings.append(int(st[i].year))
+
+# merge crossings less than 3 years after the last counted transition
+transitions = []
+for y in crossings:
+    if (not transitions) or (y - transitions[-1] >= 3):
+        transitions.append(y)
+
+# documented Pacific climate shifts over 1950-2014
+documented_shifts = {"1976/77": (1976, 1977),
+                     "1988/89": (1988, 1989),
+                     "1998/99": (1998, 1999)}
+shift_match = {}
+for name, yrs in documented_shifts.items():
+    shift_match[name] = [y for y in transitions
+                         if min(abs(y - yrs[0]), abs(y - yrs[1])) <= 1]
+
+# ---- 10. summary tables ---------------------------------------------------
+summary = pd.DataFrame({
+    "explained_variance_pct": {k: round(explained_variance[k], 1) for k in order},
+    "amplitude_degC_per_SD":  {k: round(amplitude[k], 3)         for k in order},
+    "amplitude_RMS_degC_SD":  {k: round(amplitude_rms[k], 3)     for k in order},
+    "lag12_autocorr":         {k: round(lag12_autocorr[k], 3)    for k in order},
+})
+summary.loc[[m for m in models], "pattern_corr_vs_ERSSTv5"] = \
+    [round(pattern_corr[m], 3) for m in models]
+
+best_model = max(models, key=lambda m: pattern_corr[m])
+
+print(summary.to_string())
+print()
+print(f"ERSSTv5 index vs published NOAA PDO : r = {corr_published:.3f} "
+      f"(p = {corr_published_pvalue:.3g}, n = {corr_published_n})")
+print(f"PDO phase-transition years (108-month running mean) : {transitions}")
+print(f"Matched documented shifts : {shift_match}")
+print(f"Best pattern reproduction : {best_model} "
+      f"(r = {pattern_corr[best_model]:.3f})")
+
+# --- visualization ---
+import matplotlib as mpl
+
+# ===========================================================================
+# Figure 1 - regression patterns over the PDO domain
+# ===========================================================================
+def _to360(da):
+    """Continuous 0-360 longitude axis so the dateline-crossing domain is one strip."""
+    return da.assign_coords(lon=(da["lon"] % 360)).sortby("lon")
+
+panels = [_to360(regression_pattern[k]) for k in order]
+
+pooled = np.concatenate([np.abs(np.asarray(p.values, dtype=float)).ravel()
+                         for p in panels])
+vmax = float(np.nanpercentile(pooled, 98))
+levels = np.linspace(-vmax, vmax, 21)
+
+cmap = plt.get_cmap("RdBu_r").copy()
+cmap.set_bad("0.85")
+
+fig, axes = plt.subplots(2, 2, figsize=(13.5, 9.0), constrained_layout=True)
+axes = axes.ravel()
+
+for ax, k, da in zip(axes, order, panels):
+    lon = np.asarray(da["lon"].values)
+    lat = np.asarray(da["lat"].values)
+    mesh = ax.pcolormesh(lon, lat, np.asarray(da.values, dtype=float),
+                         cmap=cmap, vmin=-vmax, vmax=vmax,
+                         shading="auto")
+    ax.contour(lon, lat, np.asarray(da.values, dtype=float),
+               levels=[0.0], colors="k", linewidths=0.6)
+    ax.set_xlim(110, 260)
+    ax.set_ylim(20, 70)
+    ax.set_xticks([110, 140, 170, 200, 230, 260])
+    ax.set_xticklabels(["110E", "140E", "170E", "160W", "130W", "100W"])
+    ax.set_yticks([20, 30, 40, 50, 60, 70])
+    ax.set_ylabel("Latitude (deg N)")
+    ax.set_xlabel("Longitude")
+
+    if k == "ERSSTv5":
+        ax.set_title(f"{k}  (var. expl. = {explained_variance[k]:.1f} %)\n"
+                     "reference pattern", fontsize=10)
+    else:
+        ax.set_title(f"{k}  (var. expl. = {explained_variance[k]:.1f} %,\n"
+                     f"pattern r vs ERSSTv5 = {pattern_corr[k]:.3f})", fontsize=10)
+
+cbar = fig.colorbar(mesh, ax=axes.tolist(), orientation="vertical",
+                    extend="both", shrink=0.9, pad=0.02)
+cbar.set_label("SST regression (\u00b0C per SD)", fontsize=9)
+
+fig.suptitle("Figure 1 - PDO regression pattern on the standardized index, "
+             "20\u00b0N-70\u00b0N, 110\u00b0E-100\u00b0W, 1950-2014\n"
+             f"shared diverging scale clipped at the 98th percentile of |pattern| "
+             f"({vmax:.2f} \u00b0C/SD); black contour = zero", fontsize=11)
+
+# ===========================================================================
+# Figure 2 - standardized PDO indices + 9-year running mean + transitions
+# ===========================================================================
+fig2, ax2 = plt.subplots(figsize=(13.5, 6.0), constrained_layout=True)
+
+colors = {"ERSSTv5": "#111111",
+          "CESM2": "#d62728",
+          "GFDL-ESM4": "#1f77b4",
+          "MPI-ESM1-2-LR": "#2ca02c"}
+
+for k in order:
+    ax2.plot(np.asarray(pdo_index[k]["time"].values),
+             np.asarray(pdo_index[k].values, dtype=float),
+             color=colors[k], lw=0.6, alpha=0.75,
+             label=f"{k}" + (" (ERSST computed)" if k == "ERSSTv5" else " (model)"))
+
+ax2.plot(np.asarray(pdo_published["time"].values),
+         np.asarray(pdo_published.values, dtype=float),
+         color="#9467bd", lw=0.9, ls="--", alpha=0.9,
+         label="Published PDO (NOAA NCEI)")
+
+ax2.plot(np.asarray(smoothed_ersst["time"].values), sv,
+         color="#ff7f0e", lw=2.6, label="ERSSTv5 108-month running mean")
+
+ymin, ymax = -4.0, 4.0
+for y in transitions:
+    xt = pd.Timestamp(f"{y}-07-01")
+    ax2.axvline(xt, color="grey", ls=":", lw=1.0)
+    ax2.text(xt, ymax * 0.94, str(y), rotation=90, va="top", ha="right",
+             fontsize=8, color="dimgrey")
+
+ax2.set_ylim(ymin, ymax)
+ax2.set_xlim(pd.Timestamp("1950-01-01"), pd.Timestamp("2014-12-31"))
+ax2.axhline(0.0, color="grey", lw=0.8)
+ax2.set_xlabel("Year")
+ax2.set_ylabel("Standardized PDO index")
+ax2.set_title("Figure 2 - Standardized PDO index, 1950-2014: models vs ERSSTv5 "
+              "and the published index\n"
+              "dotted vertical lines = sign changes of the 108-month centred "
+              "ERSSTv5 running mean (crossings < 3 yr after the previous one merged)",
+              fontsize=11)
+ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=3,
+           fontsize=8.5, frameon=False)
+</executed_code>
+
+Here are the results of code execution:
+
+Status Summary:
+- Computation: Success
+- Visualization: Generated
+
+<observation>
+[
+  {
+    "type": "computation",
+    "status": "success",
+    "results": {
+      "time_range": [
+        "1950-01",
+        "2014-12"
+      ],
+      "base_period": [
+        "1950-01",
+        "2014-12"
+      ],
+      "models": [
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "order": [
+        "ERSSTv5",
+        "CESM2",
+        "GFDL-ESM4",
+        "MPI-ESM1-2-LR"
+      ],
+      "raw": {
+        "ERSSTv5": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "lat": 89,
+            "lon": 180
+          },
+          "units": "degC",
+          "long_name": "Monthly Means of Sea Surface Temperature",
+          "source_dataset": "ersst",
+          "size": 12495600,
+          "n_valid": 8570640,
+          "min": -1.7999999523162842,
+          "max": 34.07516098022461,
+          "mean": 13.684885025024414,
+          "std": 11.519000053405762
+        },
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "nlat": 384,
+            "nlon": 320
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "cmip6_historical",
+          "size": 95846400,
+          "n_valid": 67154880,
+          "min": -1.953375220298767,
+          "max": 33.92473602294922,
+          "mean": 17.253204345703125,
+          "std": 11.540406227111816
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "cmip6_historical",
+          "size": 50544000,
+          "n_valid": 34759920,
+          "min": -2.265211582183838,
+          "max": 36.423118591308594,
+          "mean": 13.544767379760742,
+          "std": 11.476192474365234
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "j": 220,
+            "i": 254
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "cmip6_historical",
+          "size": 43586400,
+          "n_valid": 28696980,
+          "min": -1.900230884552002,
+          "max": 35.88800811767578,
+          "mean": 9.807075500488281,
+          "std": 10.308302879333496
+        }
+      },
+      "sst_1deg": {
+        "ERSSTv5": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Monthly Means of Sea Surface Temperature",
+          "source_dataset": "woa23",
+          "size": 50544000,
+          "n_valid": 34563360,
+          "min": -1.8000000398010152,
+          "max": 34.0751609847425,
+          "mean": 13.56005423054811,
+          "std": 11.546424317151395
+        },
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "woa23",
+          "size": 50544000,
+          "n_valid": 33188220,
+          "min": -1.952355980873108,
+          "max": 33.874251973981295,
+          "mean": 13.99630230650321,
+          "std": 11.759461051608513
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "woa23",
+          "size": 50544000,
+          "n_valid": 34759920,
+          "min": -2.265211582183838,
+          "max": 36.423118591308594,
+          "mean": 13.544768342481014,
+          "std": 11.476192516428195
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature",
+          "source_dataset": "woa23",
+          "size": 50544000,
+          "n_valid": 33310680,
+          "min": -1.9000000709177516,
+          "max": 35.69987802259948,
+          "mean": 13.275385123073917,
+          "std": 11.172804837082392
+        }
+      },
+      "sst_anom": {
+        "ERSSTv5": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Monthly Means of Sea Surface Temperature anomaly",
+          "source_dataset": "woa23",
+          "size": 50544000,
+          "n_valid": 34563360,
+          "min": -13.864296737714076,
+          "max": 9.439443621195078,
+          "mean": -1.347268573737447e-17,
+          "std": 0.5439530438783394
+        },
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature anomaly",
+          "source_dataset": "woa23",
+          "size": 50544000,
+          "n_valid": 33188220,
+          "min": -8.702996939929427,
+          "max": 6.796799861074331,
+          "mean": -7.015460414986692e-17,
+          "std": 0.5930611385732403
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature anomaly",
+          "source_dataset": "woa23",
+          "size": 50544000,
+          "n_valid": 34759920,
+          "min": -10.839560599510486,
+          "max": 10.408910476530973,
+          "mean": -6.698250273702288e-18,
+          "std": 0.629311969419837
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780,
+            "lat": 180,
+            "lon": 360
+          },
+          "units": "degC",
+          "long_name": "Sea Surface Temperature anomaly",
+          "source_dataset": "woa23",
+          "size": 50544000,
+          "n_valid": 33310680,
+          "min": -13.326520448685194,
+          "max": 9.375585250210378,
+          "mean": -6.989669489000814e-17,
+          "std": 0.6624922363883857
+        }
+      },
+      "pdo_index": {
+        "ERSSTv5": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780
+          },
+          "units": "standardized",
+          "long_name": "Pacific Decadal Oscillation Index",
+          "size": 780,
+          "n_valid": 780,
+          "min": -2.7502165829821754,
+          "max": 2.8037571358890787,
+          "mean": 1.8219044506669236e-17,
+          "std": 0.9999999999999999
+        },
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780
+          },
+          "units": "standardized",
+          "long_name": "Pacific Decadal Oscillation Index",
+          "size": 780,
+          "n_valid": 780,
+          "min": -3.15898041844779,
+          "max": 2.410216964306206,
+          "mean": -4.554761126667309e-18,
+          "std": 1.0
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780
+          },
+          "units": "standardized",
+          "long_name": "Pacific Decadal Oscillation Index",
+          "size": 780,
+          "n_valid": 780,
+          "min": -3.3755625276018324,
+          "max": 2.834212898656796,
+          "mean": 0.0,
+          "std": 0.9999999999999999
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "time": 780
+          },
+          "units": "standardized",
+          "long_name": "Pacific Decadal Oscillation Index",
+          "size": 780,
+          "n_valid": 780,
+          "min": -2.7138908179521843,
+          "max": 2.491852236531399,
+          "mean": -9.109522253334618e-18,
+          "std": 0.9999999999999998
+        }
+      },
+      "eof_pattern": {
+        "ERSSTv5": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 50,
+            "lon": 150
+          },
+          "units": "dimensionless",
+          "long_name": "First EOF pattern of North Pacific SST",
+          "source_dataset": "woa23",
+          "size": 7500,
+          "n_valid": 4754,
+          "min": -3.473338141401814e-07,
+          "max": 2.4695490322773076e-07,
+          "mean": -3.150249762580881e-08,
+          "std": 1.4527164563489472e-07
+        },
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 50,
+            "lon": 150
+          },
+          "units": "dimensionless",
+          "long_name": "First EOF pattern of North Pacific SST",
+          "source_dataset": "woa23",
+          "size": 7500,
+          "n_valid": 4466,
+          "min": -4.42210150684577e-07,
+          "max": 2.7990976038523095e-07,
+          "mean": -3.889075225560518e-08,
+          "std": 1.5047708645810895e-07
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 50,
+            "lon": 150
+          },
+          "units": "dimensionless",
+          "long_name": "First EOF pattern of North Pacific SST",
+          "source_dataset": "woa23",
+          "size": 7500,
+          "n_valid": 4724,
+          "min": -5.787600601017899e-07,
+          "max": 3.61257393167499e-07,
+          "mean": -3.713881773492733e-08,
+          "std": 1.4761140669459995e-07
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 50,
+            "lon": 150
+          },
+          "units": "dimensionless",
+          "long_name": "First EOF pattern of North Pacific SST",
+          "source_dataset": "woa23",
+          "size": 7500,
+          "n_valid": 4390,
+          "min": -8.934168844088734e-07,
+          "max": 2.663975246912741e-07,
+          "mean": -5.174840421541714e-08,
+          "std": 1.5049442184570826e-07
+        }
+      },
+      "explained_variance": {
+        "ERSSTv5": 23.04659317348885,
+        "CESM2": 26.09273209535903,
+        "GFDL-ESM4": 14.228195820072962,
+        "MPI-ESM1-2-LR": 22.920348583600756
+      },
+      "regression_pattern": {
+        "ERSSTv5": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 50,
+            "lon": 150
+          },
+          "units": "degC",
+          "long_name": "SST anomaly regressed on the standardized PDO index",
+          "source_dataset": "woa23",
+          "size": 7500,
+          "n_valid": 4754,
+          "min": -0.7624140226398777,
+          "max": 0.5420775953924158,
+          "mean": -0.06914945852214904,
+          "std": 0.3188780744730091
+        },
+        "CESM2": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 50,
+            "lon": 150
+          },
+          "units": "degC",
+          "long_name": "SST anomaly regressed on the standardized PDO index",
+          "source_dataset": "woa23",
+          "size": 7500,
+          "n_valid": 4466,
+          "min": -1.0423091912713656,
+          "max": 0.6597598780387735,
+          "mean": -0.09166725008622374,
+          "std": 0.35468125248627796
+        },
+        "GFDL-ESM4": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 50,
+            "lon": 150
+          },
+          "units": "degC",
+          "long_name": "SST anomaly regressed on the standardized PDO index",
+          "source_dataset": "woa23",
+          "size": 7500,
+          "n_valid": 4724,
+          "min": -1.1142325926209014,
+          "max": 0.6954950333628945,
+          "mean": -0.07149989050998548,
+          "std": 0.28418242718172343
+        },
+        "MPI-ESM1-2-LR": {
+          "type": "DataArray",
+          "dims": {
+            "lat": 50,
+            "lon": 150
+          },
+          "units": "degC",
+          "long_name": "SST anomaly regressed on the standardized PDO index",
+          "source_dataset": "woa23",
+          "size": 7500,
+          "n_valid": 4390,
+          "min": -2.351559160196571,
+          "max": 0.7011839043809331,
+          "mean": -0.1362067764605662,
+          "std": 0.3961157912958831
+        }
+      },
+      "amplitude": {
+        "ERSSTv5": 0.7624140226398777,
+        "CESM2": 1.0423091912713656,
+        "GFDL-ESM4": 1.1142325926209014,
+        "MPI-ESM1-2-LR": 2.351559160196571
+      },
+      "amplitude_rms": {
+        "ERSSTv5": 0.32628955544657007,
+        "CESM2": 0.3663354686671837,
+        "GFDL-ESM4": 0.2930390524517773,
+        "MPI-ESM1-2-LR": 0.4188794648436973
+      },
+      "lag12_autocorr": {
+        "ERSSTv5": 0.3416103788465583,
+        "CESM2": 0.22346948127247385,
+        "GFDL-ESM4": 0.30499519742489223,
+        "MPI-ESM1-2-LR": 0.42544956217845187
+      },
+      "lag12_pvalue": {
+        "ERSSTv5": 0.00047125547932491685,
+        "CESM2": 0.06899848225543592,
+        "GFDL-ESM4": 0.00045428543675596345,
+        "MPI-ESM1-2-LR": 0.0059111834628990945
+      },
+      "pdo_published": {
+        "type": "DataArray",
+        "dims": {
+          "time": 780
+        },
+        "units": "1",
+        "long_name": "North Pacific anomaly from NOAA NCEI pdo",
+        "source_dataset": "cpc_indices",
+        "size": 780,
+        "n_valid": 780,
+        "min": -3.11,
+        "max": 2.58,
+        "mean": 0.0034230769230769254,
+        "std": 1.0198457402109546
+      },
+      "corr_published": 0.9615297923508339,
+      "corr_published_pvalue": 0.0,
+      "corr_published_n": 780,
+      "pattern_corr": {
+        "CESM2": 0.9246807525230161,
+        "GFDL-ESM4": 0.891235839710799,
+        "MPI-ESM1-2-LR": 0.7503211881262598
+      },
+      "pattern_corr_p": {
+        "CESM2": 0.0,
+        "GFDL-ESM4": 0.0,
+        "MPI-ESM1-2-LR": 0.0
+      },
+      "smoothed_ersst": {
+        "type": "DataArray",
+        "dims": {
+          "time": 780
+        },
+        "units": "standardized",
+        "long_name": "Pacific Decadal Oscillation Index",
+        "size": 780,
+        "n_valid": 673,
+        "min": -0.6472029284343311,
+        "max": 0.9553694148073214,
+        "mean": 0.10797733648251381,
+        "std": 0.42306633690666623
+      },
+      "sv": {
+        "type": "ndarray",
+        "shape": [
+          780
+        ],
+        "size": 780,
+        "n_valid": 673,
+        "min": -0.6472029284343311,
+        "max": 0.9553694148073214,
+        "mean": 0.10797733648251381,
+        "std": 0.42306633690666623
+      },
+      "st": "DatetimeIndex(['1950-01-01', '1950-02-01', '1950-03-01', '1950-04-01',\n               '1950-05-01', '1950-06-01', '1950-07-01', '1950-08-01',\n               '1950-09-01', '1950-10-01',\n               ...\n               '2014-03-01', '2014-04-01', '2014-05-01', '2014-06-01',\n               '2014-07-01', '2014-08-01', '2014-09-01', '2014-10-01',\n               '2014-11-01', '2014-12-01'],\n              dtype='datetime64[ns]', length=780, freq=None)",
+      "sg": {
+        "type": "ndarray",
+        "shape": [
+          780
+        ],
+        "size": 780,
+        "n_valid": 673,
+        "min": -1.0,
+        "max": 1.0,
+        "mean": -0.031203566121842496,
+        "std": 0.9995130501705717
+      },
+      "crossings": [
+        1961,
+        1962,
+        1976,
+        2002
+      ],
+      "transitions": [
+        1961,
+        1976,
+        2002
+      ],
+      "documented_shifts": {
+        "1976/77": [
+          1976,
+          1977
+        ],
+        "1988/89": [
+          1988,
+          1989
+        ],
+        "1998/99": [
+          1998,
+          1999
+        ]
+      },
+      "shift_match": {
+        "1976/77": [
+          1976
+        ],
+        "1988/89": [],
+        "1998/99": []
+      },
+      "summary": "               explained_variance_pct  ...  pattern_corr_vs_ERSSTv5\nERSSTv5                          23.0  ...                      NaN\nCESM2                            26.1  ...                    0.925\nGFDL-ESM4                        14.2  ...                    0.891\nMPI-ESM1-2-LR                    22.9  ...                    0.750\n\n[4 rows x 5 columns]",
+      "best_model": "CESM2"
+    }
+  },
+  {
+    "type": "visualization",
+    "status": "success",
+    "paths": [
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_no_knowledge_20261020/T9_deepseek-flash_20261021_120722/turn01/figures/visualization_T9_deepseek-flash_20261021_120722_turn1_1.png",
+      "/home/lorraine/projects/2025-jingwei_QA_GMD/results/deepseek-v4.1-flash_kbstripped_no_knowledge_20261020/T9_deepseek-flash_20261021_120722/turn01/figures/visualization_T9_deepseek-flash_20261021_120722_turn1_2.png"
+    ]
+  }
+]
+</observation>
+
+Please provide a clear scientific summary inside <solution></solution> tags.
+
+Describe the methodology strictly from the <executed_code> above, never by inferring it from variable
+names: the baseline period, the source of any climatology, the weighting, the units, the region and
+time range, the range of lags — all of it must match the tools and arguments the code actually
+called. Do not report a step the code did not take. Where a variable name in the observation is
+ambiguous, the code decides what it means.
+
+If computation succeeded, include:
+1. Direct answer to the user's question
+2. Key numerical results and their interpretation
+3. If visualization was generated, describe what it shows. The description should outline the visualization's intended logic and methodology, without interpreting the specific visual result.
+4. Any important insights or patterns observed
+
+If computation failed, explain:
+1. What went wrong
+2. Efforts made by the agent to solve the question, including data selection, tool choice, computation and visualization attempts
+3. Suggestions for how to reformulate the query
+
+
+===== USER =====
+Provide the final explanation in English.
+
+===== RESPONSE =====
+<solution>
+## Methodology actually used
+
+The analysis covered **1950-01 through 2014-12** with baseline/climatology period **1950-01 to 2014-12**. Global monthly SST fields were loaded with `load_regular_data`: ERSSTv5 `sst` from `ersst`, and CMIP6 historical `tos` for **CESM2, GFDL-ESM4, and MPI-ESM1-2-LR**. Each source was bilinearly regridded to a common **1° grid** using `regrid_horizontal(target="1deg", method="bilinear")`. Monthly anomalies were computed relative to **each source’s own 1950–2014 monthly climatology** with `compute_anomaly_vs_own_climatology(freq="month", base_period=["1950-01","2014-12"])`.
+
+The leading North Pacific SST mode and standardized PDO index were obtained with `compute_pdo_index` applied to the global anomaly fields; the code notes that this tool removes the global-mean anomaly itself and cuts the PDO domain **20°N–70°N, 110°E–100°W**. The returned explained variance, EOF, and regression pattern were used. Amplitude was computed from the regression pattern as the **maximum absolute regression value** in °C per standard deviation of the standardized index; the code also computed a domain-RMS amplitude as a supplementary diagnostic. Lag-1-year persistence was computed as the **12-month autocorrelation** of each standardized monthly index with `analyze_correlation(..., dim="time", lag=12)`. Pattern correlations between model regression patterns and the ERSSTv5 regression pattern were computed with `analyze_correlation(..., dim=["lat","lon"], method="pearson", weighting="area")`, i.e. **area-weighted spatial Pearson correlation**.
+
+The published PDO series was loaded from `cpc_indices` with product `pdo`, restricted to the same time range, and correlated with the ERSSTv5-derived standardized index over time using `analyze_correlation(..., dim="time")` with no lag. The 9-year smoothed ERSSTv5 index was formed with `temporal_aggregate(freq="rolling", op="mean", window=108, center=True)`. Sign changes were identified from the 108-month centred running mean; crossings less than 3 years after the last counted transition were merged into the earlier transition. Documented shifts checked by the code were **1976/77, 1988/89, and 1998/99**, with a match allowed within 1 year.
+
+## Key numerical results
+
+| Source | Explained variance (%) | Peak amplitude (max |regression|) (°C SD⁻¹) | Domain RMS amplitude (°C SD⁻¹) | Lag-12 autocorrelation |
+|---|---:|---:|---:|---:|
+| ERSSTv5 | 23.0 | 0.762 | 0.326 | 0.342 |
+| CESM2 | 26.1 | 1.042 | 0.366 | 0.223 |
+| GFDL-ESM4 | 14.2 | 1.114 | 0.293 | 0.305 |
+| MPI-ESM1-2-LR | 22.9 | 2.352 | 0.419 | 0.425 |
+
+The ERSSTv5-derived standardized PDO index correlates with the published PDO series at **r = 0.962** (p reported as 0.0, n = 780). This demonstrates strong temporal agreement between the ERSSTv5-derived index and the published observation-derived PDO index over 1950–2014. It does **not** demonstrate independence, causality, or a physical mechanism, because both series are observation-derived and are not independent validation datasets.
+
+Spatial pattern correlations of each model’s PDO regression pattern with the ERSSTv5 regression pattern:
+
+| Model | Pattern correlation vs ERSSTv5 |
+|---|---:|
+| CESM2 | 0.925 |
+| GFDL-ESM4 | 0.891 |
+| MPI-ESM1-2-LR | 0.750 |
+
+**CESM2 reproduces the observed spatial PDO regression pattern best** by this metric. Pattern correlation assesses spatial similarity only; it does not assess amplitude, timing, or persistence. Using the code’s peak-amplitude definition, all three models overestimate the observed peak amplitude, especially MPI-ESM1-2-LR (2.352 vs 0.762 °C SD⁻¹). Using the supplementary domain-RMS amplitude, CESM2 and MPI-ESM1-2-LR are somewhat larger than observed, while GFDL-ESM4 is smaller. For lag-12 persistence, GFDL-ESM4 is closest to ERSSTv5 (0.305 vs 0.342), CESM2 is lower (0.223), and MPI-ESM1-2-LR is higher (0.425). Thus the models’ amplitude and persistence are only partly consistent with observations and do not uniformly match the observed spatial pattern ranking.
+
+## Observed PDO phase transitions
+
+The sign changes of the 108-month centred running mean of the ERSSTv5 standardized PDO index occurred at **1961, 1962, 1976, and 2002**. After merging a crossing less than 3 years after the previous counted transition, keeping the earlier year, the retained transitions are:
+
+**1961, 1976, 2002**
+
+Among the documented Pacific climate shifts checked by the code—1976/77, 1988/89, and 1998/99—only **1976** is matched, corresponding to the **1976/77** shift. Under this smoothed-index sign-change criterion, no transitions were matched to 1988/89 or 1998/99. The 1961 and 2002 transitions were detected but were not matches to the listed documented shifts.
+
+## Figures generated
+
+**Figure 1** is a 2×2 panel of the PDO regression patterns over 20°N–70°N, 110°E–100°W in the order ERSSTv5, CESM2, GFDL-ESM4, MPI-ESM1-2-LR. It uses a shared diverging colour scale centred on zero, labelled in °C per standard deviation, with a zero contour. Each panel is annotated with its explained variance; model panels are also annotated with their area-weighted spatial pattern correlation against the ERSSTv5 regression pattern. The colour scale is clipped at the 98th percentile of the pooled absolute regression values across the four panels.
+
+**Figure 2** is a single time-series panel showing the standardized PDO index for ERSSTv5, CESM2, GFDL-ESM4, and MPI-ESM1-2-LR, plus the published PDO series as a distinguishable fifth line. It overlays the 108-month centred running mean of the ERSSTv5 index and marks the detected transition years with vertical dotted lines. The y-axis is labelled as the standardized PDO index.
+
+## Main insights
+
+- ERSSTv5’s leading North Pacific mode explains **23.0%** of monthly SST anomaly variance over the PDO domain. CESM2 and MPI-ESM1-2-LR are close to this (26.1% and 22.9%), while GFDL-ESM4 explains substantially less (14.2%).
+- The ERSSTv5-derived index is highly correlated with the published PDO series (**r = 0.962**), confirming close temporal agreement with an observation-derived PDO product, but not independent validation or causality.
+- CESM2 has the highest spatial pattern correlation with the observed regression pattern (**0.925**), followed by GFDL-ESM4 (**0.891**) and MPI-ESM1-2-LR (**0.750**).
+- Amplitude and persistence checks separate from pattern correlation show mixed consistency: all models overestimate peak regression amplitude, and lag-12 autocorrelation ranges from too low in CESM2 to too high in MPI-ESM1-2-LR, with GFDL-ESM4 closest for persistence.
+- The smoothed ERSSTv5 index identifies retained phase transitions in **1961, 1976, and 2002**; only **1976** corresponds to the documented 1976/77 Pacific climate shift within the code’s matching criterion.
+</solution>
